@@ -18,13 +18,26 @@ import { AppliedLaunchObservationStore } from "./applied-launch-observation-stor
 import { NativePermissionStore } from "./native-permission-store.js";
 import { RigRepository } from "./rig-repository.js";
 import { SessionTransport, inspectStartupStagedText } from "./session-transport.js";
-import { startupSubmissionEvidence, type StartupSubmissionDiagnostic } from "./startup-submission-evidence.js";
+import { startupOwnCollapsedPaste, startupSubmissionEvidence, type StartupSubmissionDiagnostic } from "./startup-submission-evidence.js";
 import type { AppliedLaunchObservation } from "./permission-drift.js";
 import { resolveReadinessTimeoutMs } from "./readiness-timeout.js";
 import { SettingsStore } from "./user-settings/settings-store.js";
+import { shellQuote } from "../adapters/shell-quote.js";
 
 // Expanded startup text can put the current input marker above 50 scrollback lines.
 const STARTUP_SUBMIT_CAPTURE_LINES = 200;
+// Claude Code 2.1.289 has taken Enter on a large startup paste after the first look, while the composer
+// still showed that paste collapsed. Only that transient is looked at again, 200 ms apart, up to this many
+// times: about 5 s of waiting per send, plus capture time. Nothing is typed meanwhile.
+const STARTUP_SUBMIT_SETTLE_LOOKS = 25;
+
+/** Pending context belongs to this occupant and is consumed before delivery starts. */
+export function hasPendingFreshStartup(db: Database.Database, nodeId: string, sessionId: string): boolean {
+  const row = db.prepare("SELECT payload FROM events WHERE node_id = ? AND type IN ('node.startup_pending', 'node.startup_ready', 'node.startup_failed') ORDER BY seq DESC LIMIT 1").get(nodeId) as { payload: string } | undefined;
+  if (!row) return false;
+  const event = JSON.parse(row.payload);
+  return event.type === "node.startup_failed" && event.sessionId === sessionId && event.freshContextPending === true;
+}
 
 // -- Types --
 
@@ -208,7 +221,7 @@ export class StartupOrchestrator {
     // RestoreOrchestrator already reconciled the saved activity selection before
     // native resume. Fresh launches still project empty plans to support removal.
     let projectionResult: ProjectionResult;
-    if (!(input.preserveStartupContext && input.adapter.runtime === "claude-code")) try {
+    if (!(input.preserveStartupContext && input.adapter.runtime === "claude-code" && input.plan.entries.length === 0)) try {
       projectionResult = await input.adapter.project(input.plan, input.binding);
       warnings.push(...(projectionResult.warnings ?? []));
       if (projectionResult.failed.length > 0) {
@@ -539,10 +552,7 @@ export class StartupOrchestrator {
    * daemon loss during delivery: uncertain delivery is never blindly replayed.
    */
   canContinueFresh(nodeId: string, sessionId: string): boolean {
-    const row = this.db.prepare("SELECT payload FROM events WHERE node_id = ? AND type IN ('node.startup_pending', 'node.startup_ready', 'node.startup_failed') ORDER BY seq DESC LIMIT 1").get(nodeId) as { payload: string } | undefined;
-    if (!row) return false;
-    const event = JSON.parse(row.payload);
-    return event.type === "node.startup_failed" && event.sessionId === sessionId && event.freshContextPending === true;
+    return hasPendingFreshStartup(this.db, nodeId, sessionId);
   }
 
   /**
@@ -586,6 +596,9 @@ export class StartupOrchestrator {
     evidence?: string,
     freshContextPending = false,
   ): StartupResult {
+    if (status === "attention_required" && freshContextPending && input.binding.tmuxSession) {
+      errors.push(`After resolving it in ${input.binding.tmuxSession}, run: rig seat continue ${shellQuote(input.binding.tmuxSession)}`);
+    }
     this.sessionRegistry.updateStartupStatus(input.sessionId, status);
     this.eventBus.emit({
       type: "node.startup_failed",
@@ -781,9 +794,9 @@ export class StartupOrchestrator {
     const diagnostic: StartupSubmissionDiagnostic = { startupAttemptId: input.startupAttemptId,
       sendOrder, source, ...(actionIndex === undefined ? {} : { actionIndex }), observations: [], retry: "not_run" };
     let phase: "initial" | "guarded_retry" | "after_retry" = "initial";
-    const record = (pane: string | null) => {
+    const record = (pane: string | null, look?: number) => {
       const evidence = startupSubmissionEvidence(pane, text, STARTUP_SUBMIT_CAPTURE_LINES);
-      if (evidence) diagnostic.observations.push({ ...evidence, phase });
+      if (evidence) diagnostic.observations.push({ ...evidence, phase, ...(look === undefined ? {} : { look }) });
       return evidence;
     };
     const unverified = (reason: string): null => {
@@ -791,15 +804,16 @@ export class StartupOrchestrator {
       return null; // An unavailable observation is not a failed delivery.
     };
     // tmux accepting Enter does not prove the TUI submitted a large bracketed paste.
-    // Reuse submitOnly's content check and guarded retry; never repaste or loop.
+    // Reuse submitOnly's content check and guarded retry; never repaste or resend.
     try {
       await this.sleep(200);
-      const pane = await this.tmuxAdapter.capturePaneContent(tmuxSession, STARTUP_SUBMIT_CAPTURE_LINES);
-      if (!pane?.trim()) { record(pane); return unverified("Startup submission capture is unavailable after Enter."); }
-      const before = inspectStartupStagedText(pane, text);
+      const first = await this.tmuxAdapter.capturePaneContent(tmuxSession, STARTUP_SUBMIT_CAPTURE_LINES);
+      if (!first?.trim()) { record(first); return unverified("Startup submission capture is unavailable after Enter."); }
+      const { pane, state: before, looks } = await this.settleOwnPaste(tmuxSession, first, text);
       if (before === "clear") { input.lastSubmissionConfirmed = true; return null; }
       if (before === "unverified") {
-        const evidence = record(pane);
+        if (looks) record(first, 0);
+        const evidence = record(pane, looks || undefined);
         return unverified(evidence?.reason === "unrecognized_composer_boundary"
           ? "Startup submission is unverified: the current composer boundary was not recognized."
           : "Startup submission is unverified: the current composer does not positively match the complete prompt.");
@@ -841,6 +855,28 @@ export class StartupOrchestrator {
     } finally {
       if (diagnostic.observations.length) input.submissionDiagnostics.push(diagnostic);
     }
+  }
+
+  /**
+   * Claude can take the startup Enter after the first look while the composer still shows our paste collapsed.
+   * Only that transient is looked at again, until the composer reads clear or staged, shows anything else, or
+   * the looks run out. A draft, ghost text or any other mismatch keeps its first-look verdict. Observation only.
+   * Remaining ambiguity: a person who clears a collapsed paste with the same line count inside the window reads
+   * as submitted.
+   */
+  private async settleOwnPaste(tmuxSession: string, pane: string, text: string): Promise<{ pane: string; state: ReturnType<typeof inspectStartupStagedText>; looks: number }> {
+    let state = inspectStartupStagedText(pane, text);
+    let looks = 0;
+    while (state === "unverified" && looks < STARTUP_SUBMIT_SETTLE_LOOKS && startupOwnCollapsedPaste(pane, text)) {
+      await this.sleep(200);
+      // A failed re-look adds nothing; the last usable observation stands.
+      const next = await this.tmuxAdapter.capturePaneContent(tmuxSession, STARTUP_SUBMIT_CAPTURE_LINES).catch(() => null);
+      if (!next?.trim()) break;
+      pane = next;
+      state = inspectStartupStagedText(pane, text);
+      looks++;
+    }
+    return { pane, state, looks };
   }
 }
 
