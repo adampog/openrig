@@ -50,6 +50,12 @@ pods:
         runtime: codex
         profile: default
         cwd: "."
+      - id: qwen
+        agent_ref: "local:../../packages/daemon/specs/agents/development/implementer"
+        runtime: pi
+        model: macllm/mlx-community/Qwen3.6-35B-A3B-4bit
+        profile: default
+        cwd: "."
     edges:
       - kind: delegates_to
         from: builder
@@ -59,6 +65,9 @@ pods:
         to: qa
       - kind: delegates_to
         from: codex
+        to: qa
+      - kind: delegates_to
+        from: qwen
         to: qa
 
 edges:
@@ -74,3 +83,6 @@ edges:
   - kind: delegates_to
     from: orch.lead
     to: dev.qa
+  - kind: delegates_to
+    from: orch.lead
+    to: dev.qwen
