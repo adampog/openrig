@@ -12,7 +12,7 @@ missions:
 # Skill source and the System World remain outside the project workspace.
 
 # Project-level workflow: every mission starts with a plan step and ends with a release
-# step, both owned by the openrig-build orchestrator. Each mission's mission.yaml overrides
+# step, both owned by the workshop orchestrator. Each mission's mission.yaml overrides
 # this profile with its own slice steps between the two.
 lifecycle:
   profile: mission-v1
@@ -22,12 +22,12 @@ lifecycle:
       workflow:
         objective: Deliver one mission, from plan through its slices to a local release.
         target:
-          rig: openrig-build
+          rig: workshop
         entry:
           role: lead
         roles:
           lead:
-            preferred_targets: [orch-lead@openrig-build]
+            preferred_targets: [orch-lead@workshop]
         exception_routing:
           default: orchestrator
           orchestrator_role: lead
