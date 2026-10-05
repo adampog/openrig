@@ -131,3 +131,10 @@ test("jev log shows each task's pick, the seat, and why, without reading transcr
     assert.equal(JSON.parse((await w.jev("log", "-n", "1", "--json")).stdout).length, 1);
   } finally { stub.close(); w.done(); }
 });
+
+test("the shipped defaults offer Jev exactly the models that have a seat: no Haiku", () => {
+  const d = JSON.parse(readFileSync(path.join(HERE, "jev.defaults.json"), "utf8"));
+  assert.deepEqual(Object.keys(d.candidates).sort(), ["codex", "opus", "sonnet"]);
+  assert.deepEqual(Object.keys(d.seats).sort(), Object.keys(d.candidates).sort());
+  assert.ok(Object.values(d.seats).includes(d.default_seat));
+});

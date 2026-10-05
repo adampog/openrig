@@ -4,10 +4,6 @@
   "jev_model": "jev-latest",
   "timeout_ms": 1500,
   "candidates": {
-    "haiku": {
-      "runtime": "claude-code",
-      "description": "Claude Haiku: the fastest and cheapest. Small, well-defined changes such as typos, renames, one-file edits and simple questions."
-    },
     "sonnet": {
       "runtime": "claude-code",
       "description": "Claude Sonnet: capable and mid-cost. Typical features and bug fixes across a few files, with tests."

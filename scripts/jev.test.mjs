@@ -67,7 +67,7 @@ function assertNoKey(dir, ...outputs) {
 }
 
 test("a confident pick returns the model, effort and confidences, and is recorded", async () => {
-  const stub = await stubJev(() => answer("opus", 0.62, { haiku: 0.05, sonnet: 0.2, opus: 0.7, codex: 0.05 }, "high", 1));
+  const stub = await stubJev(() => answer("opus", 0.62, { sonnet: 0.2, opus: 0.7, codex: 0.1 }, "high", 1));
   const dir = home({ endpoint: stub.url });
   try {
     const r = await jev(dir, "decide", "--default", "sonnet", "--json", "Root-cause seats marked detached after resume");
@@ -78,7 +78,7 @@ test("a confident pick returns the model, effort and confidences, and is recorde
     assert.equal(out.effort, "high");
     assert.equal(out.fallback.applied, false);
     assert.equal(out.jev.model.confidence, 0.62);
-    assert.deepEqual(out.jev.model.probabilities, { haiku: 0.05, sonnet: 0.2, opus: 0.7, codex: 0.05 });
+    assert.deepEqual(out.jev.model.probabilities, { sonnet: 0.2, opus: 0.7, codex: 0.1 });
 
     const [rec] = records(dir);
     assert.equal(rec.task, "Root-cause seats marked detached after resume");
@@ -89,7 +89,7 @@ test("a confident pick returns the model, effort and confidences, and is recorde
     // The question carries the candidates from config and the cheapest-first rule; the key goes only in the header.
     const [req] = stub.requests;
     assert.equal(req.auth, `Bearer ${FAKE_KEY}`);
-    assert.deepEqual(Object.keys(req.body.questions.model.criteria), ["haiku", "sonnet", "opus", "codex"]);
+    assert.deepEqual(Object.keys(req.body.questions.model.criteria), ["sonnet", "opus", "codex"]);
     assert.match(req.body.questions.model.instructions, /cheapest/);
     assert.deepEqual(Object.keys(req.body.questions.effort.criteria), ["low", "medium", "high"]);
 
@@ -102,7 +102,7 @@ test("a confident pick returns the model, effort and confidences, and is recorde
 });
 
 test("a low-confidence pick falls back to the seat's default and names Jev's would-be pick", async () => {
-  const stub = await stubJev(() => answer("haiku", 0.38, { haiku: 0.54, codex: 0.32, sonnet: 0.1, opus: 0.04 }, "low", 0.73));
+  const stub = await stubJev(() => answer("codex", 0.38, { codex: 0.54, sonnet: 0.32, opus: 0.14 }, "low", 0.73));
   const dir = home({ endpoint: stub.url });
   try {
     const r = await jev(dir, "decide", "--default", "sonnet", "--json", "Add --json to habit list, with tests");
@@ -110,13 +110,13 @@ test("a low-confidence pick falls back to the seat's default and names Jev's wou
     assert.equal(r.code, 0);
     assert.equal(out.model, "sonnet");
     assert.equal(out.fallback.applied, true);
-    assert.match(out.fallback.reason, /confidence in haiku \(0\.38\) is below the threshold 0\.4/);
-    assert.equal(out.jev.model.choice, "haiku");
+    assert.match(out.fallback.reason, /confidence in codex \(0\.38\) is below the threshold 0\.4/);
+    assert.equal(out.jev.model.choice, "codex");
     assert.equal(records(dir)[0].fallback.applied, true);
 
     const human = await jev(dir, "decide", "--default", "sonnet", "Add --json to habit list, with tests");
-    assert.match(human.stdout, /Model: {2}sonnet \(default: Jev's confidence in haiku/);
-    assert.match(human.stdout, /Jev would pick: haiku \(confidence 0\.38\)/);
+    assert.match(human.stdout, /Model: {2}sonnet \(default: Jev's confidence in codex/);
+    assert.match(human.stdout, /Jev would pick: codex \(confidence 0\.38\)/);
   } finally { stub.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
