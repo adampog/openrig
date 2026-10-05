@@ -102,7 +102,7 @@ test("a confident pick returns the model, effort and confidences, and is recorde
 });
 
 test("a low-confidence pick falls back to the seat's default and names Jev's would-be pick", async () => {
-  const stub = await stubJev(() => answer("codex", 0.38, { codex: 0.54, sonnet: 0.32, opus: 0.14 }, "low", 0.73));
+  const stub = await stubJev(() => answer("codex", 0.18, { codex: 0.54, sonnet: 0.32, opus: 0.14 }, "low", 0.73));
   const dir = home({ endpoint: stub.url });
   try {
     const r = await jev(dir, "decide", "--default", "sonnet", "--json", "Add --json to habit list, with tests");
@@ -110,13 +110,13 @@ test("a low-confidence pick falls back to the seat's default and names Jev's wou
     assert.equal(r.code, 0);
     assert.equal(out.model, "sonnet");
     assert.equal(out.fallback.applied, true);
-    assert.match(out.fallback.reason, /confidence in codex \(0\.38\) is below the threshold 0\.4/);
+    assert.match(out.fallback.reason, /confidence in codex \(0\.18\) is below the threshold 0\.25/);
     assert.equal(out.jev.model.choice, "codex");
     assert.equal(records(dir)[0].fallback.applied, true);
 
     const human = await jev(dir, "decide", "--default", "sonnet", "Add --json to habit list, with tests");
     assert.match(human.stdout, /Model: {2}sonnet \(default: Jev's confidence in codex/);
-    assert.match(human.stdout, /Jev would pick: codex \(confidence 0\.38\)/);
+    assert.match(human.stdout, /Jev would pick: codex \(confidence 0\.18\)/);
   } finally { stub.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
