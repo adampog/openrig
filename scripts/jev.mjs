@@ -246,7 +246,8 @@ async function route(task) {
     if (!r.reason) Object.assign(r, { seat: chosen, model: d.model, effort: d.effort, fallback: false, reason: null });
     if (r.reason) r.fallback = true;
   }
-  appendFileSync(paths.record, `${JSON.stringify(r)}\n`);
+  // A record that can't be written never stops dispatch: the seat is still returned, with the error.
+  try { appendFileSync(paths.record, `${JSON.stringify(r)}\n`); } catch (err) { r.record_error = err?.code ?? "write failed"; }
   return r;
 }
 
@@ -277,15 +278,22 @@ async function main(argv) {
       r.jev ? `Jev picked ${r.jev.model} (confidence ${fmt(r.jev.confidence)})${r.jev.effort ? `, effort ${r.jev.effort}` : ""}` : null,
       r.fallback ? `Default seat because: ${r.reason}` : null,
       `Put in the row body: Jev: ${r.model ?? "default"}${r.effort ? `, effort ${r.effort}` : ""}${r.fallback ? ` (default: ${r.reason})` : ""}`,
+      r.record_error ? `Not recorded (${r.record_error}); jev log won't show this task` : null,
     ].filter(Boolean).join("\n"));
     return 0;
   }
   if (command === "log") {
     const n = rest.includes("-n") ? Number(rest[rest.indexOf("-n") + 1]) || 20 : 20;
-    let entries = [];
-    try { entries = readFileSync(paths.record, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((e) => e.type === "route"); } catch { /* no record yet */ }
-    entries = entries.slice(-n);
-    console.log(json ? JSON.stringify(entries) : entries.map(routeLine).join("\n") || "No routed tasks yet.");
+    let text = "";
+    try { text = readFileSync(paths.record, "utf8"); } catch { /* no record yet */ }
+    let skipped = 0;
+    const entries = text.split("\n").filter((l) => l.trim()).flatMap((l) => {
+      try { return [JSON.parse(l)]; } catch { skipped++; return []; }
+    }).filter((e) => e.type === "route").slice(-n);
+    const note = skipped ? `${skipped} unreadable line(s) in ${paths.record} skipped` : null;
+    if (json) console.log(JSON.stringify(entries));
+    else console.log([entries.map(routeLine).join("\n") || "No routed tasks yet.", note].filter(Boolean).join("\n"));
+    if (json && note) console.error(note);
     return 0;
   }
   if (command === "decide") {

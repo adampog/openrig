@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -61,6 +61,7 @@ function world({ endpoint = "http://127.0.0.1:9/x", running = [OPUS, SONNET, COD
     route: async (task) => JSON.parse((await new Promise((resolve) => execFile(process.execPath, [JEV, "route", "--json", task], { env }, (e, out) => resolve(out))))),
     calls: () => readFileSync(calls, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)),
     home,
+    record: path.join(openrig, "jev", "decisions.jsonl"),
     done: () => rmSync(root, { recursive: true, force: true }),
   };
 }
@@ -188,4 +189,43 @@ test("an old error followed by more work, or the words in ordinary output, do no
       } finally { w.done(); }
     }
   } finally { stub.close(); }
+});
+
+test("a record that can't be written still returns the seat, with the error", { skip: !existsSync("/dev/full") && "no /dev/full" }, async () => {
+  const stub = await stubJev(() => answer("sonnet", 0.8));
+  const w = world({ endpoint: stub.url });
+  try {
+    symlinkSync("/dev/full", w.record); // every write fails with ENOSPC
+    for (const off of [false, true]) {
+      if (off) await w.jev("off");
+      const r = await w.jev("route", "--json", "Add a flag");
+      assert.equal(r.code, 0);
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.seat, off ? OPUS : SONNET);
+      assert.equal(out.record_error, "ENOSPC");
+      const human = await w.jev("route", "Add a flag");
+      assert.equal(human.code, 0);
+      assert.match(human.stdout, new RegExp(`Dispatch to: ${off ? OPUS : SONNET}`));
+      assert.match(human.stdout, /Not recorded \(ENOSPC\); jev log won't show this task/);
+    }
+  } finally { stub.close(); w.done(); }
+});
+
+test("jev log shows every readable route and counts damaged lines instead of hiding them", async () => {
+  const stub = await stubJev(() => answer("opus", 0.8));
+  const w = world({ endpoint: stub.url });
+  try {
+    await w.route("First task");
+    appendFileSync(w.record, '{"type":"route","time":"2026-10-05T05:0\n');
+    await w.route("Second task");
+    appendFileSync(w.record, '{"type":"route","ti');
+    const log = await w.jev("log");
+    const lines = log.stdout.trim().split("\n");
+    assert.match(lines[0], /— First task$/);
+    assert.match(lines[1], /— Second task$/);
+    assert.match(lines[2], /^2 unreadable line\(s\) in .*decisions\.jsonl skipped$/);
+    const json = await w.jev("log", "--json");
+    assert.deepEqual(JSON.parse(json.stdout).map((e) => e.task), ["First task", "Second task"]);
+    assert.match(json.stderr, /2 unreadable line\(s\)/);
+  } finally { stub.close(); w.done(); }
 });
