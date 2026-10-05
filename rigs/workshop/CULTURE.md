@@ -28,6 +28,13 @@ judgment. The team turns specified slices into working, independently checked ch
   - Commits locally as the candidate.
   - Hands the candidate to dev-qa with the commit, how to exercise it, and what it did not check.
   - Repairs anything QA finds.
+  - May hand small, bounded tasks (lookups, summaries, drafts, test runs) to dev-qwen and
+    reviews what comes back before using it. dev-qwen's work is never the candidate until
+    dev-builder has checked it.
+- **dev-qwen** helps dev-builder on a local Qwen model:
+  - Takes only tasks from dev-builder and replies to `dev-builder@workshop`.
+  - Never commits, never contacts orch-lead or dev-qa.
+  - Unavailable when the owner's MacBook is asleep or off the home network.
 - **dev-qa** checks the slice independently:
   - Checks the exact candidate through the public interface against the slice's proof
     contract, using a throwaway data location.

@@ -35,10 +35,26 @@ pods:
         runtime: codex
         profile: default
         cwd: "."
+      # Helper for dev.builder on the local Qwen model (MacBook, mlx_lm.server).
+      # Its provider lives in ~/.openrig/state/pi/dev-qwen@workshop/agent/{models.json,settings.json},
+      # which OpenRig does not write; it needs supportsDeveloperRole: false.
+      - id: qwen
+        agent_ref: "local:../../packages/daemon/specs/agents/development/implementer"
+        runtime: pi
+        profile: default
+        cwd: "."
+        startup:
+          files:
+            - path: qwen-helper.md
+              orientation: role
+              delivery_hint: guidance_merge
     edges:
       - kind: delegates_to
         from: builder
         to: qa
+      - kind: delegates_to
+        from: builder
+        to: qwen
 
 edges:
   - kind: delegates_to
