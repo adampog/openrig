@@ -13,6 +13,20 @@ working together in another.
 The team reuses OpenRig's built-in orchestrator, implementer and QA agents from
 `packages/daemon/specs/agents`. How they work together is in [CULTURE.md](CULTURE.md).
 
+## Set it up on another Omarchy machine
+
+`omarchy/setup.sh` installs herdr, Node 24, Claude Code, Codex and this OpenRig
+fork, applies the herdr config, starts the kernel, and launches the workshop on
+`~/Projects/rig-sandbox`. It is safe to re-run.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/adampog/openrig/main/rigs/workshop/omarchy/setup.sh \
+  | bash -s -- --project-from desktop:Projects/rig-sandbox
+```
+
+`--project-from` copies the sandbox project from another machine over ssh; leave
+it out to start with an empty repository. `--help` lists the other options.
+
 ## Run it
 
 From the root of this repository:

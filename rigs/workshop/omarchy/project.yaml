@@ -1,0 +1,44 @@
+schema: openrig.project/v0alpha1
+kind: project
+metadata:
+  id: default
+install:
+  intent: SPEC.md
+  context: []
+  skills: []
+missions:
+  root: missions
+# Add ordered project Markdown addresses and stable catalog skill IDs above.
+# Skill source and the System World remain outside the project workspace.
+
+# Project-level workflow: every mission starts with a plan step and ends with a release
+# step, both owned by the workshop orchestrator. Each mission's mission.yaml overrides
+# this profile with its own slice steps between the two.
+lifecycle:
+  profile: mission-v1
+  profiles:
+    mission-v1:
+      required_steps: [plan, release]
+      workflow:
+        objective: Deliver one mission, from plan through its slices to a local release.
+        target:
+          rig: workshop
+        entry:
+          role: lead
+        roles:
+          lead:
+            preferred_targets: [orch-lead@workshop]
+        exception_routing:
+          default: orchestrator
+          orchestrator_role: lead
+        steps:
+          - id: plan
+            actor_role: lead
+            objective: Confirm the mission's slices are specified and ready, and record the build order in the mission's PROGRESS.md.
+            depends_on: []
+            allowed_exits: [handoff, waiting, failed]
+          - id: release
+            actor_role: lead
+            objective: Close the mission as its SPEC.md acceptance describes, confirm every slice reads ready in rig proof show, and tell the human how to try the result. Commit locally only.
+            depends_on: [plan]
+            allowed_exits: [done, waiting, failed]
