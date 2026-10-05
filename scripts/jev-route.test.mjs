@@ -8,14 +8,18 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const JEV = path.join(HERE, "jev.mjs");
+const JEV = process.env.JEV_TEST_SCRIPT || path.join(HERE, "jev.mjs");
 const OPUS = "dev-builder@r", SONNET = "dev-sonnet@r", CODEX = "dev-codex@r", QA = "dev-qa@r";
 
-// A fake `rig` that only answers `ps` and `capture` (reads). Any other call (send, ...) is logged and fails.
+// A fake `rig` that only answers `whoami`, `ps` and `capture` (reads). Any other call (send, ...) is logged and fails.
 const FAKE_RIG = `#!/usr/bin/env node
 const fs = require("node:fs");
 const [cmd, ...a] = process.argv.slice(2);
 fs.appendFileSync(process.env.FAKE_RIG_CALLS, JSON.stringify([cmd, ...a]) + "\\n");
+if (cmd === "whoami" && process.env.FAKE_RIG_IDENTITY !== "down") {
+  process.stdout.write(process.env.FAKE_RIG_IDENTITY);
+  process.exit(0);
+}
 if (cmd === "ps" && process.env.FAKE_RIG_SEATS !== "down") {
   const seats = JSON.parse(process.env.FAKE_RIG_SEATS);
   process.stdout.write(JSON.stringify({ entries: seats.map((s) => ({ canonicalSessionName: s, sessionStatus: "running", startupStatus: "ready" })) }));
@@ -41,26 +45,30 @@ const answer = (model, confidence, effort = "medium") => ({
   answers: { model: { choice: model, confidence, probabilities: { [model]: confidence } }, effort: { choice: effort, confidence: 0.9 } },
 });
 
-function world({ endpoint = "http://127.0.0.1:9/x", running = [OPUS, SONNET, CODEX, QA], screens = {} } = {}) {
+function world({ endpoint = "http://127.0.0.1:9/x", running = [OPUS, SONNET, CODEX, QA], screens = {}, identity = null, session = "", config = {}, configText = null, redirect = null } = {}) {
   const root = mkdtempSync(path.join(tmpdir(), "jev-route-"));
   const home = path.join(root, "home"), openrig = path.join(root, "openrig"), bin = path.join(root, "bin");
   for (const d of [home, path.join(openrig, "secrets"), path.join(openrig, "jev"), bin]) mkdirSync(d, { recursive: true });
   writeFileSync(path.join(openrig, "secrets", "jev.env"), "JEV_API_KEY=fake-route-key-0123\n");
-  // The human's live config shape: no seat keys, so the seat map comes from jev.defaults.json.
+  // Isolated legacy config; optional per-rig profiles exercise the new shape.
   const { seats, default_seat, ...defaults } = JSON.parse(readFileSync(path.join(HERE, "jev.defaults.json"), "utf8"));
-  writeFileSync(path.join(openrig, "jev", "config.json"), JSON.stringify({ ...defaults, threshold: 0.25, endpoint,
-    seats: { opus: OPUS, sonnet: SONNET, codex: CODEX }, default_seat: OPUS }));
+  writeFileSync(path.join(openrig, "jev", "config.json"), configText ?? JSON.stringify({ ...defaults, threshold: 0.25, endpoint,
+    seats: { opus: OPUS, sonnet: SONNET, codex: CODEX }, default_seat: OPUS, ...config }));
   writeFileSync(path.join(bin, "rig"), FAKE_RIG); chmodSync(path.join(bin, "rig"), 0o755);
   const calls = path.join(root, "calls.jsonl");
   writeFileSync(calls, "");
-  const env = { PATH: `${bin}${path.delimiter}${process.env.PATH}`, HOME: home, OPENRIG_HOME: openrig, FAKE_RIG_CALLS: calls,
+  const preload = path.join(root, "redirect.mjs");
+  if (redirect) writeFileSync(preload, `const original = globalThis.fetch; globalThis.fetch = (url, options) => original(${JSON.stringify(redirect)}, options);`);
+  const env = { PATH: `${bin}${path.delimiter}${process.env.PATH}`, HOME: home, OPENRIG_HOME: openrig, OPENRIG_SESSION_NAME: session, FAKE_RIG_CALLS: calls,
+    FAKE_RIG_IDENTITY: identity ? JSON.stringify({ identity: { rigName: identity } }) : "down",
     FAKE_RIG_SEATS: running === "down" ? "down" : JSON.stringify(running),
     FAKE_RIG_SCREENS: screens === "down" ? "down" : JSON.stringify(screens) };
   return {
-    jev: (...args) => new Promise((resolve) => execFile(process.execPath, [JEV, ...args], { env }, (err, stdout, stderr) => resolve({ code: err ? err.code : 0, stdout, stderr }))),
-    route: async (task) => JSON.parse((await new Promise((resolve) => execFile(process.execPath, [JEV, "route", "--json", task], { env }, (e, out) => resolve(out))))),
+    jev: (...args) => new Promise((resolve) => execFile(process.execPath, [...(redirect ? ["--import", preload] : []), JEV, ...args], { env }, (err, stdout, stderr) => resolve({ code: err ? err.code : 0, stdout, stderr }))),
+    route: async (task) => JSON.parse((await new Promise((resolve) => execFile(process.execPath, [...(redirect ? ["--import", preload] : []), JEV, "route", "--json", task], { env }, (e, out) => resolve(out))))),
     calls: () => readFileSync(calls, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)),
     home,
+    configPath: path.join(openrig, "jev", "config.json"),
     record: path.join(openrig, "jev", "decisions.jsonl"),
     done: () => rmSync(root, { recursive: true, force: true }),
   };
@@ -68,7 +76,7 @@ function world({ endpoint = "http://127.0.0.1:9/x", running = [OPUS, SONNET, COD
 
 /** Routing only ever reads (`rig ps`, `rig capture`), and never touches the human's Claude settings. */
 function assertHandsOff(w) {
-  assert.ok(w.calls().every(([cmd]) => cmd === "ps" || cmd === "capture"), JSON.stringify(w.calls()));
+  assert.ok(w.calls().every(([cmd]) => cmd === "whoami" || cmd === "ps" || cmd === "capture"), JSON.stringify(w.calls()));
   assert.equal(existsSync(path.join(w.home, ".claude")), false);
 }
 
@@ -228,4 +236,202 @@ test("jev log shows every readable route and counts damaged lines instead of hid
     assert.deepEqual(JSON.parse(json.stdout).map((e) => e.task), ["First task", "Second task"]);
     assert.match(json.stderr, /2 unreadable line\(s\)/);
   } finally { stub.close(); w.done(); }
+});
+
+const RIGS = {
+  "plugin-build": {
+    seats: { opus: "dev-builder@plugin-build", codex: "dev-codex@plugin-build" },
+    default_seat: "dev-builder@plugin-build",
+  },
+  "theme-build": {
+    seats: { opus: "dev-builder@theme-build", fable: "dev-fable@theme-build", qwen: "dev-qwen@theme-build" },
+    default_seat: "dev-builder@theme-build",
+    candidates: {
+      fable: { runtime: "claude-code", description: "Claude Fable 5.1: hardest scenes and visual design" },
+      qwen: { runtime: "pi", description: "Text-only chores; cannot look at images" },
+      codex: { runtime: "codex", description: "No seat here; never offer this model" },
+    },
+  },
+};
+const RIG_RUNNING = Object.values(RIGS).flatMap((r) => Object.values(r.seats));
+
+test("same task uses the asking rig's own model seat and default on fallback", async () => {
+  const stub = await stubJev(() => answer("opus", 0.9));
+  try {
+    for (const rig of Object.keys(RIGS)) {
+      // Both rigs offer opus for this test; their normal candidate overrides are checked separately.
+      const rigs = Object.fromEntries(Object.entries(RIGS).map(([name, r]) => [name, { ...r, candidates: undefined }]));
+      const w = world({ endpoint: stub.url, identity: rig, running: RIG_RUNNING, config: { rigs } });
+      try {
+        const r = await w.route("Build the same task");
+        assert.equal(r.rig, rig);
+        assert.equal(r.seat, RIGS[rig].seats.opus);
+        assert.equal(r.fallback_seat, RIGS[rig].default_seat);
+        await w.jev("off");
+        const fallback = await w.route("Build the same task");
+        assert.equal(fallback.seat, RIGS[rig].default_seat);
+        assert.equal(fallback.rig, rig);
+        const records = readFileSync(w.record, "utf8").trim().split("\n").map(JSON.parse);
+        assert.ok(records.every((record) => record.rig === rig));
+        assertHandsOff(w);
+      } finally { w.done(); }
+    }
+  } finally { stub.close(); }
+});
+
+test("explicit --rig overrides identity; outside a rig it selects that rig", async () => {
+  const stub = await stubJev(() => answer("codex", 0.9));
+  try {
+    for (const identity of [null, "theme-build"]) {
+      const w = world({ endpoint: stub.url, identity, running: RIG_RUNNING, config: { rigs: RIGS } });
+      try {
+        const out = await w.jev("route", "--rig", "plugin-build", "--json", "Write a parser");
+        assert.equal(out.code, 0);
+        const r = JSON.parse(out.stdout);
+        assert.equal(r.rig, "plugin-build");
+        assert.equal(r.seat, RIGS["plugin-build"].seats.codex);
+        assert.equal(r.task, "Write a parser");
+        assert.equal(w.calls().some(([cmd]) => cmd === "whoami"), false);
+      } finally { w.done(); }
+    }
+  } finally { stub.close(); }
+});
+
+test("rig candidates replace shared candidates, filter unmapped models, and allow fable", async () => {
+  let model = "codex";
+  const stub = await stubJev(() => answer(model, 0.9));
+  const plugin = world({ endpoint: stub.url, identity: "plugin-build", running: RIG_RUNNING, config: { rigs: RIGS } });
+  const theme = world({ endpoint: stub.url, identity: "theme-build", running: RIG_RUNNING, config: { rigs: RIGS } });
+  try {
+    assert.equal((await plugin.route("Build a parser")).seat, RIGS["plugin-build"].seats.codex);
+    assert.deepEqual(Object.keys(stub.requests.at(-1).questions.model.criteria).sort(), ["codex", "opus"]);
+    model = "fable";
+    assert.equal((await theme.route("Build a scene")).seat, RIGS["theme-build"].seats.fable);
+    assert.deepEqual(stub.requests.at(-1).questions.model.criteria, {
+      fable: RIGS["theme-build"].candidates.fable.description,
+      qwen: RIGS["theme-build"].candidates.qwen.description,
+    });
+    // Even a bad answer cannot select a model that was excluded from the asking rig.
+    model = "codex";
+    const rejected = await theme.route("Build a scene");
+    assert.equal(rejected.seat, RIGS["theme-build"].default_seat);
+    assert.equal(rejected.fallback, true);
+    assert.match(rejected.reason, /known candidate/);
+  } finally { stub.close(); plugin.done(); theme.done(); }
+});
+
+test("stopped picked seat is reported in text and JSON alongside the fallback", async () => {
+  const stub = await stubJev(() => answer("fable", 0.9, "high"));
+  const w = world({ endpoint: stub.url, identity: "theme-build", running: [RIGS["theme-build"].default_seat], config: { rigs: RIGS } });
+  try {
+    const r = await w.route("Render the hardest scene");
+    assert.equal(r.picked_seat, "dev-fable@theme-build");
+    assert.equal(r.picked_model, "fable");
+    assert.equal(r.picked_running, false);
+    assert.equal(r.fallback_seat, "dev-builder@theme-build");
+    assert.equal(r.seat, r.fallback_seat);
+    assert.equal(r.fallback, true);
+    const text = (await w.jev("route", "Render the hardest scene")).stdout;
+    assert.match(text, /Picked seat: dev-fable@theme-build.*not running/);
+    assert.match(text, /Fallback seat: dev-builder@theme-build/);
+    assertHandsOff(w);
+  } finally { stub.close(); w.done(); }
+});
+
+test("route and decide help make no call or record, including -h", async () => {
+  const stub = await stubJev(() => answer("opus", 0.9));
+  const w = world({ endpoint: stub.url });
+  try {
+    for (const command of ["route", "decide"]) {
+      for (const flag of ["--help", "-h"]) {
+        const out = await w.jev(command, flag);
+        assert.equal(out.code, 0);
+        assert.match(out.stdout, /Usage:/);
+      }
+    }
+    assert.equal(stub.requests.length, 0);
+    assert.deepEqual(w.calls(), []);
+    assert.equal(existsSync(w.record), false);
+  } finally { stub.close(); w.done(); }
+});
+
+test("status, log, and decision records show the rig", async () => {
+  const stub = await stubJev(() => answer("codex", 0.9));
+  const w = world({ endpoint: stub.url, identity: "plugin-build", running: RIG_RUNNING, config: { rigs: RIGS } });
+  try {
+    await w.route("Implement the parser");
+    assert.match((await w.jev("status")).stdout, /Rig: plugin-build/);
+    assert.equal(JSON.parse((await w.jev("status", "--json")).stdout).rig, "plugin-build");
+    assert.match((await w.jev("log")).stdout, /plugin-build/);
+    assert.equal(JSON.parse((await w.jev("log", "--json")).stdout)[0].rig, "plugin-build");
+    const d = JSON.parse((await w.jev("decide", "--json", "Implement the parser")).stdout);
+    assert.equal(d.rig, "plugin-build");
+  } finally { stub.close(); w.done(); }
+});
+
+test("unconfigured rigs and malformed --rig cannot dispatch into another rig", async () => {
+  const stub = await stubJev(() => answer("codex", 0.9));
+  const w = world({ endpoint: stub.url, identity: "unconfigured", config: { rigs: RIGS } });
+  try {
+    for (const args of [["route", "Task"], ["route", "--rig", "missing", "Task"], ["route", "--rig"], ["route", "--rig", "--json", "Task"]]) {
+      const out = await w.jev(...args);
+      assert.equal(out.code, 2);
+      assert.match(out.stderr, /rig|--rig/);
+    }
+    assert.equal(stub.requests.length, 0);
+    assert.equal(existsSync(w.record), false);
+  } finally { stub.close(); w.done(); }
+});
+
+test("unchanged live legacy config routes all four models as before with no rig override", async () => {
+  const configText = readFileSync(path.join(HERE, "fixtures", "jev-legacy-config.json"), "utf8");
+  const config = JSON.parse(configText);
+  for (const [model, seat] of Object.entries(config.seats)) {
+    const stub = await stubJev(() => answer(model, 0.9));
+    const w = world({ configText, redirect: stub.url, identity: "openrig-build", running: Object.values(config.seats) });
+    try {
+      const r = await w.route("Implement the same task");
+      assert.deepEqual([r.seat, r.model, r.effort, r.fallback, r.reason], [seat, model, "medium", false, null]);
+      assert.deepEqual(Object.keys(stub.requests.at(-1).questions.model.criteria), Object.keys(config.candidates));
+      await w.jev("off");
+      const fallback = await w.route("Implement the same task");
+      assert.deepEqual([fallback.seat, fallback.model, fallback.fallback, fallback.reason], ["dev-builder@openrig-build", "opus", true, "routing is off"]);
+      assert.equal(readFileSync(w.configPath, "utf8"), configText);
+      assertHandsOff(w);
+    } finally { stub.close(); w.done(); }
+  }
+});
+
+
+test("unavailable identity uses the runtime session address, then legacy when outside a rig", async () => {
+  const stub = await stubJev(() => answer("codex", 0.9));
+  try {
+    for (const [session, seat, rig] of [["orch-lead@plugin-build", "dev-codex@plugin-build", "plugin-build"], ["", CODEX, "r"]]) {
+      const w = world({ endpoint: stub.url, session, running: [...RIG_RUNNING, CODEX], config: { rigs: RIGS } });
+      try {
+        const r = await w.route("Write a parser");
+        assert.equal(r.rig, rig);
+        assert.equal(r.seat, seat);
+      } finally { w.done(); }
+    }
+  } finally { stub.close(); }
+});
+
+test("per-rig default and seat addresses are validated before calling Jev", async () => {
+  const stub = await stubJev(() => answer("codex", 0.9));
+  try {
+    for (const profile of [
+      { seats: { codex: CODEX }, default_seat: CODEX },
+      { seats: { codex: "dev-codex@plugin-build" } },
+    ]) {
+      const w = world({ endpoint: stub.url, identity: "plugin-build", config: { rigs: { "plugin-build": profile } } });
+      try {
+        const out = await w.jev("route", "Task");
+        assert.equal(out.code, 2);
+        assert.match(out.stderr, /must all address that rig|default_seat/);
+        assert.equal(existsSync(w.record), false);
+      } finally { w.done(); }
+    }
+    assert.equal(stub.requests.length, 0);
+  } finally { stub.close(); }
 });

@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // jev — ask Jev (TypeSafe) which model and effort a task needs, and record the answer.
 //
-//   jev decide [--default MODEL] [--json] [TASK... | -]   (no TASK or "-": read stdin)
+//   jev decide [--rig NAME] [--default MODEL] [--json] [TASK... | -]   (no TASK or "-": read stdin)
 //   jev on | off | status [--json]
-//   jev route [--json] [TASK... | -]     pick the implementation seat for TASK
+//   jev route [--rig NAME] [--json] [TASK... | -]     pick the implementation seat for TASK
 //   jev log [-n N] [--json]
 //
 // Everything lives under $OPENRIG_HOME (default ~/.openrig):
@@ -33,30 +33,75 @@ const paths = {
 const defaultsPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "jev.defaults.json");
 
 const USAGE = `Usage:
-  jev decide [--default MODEL] [--json] [TASK... | -]
+  jev decide [--rig NAME] [--default MODEL] [--json] [TASK... | -]
       Ask Jev which model and effort TASK needs (stdin when TASK is omitted or "-").
       --default MODEL  the target seat's own model, used whenever Jev's pick is not used
   jev on | off       turn Jev routing on or off for every rig (takes effect on the next decision)
-  jev status [--json]
-  jev route [--json] [TASK... | -]
+  jev status [--rig NAME] [--json]
+  jev route [--rig NAME] [--json] [TASK... | -]
       Pick the implementation seat for TASK: the seat fixed on Jev's chosen model, or the default
       seat when Jev is unsure, routing is off, Jev is down, or the chosen seat isn't running or its
       model is failing (read from the seat's screen).
-      Prints the seat and effort to put in the dispatch. Never types into any seat.
+      --rig NAME overrides the asking seat's rig (otherwise read with rig whoami).
+      Without a rig identity or override, use the legacy seats/default_seat config.
+      Reports the picked seat, whether it is running, and the fallback dispatch seat.
+      Prints the seat and effort to put in the dispatch. Never starts, stops or types into a seat.
   jev log [-n N] [--json]  recent routes: task, Jev's pick, the seat, and why
 Config: ${paths.config}
 Record: ${paths.record}`;
 
-function loadConfig() {
-  if (!existsSync(paths.config)) {
+function loadConfig({ initialize = true } = {}) {
+  if (!existsSync(paths.config) && initialize) {
     mkdirSync(dir, { recursive: true });
     writeFileSync(paths.config, readFileSync(defaultsPath, "utf8"));
   }
   try {
-    return { config: { ...JSON.parse(readFileSync(defaultsPath, "utf8")), ...JSON.parse(readFileSync(paths.config, "utf8")) } };
+    return { config: { ...JSON.parse(readFileSync(defaultsPath, "utf8")), ...(existsSync(paths.config) ? JSON.parse(readFileSync(paths.config, "utf8")) : {}) } };
   } catch {
     return { config: JSON.parse(readFileSync(defaultsPath, "utf8")), warning: `${paths.config} is not valid JSON; using the built-in defaults` };
   }
+}
+
+// Identity comes from the installed CLI, never from a sibling seat or the config's first rig.
+// Bound the read so dispatch does not hang when the daemon is unavailable. The runtime's
+// session address is a fallback; without either identity source we retain legacy behavior.
+async function askingRig(explicitRig) {
+  if (explicitRig) return explicitRig;
+  try {
+    const { stdout } = await promisify(execFile)("rig", ["whoami", "--json"], { timeout: 1500, maxBuffer: 1024 * 1024 });
+    const rig = JSON.parse(stdout).identity?.rigName;
+    if (typeof rig === "string" && rig) return rig;
+  } catch { /* no live identity; try the runtime address below */ }
+  return seatRig(process.env.OPENRIG_SESSION_NAME);
+}
+
+const seatRig = (seat) => typeof seat === "string" ? seat.split("@").at(1) || null : null;
+
+/** Per-rig maps replace the legacy map; missing candidates inherit the shared list. */
+async function selectedConfig(explicitRig, { forRoute = false, initialize = true } = {}) {
+  const { config: shared, warning } = loadConfig({ initialize });
+  const requestedRig = await askingRig(explicitRig);
+  const legacyRig = seatRig(shared.default_seat);
+  const rig = requestedRig ?? legacyRig;
+  const profile = requestedRig ? shared.rigs?.[requestedRig] : null;
+  if (requestedRig && !profile && requestedRig !== legacyRig) {
+    throw new Error(`No Jev seat config for rig ${requestedRig}; add rigs.${requestedRig} to ${paths.config}`);
+  }
+  const config = profile ? { ...shared, seats: profile.seats ?? {}, default_seat: profile.default_seat,
+    candidates: profile.candidates ?? shared.candidates } : { ...shared };
+  if (profile || forRoute) {
+    if (!config.default_seat || !Object.values(config.seats ?? {}).includes(config.default_seat)) {
+      throw new Error(`Jev rig ${rig ?? "legacy"} needs a default_seat present in its seats map`);
+    }
+    if (rig && Object.values(config.seats ?? {}).some((seat) => seatRig(seat) !== rig)) {
+      throw new Error(`Jev seats for rig ${rig} must all address that rig`);
+    }
+  }
+  if (forRoute || profile) {
+    config.candidates = Object.fromEntries(Object.entries(config.candidates ?? {})
+      .filter(([model]) => Object.hasOwn(config.seats ?? {}, model)));
+  }
+  return { config, rig, warning };
 }
 
 function routingOn() {
@@ -127,11 +172,12 @@ async function askJev(task, config, key) {
   return { jev: { model, effort, jev_model: data.model ?? null, latency_ms: Date.now() - started } };
 }
 
-async function decide(task, defaultModel) {
-  const { config, warning } = loadConfig();
+async function decide(task, defaultModel, selection) {
+  const { config, warning, rig } = selection;
   const result = {
     time: new Date().toISOString(),
     task,
+    rig,
     routing: routingOn() ? "on" : "off",
     model: defaultModel ?? "seat-default",
     runtime: null,
@@ -144,6 +190,7 @@ async function decide(task, defaultModel) {
   };
   const key = result.routing === "on" ? readKey() : null;
   if (result.routing === "off") result.fallback.reason = "routing is off";
+  else if (!Object.keys(config.candidates ?? {}).length) result.fallback.reason = "no candidates have a seat in this rig";
   else if (!key) result.fallback.reason = `no JEV_API_KEY in ${paths.secret}`;
   else {
     const asked = await askJev(task, config, key);
@@ -219,15 +266,17 @@ async function failingModel(seat, patterns) {
 }
 
 /** The seat a task goes to. Seats are fixed to their models; nothing here changes a seat. */
-async function route(task) {
-  const { config } = loadConfig();
+async function route(task, selection) {
+  const { config, rig } = selection;
   const seats = config.seats ?? {};
   const fallbackSeat = config.default_seat;
   const defaultModel = Object.keys(seats).find((m) => seats[m] === fallbackSeat);
-  const d = await decide(task, defaultModel);
+  const d = await decide(task, defaultModel, selection);
   const r = {
-    type: "route", time: new Date().toISOString(), task,
+    type: "route", time: new Date().toISOString(), task, rig,
     jev: d.jev ? { model: d.jev.model.choice, confidence: d.jev.model.confidence, effort: d.jev.effort?.choice ?? null } : null,
+    picked_seat: d.jev ? seats[d.jev.model.choice] ?? null : null,
+    picked_model: d.jev?.model.choice ?? null, picked_running: null, fallback_seat: fallbackSeat,
     seat: fallbackSeat, model: defaultModel ?? null, effort: null, fallback: d.fallback.applied, reason: d.fallback.reason,
   };
   if (!d.fallback.applied) {
@@ -236,8 +285,11 @@ async function route(task) {
     try { running = await runningSeats(); } catch { /* reported below */ }
     if (!chosen) r.reason = `no seat is fixed on ${d.model}`;
     else if (!running) r.reason = `rig ps unavailable, so ${chosen} could not be checked`;
-    else if (!running.has(chosen)) r.reason = `${chosen} (${d.model}) isn't running`;
-    else {
+    else if (!running.has(chosen)) {
+      r.picked_running = false;
+      r.reason = `${chosen} (${d.model}) isn't running`;
+    } else {
+      r.picked_running = true;
       try {
         const failing = await failingModel(chosen, config.failing_seat_patterns ?? []);
         if (failing) r.reason = `${chosen} (${d.model}) is running but its model is failing: ${failing}`;
@@ -251,11 +303,27 @@ async function route(task) {
   return r;
 }
 
-const routeLine = (r) => `${r.time.slice(0, 19)}  ${r.seat}  ${r.model ?? "?"}${r.effort ? `/${r.effort}` : ""}  `
+const routeLine = (r) => `${r.time.slice(0, 19)}  [rig: ${r.rig ?? seatRig(r.seat) ?? "legacy"}]  ${r.seat}  ${r.model ?? "?"}${r.effort ? `/${r.effort}` : ""}  `
   + `[Jev: ${r.jev ? `${r.jev.model} ${fmt(r.jev.confidence)}` : "no pick"}]  ${r.fallback ? `default: ${r.reason}` : "Jev's pick"}  — ${r.task.slice(0, 60)}`;
 
 async function main(argv) {
-  const [command, ...rest] = argv;
+  const [command, ...args] = argv;
+  // Help exits before reading stdin, config, identity, secrets, or calling Jev.
+  if (command === "--help" || command === "-h" || args.includes("--help") || args.includes("-h")) {
+    console.log(USAGE);
+    return 0;
+  }
+  let explicitRig;
+  const rest = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--rig") {
+      explicitRig = args[++i];
+      if (!explicitRig || explicitRig.startsWith("-")) {
+        console.error("--rig needs a rig name");
+        return 2;
+      }
+    } else rest.push(args[i]);
+  }
   const json = rest.includes("--json");
   if (command === "on" || command === "off") {
     setRouting(command);
@@ -263,17 +331,22 @@ async function main(argv) {
     return 0;
   }
   if (command === "status") {
-    const status = { routing: routingOn() ? "on" : "off", key: readKey() ? "found" : "missing", config: paths.config, record: paths.record };
-    console.log(json ? JSON.stringify(status) : `Jev routing is ${status.routing}. API key: ${status.key}.\nConfig: ${status.config}\nRecord: ${status.record}`);
+    const { rig } = await selectedConfig(explicitRig, { initialize: false });
+    const status = { rig, routing: routingOn() ? "on" : "off", key: readKey() ? "found" : "missing", config: paths.config, record: paths.record };
+    console.log(json ? JSON.stringify(status) : `Jev routing is ${status.routing}. API key: ${status.key}.\nRig: ${status.rig ?? "legacy"}\nConfig: ${status.config}\nRecord: ${status.record}`);
     return 0;
   }
   if (command === "route") {
     const words = rest.filter((w) => w !== "--json");
     const task = (words.length && words.join(" ") !== "-" ? words.join(" ") : await readStdin()).trim();
     if (!task) { console.error(`jev route needs a task.\n\n${USAGE}`); return 2; }
-    const r = await route(task);
+    const selection = await selectedConfig(explicitRig, { forRoute: true });
+    const r = await route(task, selection);
     console.log(json ? JSON.stringify(r) : [
+      `Rig: ${r.rig ?? "legacy"}`,
       `Dispatch to: ${r.seat}  (${r.model ?? "its fixed model"})`,
+      r.picked_seat ? `Picked seat: ${r.picked_seat} (${r.picked_model}); ${r.picked_running === false ? "not running" : r.picked_running === true ? "running" : "running state not checked"}` : null,
+      `Fallback seat: ${r.fallback_seat}`,
       `Effort: ${r.effort ?? "the seat's usual"}`,
       r.jev ? `Jev picked ${r.jev.model} (confidence ${fmt(r.jev.confidence)})${r.jev.effort ? `, effort ${r.jev.effort}` : ""}` : null,
       r.fallback ? `Default seat because: ${r.reason}` : null,
@@ -306,7 +379,7 @@ async function main(argv) {
     }
     const task = (words.length && words.join(" ") !== "-" ? words.join(" ") : await readStdin()).trim();
     if (!task) { console.error(`jev decide needs a task.\n\n${USAGE}`); return 2; }
-    const result = await decide(task, defaultModel);
+    const result = await decide(task, defaultModel, await selectedConfig(explicitRig));
     console.log(json ? JSON.stringify(result) : human(result));
     return 0;
   }
@@ -314,4 +387,9 @@ async function main(argv) {
   return command === undefined || command === "help" || command === "--help" ? 0 : 2;
 }
 
-process.exitCode = await main(process.argv.slice(2));
+try {
+  process.exitCode = await main(process.argv.slice(2));
+} catch (err) {
+  console.error(err.message);
+  process.exitCode = 2;
+}
