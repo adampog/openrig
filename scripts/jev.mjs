@@ -40,7 +40,8 @@ const USAGE = `Usage:
   jev status [--json]
   jev route [--json] [TASK... | -]
       Pick the implementation seat for TASK: the seat fixed on Jev's chosen model, or the default
-      seat when Jev is unsure, routing is off, Jev is down, or the chosen seat isn't running.
+      seat when Jev is unsure, routing is off, Jev is down, or the chosen seat isn't running or its
+      model is failing (read from the seat's screen).
       Prints the seat and effort to put in the dispatch. Never types into any seat.
   jev log [-n N] [--json]  recent routes: task, Jev's pick, the seat, and why
 Config: ${paths.config}
@@ -204,6 +205,19 @@ async function runningSeats() {
     .map((e) => e.canonicalSessionName));
 }
 
+/**
+ * The model error a running seat is stuck on, if any: an error line among the last few lines above its
+ * prompt. Read with `rig capture` only; an older error followed by more work does not count.
+ */
+async function failingModel(seat, patterns) {
+  const { stdout } = await promisify(execFile)("rig", ["capture", seat, "--lines", "60"], { maxBuffer: 8 * 1024 * 1024 });
+  const lines = stdout.split("\n");
+  const prompt = lines.findLastIndex((l) => /^\s*[›❯](\s|$)/.test(l));
+  const above = lines.slice(0, prompt < 0 ? lines.length : prompt).filter((l) => l.trim() && !/^[\s─═-]+$/.test(l)).slice(-3);
+  const res = patterns.map((p) => new RegExp(p, "i"));
+  return above.find((l) => res.some((re) => re.test(l)))?.trim() ?? null;
+}
+
 /** The seat a task goes to. Seats are fixed to their models; nothing here changes a seat. */
 async function route(task) {
   const { config } = loadConfig();
@@ -223,7 +237,13 @@ async function route(task) {
     if (!chosen) r.reason = `no seat is fixed on ${d.model}`;
     else if (!running) r.reason = `rig ps unavailable, so ${chosen} could not be checked`;
     else if (!running.has(chosen)) r.reason = `${chosen} (${d.model}) isn't running`;
-    else Object.assign(r, { seat: chosen, model: d.model, effort: d.effort, fallback: false, reason: null });
+    else {
+      try {
+        const failing = await failingModel(chosen, config.failing_seat_patterns ?? []);
+        if (failing) r.reason = `${chosen} (${d.model}) is running but its model is failing: ${failing}`;
+      } catch { r.reason = `${chosen}'s screen could not be read to check its model`; }
+    }
+    if (!r.reason) Object.assign(r, { seat: chosen, model: d.model, effort: d.effort, fallback: false, reason: null });
     if (r.reason) r.fallback = true;
   }
   appendFileSync(paths.record, `${JSON.stringify(r)}\n`);

@@ -70,8 +70,8 @@ changes model: never type `/model` or `/effort` into a seat, and never answer a 
 - **Before dispatching,** orch-lead runs `jev route "<one-line task>"`. It prints the seat to
   dispatch to and a line for the row body with the model and effort. Create the row for that
   seat and put that line in the body; the seat works at that effort.
-- **Defaults.** When Jev is unsure, routing is off, Jev is unreachable or the chosen seat isn't
-  running, `jev route` names dev-builder (Opus) and says why. Dispatch there; never wait on Jev.
+- **Defaults.** When Jev is unsure, routing is off, Jev is unreachable, or the chosen seat isn't
+  running or is stuck on a model error (such as Codex "at capacity"), `jev route` names dev-builder (Opus) and says why. Dispatch there; never wait on Jev.
 - **QA is never routed.** dev-qa only judges, so whichever seat built a slice, dev-qa checks it.
 - **orch-lead is not routed.** It stays on its own fixed model.
 - **The human's view.** `jev log` lists each task's pick, the seat and any fallback reason.

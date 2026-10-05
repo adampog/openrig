@@ -11,7 +11,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const JEV = path.join(HERE, "jev.mjs");
 const OPUS = "dev-builder@r", SONNET = "dev-sonnet@r", CODEX = "dev-codex@r", QA = "dev-qa@r";
 
-// A fake `rig` that only answers `ps`. Any other call (send, capture, ...) is logged and fails.
+// A fake `rig` that only answers `ps` and `capture` (reads). Any other call (send, ...) is logged and fails.
 const FAKE_RIG = `#!/usr/bin/env node
 const fs = require("node:fs");
 const [cmd, ...a] = process.argv.slice(2);
@@ -19,6 +19,10 @@ fs.appendFileSync(process.env.FAKE_RIG_CALLS, JSON.stringify([cmd, ...a]) + "\\n
 if (cmd === "ps" && process.env.FAKE_RIG_SEATS !== "down") {
   const seats = JSON.parse(process.env.FAKE_RIG_SEATS);
   process.stdout.write(JSON.stringify({ entries: seats.map((s) => ({ canonicalSessionName: s, sessionStatus: "running", startupStatus: "ready" })) }));
+  process.exit(0);
+}
+if (cmd === "capture" && process.env.FAKE_RIG_SCREENS !== "down") {
+  process.stdout.write(JSON.parse(process.env.FAKE_RIG_SCREENS)[a[0]] ?? "\\n› Ask Codex to do anything\\n");
   process.exit(0);
 }
 process.exit(1);
@@ -37,7 +41,7 @@ const answer = (model, confidence, effort = "medium") => ({
   answers: { model: { choice: model, confidence, probabilities: { [model]: confidence } }, effort: { choice: effort, confidence: 0.9 } },
 });
 
-function world({ endpoint = "http://127.0.0.1:9/x", running = [OPUS, SONNET, CODEX, QA] } = {}) {
+function world({ endpoint = "http://127.0.0.1:9/x", running = [OPUS, SONNET, CODEX, QA], screens = {} } = {}) {
   const root = mkdtempSync(path.join(tmpdir(), "jev-route-"));
   const home = path.join(root, "home"), openrig = path.join(root, "openrig"), bin = path.join(root, "bin");
   for (const d of [home, path.join(openrig, "secrets"), path.join(openrig, "jev"), bin]) mkdirSync(d, { recursive: true });
@@ -50,7 +54,8 @@ function world({ endpoint = "http://127.0.0.1:9/x", running = [OPUS, SONNET, COD
   const calls = path.join(root, "calls.jsonl");
   writeFileSync(calls, "");
   const env = { PATH: `${bin}${path.delimiter}${process.env.PATH}`, HOME: home, OPENRIG_HOME: openrig, FAKE_RIG_CALLS: calls,
-    FAKE_RIG_SEATS: running === "down" ? "down" : JSON.stringify(running) };
+    FAKE_RIG_SEATS: running === "down" ? "down" : JSON.stringify(running),
+    FAKE_RIG_SCREENS: screens === "down" ? "down" : JSON.stringify(screens) };
   return {
     jev: (...args) => new Promise((resolve) => execFile(process.execPath, [JEV, ...args], { env }, (err, stdout, stderr) => resolve({ code: err ? err.code : 0, stdout, stderr }))),
     route: async (task) => JSON.parse((await new Promise((resolve) => execFile(process.execPath, [JEV, "route", "--json", task], { env }, (e, out) => resolve(out))))),
@@ -60,9 +65,9 @@ function world({ endpoint = "http://127.0.0.1:9/x", running = [OPUS, SONNET, COD
   };
 }
 
-/** Routing only ever asks `rig ps`, and never touches the human's Claude settings. */
+/** Routing only ever reads (`rig ps`, `rig capture`), and never touches the human's Claude settings. */
 function assertHandsOff(w) {
-  assert.ok(w.calls().every(([cmd]) => cmd === "ps"), JSON.stringify(w.calls()));
+  assert.ok(w.calls().every(([cmd]) => cmd === "ps" || cmd === "capture"), JSON.stringify(w.calls()));
   assert.equal(existsSync(path.join(w.home, ".claude")), false);
 }
 
@@ -137,4 +142,50 @@ test("the shipped defaults offer Jev exactly the models that have a seat: no Hai
   assert.deepEqual(Object.keys(d.candidates).sort(), ["codex", "opus", "sonnet"]);
   assert.deepEqual(Object.keys(d.seats).sort(), Object.keys(d.candidates).sort());
   assert.ok(Object.values(d.seats).includes(d.default_seat));
+});
+
+const CODEX_CAPACITY = [
+  "• Explored", "  └ Search ^## Resolve the selected path", "",
+  "■ Selected model is at capacity. Please try a different model.", "", "",
+  "› Ask Codex to do anything", "", "  GPT-6.1-Sol default · ~/Projects/openrig-work", "  ? for shortcuts",
+].join("\n");
+const CLAUDE_OVERLOADED = [
+  "❯ Mission: x", "  ⎿  API Error: 529 {\"type\":\"overloaded_error\"}", "",
+  "─".repeat(40), "❯ ", "─".repeat(40), "  ⏵⏵ auto mode on",
+].join("\n");
+
+test("a running seat whose model is failing counts as unavailable: the task goes to the default seat, and why", async () => {
+  const codex = await stubJev(() => answer("codex", 0.8));
+  const sonnet = await stubJev(() => answer("sonnet", 0.8));
+  try {
+    for (const [stub, screens, reason] of [
+      [codex, { [CODEX]: CODEX_CAPACITY }, /dev-codex@r \(codex\) is running but its model is failing: ■ Selected model is at capacity\. Please try a different model\./],
+      [sonnet, { [SONNET]: CLAUDE_OVERLOADED }, /dev-sonnet@r \(sonnet\) is running but its model is failing: ⎿ {2}API Error: 529/],
+      [codex, "down", /dev-codex@r's screen could not be read to check its model/],
+    ]) {
+      const w = world({ endpoint: stub.url, screens });
+      try {
+        const r = await w.route("Write the parser");
+        assert.deepEqual([r.seat, r.model, r.fallback], [OPUS, "opus", true]);
+        assert.match(r.reason, reason);
+        assertHandsOff(w);
+        assert.ok(w.calls().some(([cmd, seat]) => cmd === "capture" && seat !== OPUS));
+      } finally { w.done(); }
+    }
+  } finally { codex.close(); sonnet.close(); }
+});
+
+test("an old error followed by more work, or the words in ordinary output, do not make a seat unavailable", async () => {
+  const stub = await stubJev(() => answer("codex", 0.8));
+  const recovered = CODEX_CAPACITY.replace("\n\n\n› Ask", "\n\n› retry\n\n• Ran npm test\n  └ 12 passing\n\n• Done: tests pass.\n\n› Ask");
+  const prose = CODEX_CAPACITY.replace("■ Selected model is at capacity. Please try a different model.", "• Noted: the old error said the model was at capacity; it has recovered.");
+  try {
+    for (const screen of [recovered, prose]) {
+      const w = world({ endpoint: stub.url, screens: { [CODEX]: screen } });
+      try {
+        const r = await w.route("Write the parser");
+        assert.deepEqual([r.seat, r.fallback, r.reason], [CODEX, false, null]);
+      } finally { w.done(); }
+    }
+  } finally { stub.close(); }
 });

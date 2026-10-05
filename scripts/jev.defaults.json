@@ -27,5 +27,10 @@
     "sonnet": "dev-sonnet@openrig-build",
     "codex": "dev-codex@openrig-build"
   },
-  "default_seat": "dev-builder@openrig-build"
+  "default_seat": "dev-builder@openrig-build",
+  "failing_seat_patterns": [
+    "^\\s*■ .*(at capacity|usage limit|rate limit|overloaded)",
+    "^\\s*⎿\\s+API Error",
+    "^\\s*⎿\\s+.*(usage limit|hit your limit)"
+  ]
 }
