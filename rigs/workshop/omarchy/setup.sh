@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Recreate the OpenRig workshop setup on an Omarchy machine:
 #   herdr (pacman) + Node 24 (mise) + OpenRig CLI built from the adampog/openrig fork
-#   + the herdr config + kernel rig + the workshop rig working ~/Projects/rig-sandbox.
+#   + the herdr config + jev (Jev model routing) + kernel rig + the workshop rig
+#   working ~/Projects/rig-sandbox.
 #
 # Run it from any Omarchy machine:
 #   curl -fsSL https://raw.githubusercontent.com/adampog/openrig/main/rigs/workshop/omarchy/setup.sh | bash
@@ -20,6 +21,7 @@ PROJECT_FROM=""
 CLI_PREFIX="$HOME/.local/share/openrig-cli"
 LAUNCH_RIG=1
 OPEN_TERMINALS=1
+JEV_KEY_FROM=""
 
 usage() {
   cat <<EOF
@@ -33,6 +35,9 @@ Usage: setup.sh [options]
   --ref REF              Branch or tag of $REPO_URL to build (default: $REPO_REF)
   --no-up                Install everything but don't launch the workshop rig
   --no-terminals         Don't open the workshop seats as herdr tiles
+  --jev-key-from SOURCE  Copy the Jev API key file over ssh, e.g.
+                         desktop:.openrig/secrets/jev.env. Without it, you're asked
+                         for the key (or can skip it).
   -h, --help             Show this help
 EOF
 }
@@ -45,6 +50,7 @@ while [ $# -gt 0 ]; do
     --ref) REPO_REF="$2"; shift 2 ;;
     --no-up) LAUNCH_RIG=0; shift ;;
     --no-terminals) OPEN_TERMINALS=0; shift ;;
+    --jev-key-from) JEV_KEY_FROM="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -174,6 +180,37 @@ install_file "$REPO_DIR/rigs/workshop/omarchy/herdr-config.toml" "$HOME/.config/
 herdr server reload-config >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
+step "Installing jev (Jev picks the model for each task)"
+JEV_SCRIPT="$REPO_DIR/scripts/jev.mjs"
+JEV_ENV="${OPENRIG_HOME:-$HOME/.openrig}/secrets/jev.env"
+if [ ! -f "$JEV_SCRIPT" ]; then
+  note "this OpenRig checkout doesn't include jev yet; skipping (re-run after it reaches $REPO_REF)"
+else
+  ln -sfn "$JEV_SCRIPT" "$HOME/.local/bin/jev"
+  note "linked $HOME/.local/bin/jev -> $JEV_SCRIPT"
+  # The key never lives in the repo: copy it from another machine, or type it in.
+  mkdir -p "$(dirname "$JEV_ENV")"
+  if [ -f "$JEV_ENV" ]; then
+    note "Jev API key already saved in $JEV_ENV"
+  elif [ -n "$JEV_KEY_FROM" ]; then
+    (umask 077; scp -q "$JEV_KEY_FROM" "$JEV_ENV")
+    chmod 600 "$JEV_ENV"
+    note "copied the Jev API key from $JEV_KEY_FROM"
+  elif [ -e /dev/tty ]; then
+    jev_key=""
+    read -rs -p "    Jev API key (input hidden; Enter to skip): " jev_key </dev/tty || true
+    echo
+    if [ -n "$jev_key" ]; then
+      (umask 077; printf 'JEV_API_KEY=%s\n' "$jev_key" > "$JEV_ENV")
+      note "saved the Jev API key to $JEV_ENV"
+    fi
+    unset jev_key
+  fi
+  [ -f "$JEV_ENV" ] || note "no Jev API key yet: jev will use each seat's default model until $JEV_ENV exists"
+  "$HOME/.local/bin/jev" status || note "jev status failed; check $JEV_SCRIPT"
+fi
+
+# ---------------------------------------------------------------------------
 step "Checking Claude Code and Codex sign-in"
 claude_ok=0; codex_ok=0
 claude auth status >/dev/null 2>&1 && claude_ok=1
@@ -245,3 +282,4 @@ step "Done"
 note "Kernel:   rig ps --nodes --rig kernel   (mission control: rig tui)"
 note "Workshop: rig ps --nodes --rig workshop"
 note "Give it work: rig send orch-lead@workshop 'Work mission <name>, one slice at a time.'"
+note "Jev routing: jev status | jev on | jev off"
