@@ -1,0 +1,29 @@
+{
+  "threshold": 0.4,
+  "endpoint": "https://api.typesafe.ai/v1/systemone",
+  "jev_model": "jev-latest",
+  "timeout_ms": 1500,
+  "candidates": {
+    "haiku": {
+      "runtime": "claude-code",
+      "description": "Claude Haiku: the fastest and cheapest. Small, well-defined changes such as typos, renames, one-file edits and simple questions."
+    },
+    "sonnet": {
+      "runtime": "claude-code",
+      "description": "Claude Sonnet: capable and mid-cost. Typical features and bug fixes across a few files, with tests."
+    },
+    "opus": {
+      "runtime": "claude-code",
+      "description": "Claude Opus: the most capable and most expensive Claude model. Hard debugging, cross-cutting changes, architecture and ambiguous work."
+    },
+    "codex": {
+      "runtime": "codex",
+      "description": "Codex: OpenAI's coding agent, a separate runtime. Well-specified implementation and test writing in a codebase."
+    }
+  },
+  "efforts": {
+    "low": "Straightforward; little reasoning needed.",
+    "medium": "Some design or investigation needed.",
+    "high": "Deep reasoning: unclear root cause, many interacting parts, or high risk."
+  }
+}
