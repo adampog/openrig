@@ -26,9 +26,23 @@ pods:
   - id: dev
     label: Implementation
     members:
+      # Implementation seats, one per Jev candidate, each fixed to its model. jev route picks one;
+      # builder (Opus) is the default seat. QA never builds.
       - id: builder
         agent_ref: "local:../../packages/daemon/specs/agents/development/implementer"
         runtime: claude-code
+        model: opus
+        profile: default
+        cwd: "."
+      - id: sonnet
+        agent_ref: "local:../../packages/daemon/specs/agents/development/implementer"
+        runtime: claude-code
+        model: sonnet
+        profile: default
+        cwd: "."
+      - id: codex
+        agent_ref: "local:../../packages/daemon/specs/agents/development/implementer"
+        runtime: codex
         profile: default
         cwd: "."
       - id: qa
@@ -40,11 +54,23 @@ pods:
       - kind: delegates_to
         from: builder
         to: qa
+      - kind: delegates_to
+        from: sonnet
+        to: qa
+      - kind: delegates_to
+        from: codex
+        to: qa
 
 edges:
   - kind: delegates_to
     from: orch.lead
     to: dev.builder
+  - kind: delegates_to
+    from: orch.lead
+    to: dev.sonnet
+  - kind: delegates_to
+    from: orch.lead
+    to: dev.codex
   - kind: delegates_to
     from: orch.lead
     to: dev.qa

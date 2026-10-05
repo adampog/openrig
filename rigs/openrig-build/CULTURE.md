@@ -34,7 +34,8 @@ The team turns specified slices into small, independently checked changes.
   - Dispatches that slice to dev-builder as a queue row.
   - Tracks progress, keeps the mission's `PROGRESS.md` honest, and reports to the human.
   - Never writes product code.
-- **dev-builder** builds the slice:
+- **dev-builder** (Opus, the default), **dev-sonnet** (Sonnet) and **dev-codex** (Codex) are the
+  implementation seats, each fixed to its model. Whichever one a slice is routed to builds it:
   - Claims the slice row and creates the slice's branch from `main`.
   - Makes the smallest change that meets the slice's mini-requirements, with tests.
   - Commits locally as the candidate.
@@ -61,7 +62,22 @@ Only one slice is in flight at a time. When every slice in the mission is proven
 closes the mission as its `SPEC.md` describes. It lists each slice branch for the human with a
 one-line summary and how to try it.
 
-## When a mission runs as a workflow
+## Model routing (Jev)
+
+Each task goes to the implementation seat already running the model Jev picks for it. No seat ever
+changes model: never type `/model` or `/effort` into a seat, and never answer a model menu.
+
+- **Before dispatching,** orch-lead runs `jev route "<one-line task>"`. It prints the seat to
+  dispatch to and a line for the row body with the model and effort. Create the row for that
+  seat and put that line in the body; the seat works at that effort.
+- **Defaults.** When Jev is unsure, routing is off, Jev is unreachable, or the chosen seat isn't
+  running or is stuck on a model error (such as Codex "at capacity"), `jev route` names dev-builder (Opus) and says why. Dispatch there; never wait on Jev.
+- **QA is never routed.** dev-qa only judges, so whichever seat built a slice, dev-qa checks it.
+- **orch-lead is not routed.** It stays on its own fixed model.
+- **The human's view.** `jev log` lists each task's pick, the seat and any fallback reason.
+  `jev off` sends everything to the default seat until `jev on`.
+
+
 
 A mission whose `mission.yaml` has a `lifecycle` section runs as an OpenRig workflow. The
 project's `project.yaml` profile supplies the `plan` and `release` steps, and the mission adds
