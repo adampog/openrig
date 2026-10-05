@@ -239,13 +239,13 @@ test("jev log shows every readable route and counts damaged lines instead of hid
 });
 
 const RIGS = {
-  "plugin-build": {
-    seats: { opus: "dev-builder@plugin-build", codex: "dev-codex@plugin-build" },
-    default_seat: "dev-builder@plugin-build",
+  "OmarchyPlugin-build": {
+    seats: { opus: "dev-builder@OmarchyPlugin-build", codex: "dev-codex@OmarchyPlugin-build" },
+    default_seat: "dev-builder@OmarchyPlugin-build",
   },
-  "theme-build": {
-    seats: { opus: "dev-builder@theme-build", fable: "dev-fable@theme-build", qwen: "dev-qwen@theme-build" },
-    default_seat: "dev-builder@theme-build",
+  "OmarchyTheme-build": {
+    seats: { opus: "dev-builder@OmarchyTheme-build", fable: "dev-fable@OmarchyTheme-build", qwen: "dev-qwen@OmarchyTheme-build" },
+    default_seat: "dev-builder@OmarchyTheme-build",
     candidates: {
       fable: { runtime: "claude-code", description: "Claude Fable 5.1: hardest scenes and visual design" },
       qwen: { runtime: "pi", description: "Text-only chores; cannot look at images" },
@@ -282,14 +282,14 @@ test("same task uses the asking rig's own model seat and default on fallback", a
 test("explicit --rig overrides identity; outside a rig it selects that rig", async () => {
   const stub = await stubJev(() => answer("codex", 0.9));
   try {
-    for (const identity of [null, "theme-build"]) {
+    for (const identity of [null, "OmarchyTheme-build"]) {
       const w = world({ endpoint: stub.url, identity, running: RIG_RUNNING, config: { rigs: RIGS } });
       try {
-        const out = await w.jev("route", "--rig", "plugin-build", "--json", "Write a parser");
+        const out = await w.jev("route", "--rig", "OmarchyPlugin-build", "--json", "Write a parser");
         assert.equal(out.code, 0);
         const r = JSON.parse(out.stdout);
-        assert.equal(r.rig, "plugin-build");
-        assert.equal(r.seat, RIGS["plugin-build"].seats.codex);
+        assert.equal(r.rig, "OmarchyPlugin-build");
+        assert.equal(r.seat, RIGS["OmarchyPlugin-build"].seats.codex);
         assert.equal(r.task, "Write a parser");
         assert.equal(w.calls().some(([cmd]) => cmd === "whoami"), false);
       } finally { w.done(); }
@@ -300,21 +300,21 @@ test("explicit --rig overrides identity; outside a rig it selects that rig", asy
 test("rig candidates replace shared candidates, filter unmapped models, and allow fable", async () => {
   let model = "codex";
   const stub = await stubJev(() => answer(model, 0.9));
-  const plugin = world({ endpoint: stub.url, identity: "plugin-build", running: RIG_RUNNING, config: { rigs: RIGS } });
-  const theme = world({ endpoint: stub.url, identity: "theme-build", running: RIG_RUNNING, config: { rigs: RIGS } });
+  const plugin = world({ endpoint: stub.url, identity: "OmarchyPlugin-build", running: RIG_RUNNING, config: { rigs: RIGS } });
+  const theme = world({ endpoint: stub.url, identity: "OmarchyTheme-build", running: RIG_RUNNING, config: { rigs: RIGS } });
   try {
-    assert.equal((await plugin.route("Build a parser")).seat, RIGS["plugin-build"].seats.codex);
+    assert.equal((await plugin.route("Build a parser")).seat, RIGS["OmarchyPlugin-build"].seats.codex);
     assert.deepEqual(Object.keys(stub.requests.at(-1).questions.model.criteria).sort(), ["codex", "opus"]);
     model = "fable";
-    assert.equal((await theme.route("Build a scene")).seat, RIGS["theme-build"].seats.fable);
+    assert.equal((await theme.route("Build a scene")).seat, RIGS["OmarchyTheme-build"].seats.fable);
     assert.deepEqual(stub.requests.at(-1).questions.model.criteria, {
-      fable: RIGS["theme-build"].candidates.fable.description,
-      qwen: RIGS["theme-build"].candidates.qwen.description,
+      fable: RIGS["OmarchyTheme-build"].candidates.fable.description,
+      qwen: RIGS["OmarchyTheme-build"].candidates.qwen.description,
     });
     // Even a bad answer cannot select a model that was excluded from the asking rig.
     model = "codex";
     const rejected = await theme.route("Build a scene");
-    assert.equal(rejected.seat, RIGS["theme-build"].default_seat);
+    assert.equal(rejected.seat, RIGS["OmarchyTheme-build"].default_seat);
     assert.equal(rejected.fallback, true);
     assert.match(rejected.reason, /known candidate/);
   } finally { stub.close(); plugin.done(); theme.done(); }
@@ -322,18 +322,18 @@ test("rig candidates replace shared candidates, filter unmapped models, and allo
 
 test("stopped picked seat is reported in text and JSON alongside the fallback", async () => {
   const stub = await stubJev(() => answer("fable", 0.9, "high"));
-  const w = world({ endpoint: stub.url, identity: "theme-build", running: [RIGS["theme-build"].default_seat], config: { rigs: RIGS } });
+  const w = world({ endpoint: stub.url, identity: "OmarchyTheme-build", running: [RIGS["OmarchyTheme-build"].default_seat], config: { rigs: RIGS } });
   try {
     const r = await w.route("Render the hardest scene");
-    assert.equal(r.picked_seat, "dev-fable@theme-build");
+    assert.equal(r.picked_seat, "dev-fable@OmarchyTheme-build");
     assert.equal(r.picked_model, "fable");
     assert.equal(r.picked_running, false);
-    assert.equal(r.fallback_seat, "dev-builder@theme-build");
+    assert.equal(r.fallback_seat, "dev-builder@OmarchyTheme-build");
     assert.equal(r.seat, r.fallback_seat);
     assert.equal(r.fallback, true);
     const text = (await w.jev("route", "Render the hardest scene")).stdout;
-    assert.match(text, /Picked seat: dev-fable@theme-build.*not running/);
-    assert.match(text, /Fallback seat: dev-builder@theme-build/);
+    assert.match(text, /Picked seat: dev-fable@OmarchyTheme-build.*not running/);
+    assert.match(text, /Fallback seat: dev-builder@OmarchyTheme-build/);
     assertHandsOff(w);
   } finally { stub.close(); w.done(); }
 });
@@ -357,15 +357,15 @@ test("route and decide help make no call or record, including -h", async () => {
 
 test("status, log, and decision records show the rig", async () => {
   const stub = await stubJev(() => answer("codex", 0.9));
-  const w = world({ endpoint: stub.url, identity: "plugin-build", running: RIG_RUNNING, config: { rigs: RIGS } });
+  const w = world({ endpoint: stub.url, identity: "OmarchyPlugin-build", running: RIG_RUNNING, config: { rigs: RIGS } });
   try {
     await w.route("Implement the parser");
-    assert.match((await w.jev("status")).stdout, /Rig: plugin-build/);
-    assert.equal(JSON.parse((await w.jev("status", "--json")).stdout).rig, "plugin-build");
-    assert.match((await w.jev("log")).stdout, /plugin-build/);
-    assert.equal(JSON.parse((await w.jev("log", "--json")).stdout)[0].rig, "plugin-build");
+    assert.match((await w.jev("status")).stdout, /Rig: OmarchyPlugin-build/);
+    assert.equal(JSON.parse((await w.jev("status", "--json")).stdout).rig, "OmarchyPlugin-build");
+    assert.match((await w.jev("log")).stdout, /OmarchyPlugin-build/);
+    assert.equal(JSON.parse((await w.jev("log", "--json")).stdout)[0].rig, "OmarchyPlugin-build");
     const d = JSON.parse((await w.jev("decide", "--json", "Implement the parser")).stdout);
-    assert.equal(d.rig, "plugin-build");
+    assert.equal(d.rig, "OmarchyPlugin-build");
   } finally { stub.close(); w.done(); }
 });
 
@@ -406,7 +406,7 @@ test("unchanged live legacy config routes all four models as before with no rig 
 test("unavailable identity uses the runtime session address, then legacy when outside a rig", async () => {
   const stub = await stubJev(() => answer("codex", 0.9));
   try {
-    for (const [session, seat, rig] of [["orch-lead@plugin-build", "dev-codex@plugin-build", "plugin-build"], ["", CODEX, "r"]]) {
+    for (const [session, seat, rig] of [["orch-lead@OmarchyPlugin-build", "dev-codex@OmarchyPlugin-build", "OmarchyPlugin-build"], ["", CODEX, "r"]]) {
       const w = world({ endpoint: stub.url, session, running: [...RIG_RUNNING, CODEX], config: { rigs: RIGS } });
       try {
         const r = await w.route("Write a parser");
@@ -422,9 +422,9 @@ test("per-rig default and seat addresses are validated before calling Jev", asyn
   try {
     for (const profile of [
       { seats: { codex: CODEX }, default_seat: CODEX },
-      { seats: { codex: "dev-codex@plugin-build" } },
+      { seats: { codex: "dev-codex@OmarchyPlugin-build" } },
     ]) {
-      const w = world({ endpoint: stub.url, identity: "plugin-build", config: { rigs: { "plugin-build": profile } } });
+      const w = world({ endpoint: stub.url, identity: "OmarchyPlugin-build", config: { rigs: { "OmarchyPlugin-build": profile } } });
       try {
         const out = await w.jev("route", "Task");
         assert.equal(out.code, 2);
@@ -452,5 +452,22 @@ test("decide stays model-only and status shows identity even without a rig seat 
     assert.equal(status.code, 0);
     assert.equal(JSON.parse(status.stdout).rig, "advisor");
     assert.ok(w.calls().every(([cmd]) => cmd === "whoami"));
+  } finally { stub.close(); w.done(); }
+});
+
+
+test("rig names match exactly, preserving OmarchyPlugin-build capitals", async () => {
+  const stub = await stubJev(() => answer("codex", 0.9));
+  const w = world({ endpoint: stub.url, identity: "OmarchyPlugin-build", running: RIG_RUNNING, config: { rigs: RIGS } });
+  try {
+    const picked = await w.route("Build a plugin");
+    assert.equal(picked.rig, "OmarchyPlugin-build");
+    assert.equal(picked.seat, "dev-codex@OmarchyPlugin-build");
+    for (const rig of ["omarchyplugin-build", "OMARCHYPLUGIN-BUILD"]) {
+      const out = await w.jev("route", "--rig", rig, "Build a plugin");
+      assert.equal(out.code, 2);
+      assert.match(out.stderr, new RegExp(`No Jev seat config for rig ${rig}`));
+    }
+    assert.equal(stub.requests.length, 1);
   } finally { stub.close(); w.done(); }
 });

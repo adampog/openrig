@@ -13,21 +13,21 @@ additional rigs:
 ```json
 {
   "rigs": {
-    "plugin-build": {
+    "OmarchyPlugin-build": {
       "seats": {
-        "opus": "dev-builder@plugin-build",
-        "sonnet": "dev-sonnet@plugin-build",
-        "codex": "dev-codex@plugin-build"
+        "opus": "dev-builder@OmarchyPlugin-build",
+        "sonnet": "dev-sonnet@OmarchyPlugin-build",
+        "codex": "dev-codex@OmarchyPlugin-build"
       },
-      "default_seat": "dev-builder@plugin-build"
+      "default_seat": "dev-builder@OmarchyPlugin-build"
     },
-    "theme-build": {
+    "OmarchyTheme-build": {
       "seats": {
-        "opus": "dev-builder@theme-build",
-        "fable": "dev-fable@theme-build",
-        "qwen": "dev-qwen@theme-build"
+        "opus": "dev-builder@OmarchyTheme-build",
+        "fable": "dev-fable@OmarchyTheme-build",
+        "qwen": "dev-qwen@OmarchyTheme-build"
       },
-      "default_seat": "dev-builder@theme-build",
+      "default_seat": "dev-builder@OmarchyTheme-build",
       "candidates": {
         "opus": {
           "runtime": "claude-code",
@@ -47,7 +47,8 @@ additional rigs:
 }
 ```
 
-Each rig supplies its complete seat map and a default seat present in that map.
+Rig names match exactly, including case (`OmarchyPlugin-build` differs from
+`omarchyplugin-build`). Each rig supplies its complete seat map and a default seat present in that map.
 Routing requires all its seat addresses to name that rig. Its optional candidates replace the
 shared candidates; omitting them inherits the shared candidates. Routing only
 offers models with a seat in the selected rig, including stopped bench seats.
