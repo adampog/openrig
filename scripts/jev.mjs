@@ -3,11 +3,13 @@
 //
 //   jev decide [--default MODEL] [--json] [TASK... | -]   (no TASK or "-": read stdin)
 //   jev on | off | status [--json]
+//   jev route [--json] [TASK... | -]     pick the implementation seat for TASK
+//   jev log [-n N] [--json]
 //
 // Everything lives under $OPENRIG_HOME (default ~/.openrig):
-//   jev/config.json        threshold, candidates and efforts (seeded from jev.defaults.json)
+//   jev/config.json        threshold, candidates, efforts, seats (keys missing here come from jev.defaults.json)
 //   jev/routing            the on/off switch; absent means on
-//   jev/decisions.jsonl    one JSON line per decision
+//   jev/decisions.jsonl    one JSON line per decision and per route
 //   secrets/jev.env        JEV_API_KEY, read here and never printed or recorded
 //
 // A decision always exits 0: when routing is off, the key is missing, Jev is
@@ -17,6 +19,8 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeF
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 
 const home = process.env.OPENRIG_HOME || path.join(homedir(), ".openrig");
 const dir = path.join(home, "jev");
@@ -34,6 +38,11 @@ const USAGE = `Usage:
       --default MODEL  the target seat's own model, used whenever Jev's pick is not used
   jev on | off       turn Jev routing on or off for every rig (takes effect on the next decision)
   jev status [--json]
+  jev route [--json] [TASK... | -]
+      Pick the implementation seat for TASK: the seat fixed on Jev's chosen model, or the default
+      seat when Jev is unsure, routing is off, Jev is down, or the chosen seat isn't running.
+      Prints the seat and effort to put in the dispatch. Never types into any seat.
+  jev log [-n N] [--json]  recent routes: task, Jev's pick, the seat, and why
 Config: ${paths.config}
 Record: ${paths.record}`;
 
@@ -43,7 +52,7 @@ function loadConfig() {
     writeFileSync(paths.config, readFileSync(defaultsPath, "utf8"));
   }
   try {
-    return { config: JSON.parse(readFileSync(paths.config, "utf8")) };
+    return { config: { ...JSON.parse(readFileSync(defaultsPath, "utf8")), ...JSON.parse(readFileSync(paths.config, "utf8")) } };
   } catch {
     return { config: JSON.parse(readFileSync(defaultsPath, "utf8")), warning: `${paths.config} is not valid JSON; using the built-in defaults` };
   }
@@ -188,6 +197,42 @@ async function readStdin() {
   return text;
 }
 
+async function runningSeats() {
+  const { stdout } = await promisify(execFile)("rig", ["ps", "--nodes", "--json"], { maxBuffer: 8 * 1024 * 1024 });
+  return new Set((JSON.parse(stdout).entries ?? [])
+    .filter((e) => e.sessionStatus === "running" && e.startupStatus === "ready")
+    .map((e) => e.canonicalSessionName));
+}
+
+/** The seat a task goes to. Seats are fixed to their models; nothing here changes a seat. */
+async function route(task) {
+  const { config } = loadConfig();
+  const seats = config.seats ?? {};
+  const fallbackSeat = config.default_seat;
+  const defaultModel = Object.keys(seats).find((m) => seats[m] === fallbackSeat);
+  const d = await decide(task, defaultModel);
+  const r = {
+    type: "route", time: new Date().toISOString(), task,
+    jev: d.jev ? { model: d.jev.model.choice, confidence: d.jev.model.confidence, effort: d.jev.effort?.choice ?? null } : null,
+    seat: fallbackSeat, model: defaultModel ?? null, effort: null, fallback: d.fallback.applied, reason: d.fallback.reason,
+  };
+  if (!d.fallback.applied) {
+    const chosen = seats[d.model];
+    let running = null;
+    try { running = await runningSeats(); } catch { /* reported below */ }
+    if (!chosen) r.reason = `no seat is fixed on ${d.model}`;
+    else if (!running) r.reason = `rig ps unavailable, so ${chosen} could not be checked`;
+    else if (!running.has(chosen)) r.reason = `${chosen} (${d.model}) isn't running`;
+    else Object.assign(r, { seat: chosen, model: d.model, effort: d.effort, fallback: false, reason: null });
+    if (r.reason) r.fallback = true;
+  }
+  appendFileSync(paths.record, `${JSON.stringify(r)}\n`);
+  return r;
+}
+
+const routeLine = (r) => `${r.time.slice(0, 19)}  ${r.seat}  ${r.model ?? "?"}${r.effort ? `/${r.effort}` : ""}  `
+  + `[Jev: ${r.jev ? `${r.jev.model} ${fmt(r.jev.confidence)}` : "no pick"}]  ${r.fallback ? `default: ${r.reason}` : "Jev's pick"}  — ${r.task.slice(0, 60)}`;
+
 async function main(argv) {
   const [command, ...rest] = argv;
   const json = rest.includes("--json");
@@ -199,6 +244,28 @@ async function main(argv) {
   if (command === "status") {
     const status = { routing: routingOn() ? "on" : "off", key: readKey() ? "found" : "missing", config: paths.config, record: paths.record };
     console.log(json ? JSON.stringify(status) : `Jev routing is ${status.routing}. API key: ${status.key}.\nConfig: ${status.config}\nRecord: ${status.record}`);
+    return 0;
+  }
+  if (command === "route") {
+    const words = rest.filter((w) => w !== "--json");
+    const task = (words.length && words.join(" ") !== "-" ? words.join(" ") : await readStdin()).trim();
+    if (!task) { console.error(`jev route needs a task.\n\n${USAGE}`); return 2; }
+    const r = await route(task);
+    console.log(json ? JSON.stringify(r) : [
+      `Dispatch to: ${r.seat}  (${r.model ?? "its fixed model"})`,
+      `Effort: ${r.effort ?? "the seat's usual"}`,
+      r.jev ? `Jev picked ${r.jev.model} (confidence ${fmt(r.jev.confidence)})${r.jev.effort ? `, effort ${r.jev.effort}` : ""}` : null,
+      r.fallback ? `Default seat because: ${r.reason}` : null,
+      `Put in the row body: Jev: ${r.model ?? "default"}${r.effort ? `, effort ${r.effort}` : ""}${r.fallback ? ` (default: ${r.reason})` : ""}`,
+    ].filter(Boolean).join("\n"));
+    return 0;
+  }
+  if (command === "log") {
+    const n = rest.includes("-n") ? Number(rest[rest.indexOf("-n") + 1]) || 20 : 20;
+    let entries = [];
+    try { entries = readFileSync(paths.record, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((e) => e.type === "route"); } catch { /* no record yet */ }
+    entries = entries.slice(-n);
+    console.log(json ? JSON.stringify(entries) : entries.map(routeLine).join("\n") || "No routed tasks yet.");
     return 0;
   }
   if (command === "decide") {
