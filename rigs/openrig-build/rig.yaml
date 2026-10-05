@@ -1,0 +1,50 @@
+version: "0.2"
+name: openrig-build
+summary: >
+  The team that works on OpenRig itself, like the "openrig-build" rig in the
+  video: an orchestrator in its own pod, and a builder and QA pair in another.
+  It works OpenRig missions slice by slice, with every slice going build ->
+  independent QA. Launch it in this repository:
+  rig up rigs/openrig-build/rig.yaml --cwd <this repo>.
+
+culture_file: CULTURE.md
+
+# Claude seats run in Claude Code's auto mode; Codex seats keep the default sandbox.
+permission_policy: builtin:auto
+
+pods:
+  - id: orch
+    label: Orchestration
+    members:
+      - id: lead
+        agent_ref: "local:../../packages/daemon/specs/agents/orchestration/orchestrator"
+        runtime: claude-code
+        profile: default
+        cwd: "."
+    edges: []
+
+  - id: dev
+    label: Implementation
+    members:
+      - id: builder
+        agent_ref: "local:../../packages/daemon/specs/agents/development/implementer"
+        runtime: claude-code
+        profile: default
+        cwd: "."
+      - id: qa
+        agent_ref: "local:../../packages/daemon/specs/agents/development/qa"
+        runtime: codex
+        profile: default
+        cwd: "."
+    edges:
+      - kind: delegates_to
+        from: builder
+        to: qa
+
+edges:
+  - kind: delegates_to
+    from: orch.lead
+    to: dev.builder
+  - kind: delegates_to
+    from: orch.lead
+    to: dev.qa
