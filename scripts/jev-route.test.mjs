@@ -435,3 +435,22 @@ test("per-rig default and seat addresses are validated before calling Jev", asyn
     assert.equal(stub.requests.length, 0);
   } finally { stub.close(); }
 });
+
+
+test("decide stays model-only and status shows identity even without a rig seat profile", async () => {
+  const stub = await stubJev(() => answer("codex", 0.9));
+  const w = world({ endpoint: stub.url, identity: "advisor", config: { rigs: RIGS } });
+  try {
+    const out = await w.jev("decide", "--json", "Implement a parser");
+    assert.equal(out.code, 0);
+    const d = JSON.parse(out.stdout);
+    assert.equal(d.model, "codex");
+    assert.equal(d.rig, "advisor");
+    assert.equal(d.runtime, "codex");
+    assert.deepEqual(Object.keys(stub.requests[0].questions.model.criteria), ["sonnet", "opus", "codex"]);
+    const status = await w.jev("status", "--json");
+    assert.equal(status.code, 0);
+    assert.equal(JSON.parse(status.stdout).rig, "advisor");
+    assert.ok(w.calls().every(([cmd]) => cmd === "whoami"));
+  } finally { stub.close(); w.done(); }
+});

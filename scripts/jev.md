@@ -48,7 +48,7 @@ additional rigs:
 ```
 
 Each rig supplies its complete seat map and a default seat present in that map.
-All its seat addresses must name that rig. Its optional candidates replace the
+Routing requires all its seat addresses to name that rig. Its optional candidates replace the
 shared candidates; omitting them inherits the shared candidates. Routing only
 offers models with a seat in the selected rig, including stopped bench seats.
 Fable uses the candidate key `fable` and runtime `claude-code`; it is not added to
@@ -58,7 +58,7 @@ Rig selection is `--rig NAME`, then `rig whoami --json`'s `identity.rigName`, th
 `OPENRIG_SESSION_NAME`'s rig suffix if identity is unavailable. The identity read
 has a 1.5-second timeout. Without any identity or override, routing uses the
 legacy top-level map. An identified rig without a profile can use the legacy map
-only if its default seat names that rig. Otherwise Jev reports missing config
+only if its default seat names that rig. Otherwise `route` reports missing config
 and exits 2 before asking for a model or recording a decision.
 
 `seat`, `model` and `effort` still describe the recommended dispatch, with
@@ -71,7 +71,8 @@ reported but not checked for running state.
 `jev status [--rig NAME]` shows the selected rig. New decisions and routes record
 it; `jev log` shows it for each route (older text entries derive it from the seat
 address). `decide [--rig NAME]` uses that rig's candidates but still returns a
-model and effort rather than a seat. Legacy `decide` keeps its shared candidates.
+model and effort rather than a seat. `decide` needs no seat map: an unconfigured rig keeps the shared candidates,
+while still recording its identity. `status` also needs no seat map.
 
 Run the isolated tests with Node 24:
 

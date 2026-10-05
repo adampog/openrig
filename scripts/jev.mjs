@@ -84,12 +84,12 @@ async function selectedConfig(explicitRig, { forRoute = false, initialize = true
   const legacyRig = seatRig(shared.default_seat);
   const rig = requestedRig ?? legacyRig;
   const profile = requestedRig ? shared.rigs?.[requestedRig] : null;
-  if (requestedRig && !profile && requestedRig !== legacyRig) {
+  if (forRoute && requestedRig && !profile && requestedRig !== legacyRig) {
     throw new Error(`No Jev seat config for rig ${requestedRig}; add rigs.${requestedRig} to ${paths.config}`);
   }
   const config = profile ? { ...shared, seats: profile.seats ?? {}, default_seat: profile.default_seat,
     candidates: profile.candidates ?? shared.candidates } : { ...shared };
-  if (profile || forRoute) {
+  if (forRoute) {
     if (!config.default_seat || !Object.values(config.seats ?? {}).includes(config.default_seat)) {
       throw new Error(`Jev rig ${rig ?? "legacy"} needs a default_seat present in its seats map`);
     }
@@ -97,7 +97,7 @@ async function selectedConfig(explicitRig, { forRoute = false, initialize = true
       throw new Error(`Jev seats for rig ${rig} must all address that rig`);
     }
   }
-  if (forRoute || profile) {
+  if (forRoute) {
     config.candidates = Object.fromEntries(Object.entries(config.candidates ?? {})
       .filter(([model]) => Object.hasOwn(config.seats ?? {}, model)));
   }
