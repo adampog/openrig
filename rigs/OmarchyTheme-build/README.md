@@ -66,4 +66,5 @@ rig terminal open OmarchyTheme-build --provider herdr
 ```
 
 Do not launch from a checkout where people switch branches. Then type the outcome you want into `orch-lead`, or
-point it at a mission of the `omarchy-themes` project.
+point it at a mission. For now missions live in `~/.openrig/workspace/missions/` as `omarchy-themes-<mission>`, not
+under the `omarchy-themes` project (see "Where things live" in CULTURE.md).

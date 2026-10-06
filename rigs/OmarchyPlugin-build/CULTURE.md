@@ -20,7 +20,9 @@ anyone builds on them.
   (`/usr/share/omarchy/bin/omarchy-plugin-validate`).
 - A plugin gets the injected `shell`, `manifest` and registry facades
   (`/usr/share/omarchy/shell/services/Plugin*Api.qml`), `qs.Ui` (`BarWidget` is the base for bar
-  widgets) and `qs.Commons` (`Color`, `Style`, `Border`). Panels and overlays declare `open()` and
+  widgets) and `qs.Commons` (`Color`, `Style`, `Border`). A bar widget is the exception: the bar
+  injects `bar`, `moduleName` and `settings` into it, not `manifest` (found by the proof task on
+  2026-10-06). Panels and overlays declare `open()` and
   `close()`; the built-in OSD takes the payload as `open(payloadJson)`
   (`shell/plugins/osd/Osd.qml`), the agents panel takes none (`shell/plugins/agents/Panel.qml`).
   Read the built-in closest to your kind before writing the entry point.
@@ -52,18 +54,35 @@ the moment a file in it changes (`shell/services/PluginRegistry.qml`, `shell/she
 
 ## Where things live
 
-- **Intent and plan:** the work tree project `omarchy-plugins`. It holds the project `SPEC.md`, then
-  `missions/<mission>/` with a `SPEC.md`, a `mission.yaml` and `slices/<NN-slug>/`. Each slice has a
-  `SPEC.md`, a `PROGRESS.md` and a `PROOF.md`. The project is not the workspace root, so address it
-  explicitly:
+- **Intent:** the work tree project `omarchy-plugins` supplies the project `SPEC.md` and context
+  (`rig context work-install --project omarchy-plugins`). For now it holds no missions.
+- **Plan:** missions live in the central work tree, `~/.openrig/workspace/missions/`, in folders
+  named `plugins-<mission>` (for example `plugins-proof-label-widget`). Each has a `SPEC.md`, a
+  `mission.yaml` and `slices/<NN-slug>/`; each slice has a `SPEC.md`, a `PROGRESS.md` and a
+  `PROOF.md`. The installed daemon's `rig proof show` and `rig proof judge` find missions only
+  there, so a mission under the project would fail with `scope_missing`. Address them like this:
   ```sh
-  PROJECT_ROOT=$(rig context work-install --project omarchy-plugins --json | jq -r .position.projectRoot)
-  rig scope --workspace "$PROJECT_ROOT" mission graph <mission>
-  rig scope --workspace "$PROJECT_ROOT" slice progress <NN-slug> --mission <mission> --add "<text>"
-  rig proof --workspace "$PROJECT_ROOT" add <NN-slug> --mission <mission> ...
+  rig scope --workspace ~/.openrig/workspace mission graph <mission>
+  rig scope --workspace ~/.openrig/workspace slice progress <NN-slug> --mission <mission> --add "<text>"
+  rig proof --workspace ~/.openrig/workspace add <NN-slug> --mission <mission> ...
+  rig proof show <mission>/slices/<NN-slug>
   ```
-  `rig proof show` and `rig proof judge` read the daemon's own work tree, so the project has to be
-  registered there as well.
+- **Creating a mission:** OpenRig mints mission ids per project, and ids minted that way have
+  clashed. List the ids already used, then pass the next free one explicitly:
+  ```sh
+  grep -h '^id:' ~/.openrig/workspace/missions/*/SPEC.md
+  rig scope --workspace ~/.openrig/workspace mission create plugins-<mission> --id OPR.99.0.N
+  ```
+- **Proof judges:** each `mission.yaml` names who may judge its proof. Here that is dev-qa:
+  ```yaml
+  proofPolicy:
+    judges: [ dev-qa@OmarchyPlugin-build ]
+  ```
+- **What changes back:** the daemon fix for project roots (branch `fix/proof-scope-project-roots`,
+  carried by `fix/project-roots-everywhere`) lets proof commands find missions under a project.
+  Once an OpenRig with it is installed, missions can move back to the project's own `missions/`
+  folder and the commands above take the project root as `--workspace`. Until the human says it is
+  installed, keep missions central.
 - **Code:** your working directory, `~/Projects/omarchy-plugins`. Each plugin is its own git repo
   in a folder named for its id, because a plugin is installed from its own repo. `_harness/` is a
   shared repo for the test harness. Commit locally.
@@ -118,11 +137,12 @@ skipped silently.
 3. Unit tests under Node for the JavaScript. Keep logic in plain modules so it can be tested
    without the shell.
 4. A contract test: the plugin loaded by a second, windowless Quickshell on a scratch config and a
-   scratch HOME, from `_harness/`. Upstream's `test/shell.d/bar-widget-contract-test.sh` is the
-   pattern (not installed; not run by the team that wrote this file). That second shell still
-   connects to the human's compositor, so it must open no visible surface. Whether a panel or
-   overlay can be exercised without drawing on the human's one monitor is not established. Until it
-   is, anything that would draw on their screen needs their OK first, asked through orch-lead.
+   scratch HOME, from `_harness/`. For bar widgets this is established:
+   `_harness/contract/bar-widget-contract.sh` ran it offscreen on 2026-10-06 (mission
+   `plugins-proof-label-widget`). That second shell still connects to the human's compositor, so it
+   must open no visible surface. Panels and overlays are still unproven: whether one can be
+   exercised without drawing on the human's one monitor is not established. Until it is, anything
+   that would draw on their screen needs their OK first, asked through orch-lead.
 5. The human's own trial, after the release gate.
 
 ## The release gate
@@ -145,6 +165,9 @@ changes model: never type `/model` or `/effort` into a seat, and never answer a 
 - **When Jev picks a bench seat that is not running,** `jev route` says so and names the default
   seat as well. Start the bench seat and dispatch to it when Jev's effort is medium or high, or
   when more work for that seat is already queued. Otherwise dispatch to the default seat.
+- **When a bench seat is started for a task,** whether Jev picked it or the mission or dispatch
+  requires it, run `jev route` again for that task once the seat is running, so the log names the
+  seat that did the work.
 - **Defaults.** When Jev is unsure, routing is off, Jev is unreachable, or the chosen seat is
   stuck on a model error, `jev route` names dev-builder (Opus) and says why. Dispatch there; never
   wait on Jev.
@@ -160,7 +183,8 @@ The human decided on 2026-10-05 that this rig's orchestrator starts and stops it
 The bench seats are not in `rig.yaml`; each has a member file in `bench/` next to it, and the
 orchestrator adds one to the running rig with `rig add`.
 
-- **Start one when:** Jev picks it and the rule above says to; a plugin is ready for the release
+- **Start one when:** the mission or the dispatch row requires that bench seat; Jev picks it and the
+  rule above says to; a plugin is ready for the release
   gate (review-reviewer); an API question cannot be answered from the installed sources, or
   Omarchy's version has changed (research-scout); or two or more ready slices touch different
   plugins and the running builders are busy (an extra builder from the template).
@@ -172,8 +196,8 @@ orchestrator adds one to the running rig with `rig add`.
   it does not resume.
 - **Hand work over in the row.** Give a restarted bench seat its work through queue rows that carry
   everything it needs, and never rely on a bench seat remembering an earlier conversation.
-- **Remove** extra builders added from the template at the end of a mission, and stop bench seats
-  named here (with `rig remove`) at the end of a mission. Never remove a core seat this file names.
+- **Remove** at the end of a mission, with `rig remove`: extra builders added from the template, and
+  the bench seats named here, stopped or running. Never remove one of the five always-on core seats.
 - **Limits:** at most three bench or extra seats running at once. Only the bench seats named here
   and the extra-builder template. Beyond that, ask the human through advisor-lead@kernel.
 - **Log** every start, stop and removal in the mission's `NOTES.md`: the time, the seat, and why.
@@ -235,11 +259,15 @@ delivered again. Put what it needs to know in the queue row:
 rig seat launch <id>@OmarchyPlugin-build --fresh --reason "<why>"
 ```
 
-Remove an extra builder at the end of the mission (it refuses while a live row names it):
+Remove a bench seat or an extra builder at the end of the mission (it refuses while a live row names
+it). Here `<id>` is the member id, for example `fable` or `extra1`:
 
 ```sh
 rig remove "$RIG_ID" dev.<id>
 ```
+
+For review-reviewer and research-scout, the node is `review.reviewer` or `research.scout` in place of
+`dev.<id>`.
 
 ### After starting one
 
@@ -278,4 +306,15 @@ held a rig for half an hour.
   human's explicit go-ahead.
 - System packages are the human's to install. Tools that install into the project folder are fine.
 - Work another seat must act on goes in the queue. `rig send` is for short conversation.
+- **Report-only rows** close as no-follow-on. When a row asks only for a report, give the report to
+  the row's source and close the row with
+  `rig queue update <qitem> --state done --closure-reason no-follow-on --note "<the report, or where it is>"`.
+  Never close one as handed_off_to when there is no successor row.
+- **Quoting in shell commands.** Put the body of a `rig send` in single quotes. Never put backticks or
+  command substitution (a dollar sign followed by an opening parenthesis) inside a shell argument:
+  the shell runs them before the command does. On 2026-10-06 a bench seat sent a double-quoted
+  message with backticks in it, and the shell ran `omarchy theme set` with no argument. It printed
+  usage only, but it could have changed the human's desktop. Write files with your file tools, not
+  with echo or a heredoc. The commands written out in this file are exact and safe to run as they
+  are; this rule is for text you compose.
 - If you're blocked, name the exact decision you need, keep the queue row, and tell orch-lead.

@@ -67,16 +67,36 @@ The art director owns the bar. QA checks the contract. The human decides.
 
 ## Where things live
 
-- **Intent and plan:** the work tree project `omarchy-themes`: the project `SPEC.md`, then `missions/<mission>/` with slices. The project is not the workspace
-  root, so address it explicitly:
+- **Intent:** the work tree project `omarchy-themes` supplies the project `SPEC.md` and context
+  (`rig context work-install --project omarchy-themes`). For now it holds no missions.
+- **Plan:** missions live in the central work tree, `~/.openrig/workspace/missions/`, in folders
+  named `omarchy-themes-<mission>` (for example `omarchy-themes-toolkit-bootstrap`), each with a
+  `SPEC.md`, a `mission.yaml` and slices. The installed daemon's `rig proof show` and
+  `rig proof judge` find missions only there, so a mission under the project would fail with
+  `scope_missing`. Address them like this:
   ```sh
-  PROJECT_ROOT=$(rig context work-install --project omarchy-themes --json | jq -r .position.projectRoot)
-  rig scope --workspace "$PROJECT_ROOT" mission graph <mission>
-  rig scope --workspace "$PROJECT_ROOT" slice progress <NN-slug> --mission <mission> --add "<text>"
-  rig proof --workspace "$PROJECT_ROOT" add <NN-slug> --mission <mission> ...
+  rig scope --workspace ~/.openrig/workspace mission graph <mission>
+  rig scope --workspace ~/.openrig/workspace slice progress <NN-slug> --mission <mission> --add "<text>"
+  rig proof --workspace ~/.openrig/workspace add <NN-slug> --mission <mission> ...
+  rig proof show <mission>/slices/<NN-slug>
   ```
-  `rig proof show` and `rig proof judge` read the daemon's own work tree, so the project has to be
-  registered there as well.
+- **Creating a mission:** OpenRig mints mission ids per project, and ids minted that way have
+  clashed. List the ids already used, then pass the next free one explicitly:
+  ```sh
+  grep -h '^id:' ~/.openrig/workspace/missions/*/SPEC.md
+  rig scope --workspace ~/.openrig/workspace mission create omarchy-themes-<mission> --id OPR.99.0.N
+  ```
+- **Proof judges:** each `mission.yaml` names who may judge its proof: dev-qa for the contract,
+  and the art director for the look:
+  ```yaml
+  proofPolicy:
+    judges: [ dev-qa@OmarchyTheme-build, art-director@OmarchyTheme-build ]
+  ```
+- **What changes back:** the daemon fix for project roots (branch `fix/proof-scope-project-roots`,
+  carried by `fix/project-roots-everywhere`) lets proof commands find missions under a project.
+  Once an OpenRig with it is installed, missions can move back to the project's own `missions/`
+  folder and the commands above take the project root as `--workspace`. Until the human says it is
+  installed, keep missions central.
 - **Code:** your working directory, `~/Projects/omarchy-themes`. Each theme, or family of themes
   that share art, is its own git repo. `_toolkit/` is a shared repo: the render pipeline, palette
   and contrast checks, and the preview builder, reused by every theme. Commit locally.
@@ -130,11 +150,15 @@ The art director owns the bar. QA checks the contract. The human decides.
 ## Imaging tools
 
 - On this host: ImageMagick, `rsvg-convert`, `ffmpeg`, `uv` with Python 3.13, and one RTX 3090 Ti.
-  Blender, Inkscape and GIMP are there once the human has installed them; check with
-  `command -v` and say so if one is missing rather than working around it.
-- Python libraries go in a `.venv` inside the repo, made with `uv`. The Blender Python wheel
-  (`bpy`) rendered on the GPU from such a venv on 2026-10-05. System packages are the human's to
-  install.
+  Inkscape and GIMP were present on 2026-10-06; check with `command -v` and say so if a tool is
+  missing rather than working around it.
+- Two Blenders are installed. Blender 5.2.1 is the system package (`/usr/bin/blender`). The
+  toolkit does not use it: `_toolkit/scenes.py` imports the `bpy` 5.2.2 wheel from
+  `_toolkit/.venv` and runs as `.venv/bin/python scenes.py ...`, because the venv pins the
+  version and the renders stay the same when the system package updates (`_toolkit/README.md`).
+  `_toolkit/build.py` needs no `bpy` and runs as `python3 build.py <theme-dir>`.
+- Python libraries go in a `.venv` inside the repo, made with `uv`. The `bpy` wheel rendered on the
+  GPU from such a venv on 2026-10-05. System packages are the human's to install.
 - Art is original and made by code committed in the repo, so it can be made again. No downloaded
   or third-party images, textures, environment maps or models, and no image-generation models,
   unless a mission says otherwise (the human, 2026-10-05).
@@ -156,6 +180,9 @@ changes model: never type `/model` or `/effort` into a seat, and never answer a 
 - **When Jev picks a bench seat that is not running,** `jev route` says so and names the default
   seat as well. Start the bench seat and dispatch to it when Jev's effort is medium or high, or
   when more work for that seat is already queued. Otherwise dispatch to the default seat.
+- **When a bench seat is started for a task,** whether Jev picked it or the mission or dispatch
+  requires it, run `jev route` again for that task once the seat is running, so the log names the
+  seat that did the work.
 - **Defaults.** When Jev is unsure, routing is off, Jev is unreachable, or the chosen seat is
   stuck on a model error, `jev route` names dev-builder (Opus) and says why. Dispatch there; never
   wait on Jev.
@@ -170,9 +197,9 @@ The human decided on 2026-10-05 that this rig's orchestrator starts and stops it
 The bench seats are not in `rig.yaml`; each has a member file in `bench/` next to it, and the
 orchestrator adds one to the running rig with `rig add`.
 
-- **Start one when:** Jev picks it and the rule above says to; or two or more scenes or themes
-  are ready to be worked at once and the running builders are busy (an extra builder from the
-  template).
+- **Start one when:** the mission or the dispatch row requires that bench seat; Jev picks it and the
+  rule above says to; or two or more scenes or themes are ready to be worked at once and the
+  running builders are busy (an extra builder from the template).
 - **Stop one when** its work is handed back and no pending, in-progress or blocked queue row
   names it. Stopping keeps the seat in the rig and its transcript, but leaves the rig showing
   partial/degraded in `rig ps` (fewer nodes than expected). Use stop only for a pause within a
@@ -181,8 +208,8 @@ orchestrator adds one to the running rig with `rig add`.
   a stopped seat" below); it does not resume.
 - **Hand work over in the row.** Give a restarted bench seat its work through queue rows that carry
   everything it needs, and never rely on a bench seat remembering an earlier conversation.
-- **Remove** extra builders added from the template at the end of a mission, and stop bench seats
-  named here (with `rig remove`) at the end of a mission. Never remove a core seat this file names.
+- **Remove** at the end of a mission, with `rig remove`: extra builders added from the template, and
+  the bench seats named here, stopped or running. Never remove one of the five always-on core seats.
 - **Limits:** at most three bench or extra seats running at once. Only the bench seats named here
   and the extra-builder template. Beyond that, ask the human through advisor-lead@kernel.
 - **Log** every start, stop and removal in the mission's `NOTES.md`: the time, the seat, and why.
@@ -243,7 +270,8 @@ delivered again. Put what it needs to know in the queue row:
 rig seat launch <id>@OmarchyTheme-build --fresh --reason "<why>"
 ```
 
-Remove an extra builder at the end of the mission (it refuses while a live row names it):
+Remove a bench seat or an extra builder at the end of the mission (it refuses while a live row names
+it). Here `<id>` is the member id, for example `fable` or `extra1`:
 
 ```sh
 rig remove "$RIG_ID" dev.<id>
@@ -252,8 +280,11 @@ rig remove "$RIG_ID" dev.<id>
 ### After starting one
 
 Check that the seat answers `rig whoami` and can state its role and this rig's rules before giving it
-work (`rig capture <id>@OmarchyTheme-build --lines 40` shows its screen). A fresh Claude seat may be
-waiting at a consent prompt in its terminal. orch-lead cannot answer that for it: ask the human,
+work (`rig capture <id>@OmarchyTheme-build --lines 40` shows its screen). Ask it which model it is
+running and compare the answer with the seat table in README.md: a fresh bench seat may misstate
+its own model (on 2026-10-06 dev-qwen said it was Opus). If it is wrong, tell it the right model.
+A fresh Claude seat may be waiting at a consent prompt in its terminal. orch-lead cannot answer that
+for it: ask the human,
 through advisor-lead@kernel, to clear it in the seat's terminal (`rig terminal open OmarchyTheme-build`),
 then run `rig seat continue <id>@OmarchyTheme-build` to deliver the startup context that was waiting.
 dev-qwen (it cannot look at images) also needs its pi provider settings under `~/.openrig/state/pi/dev-qwen@OmarchyTheme-build/agent/`,
@@ -289,4 +320,15 @@ review folder. Relay their words exactly.
 - Commit locally only. Pushing, publishing a theme's repo and anything sent upstream need the
   human's explicit go-ahead.
 - Work another seat must act on goes in the queue. `rig send` is for short conversation.
+- **Report-only rows** close as no-follow-on. When a row asks only for a report, give the report to
+  the row's source and close the row with
+  `rig queue update <qitem> --state done --closure-reason no-follow-on --note "<the report, or where it is>"`.
+  Never close one as handed_off_to when there is no successor row.
+- **Quoting in shell commands.** Put the body of a `rig send` in single quotes. Never put backticks or
+  command substitution (a dollar sign followed by an opening parenthesis) inside a shell argument:
+  the shell runs them before the command does. On 2026-10-06 a bench seat sent a double-quoted
+  message with backticks in it, and the shell ran `omarchy theme set` with no argument. It printed
+  usage only, but it could have changed the human's desktop. Write files with your file tools, not
+  with echo or a heredoc. The commands written out in this file are exact and safe to run as they
+  are; this rule is for text you compose.
 - If you're blocked, name the exact decision you need, keep the queue row, and tell orch-lead.

@@ -62,4 +62,5 @@ rig terminal open OmarchyPlugin-build --provider herdr
 ```
 
 Do not launch from a checkout where people switch branches. Then type the outcome you want into
-`orch-lead`, or point it at a mission of the `omarchy-plugins` project.
+`orch-lead`, or point it at a mission. For now missions live in `~/.openrig/workspace/missions/` as
+`plugins-<mission>`, not under the `omarchy-plugins` project (see "Where things live" in CULTURE.md).
