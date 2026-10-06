@@ -20,7 +20,15 @@ export function proofRoutes(): Hono {
   };
   app.get("/", c => {
     const root = indexer(c).slicesRoot, scope = c.req.query("scope");
-    if (!scope) return c.json({ ...readProjectReadiness(root), sourceObservation: proofSourceObservation(c) });
+    if (!scope) {
+      // The default fields are unchanged. `projects` adds each allowed root's own readiness with its
+      // project id, so same-named missions in different projects stay distinguishable.
+      const projects = proofMissionRoots(c, root).map(r => {
+        try { return { id: r.id, missionsRoot: r.root, ...readProjectReadiness(r.root) }; }
+        catch (e) { return { id: r.id, missionsRoot: r.root, error: e instanceof Error ? e.message : String(e) }; }
+      });
+      return c.json({ ...readProjectReadiness(root), projects, sourceObservation: proofSourceObservation(c) });
+    }
     const dir = resolveProofScopeAcross(proofMissionRoots(c, root), scope);
     if (path.basename(path.dirname(dir)) !== "slices") return c.json({ ...readMissionReadiness(dir), sourceObservation: proofSourceObservation(c) });
     const refs = c.req.queries("evidence") ?? [];

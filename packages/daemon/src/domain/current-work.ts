@@ -217,20 +217,27 @@ interface Candidate {
   basis: string;
 }
 
-/** Resolve one typed row to a work node, or to the reason it could not be resolved. */
+/** A mission root a typed row may resolve under; `id` names the project in messages. */
+export interface WorkRoot { id: string; root: string }
+
+/** Resolve one typed row to a work node, or to the reason it could not be resolved. A mission is
+ * searched under every allowed root: it must resolve to exactly one directory across all of them,
+ * so a name present in several projects is refused, never guessed. */
 function resolveRow(
-  missionsRoot: string,
+  roots: WorkRoot[],
   mission: string,
   slice: string,
 ): { ok: true; value: Candidate } | { ok: false; reason: string } {
-  const missionMatches = resolveWorkNodeDirs(missionsRoot, mission);
-  if (missionMatches.length !== 1) {
+  const found = roots.flatMap((r) => resolveWorkNodeDirs(r.root, mission).map((match) => ({ root: r, match })));
+  if (found.length !== 1) {
     return {
       ok: false,
-      reason: `mission ${mission} resolves to ${missionMatches.length} directories`,
+      reason: `mission ${mission} resolves to ${found.length} directories` +
+        (found.length > 1 ? ` (${found.map((f) => `${f.root.id}: ${path.join(f.root.root, f.match.dir)}`).join("; ")})` : ""),
     };
   }
-  const missionMatch = missionMatches[0]!;
+  const missionsRoot = found[0]!.root.root;
+  const missionMatch = found[0]!.match;
 
   const slicesRoot = path.join(missionsRoot, missionMatch.dir, "slices");
   const sliceMatches = resolveWorkNodeDirs(slicesRoot, slice);
@@ -254,14 +261,15 @@ function resolveRow(
 
 export function deriveCurrentWork(
   rows: TaggedRow[],
-  missionsRoot: string | null,
+  missionsRoots: string | WorkRoot[] | null,
 ): CurrentWorkDerivation {
   const refuse = (currentWorkBasis: string): CurrentWorkDerivation => ({
     currentWork: null,
     currentWorkBasis,
   });
 
-  if (!missionsRoot) return refuse("no missions root configured");
+  const roots: WorkRoot[] = typeof missionsRoots === "string" ? [{ id: "workspace", root: missionsRoots }] : missionsRoots ?? [];
+  if (roots.length === 0 || roots.some((r) => !r.root)) return refuse("no missions root configured");
 
   const typed: { mission: string; slice: string; qitemId?: string | null }[] = [];
   const conflicts: string[] = [];
@@ -306,7 +314,7 @@ export function deriveCurrentWork(
   const byPath = new Map<string, Candidate>();
   const failures: string[] = [];
   for (const { mission, slice, qitemId } of typed) {
-    const resolved = resolveRow(missionsRoot, mission, slice);
+    const resolved = resolveRow(roots, mission, slice);
     if (resolved.ok) {
       if (!byPath.has(resolved.value.workNodePath)) {
         byPath.set(resolved.value.workNodePath, resolved.value);

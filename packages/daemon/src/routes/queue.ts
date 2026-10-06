@@ -20,6 +20,7 @@ import { loadHostRegistry, resolveHost } from "../domain/hosts/hosts-registry-re
 import { getSelfHostId, resolvesToLocalHost } from "../domain/hosts/fanout-contract.js";
 import { remoteJsonRequest } from "../domain/hosts/remote-daemon-http.js";
 import type { SettingsStore } from "../domain/user-settings/settings-store.js";
+import { proofMissionRoots } from "../domain/proof/project-roots.js";
 import { deriveCurrentWork, deriveRole, type RoleOrientation } from "../domain/current-work.js";
 import type { WhoamiService } from "../domain/whoami-service.js";
 import type Database from "better-sqlite3";
@@ -846,7 +847,8 @@ export function queueRoutes(): Hono {
     // projection, so a second in-progress baton past the cap would be invisible and the
     // ambiguity refusal would degrade into a confident wrong answer. The derivation reads
     // the unbounded in-progress set, which makes it independent of recentLimit.
-    const derived = deriveCurrentWork(repo.listInProgressForDestination(session), missionsRoot);
+    // The default missions root plus every registered project's (same rules as the proof routes).
+    const derived = deriveCurrentWork(repo.listInProgressForDestination(session), missionsRoot ? proofMissionRoots(c, missionsRoot) : null);
     let role: RoleOrientation = { state: "unknown", reason: "calling node unavailable", files: [] };
     try {
       const identity = (c.get("whoamiService" as never) as WhoamiService | undefined)
