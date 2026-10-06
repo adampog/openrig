@@ -64,6 +64,37 @@ describe("current work resolves typed rows across registered project roots", () 
     expect(r.currentWorkBasis).toContain("plug");
     expect(r.currentWorkBasis).toContain("themes");
   });
+  it("refuses a mission or slice in a project root that is a symlink leaving that root", () => {
+    const w = workspace();
+    const outside = fs.mkdtempSync(join(tmpdir(), "current-work-outside-")); dirs.push(outside);
+    slice(outside, "elsewhere", "01-a");
+    // the whole mission is a symlink out of the project root
+    fs.symlinkSync(join(outside, "elsewhere"), join(w.root, "projects/plug/missions/escape"));
+    const m = deriveCurrentWork([row("escape", "01-a")], w.roots());
+    expect(m.currentWork).toBeNull();
+    expect(m.currentWorkBasis).toContain("resolves to 0 directories");
+    // the mission is real but its slice is a symlink out
+    fs.symlinkSync(join(outside, "elsewhere", "slices", "01-a"), join(w.root, "projects/plug/missions/plug-only/slices/02-out"));
+    const s = deriveCurrentWork([row("plug-only", "02-out")], w.roots());
+    expect(s.currentWork).toBeNull();
+    expect(s.currentWorkBasis).toContain("slice 02-out resolves to 0 directories");
+    // the mission's slices folder is a symlink out
+    fs.mkdirSync(join(w.root, "projects/plug/missions/sneaky"));
+    fs.symlinkSync(join(outside, "elsewhere", "slices"), join(w.root, "projects/plug/missions/sneaky/slices"));
+    expect(deriveCurrentWork([row("sneaky", "01-a")], w.roots()).currentWork).toBeNull();
+  });
+  it("an escaping symlink does not make a real mission of the same name ambiguous", () => {
+    const w = workspace();
+    const outside = fs.mkdtempSync(join(tmpdir(), "current-work-outside-")); dirs.push(outside);
+    slice(outside, "plug-only", "01-a");
+    fs.symlinkSync(join(outside, "plug-only"), join(w.root, "projects/themes/missions/plug-only"));
+    expect(deriveCurrentWork([row("plug-only", "01-a")], w.roots()).currentWork?.workNodePath).toBe(fs.realpathSync(w.po));
+  });
+  it("the primary root keeps its behaviour: a symlinked mission there still resolves", () => {
+    const w = workspace();
+    fs.symlinkSync(join(w.root, "projects/plug/missions/plug-only"), join(w.missions, "borrowed"));
+    expect(deriveCurrentWork([row("borrowed", "01-a")], w.roots()).currentWork).not.toBeNull();
+  });
   it("an unknown mission is still refused, and a single-root string behaves as before", () => {
     const w = workspace();
     expect(deriveCurrentWork([row("nowhere", "01-a")], w.roots()).currentWork).toBeNull();
