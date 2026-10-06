@@ -1,7 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { listProjects } from "../workspace/project-read.js";
-import { readProjectCatalog } from "../workspace/project-catalog.js";
 import type { SettingsStore } from "../user-settings/settings-store.js";
 import type { ProofRoot } from "./judgments.js";
 
@@ -23,16 +22,13 @@ export function proofMissionRoots(c: Ctx, primary: string): ProofRoot[] {
   };
   const projects: Array<{ id: string; missionsRoot: string }> = [];
   try {
-    if (c.get("settingsStore" as never) as SettingsStore | undefined) {
-      projects.push(...listProjects(c).projects.filter(p => !p.error));
-    } else {
-      // No settings store (tests, minimal hosts): the catalog beside the primary root's workspace.
-      const catalog = path.join(path.dirname(primary), "workspace.yaml");
-      for (const e of readProjectCatalog(catalog) ?? []) {
-        const root = real(path.resolve(path.dirname(catalog), e.root));
-        if (root) projects.push({ id: e.id, missionsRoot: path.join(root, "missions") });
-      }
-    }
+    // One reader for both cases: the daemon's own project read (listProjects), so manifest
+    // identity, missions.root, SPEC and containment rules are the same whether or not a settings
+    // store is present. Without one (tests, minimal hosts) the workspace is the primary root's
+    // parent, which is where the catalog lives.
+    const store = (c.get("settingsStore" as never) as SettingsStore | undefined)
+      ?? { resolveOne: (key: string) => ({ value: key === "workspace.root" ? path.dirname(primary) : undefined }) } as unknown as SettingsStore;
+    projects.push(...listProjects({ get: () => store }).projects.filter(p => !p.error));
   } catch { /* A broken catalog leaves the primary root, exactly as before. */ }
   const primaryReal = real(primary);
   const primaryId = projects.find(p => real(p.missionsRoot) === primaryReal)?.id ?? "workspace";

@@ -164,4 +164,49 @@ describe("proof show and judge across project mission roots", () => {
     expect((await app.request("/api/proof?scope=default-m/slices/01-a")).status).toBe(200);
     expect((await app.request("/api/proof?scope=omarchy-rigs/slices/01-a")).status).toBe(409);
   });
+
+  // The catalog is read the same way with and without a settings store: custom missions.root is
+  // honoured and an invalid project manifest contributes no root, on both paths.
+  describe.each([["with a settings store", true], ["without a settings store", false]])("project manifests, %s", (_name, withStore) => {
+    function manifests() {
+      const w = workspace();
+      const customProject = join(w.root, "projects/custom"), badProject = join(w.root, "projects/bad");
+      write(join(customProject, "project.yaml"), { kind: "project", metadata: { id: "custom" }, proofPolicy: { judges: ["judge@rig"] }, missions: { root: "work/missions" } });
+      write(join(customProject, "SPEC.md"), "# custom\n");
+      write(join(badProject, "project.yaml"), { kind: "project", metadata: { id: "bad" }, proofPolicy: { judges: ["judge@rig"] }, missions: { root: "../outside" } });
+      write(join(badProject, "SPEC.md"), "# bad\n");
+      write(join(w.root, "workspace.yaml"), { schema: "openrig.workspace/v0alpha1", projects: [
+        { id: "default", root: "." }, { id: "plug", root: "projects/plug" }, { id: "themes", root: "projects/themes" },
+        { id: "custom", root: "projects/custom" }, { id: "bad", root: "projects/bad" },
+      ] });
+      const customSlice = slice(join(customProject, "work/missions"), "custom-m", "01-a");
+      const badSlice = slice(join(badProject, "missions"), "bad-m", "01-a"); // default-shaped dir the manifest does not allow
+      const app = new Hono();
+      const settingsStore = { resolveOne: (key: string) => ({ value: key === "workspace.root" ? w.root : undefined }) };
+      app.use("*", async (c, next) => {
+        if (withStore) c.set("settingsStore" as never, settingsStore as never);
+        c.set("sliceIndexer" as never, { isReady: () => true, slicesRoot: join(w.root, "missions"), invalidate() {} } as never);
+        await next();
+      });
+      app.route("/api/proof", proofRoutes());
+      return { w, customSlice, badSlice, show: (scope: string) => app.request(`/api/proof?scope=${encodeURIComponent(scope)}`) };
+    }
+    it("honours a project's custom missions.root", async () => {
+      const m = manifests();
+      expect((await m.show("custom-m/slices/01-a")).status).toBe(200);
+      expect((await m.show(m.customSlice)).status).toBe(200);
+    });
+    it("gives a project with an invalid missions.root no mission root, even if a missions/ folder exists", async () => {
+      const m = manifests();
+      const res = await m.show("bad-m/slices/01-a");
+      expect(res.status).toBe(404);
+      expect((await res.json()).error).toBe("scope_missing");
+      expect((await m.show(m.badSlice)).status).toBe(400);
+    });
+    it("still serves the other projects", async () => {
+      const m = manifests();
+      expect((await m.show("plug-only/slices/01-a")).status).toBe(200);
+      expect((await m.show("omarchy-rigs/slices/01-a")).status).toBe(409);
+    });
+  });
 });
