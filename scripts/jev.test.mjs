@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -44,6 +44,10 @@ function home({ key = true, endpoint, config = {} } = {}) {
     mkdirSync(path.join(dir, "secrets"), { recursive: true });
     writeFileSync(path.join(dir, "secrets", "jev.env"), `# test key\nJEV_API_KEY=${FAKE_KEY}\n`, { mode: 0o600 });
   }
+  // Identity reads must not reach the owner's daemon, even when this suite runs in a seat.
+  mkdirSync(path.join(dir, "bin"));
+  writeFileSync(path.join(dir, "bin", "rig"), "#!/bin/sh\nexit 1\n");
+  chmodSync(path.join(dir, "bin", "rig"), 0o755);
   const defaults = JSON.parse(readFileSync(path.join(path.dirname(JEV), "jev.defaults.json"), "utf8"));
   mkdirSync(path.join(dir, "jev"), { recursive: true });
   writeFileSync(path.join(dir, "jev", "config.json"), JSON.stringify({ ...defaults, ...(endpoint ? { endpoint } : {}), ...config }));
@@ -53,7 +57,7 @@ function home({ key = true, endpoint, config = {} } = {}) {
 function jev(dir, ...args) {
   return new Promise((resolve) => {
     const started = Date.now();
-    execFile(process.execPath, [JEV, ...args], { env: { PATH: process.env.PATH, OPENRIG_HOME: dir } }, (err, stdout, stderr) =>
+    execFile(process.execPath, [JEV, ...args], { env: { PATH: `${path.join(dir, "bin")}${path.delimiter}${process.env.PATH}`, OPENRIG_HOME: dir } }, (err, stdout, stderr) =>
       resolve({ code: err ? err.code : 0, stdout, stderr, ms: Date.now() - started }));
   });
 }
