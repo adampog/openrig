@@ -195,7 +195,7 @@ this way would otherwise work in the rig folder.
 Count what is running before you start one (the limit is three):
 
 ```sh
-rig ps --nodes --rig OmarchyPlugin-build --json | jq -r '.[] | select(.sessionStatus=="running") | .logicalId' | grep -cE '^(dev\.(fable|qwen|extra.*)|review\.reviewer|research\.scout)$'
+rig ps --nodes --rig OmarchyPlugin-build --json | jq -r '.[] | select(.sessionStatus=="running") | .logicalId' | grep -cE "^(dev\.(fable|qwen|extra.*)|review\.reviewer|research\.scout)$"
 ```
 
 Start (first time). Pod and file are `dev` + `fable`, `dev` + `qwen`, `review` + `reviewer`, or

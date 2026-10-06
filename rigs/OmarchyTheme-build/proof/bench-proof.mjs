@@ -30,7 +30,7 @@ const CMD = {
   stop: (id) => `rig seat stop ${id}@OmarchyTheme-build --reason "<why>"`,
   restart: (id) => `rig seat launch ${id}@OmarchyTheme-build --fresh --reason "<why>"`,
   remove: `rig remove "$RIG_ID" dev.<id>`,
-  count: `rig ps --nodes --rig OmarchyTheme-build --json | jq -r '.[] | select(.sessionStatus=="running") | .logicalId' | grep -cE '^(dev\\.(fable|codex|qwen|extra.*))$'`,
+  count: `rig ps --nodes --rig OmarchyTheme-build --json | jq -r '.[] | select(.sessionStatus=="running") | .logicalId' | grep -cE "^(dev\\.(fable|codex|qwen|extra.*))$"`,
   queueDest: (id) => `rig queue list --destination ${id}@OmarchyTheme-build --json`,
   queueSrc: (id) => `rig queue list --source ${id}@OmarchyTheme-build --json`,
 };
