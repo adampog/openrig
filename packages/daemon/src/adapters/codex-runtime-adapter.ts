@@ -1226,7 +1226,7 @@ function upsertCodexActivityHooks(content: string, relayPath: string): string {
     "m"
   );
   if (pattern.test(next)) {
-    return next.replace(pattern, block);
+    return next.replace(pattern, () => block);
   }
   const prefix = next.replace(/\n*$/, "");
   return prefix.length > 0 ? `${prefix}\n\n${block}` : block;
@@ -1474,7 +1474,7 @@ function upsertManagedCodexConfigFragment(content: string, id: string, fragment:
   const block = `${start}\n${kept}\n${end}\n`;
 
   if (pattern.test(content)) {
-    return content.replace(pattern, block);
+    return content.replace(pattern, () => block);
   }
 
   const prefix = content.replace(/\n*$/, "");

@@ -1398,6 +1398,49 @@ describe("Codex runtime adapter", () => {
     return { project, read: () => store["/home/tester/.codex/config.toml"]! };
   }
 
+  it.each(["$'", "$&", "$$", "$`", "$1"])(
+    "preserves literal replacement token %s in config fragments on an idempotent rewrite",
+    async (token) => {
+      const value = `before ${token} after`;
+      const userConfig = 'model = "owner-before"\n\n[user]\nsentinel = "owner-after"\n';
+      const fragment = `[managed.literal]\nvalue = ${JSON.stringify(value)}\n`;
+      const { project, read } = await projectFragment(userConfig, fragment);
+      const expected = { projected: ["codex-default-config"], skipped: [], failed: [] };
+
+      expect(await project()).toEqual(expected);
+      const first = read();
+      expect(first).toContain(fragment);
+      expect(parseToml(first).managed).toEqual({ literal: { value } });
+      expect(await project()).toEqual(expected);
+      expect(read()).toBe(first);
+      expect(parseToml(read()).managed).toEqual({ literal: { value } });
+      expect(read().match(/BEGIN OPENRIG MANAGED CODEX CONFIG FRAGMENT:/g)).toHaveLength(1);
+      expect(read()).toContain(userConfig);
+    },
+  );
+
+  it.each(["$'", "$&", "$$", "$`", "$1"])(
+    "preserves literal replacement token %s in activity hook blocks on an idempotent rewrite",
+    (token) => {
+      const relay = `/daemon/before-${token}-after/activity-relay.cjs`;
+      const configPath = "/home/tester/.codex/config.toml";
+      const userConfig = 'model = "owner-before"\n\n[user]\nsentinel = "owner-after"\n';
+      const fsOps = { ...mockFs({ [relay]: "// relay", [configPath]: userConfig }), homedir: "/home/tester" };
+      const adapter = new CodexRuntimeAdapter({ tmux: mockTmux(), fsOps, activityRelayPath: relay });
+      const store = (fsOps as unknown as { _store: Record<string, string> })._store;
+
+      adapter.ensureCodexActivityHooks();
+      const first = store[configPath]!;
+      const commandLine = `command = 'node "${relay}"'`;
+      expect(first.split("\n").filter((line) => line === commandLine)).toHaveLength(4);
+      adapter.ensureCodexActivityHooks();
+      expect(store[configPath]).toBe(first);
+      expect(store[configPath]!.match(/# BEGIN OPENRIG MANAGED ACTIVITY HOOKS/g)).toHaveLength(1);
+      expect(store[configPath]).toContain('model = "owner-before"');
+      expect(store[configPath]).toContain('[user]\nsentinel = "owner-after"');
+    },
+  );
+
   it("keeps a user-owned MCP table and its values when the fragment names the same table", async () => {
     const { project, read } = await projectFragment([
       '[projects."/tmp/workspace"]',
