@@ -211,6 +211,41 @@ export function resolveProofScope(root: string, scope: string): string {
   return dir;
 }
 
+/** A mission root the proof surface may address: the daemon's primary missions root and each
+ * registered project's missions root. `id` names the project in ambiguity messages. */
+export interface ProofRoot { id: string; root: string }
+
+/**
+ * Resolve a proof scope against every allowed mission root. The scope is either a path relative
+ * to a root (`<mission>/slices/<slice>`) or an absolute path inside one. Each root is checked with
+ * the same containment rule as a single root, so a symlink or `..` that leaves a root never
+ * resolves there. One match wins; no match is `scope_missing` (or `path_escape` when every
+ * candidate escaped its root); several distinct matches are `scope_ambiguous`, listing them.
+ */
+export function resolveProofScopeAcross(roots: ProofRoot[], scope: string): string {
+  const matches = new Map<string, string[]>();
+  let escape: JudgmentError | null = null;
+  for (const { id, root } of roots) {
+    let dir: string;
+    try { dir = contained(root, scope); }
+    catch (e) {
+      if (e instanceof JudgmentError && e.code === "path_escape") { escape ??= e; continue; }
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw e;
+    }
+    if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) continue;
+    matches.set(dir, [...(matches.get(dir) ?? []), id]);
+  }
+  if (matches.size === 1) return [...matches.keys()][0]!;
+  if (matches.size > 1) {
+    const list = [...matches].map(([dir, ids]) => `${ids.join("/")}: ${dir}`).join("; ");
+    throw new JudgmentError("scope_ambiguous", `'${scope}' names a scope in several projects (${list}); pass the absolute path of the one you mean`, 409);
+  }
+  if (escape) throw escape;
+  throw new JudgmentError("scope_missing", "Select an existing mission or slice directory", 404);
+}
+const proofRootsOf = (roots: string | ProofRoot[]): ProofRoot[] => typeof roots === "string" ? [{ id: "workspace", root: roots }] : roots;
+
 export interface JudgeInput {
   scope: string; item: string; verdict: JudgmentVerdict; evidence?: string[];
   subject?: Judgment["subject"]; expectedEvidence?: Evidence[]; reason: string; expectedRevision: string;
@@ -219,14 +254,15 @@ export interface JudgeInput {
 /**
  * Records a verifiable proof judgment for a slice item into the judgments ledger.
  *
- * @param missionsRoot - Workspace root path for resolving scopes.
+ * @param missionsRoot - Missions root (or every allowed mission root) for resolving scopes.
  * @param input - Judgment details including scope, item, verdict, and evidence.
  * @param actor - Identifier of the judging actor authorized under the proof policy.
  * @param provenance - Attestation provenance string recorded in the ledger.
  * @returns Recorded judgment receipt, current slice readiness, and replay status.
  */
-export function recordJudgment(missionsRoot: string, input: JudgeInput, actor: string, provenance: string): { judgment: Judgment; readiness: ScopeReadiness; replayed: boolean } {
-  const dir = resolveProofScope(missionsRoot, input.scope), root = workspaceOf(dir, proofFs);
+export function recordJudgment(missionsRoot: string | ProofRoot[], input: JudgeInput, actor: string, provenance: string): { judgment: Judgment; readiness: ScopeReadiness; replayed: boolean } {
+  const roots = proofRootsOf(missionsRoot);
+  const dir = roots.length === 1 ? resolveProofScope(roots[0]!.root, input.scope) : resolveProofScopeAcross(roots, input.scope), root = workspaceOf(dir, proofFs);
   if (path.basename(path.dirname(dir)) !== "slices") throw new JudgmentError("slice_required", "Item judgments belong to a slice; higher outcome judgments remain workflow decisions");
   if (!fs.statSync(dir).isDirectory()) throw new JudgmentError("scope_missing", "Select a slice directory");
   const current = readSliceReadiness(dir);
