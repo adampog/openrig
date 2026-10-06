@@ -167,6 +167,8 @@ orchestrator adds one to the running rig with `rig add`.
 - **Stop one when** its work is handed back and no pending, in-progress or blocked queue row
   names it. Stopping keeps the seat in the rig and its transcript. A stopped seat is restarted
   with a blank conversation (see Restart); it does not resume.
+- **Hand work over in the row.** Give a restarted bench seat its work through queue rows that carry
+  everything it needs, and never rely on a bench seat remembering an earlier conversation.
 - **Remove** only extra builders added from the template, and only at the end of a mission.
   Never remove a seat this file names.
 - **Limits:** at most three bench or extra seats running at once. Only the bench seats named here
