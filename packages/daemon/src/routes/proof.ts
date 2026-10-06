@@ -3,7 +3,8 @@ import { proofSourceObservation } from "../domain/proof/source-watch.js";
 import * as path from "node:path";
 import type { SliceIndexer } from "../domain/slices/slice-indexer.js";
 import type { EventBus } from "../domain/event-bus.js";
-import { JudgmentError, evidenceAt, readSliceReadiness, readMissionReadiness, readProjectReadiness, recordJudgment, resolveProofScope, resolveProjectRoot, type JudgeInput } from "../domain/proof/judgments.js";
+import { JudgmentError, evidenceAt, readSliceReadiness, readMissionReadiness, readProjectReadiness, recordJudgment, resolveProofScopeAcross, resolveProjectRoot, type JudgeInput } from "../domain/proof/judgments.js";
+import { proofMissionRoots } from "../domain/proof/project-roots.js";
 import { requireSenderIdentity, resolveRecordedProvenance } from "./require-sender-identity.js";
 
 export function proofRoutes(): Hono {
@@ -19,8 +20,16 @@ export function proofRoutes(): Hono {
   };
   app.get("/", c => {
     const root = indexer(c).slicesRoot, scope = c.req.query("scope");
-    if (!scope) return c.json({ ...readProjectReadiness(root), sourceObservation: proofSourceObservation(c) });
-    const dir = resolveProofScope(root, scope);
+    if (!scope) {
+      // The default fields are unchanged. `projects` adds each allowed root's own readiness with its
+      // project id, so same-named missions in different projects stay distinguishable.
+      const projects = proofMissionRoots(c, root).map(r => {
+        try { return { id: r.id, missionsRoot: r.root, ...readProjectReadiness(r.root) }; }
+        catch (e) { return { id: r.id, missionsRoot: r.root, error: e instanceof Error ? e.message : String(e) }; }
+      });
+      return c.json({ ...readProjectReadiness(root), projects, sourceObservation: proofSourceObservation(c) });
+    }
+    const dir = resolveProofScopeAcross(proofMissionRoots(c, root), scope);
     if (path.basename(path.dirname(dir)) !== "slices") return c.json({ ...readMissionReadiness(dir), sourceObservation: proofSourceObservation(c) });
     const refs = c.req.queries("evidence") ?? [];
     let evidenceRoot = path.dirname(root);
@@ -39,7 +48,7 @@ export function proofRoutes(): Hono {
     const identity = requireSenderIdentity(c, { verb: "proof judgment", bodyClaim: body.actorSession });
     if (!identity.ok) return identity.response;
     const owner = indexer(c);
-    const result = recordJudgment(owner.slicesRoot, body, identity.session, resolveRecordedProvenance(c, identity));
+    const result = recordJudgment(proofMissionRoots(c, owner.slicesRoot), body, identity.session, resolveRecordedProvenance(c, identity));
     owner.invalidate();
     // The receipt is already durable. A lost notification must not turn a committed write into a claimed rollback.
     let notification = "unchanged";
