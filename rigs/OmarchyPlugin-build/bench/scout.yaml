@@ -1,0 +1,13 @@
+member:
+  id: scout
+  agent_ref: "local:../../packages/daemon/specs/agents/research/analyst"
+  runtime: claude-code
+  model: sonnet
+  profile: default
+  cwd: WORKDIR
+  startup:
+    files:
+      - path: CULTURE.md
+        delivery_hint: guidance_merge
+        required: true
+        applies_on: [fresh_start, restore]
