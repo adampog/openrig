@@ -30,7 +30,8 @@ export function addMemberCommand(depsOverride?: StatusDeps): Command {
     .argument("<member-fragment-path>", "Path to YAML/JSON member fragment file (spec snake_case fields)")
     .option("--json", "JSON output for agents")
     .option("--rig-root <path>", "Root directory for agent resolution")
-    .action(async (rigId: string, podNamespace: string, fragmentPath: string, opts: { json?: boolean; rigRoot?: string }) => {
+    .option("--no-view", "Add the member without accessing Herdr (normally joins an open rig wall)")
+    .action(async (rigId: string, podNamespace: string, fragmentPath: string, opts: { json?: boolean; rigRoot?: string; view?: boolean }) => {
       const deps = getDeps();
       const status = await getDaemonStatus(deps.lifecycleDeps);
       if (!daemonStatusGuard(status)) return;
@@ -78,6 +79,7 @@ export function addMemberCommand(depsOverride?: StatusDeps): Command {
       const body: Record<string, unknown> = { member };
       if (Array.isArray(edges)) body["edges"] = edges;
       if (opts.rigRoot) body["rigRoot"] = opts.rigRoot;
+      if (opts.view === false) body["noView"] = true;
 
       const client = deps.clientFactory(getDaemonUrl(status));
       const res = await client.post<AddMemberResponse>(
