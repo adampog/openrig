@@ -8,6 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 import YAML from "yaml";
 import { ConfigStore } from "../../config-store.js";
+import { listProjects } from "@openrig/daemon/project-catalog";
 
 import type {
   MissionInfo,
@@ -119,29 +120,120 @@ export function updateFrontmatter(
 // Mission discovery
 // ---------------------------------------------------------------------
 
-/** Locate the missions root from an explicit workspace override or the typed
- * `workspace.slices_root` setting. No cwd walk: discovery may enumerate
- * candidates, but selection comes from configuration. */
+/** Keep creation/unfiltered lists on the configured root. Named lookups also
+ * search registered projects, using the same catalog/manifest reader as the daemon.
+ * An explicit workspace confines the lookup to that root. */
 export function resolveMissionsRoot(opts: {
   override?: string | null;
   cwd?: string;
   configPath?: string;
+  mission?: string | null;
+  slice?: string | null;
 } = {}): string {
   const cwd = opts.cwd ?? process.cwd();
   const fromOverride = opts.override ?? process.env.OPENRIG_WORK_ROOT;
+  let overrideRoot: string | undefined;
   if (fromOverride) {
     const candidate = path.isAbsolute(fromOverride) ? fromOverride : path.resolve(cwd, fromOverride);
     const missions = path.join(candidate, "missions");
-    if (fs.existsSync(missions) && fs.statSync(missions).isDirectory()) return missions;
-    if (path.basename(candidate) === "missions" && fs.existsSync(candidate)) return candidate;
+    if (fs.existsSync(missions) && fs.statSync(missions).isDirectory()) overrideRoot = missions;
+    else if (path.basename(candidate) === "missions" && fs.existsSync(candidate)) overrideRoot = candidate;
   }
-  const configured = new ConfigStore(opts.configPath).get("workspace.slices_root") as string;
+  const store = new ConfigStore(opts.configPath);
+  const configured = overrideRoot ?? store.get("workspace.slices_root") as string;
+  if (opts.mission || opts.slice) {
+    const roots = new Map<string, string>();
+    const add = (id: string, root: string) => {
+      try {
+        const real = fs.realpathSync(root);
+        if (fs.statSync(real).isDirectory() && !roots.has(real)) roots.set(real, id);
+      } catch { /* Missing roots contribute no candidates. */ }
+    };
+    let projects: ReturnType<typeof listProjects>["projects"] = [];
+    try {
+      if (!fromOverride) projects = listProjects({ get: () => ({ resolveOne: (key: string) => ({ value: store.get(key) }) }) }).projects.filter(p => !p.error);
+    } catch { /* A broken catalog preserves the configured primary root. */ }
+    add(projects.find(p => sameRealPath(p.missionsRoot, configured))?.id ?? "workspace", configured);
+    for (const project of projects) add(project.id, project.missionsRoot);
+    const matches: Array<{ id: string; root: string; target: string }> = [];
+    let escaped = false;
+    for (const [root, id] of roots) {
+      const candidates = opts.slice
+        ? sliceCandidates(root, opts.slice, opts.mission)
+        : [path.resolve(root, opts.mission!)];
+      for (const target of candidates) {
+        if (!fs.existsSync(target) || !fs.statSync(target).isDirectory()) continue;
+        if (!isContained(root, target)) { escaped = true; continue; }
+        // A slice must belong to this missions root, rather than merely be a
+        // directory next to it. Check authored source symlinks as well.
+        if (opts.slice && !findOwningMission(root, fs.realpathSync(target))) continue;
+        const source = resolveNodeFile(target);
+        if (source && !isContained(root, source)) { escaped = true; continue; }
+        const realTarget = fs.realpathSync(target);
+        const prior = matches.find(m => m.target === realTarget);
+        // Nested registered roots can both contain an absolute target. It is
+        // one scope, not two choices; use the deepest root for its mission context.
+        if (!prior) matches.push({ id, root, target: realTarget });
+        else if (root.length > prior.root.length) Object.assign(prior, { id, root });
+        break;
+      }
+    }
+    if (matches.length === 1) return matches[0]!.root;
+    if (matches.length > 1) throw new ScopeCliError({
+      fact: `Scope "${opts.slice ?? opts.mission}" is ambiguous across projects: ${matches.map(m => `${m.id}: ${m.target}`).join("; ")}.`,
+      consequence: "Command did not run; no project was selected.",
+      action: "Pass --workspace /path/to/project, or an absolute scope path.",
+    });
+    if (escaped) throw new ScopeCliError({
+      fact: `Scope "${opts.slice ?? opts.mission}" escapes the registered missions roots.`,
+      consequence: "Command did not run.", action: "Select a scope contained in a registered project root.",
+    });
+  }
   if (configured && fs.existsSync(configured) && fs.statSync(configured).isDirectory()) return configured;
   throw new ScopeCliError({
     fact: `Configured workspace.slices_root is not a readable directory: ${configured || "(unset)"}.`,
     consequence: "No mission tree to operate on.",
     action: "Set workspace.slices_root with `rig config set`, or pass --workspace /path/to/your/workspace.",
   });
+}
+
+function sameRealPath(a: string, b: string): boolean {
+  try { return fs.realpathSync(a) === fs.realpathSync(b); } catch { return false; }
+}
+function isContained(root: string, target: string): boolean {
+  const rel = path.relative(fs.realpathSync(root), fs.realpathSync(target));
+  return rel === "" || (!path.isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${path.sep}`));
+}
+
+/** Validate write destinations, including new leaves below existing symlink
+ * parents. Checking only the selected mission/slice directory misses these. */
+export function assertScopeWritePaths(missionsRoot: string, ...targets: string[]): void {
+  for (const target of targets) {
+    let ancestor = path.resolve(target);
+    try {
+      for (;;) {
+        try { fs.lstatSync(ancestor); break; }
+        catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+          const parent = path.dirname(ancestor);
+          if (parent === ancestor) throw err;
+          ancestor = parent;
+        }
+      }
+      if (isContained(missionsRoot, ancestor)) continue;
+    } catch { /* Broken/unreadable links are not safe write destinations. */ }
+    throw new ScopeCliError({
+      fact: `Write destination ${target} escapes or cannot be resolved within missions root ${missionsRoot}.`,
+      consequence: "Refusing a write outside the selected missions root.",
+      action: "Use a destination whose real parent and existing file stay inside the selected missions root.",
+    });
+  }
+}
+
+function sliceCandidates(root: string, slice: string, mission?: string | null): string[] {
+  if (path.isAbsolute(slice)) return [slice];
+  return [path.resolve(root, "..", slice), path.resolve(root, slice),
+    ...(mission ? [path.join(root, mission, "slices", slice), path.join(root, mission, "closed", slice)] : [])];
 }
 
 /**
@@ -249,6 +341,9 @@ export function findMission(missionsRoot: string, identifier: string): MissionIn
   ];
   for (const candidate of candidates) {
     if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+      if (!isContained(missionsRoot, candidate) || (resolveNodeFile(candidate) && !isContained(missionsRoot, resolveNodeFile(candidate)!))) {
+        throw new ScopeCliError({ fact: `Mission "${identifier}" escapes missions root ${missionsRoot}.`, consequence: "Command did not run.", action: "Select a mission contained in a registered project root." });
+      }
       if (resolveNodeFile(candidate) === null) {
         throw new ScopeCliError({
           fact: `Directory "${identifier}" exists at ${candidate} but contains no ${NODE_FILE_PRECEDENCE.join(" or ")}.`,
@@ -256,7 +351,7 @@ export function findMission(missionsRoot: string, identifier: string): MissionIn
           action: "Create it as a mission with: rig scope mission create " + identifier + ". Or add a SPEC.md if the folder is intended to be a mission.",
         });
       }
-      return buildMissionInfo(missionsRoot, candidate);
+      return buildMissionInfo(missionsRoot, fs.realpathSync(candidate));
     }
   }
   throw new ScopeCliError({
@@ -366,21 +461,15 @@ export function findSlice(
   slicePath: string,
   hintMission?: string | null,
 ): SliceInfo {
-  const candidates: string[] = [];
-  if (path.isAbsolute(slicePath)) {
-    candidates.push(slicePath);
-  } else {
-    candidates.push(path.resolve(missionsRoot, "..", slicePath));
-    candidates.push(path.resolve(missionsRoot, slicePath));
-    if (hintMission) {
-      candidates.push(path.join(missionsRoot, hintMission, "slices", slicePath));
-      candidates.push(path.join(missionsRoot, hintMission, "closed", slicePath));
-    }
-  }
+  const candidates = sliceCandidates(missionsRoot, slicePath, hintMission);
   for (const candidate of candidates) {
     if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+      if (!isContained(missionsRoot, candidate)) continue;
+      const source = resolveNodeFile(candidate);
+      if (source && !isContained(missionsRoot, source)) continue;
       // Walk up to find the owning mission.
-      const owningMissionPath = findOwningMission(missionsRoot, candidate);
+      const realCandidate = fs.realpathSync(candidate);
+      const owningMissionPath = findOwningMission(fs.realpathSync(missionsRoot), realCandidate);
       if (!owningMissionPath) {
         throw new ScopeCliError({
           fact: `Slice path "${slicePath}" resolved to ${candidate} but no parent mission was found.`,
@@ -389,8 +478,8 @@ export function findSlice(
         });
       }
       const mission = buildMissionInfo(missionsRoot, owningMissionPath);
-      const sliceRoot = path.dirname(candidate);
-      return buildSliceInfo(mission, sliceRoot, path.basename(candidate));
+      const sliceRoot = path.dirname(realCandidate);
+      return buildSliceInfo(mission, sliceRoot, path.basename(realCandidate));
     }
   }
   throw new ScopeCliError({
