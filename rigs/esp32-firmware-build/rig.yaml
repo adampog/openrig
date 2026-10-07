@@ -1,0 +1,68 @@
+# Only four always-on seats. Bench members are added from bench/; hw must exist empty.
+version: '0.2'
+name: esp32-firmware-build
+summary: Build and native-test the human's ESP32 firmware fork with fixed-model builders,
+  independent QA and an on-demand hardware specialist. Launch with --cwd ~/Projects/firmware.
+  Hardware access requires the human; see CULTURE.md.
+culture_file: CULTURE.md
+permission_policy: builtin:auto
+pods:
+- id: orch
+  label: Orchestration
+  members:
+  - id: lead
+    agent_ref: local:../../packages/daemon/specs/agents/orchestration/orchestrator
+    runtime: claude-code
+    model: opus
+    profile: default
+    cwd: .
+  edges: []
+- id: dev
+  label: Implementation
+  members:
+  - id: firmware
+    agent_ref: local:../../packages/daemon/specs/agents/development/implementer
+    runtime: claude-code
+    model: opus
+    profile: default
+    cwd: .
+  - id: sonnet
+    agent_ref: local:../../packages/daemon/specs/agents/development/implementer
+    runtime: claude-code
+    model: sonnet
+    profile: default
+    cwd: .
+  - id: qa
+    agent_ref: local:../../packages/daemon/specs/agents/development/qa
+    runtime: codex
+    profile: default
+    cwd: .
+  edges:
+  - kind: delegates_to
+    from: firmware
+    to: qa
+  - kind: delegates_to
+    from: sonnet
+    to: qa
+- id: hw
+  label: ESP32 hardware expertise
+  members: []
+  edges: []
+edges:
+- kind: delegates_to
+  from: orch.lead
+  to: dev.firmware
+- kind: delegates_to
+  from: orch.lead
+  to: dev.sonnet
+- kind: delegates_to
+  from: orch.lead
+  to: dev.qa
+startup:
+  files:
+  - path: README.md
+    delivery_hint: send_text
+    required: true
+    applies_on:
+    - fresh_start
+    - restore
