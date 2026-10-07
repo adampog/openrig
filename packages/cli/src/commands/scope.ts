@@ -39,6 +39,7 @@ import {
 } from "../lib/scope/dot-id.js";
 import {
   buildMissionDependencyGraph,
+  assertScopeWritePaths,
   ensureMissionId,
   ensureMissionIdPersisted,
   findMission,
@@ -339,6 +340,7 @@ function buildSliceCreateCommand(): Command {
         const nn = nextSliceNN(mission.absPath);
         const sliceFolder = `${pad2(nn)}-${slug}`;
         const sliceAbs = path.join(mission.absPath, "slices", sliceFolder);
+        assertScopeWritePaths(missionsRoot, sliceAbs, path.join(mission.absPath, "mission.yaml"));
         if (fs.existsSync(sliceAbs)) {
           throw new ScopeCliError({
             fact: `Slice folder ${sliceAbs} already exists.`,
@@ -464,6 +466,8 @@ function buildSliceShipCommand(): Command {
         const newName = `${pad2(newNN)}-${slug}`;
         const destAbs = path.join(targetSlicesDir, newName);
         const sourceMission = findMission(missionsRoot, slice.missionName);
+        assertScopeWritePaths(missionsRoot, path.join(sourceMission.absPath, "mission.yaml"));
+        assertScopeWritePaths(targetRoot, destAbs, path.join(target.absPath, "mission.yaml"));
         const edits = [
           planMissionMembershipRemove(sourceMission.absPath, sliceManifestRef(sourceMission.absPath, slice.absPath)),
           planMissionMembershipAdd(target.absPath, `slices/${newName}/slice.yaml`, nextMissionMembershipOrder(target.absPath)),
@@ -474,6 +478,7 @@ function buildSliceShipCommand(): Command {
         const originalTargetNode = target.readmePath ? fs.readFileSync(target.readmePath, "utf8") : null;
         try {
           moveResult = moveSlice(slice.absPath, destAbs);
+          assertScopeWritePaths(targetRoot, path.join(destAbs, "SPEC.md"), path.join(destAbs, "README.md"));
           const targetId = ensureMissionIdPersisted(target, targetRoot);
           const newSliceId = sliceIdFromMission(targetId, newNN);
           const newReadme = resolveNodeFile(destAbs);
@@ -542,6 +547,7 @@ function buildSliceCloseCommand(): Command {
         const closedDir = path.join(mission.absPath, "closed");
         const destName = slice.name;
         const destAbs = path.join(closedDir, destName);
+        assertScopeWritePaths(missionsRoot, destAbs, path.join(mission.absPath, "mission.yaml"));
         const compositionEdit = planMissionMembershipRemove(
           mission.absPath,
           sliceManifestRef(mission.absPath, slice.absPath),
@@ -559,6 +565,7 @@ function buildSliceCloseCommand(): Command {
         const { usedGit, repoRoot } = moveResult;
         const newReadme = resolveNodeFile(destAbs);
         try {
+          assertScopeWritePaths(missionsRoot, path.join(destAbs, "SPEC.md"), path.join(destAbs, "README.md"));
           if (newReadme) {
             const updates: Record<string, unknown> = {
               status: `closed-${reason}`,
@@ -623,6 +630,8 @@ function buildSliceMoveCommand(): Command {
         const newName = `${pad2(newNN)}-${slug}`;
         const destAbs = path.join(targetSlicesDir, newName);
         const sourceMission = findMission(missionsRoot, slice.missionName);
+        assertScopeWritePaths(missionsRoot, path.join(sourceMission.absPath, "mission.yaml"));
+        assertScopeWritePaths(targetRoot, destAbs, path.join(target.absPath, "mission.yaml"));
         // Cross-mission dependencies cannot remain sibling edges. Name affected dependents at the move.
         const dependencyWarnings = slice.id === null ? [] : listSlices(sourceMission, "all")
           .filter((sibling) => sibling.absPath !== slice.absPath
@@ -639,6 +648,7 @@ function buildSliceMoveCommand(): Command {
         const originalTargetNode = target.readmePath ? fs.readFileSync(target.readmePath, "utf8") : null;
         try {
           moveResult = moveSlice(slice.absPath, destAbs);
+          assertScopeWritePaths(targetRoot, path.join(destAbs, "SPEC.md"), path.join(destAbs, "README.md"));
           const targetId = ensureMissionIdPersisted(target, targetRoot);
           const newSliceId = sliceIdFromMission(targetId, newNN);
           const newReadme = resolveNodeFile(destAbs);
@@ -1389,6 +1399,7 @@ function buildSliceProgressCommand(): Command {
       try {
         const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, slice: slicePath, mission: opts.mission });
         const slice = findSlice(missionsRoot, slicePath, opts.mission ?? null);
+        assertScopeWritePaths(missionsRoot, path.join(slice.absPath, "PROGRESS.md"));
         runProgressUpdate(slice.absPath, "slice", slice.name, opts, out, json);
       } catch (err) {
         fail(err, json, out);
@@ -1411,6 +1422,7 @@ function buildMissionProgressCommand(): Command {
       try {
         const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, mission: missionName });
         const mission = findMission(missionsRoot, missionName);
+        assertScopeWritePaths(missionsRoot, path.join(mission.absPath, "PROGRESS.md"));
         runProgressUpdate(mission.absPath, "mission", mission.name, opts, out, json);
       } catch (err) {
         fail(err, json, out);
@@ -1770,6 +1782,7 @@ function buildSliceRepairCommand(): Command {
       try {
         const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, slice: slicePath, mission: opts.mission });
         const legacySlice = findSlice(missionsRoot, slicePath, opts.mission ?? null);
+        assertRepairPaths(missionsRoot, legacySlice.absPath);
         const specPath = ensureCurrentSpec(legacySlice.absPath, legacySlice.readmePath, legacySlice.name);
         const slice = findSlice(missionsRoot, legacySlice.absPath, opts.mission ?? null);
         const result = backfillScopeProgress(slice.absPath, "slice");
@@ -1800,6 +1813,9 @@ function buildMissionRepairCommand(): Command {
       try {
         const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, mission: missionName });
         const legacyMission = findMission(missionsRoot, missionName);
+        assertRepairPaths(missionsRoot, legacyMission.absPath);
+        assertScopeWritePaths(missionsRoot, path.join(legacyMission.absPath, "slices"), path.join(legacyMission.absPath, "closed"));
+        for (const slice of listSlices(legacyMission, "all")) assertRepairPaths(missionsRoot, slice.absPath);
         const missionSpec = ensureCurrentSpec(legacyMission.absPath, legacyMission.readmePath, legacyMission.name);
         const mission = findMission(missionsRoot, missionName);
         const results: BackfillResult[] = [];
@@ -1874,6 +1890,10 @@ function ensureConventionFrontmatter(specPath: string, fallbackName: string): vo
     updates.depends_on = [];
   }
   if (Object.keys(updates).length > 0) updateFrontmatter(specPath, updates);
+}
+
+function assertRepairPaths(root: string, dir: string): void {
+  assertScopeWritePaths(root, ...["SPEC.md", "README.md", "PROGRESS.md", "PROOF.md", "proof", ...NOTES_FILE_PRECEDENCE].map(name => path.join(dir, name)));
 }
 
 function ensureMissionNotesSurface(dir: string, mission: ReturnType<typeof findMission>): void {

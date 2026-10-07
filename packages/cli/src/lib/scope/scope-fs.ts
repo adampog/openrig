@@ -205,6 +205,31 @@ function isContained(root: string, target: string): boolean {
   return rel === "" || (!path.isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${path.sep}`));
 }
 
+/** Validate write destinations, including new leaves below existing symlink
+ * parents. Checking only the selected mission/slice directory misses these. */
+export function assertScopeWritePaths(missionsRoot: string, ...targets: string[]): void {
+  for (const target of targets) {
+    let ancestor = path.resolve(target);
+    try {
+      for (;;) {
+        try { fs.lstatSync(ancestor); break; }
+        catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+          const parent = path.dirname(ancestor);
+          if (parent === ancestor) throw err;
+          ancestor = parent;
+        }
+      }
+      if (isContained(missionsRoot, ancestor)) continue;
+    } catch { /* Broken/unreadable links are not safe write destinations. */ }
+    throw new ScopeCliError({
+      fact: `Write destination ${target} escapes or cannot be resolved within missions root ${missionsRoot}.`,
+      consequence: "Refusing a write outside the selected missions root.",
+      action: "Use a destination whose real parent and existing file stay inside the selected missions root.",
+    });
+  }
+}
+
 function sliceCandidates(root: string, slice: string, mission?: string | null): string[] {
   if (path.isAbsolute(slice)) return [slice];
   return [path.resolve(root, "..", slice), path.resolve(root, slice),

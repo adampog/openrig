@@ -210,3 +210,76 @@ it("an absolute target under nested registered roots is one scope with the deepe
   expect(result.failed, result.output).toBe(false);
   expect(JSON.parse(result.output).slice.mission).toBe("nested-proof");
 });
+it("slice creation refuses an escaping slices parent before writing anything", async () => {
+  const dir = path.join(project, "missions/plugin-proof");
+  fs.rmSync(path.join(dir, "slices"), { recursive: true });
+  const outside = path.join(root, "outside");
+  fs.mkdirSync(outside);
+  fs.symlinkSync(outside, path.join(dir, "slices"));
+  const original = fs.readFileSync(path.join(dir, "SPEC.md"), "utf8");
+  const result = await run("scope", ["slice", "create", "plugin-proof", "escape-write", "--json"]);
+  expect(result.failed, result.output).toBe(true);
+  expect(fs.readdirSync(outside)).toEqual([]);
+  expect(fs.readFileSync(path.join(dir, "SPEC.md"), "utf8")).toBe(original);
+});
+it("proof add refuses an escaping proof directory", async () => {
+  const outside = path.join(root, "outside");
+  fs.mkdirSync(outside);
+  fs.symlinkSync(outside, path.join(project, "missions/plugin-proof/slices/01-label/proof"));
+  const result = await run("proof", ["add", "01-label", "--mission", "plugin-proof", "--artifact-type", "qa", "--verdict", "CLEAR", "--candidate-sha", "abc1234", "--money-evidence", "label visible", "--body", "observed", "--name", "qa.md", "--json"]);
+  expect(result.failed, result.output).toBe(true);
+  expect(fs.readdirSync(outside)).toEqual([]);
+});
+it("progress refuses an escaping progress file", async () => {
+  const outside = path.join(root, "outside.md");
+  write(outside, "# Progress\n");
+  fs.symlinkSync(outside, path.join(project, "missions/plugin-proof/PROGRESS.md"));
+  const result = await run("scope", ["mission", "progress", "plugin-proof", "--add", "Must stay inside", "--json"]);
+  expect(result.failed, result.output).toBe(true);
+  expect(fs.readFileSync(outside, "utf8")).toBe("# Progress\n");
+});
+it.each(["move", "ship", "close"])("slice %s refuses an escaping destination parent", async verb => {
+  const dir = verb === "close" ? path.join(project, "missions/plugin-proof") : mission(root, "destination");
+  const bucket = path.join(dir, verb === "close" ? "closed" : "slices");
+  fs.rmSync(bucket, { recursive: true, force: true });
+  const outside = path.join(root, "outside"); fs.mkdirSync(outside);
+  fs.symlinkSync(outside, bucket);
+  const args = verb === "close" ? ["--reason", "deferred"] : ["destination"];
+  const result = await run("scope", ["slice", verb, "01-label", ...args, "--mission", "plugin-proof", "--json"]);
+  expect(result.failed, result.output).toBe(true);
+  expect(fs.readdirSync(outside)).toEqual([]);
+  expect(fs.existsSync(path.join(project, "missions/plugin-proof/slices/01-label/SPEC.md"))).toBe(true);
+});
+it("mission repair refuses an escaping slices directory before any repair writes", async () => {
+  const dir = path.join(project, "missions/plugin-proof");
+  fs.rmSync(path.join(dir, "slices"), { recursive: true });
+  const outside = path.join(root, "outside");
+  const externalMission = mission(outside);
+  fs.symlinkSync(path.join(externalMission, "slices"), path.join(dir, "slices"));
+  const result = await run("scope", ["mission", "repair", "plugin-proof", "--json"]);
+  expect(result.failed, result.output).toBe(true);
+  expect(fs.existsSync(path.join(externalMission, "slices/01-label/PROGRESS.md"))).toBe(false);
+  expect(fs.existsSync(path.join(dir, "PROGRESS.md"))).toBe(false);
+});
+it("a dangling slices-directory symlink is refused without creating its target", async () => {
+  const dir = path.join(project, "missions/plugin-proof");
+  fs.rmSync(path.join(dir, "slices"), { recursive: true });
+  const outside = path.join(root, "not-created");
+  fs.symlinkSync(outside, path.join(dir, "slices"));
+  const result = await run("scope", ["slice", "create", "plugin-proof", "escape", "--json"]);
+  expect(result.failed, result.output).toBe(true);
+  expect(fs.existsSync(outside)).toBe(false);
+});
+it("a moved source symlink outside its new root is refused and the move rolled back", async () => {
+  const source = path.join(project, "missions/plugin-proof/slices/01-label/SPEC.md");
+  const shared = path.join(project, "missions/plugin-proof/shared.md");
+  const original = fs.readFileSync(source, "utf8");
+  write(shared, original);
+  fs.unlinkSync(source); fs.symlinkSync(shared, source);
+  const destination = mission(root, "destination");
+  const result = await run("scope", ["slice", "move", "01-label", "destination", "--mission", "plugin-proof", "--json"]);
+  expect(result.failed, result.output).toBe(true);
+  expect(fs.existsSync(source)).toBe(true);
+  expect(fs.existsSync(path.join(destination, "slices/02-label"))).toBe(false);
+  expect(fs.readFileSync(shared, "utf8")).toBe(original);
+});

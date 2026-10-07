@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { Command } from "commander";
 import YAML from "yaml";
 import { DaemonClient } from "../client.js";
-import { findSlice, resolveMissionsRoot } from "../lib/scope/scope-fs.js";
+import { assertScopeWritePaths, findSlice, resolveMissionsRoot } from "../lib/scope/scope-fs.js";
 import { ScopeCliError } from "../lib/scope/types.js";
 import { selectProofContractBody, isScaffoldPlaceholderText } from "../lib/scope/scaffold-placeholder.js";
 import { parseLogicalCheckboxes } from "../lib/scope/logical-checkbox.js";
@@ -457,6 +457,9 @@ checkboxes do not accept an item under the selected proof policy.
             action: "Pass a bare filename; the drop path owns the directory.",
           });
         }
+        // --replace atomically swaps the directory entry, never follows an
+        // existing artifact symlink. Validate its parent, preserving that behavior.
+        assertScopeWritePaths(missionsRoot, proofDir);
         fs.mkdirSync(proofDir, { recursive: true });
         const frontmatter = YAML.stringify(header).trimEnd();
         const content = `---\n${frontmatter}\n---\n\n${body}`;
