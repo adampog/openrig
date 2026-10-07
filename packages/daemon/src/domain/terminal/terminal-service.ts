@@ -141,7 +141,7 @@ function savedMemberToInput(m: SavedViewMember): ViewMemberInput {
   };
 }
 
-type ResolvedView = { id: string; members: ViewMemberInput[] } | { code: string; error: string };
+type ResolvedView = { id: string; rigName?: string; members: ViewMemberInput[] } | { code: string; error: string };
 
 export class TerminalService {
   private localTmux?: Promise<string | undefined>;
@@ -181,12 +181,30 @@ export class TerminalService {
     return provider.openView(composed);
   }
 
+  /** Seat addition is additive: compose only that seat, never reopen the whole rig/pod. */
+  async joinRigWall(rigName: string, seat: string): Promise<OpenViewResult> {
+    const provider = this.deps.resolveProvider("herdr");
+    if (!provider?.joinExistingWorkspace) {
+      return { provider: "herdr", ok: true, opened: [], absent: [], degraded: [], pages: 0 };
+    }
+    const rows = await this.deps.listRigSeats(rigName);
+    const members = deriveViewMembers((rows ?? []).filter(row => row.canonicalSessionName === seat), { readOnly: false });
+    if (members.length === 0) return errorResult("herdr", "seat_not_attachable", `New seat '${seat}' is not attachable in the rig inventory`);
+    const composed = composeView(`rig:${rigName}`, await this.refineLiveness(members), {
+      resolveHost: id => this.deps.resolveHost(id), panesPerPage: provider.panesPerPage,
+      localTmux: await this.resolveLocalTmux(),
+    });
+    return provider.joinExistingWorkspace(rigName, composed);
+  }
+
   private async resolveComposed(viewArg: string, panesPerPage?: number): Promise<ComposedView | { code: string; error: string }> {
     const view = (viewArg ?? "").trim();
     if (!view) return { code: "view_required", error: "a view argument is required" };
     const resolved = await this.resolveView(view);
     if ("code" in resolved) return resolved;
-    return composeView(resolved.id, await this.refineLiveness(resolved.members), { resolveHost: (id) => this.deps.resolveHost(id), panesPerPage, localTmux: await this.resolveLocalTmux() });
+    const composed = composeView(resolved.id, await this.refineLiveness(resolved.members), { resolveHost: (id) => this.deps.resolveHost(id), panesPerPage, localTmux: await this.resolveLocalTmux() });
+    if (resolved.rigName) composed.rigName = resolved.rigName;
+    return composed;
   }
 
   private planId(provider: string, composed: ComposedView): string {
@@ -276,7 +294,8 @@ export class TerminalService {
       if (rows == null) {
         return { code: "view_not_found", error: `unknown pod '${rest.slice(slash + 1)}' in rig '${rest.slice(0, slash)}'` };
       }
-      return { id: view, members: deriveViewMembers(rows, { readOnly: false }) };
+      const rigName = rows.find(row => row.rigName)?.rigName ?? undefined;
+      return { id: view, ...(rigName ? { rigName } : {}), members: deriveViewMembers(rows, { readOnly: false }) };
     }
 
     // 3. a rig — either the bare name (the common case: `rig terminal open acme`)

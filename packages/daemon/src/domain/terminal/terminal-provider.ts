@@ -56,6 +56,8 @@ export interface DegradedSeat {
  */
 export interface ComposedView {
   id: string;
+  /** Canonical inventory name for a pod's owning rig (view arguments may contain rig IDs). */
+  rigName?: string;
   opened: ComposedPane[];
   absent: AbsentSeat[];
   degraded: DegradedSeat[];
@@ -101,7 +103,7 @@ export interface OpenViewResult {
 }
 
 /**
- * The provider contract. Three methods only:
+ * The provider contract:
  *  - `status()`   — availability + version + capabilities (version-adaptive probe).
  *  - `liveness()` — is the provider surface itself up right now.
  *  - `openView()` — render an already-composed view into the provider surface.
@@ -115,4 +117,6 @@ export interface TerminalProvider {
   status(): Promise<ProviderStatus>;
   liveness(): Promise<ProviderLiveness>;
   openView(view: ComposedView): Promise<OpenViewResult>;
+  /** Add panes to an existing exact-label workspace; never create a workspace or replace its tabs. */
+  joinExistingWorkspace?(label: string, view: ComposedView): Promise<OpenViewResult>;
 }

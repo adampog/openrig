@@ -38,6 +38,7 @@ import type { PodRigInstantiator } from "../domain/rigspec-instantiator.js";
 import { convergeOp } from "../domain/topology-converge.js";
 import type { RigLifecycleService } from "../domain/rig-lifecycle-service.js";
 import type { SelfAttachService } from "../domain/self-attach-service.js";
+import type { TerminalService } from "../domain/terminal/terminal-service.js";
 
 export const rigsRoutes = new Hono();
 
@@ -834,6 +835,25 @@ rigsRoutes.post("/:rigId/pods/:podNamespace/members", async (c) => {
         return c.json(outcome, 400);
       default:
         return c.json(outcome, 500);
+    }
+  }
+
+  // Best-effort additive view work happens only after the seat launched. Never
+  // reopen a pod/rig here: that creates a second workspace and duplicates seats.
+  if (body["noView"] !== true && outcome.result.node.status === "launched" && outcome.result.node.sessionName) {
+    const terminalService = c.get("terminalService" as never) as TerminalService | undefined;
+    const rig = getRepo(c).getRig(rigId);
+    if (terminalService && rig) {
+      const warnings = outcome.result.warnings ??= [];
+      try {
+        const joined = await terminalService.joinRigWall(rig.rig.name, outcome.result.node.sessionName);
+        if (!joined.ok) {
+          warnings.push(`Seat added; Herdr wall join incomplete: ${joined.error ?? [...joined.absent, ...joined.degraded].map(s => s.reason).join("; ")}`);
+        }
+        if (joined.notes?.length) warnings.push(...joined.notes);
+      } catch (err) {
+        warnings.push(`Seat added; Herdr wall join failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
   }
 
