@@ -9,6 +9,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { Command } from "commander";
+import { ConfigStore } from "../config-store.js";
 import { DaemonClient } from "../client.js";
 import { attestationLineage, type AttestationLineage } from "../lib/scope/attestation-lineage.js";
 import { getDaemonStatus, getDaemonUrl , statusGuardMessage} from "../daemon-lifecycle.js";
@@ -213,7 +214,7 @@ function buildSliceLsCommand(): Command {
         }), json, out);
       }
       try {
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, mission: opts.mission });
         const missions = opts.mission
           ? [findMission(missionsRoot, opts.mission)]
           : listMissions(missionsRoot);
@@ -256,7 +257,7 @@ function buildSliceShowCommand(): Command {
       const out = makeStdout();
       const json = Boolean(opts.json);
       try {
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, slice: slicePath, mission: opts.mission });
         const slice = findSlice(missionsRoot, slicePath, opts.mission ?? null);
         const readme = slice.readmePath ? fs.readFileSync(slice.readmePath, "utf8") : null;
         const children = fs.readdirSync(slice.absPath, { withFileTypes: true })
@@ -333,7 +334,7 @@ function buildSliceCreateCommand(): Command {
             action: "Pick a slug containing letters or digits.",
           });
         }
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, mission: missionName });
         const mission = findMission(missionsRoot, missionName);
         const nn = nextSliceNN(mission.absPath);
         const sliceFolder = `${pad2(nn)}-${slug}`;
@@ -450,10 +451,11 @@ function buildSliceShipCommand(): Command {
       const out = makeStdout();
       const json = Boolean(opts.json);
       try {
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, slice: slicePath, mission: opts.mission });
         const slice = findSlice(missionsRoot, slicePath, opts.mission ?? null);
-        const target = findMission(missionsRoot, releaseMission);
-        if (target.name === slice.missionName) {
+        const targetRoot = resolveMissionsRoot({ override: getOpts(command).workspace, mission: releaseMission });
+        const target = findMission(targetRoot, releaseMission);
+        if (target.absPath === path.join(missionsRoot, slice.missionName)) {
           throw new ScopeCliError({ fact: "Source and release mission are the same.", consequence: "Slice not shipped.", action: "Choose a different release mission." });
         }
         const targetSlicesDir = path.join(target.absPath, "slices");
@@ -472,7 +474,7 @@ function buildSliceShipCommand(): Command {
         const originalTargetNode = target.readmePath ? fs.readFileSync(target.readmePath, "utf8") : null;
         try {
           moveResult = moveSlice(slice.absPath, destAbs);
-          const targetId = ensureMissionIdPersisted(target, missionsRoot);
+          const targetId = ensureMissionIdPersisted(target, targetRoot);
           const newSliceId = sliceIdFromMission(targetId, newNN);
           const newReadme = resolveNodeFile(destAbs);
           if (newReadme) {
@@ -534,7 +536,7 @@ function buildSliceCloseCommand(): Command {
             action: `Pick one of: ${CLOSE_REASONS.join(", ")}.`,
           });
         }
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, slice: slicePath, mission: opts.mission });
         const slice = findSlice(missionsRoot, slicePath, opts.mission ?? null);
         const mission = findMission(missionsRoot, slice.missionName);
         const closedDir = path.join(mission.absPath, "closed");
@@ -608,10 +610,11 @@ function buildSliceMoveCommand(): Command {
       const out = makeStdout();
       const json = Boolean(opts.json);
       try {
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, slice: slicePath, mission: opts.mission });
         const slice = findSlice(missionsRoot, slicePath, opts.mission ?? null);
-        const target = findMission(missionsRoot, destMission);
-        if (target.name === slice.missionName) {
+        const targetRoot = resolveMissionsRoot({ override: getOpts(command).workspace, mission: destMission });
+        const target = findMission(targetRoot, destMission);
+        if (target.absPath === path.join(missionsRoot, slice.missionName)) {
           throw new ScopeCliError({ fact: "Source and destination mission are the same.", consequence: "Slice not moved.", action: "Choose a different destination mission." });
         }
         const targetSlicesDir = path.join(target.absPath, "slices");
@@ -636,7 +639,7 @@ function buildSliceMoveCommand(): Command {
         const originalTargetNode = target.readmePath ? fs.readFileSync(target.readmePath, "utf8") : null;
         try {
           moveResult = moveSlice(slice.absPath, destAbs);
-          const targetId = ensureMissionIdPersisted(target, missionsRoot);
+          const targetId = ensureMissionIdPersisted(target, targetRoot);
           const newSliceId = sliceIdFromMission(targetId, newNN);
           const newReadme = resolveNodeFile(destAbs);
           if (newReadme) {
@@ -716,7 +719,7 @@ function buildMissionShowCommand(): Command {
       const out = makeStdout();
       const json = Boolean(opts.json);
       try {
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, mission: missionName });
         const mission = findMission(missionsRoot, missionName);
         const readme = mission.readmePath ? fs.readFileSync(mission.readmePath, "utf8") : null;
         const slices = listSlices(mission, "all").map((s) => ({
@@ -945,7 +948,7 @@ function buildMissionGraphCommand(): Command {
       const out = makeStdout();
       const json = Boolean(opts.json);
       try {
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, mission: missionName });
         const graph = buildMissionDependencyGraph(findMission(missionsRoot, missionName));
         emit(out, { ok: true, graph }, json, [
           `Ready: ${graph.ready.join(", ") || "(none)"}`,
@@ -999,11 +1002,11 @@ function buildAuditCommand(): Command {
       const out = makeStdout();
       const json = Boolean(opts.json);
       try {
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, mission: opts.mission });
         const { classifyScopeItem } = await import("../lib/scope/scope-audit.js");
         const missionName = opts.mission as string;
 
-        const missionDir = path.join(missionsRoot, missionName);
+        const missionDir = path.resolve(missionsRoot, missionName);
         if (!fs.existsSync(missionDir)) {
           throw new ScopeCliError({ fact: `Mission "${missionName}" not found at ${missionDir}.`, consequence: "Cannot audit.", action: "Check the mission name." });
         }
@@ -1384,7 +1387,7 @@ function buildSliceProgressCommand(): Command {
       const out = makeStdout();
       const json = Boolean(opts.json);
       try {
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, slice: slicePath, mission: opts.mission });
         const slice = findSlice(missionsRoot, slicePath, opts.mission ?? null);
         runProgressUpdate(slice.absPath, "slice", slice.name, opts, out, json);
       } catch (err) {
@@ -1406,7 +1409,7 @@ function buildMissionProgressCommand(): Command {
       const out = makeStdout();
       const json = Boolean(opts.json);
       try {
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, mission: missionName });
         const mission = findMission(missionsRoot, missionName);
         runProgressUpdate(mission.absPath, "mission", mission.name, opts, out, json);
       } catch (err) {
@@ -1530,7 +1533,7 @@ function buildSliceStageCommand(): Command {
       const json = Boolean(opts.json);
       try {
         const stage = validateStage(newStage);
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, slice: slicePath, mission: opts.mission });
         const slice = findSlice(missionsRoot, slicePath, opts.mission ?? null);
         if (!slice.readmePath) {
           throw new ScopeCliError({
@@ -1564,7 +1567,7 @@ function buildMissionStageCommand(): Command {
       const json = Boolean(opts.json);
       try {
         const stage = validateStage(newStage);
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, mission: missionName });
         const mission = findMission(missionsRoot, missionName);
         if (!mission.readmePath) {
           throw new ScopeCliError({
@@ -1598,7 +1601,7 @@ function buildSliceVerifiedCommand(): Command {
       const json = Boolean(opts.json);
       try {
         const source = validateAgainst(opts.against);
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, slice: slicePath, mission: opts.mission });
         const slice = findSlice(missionsRoot, slicePath, opts.mission ?? null);
         if (!slice.readmePath) {
           throw new ScopeCliError({
@@ -1629,7 +1632,7 @@ function buildMissionVerifiedCommand(): Command {
       const json = Boolean(opts.json);
       try {
         const source = validateAgainst(opts.against);
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, mission: missionName });
         const mission = findMission(missionsRoot, missionName);
         if (!mission.readmePath) {
           throw new ScopeCliError({
@@ -1765,7 +1768,7 @@ function buildSliceRepairCommand(): Command {
       const out = makeStdout();
       const json = Boolean(opts.json);
       try {
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, slice: slicePath, mission: opts.mission });
         const legacySlice = findSlice(missionsRoot, slicePath, opts.mission ?? null);
         const specPath = ensureCurrentSpec(legacySlice.absPath, legacySlice.readmePath, legacySlice.name);
         const slice = findSlice(missionsRoot, legacySlice.absPath, opts.mission ?? null);
@@ -1795,7 +1798,7 @@ function buildMissionRepairCommand(): Command {
       const out = makeStdout();
       const json = Boolean(opts.json);
       try {
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, mission: missionName });
         const legacyMission = findMission(missionsRoot, missionName);
         const missionSpec = ensureCurrentSpec(legacyMission.absPath, legacyMission.readmePath, legacyMission.name);
         const mission = findMission(missionsRoot, missionName);
@@ -1988,7 +1991,7 @@ function buildApproveCommand(tier: "slice" | "mission"): Command {
         }
         // Resolve the scope target LOCALLY (rich NN-slug resolution), then
         // send the canonical missions-root-relative path to the daemon.
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, ...(tier === "slice" ? { slice: target, mission: opts.mission } : { mission: target }) });
         let scopeAbsPath: string;
         if (tier === "slice") {
           const slice = findSlice(missionsRoot, target, opts.mission ?? null);
@@ -1996,6 +1999,14 @@ function buildApproveCommand(tier: "slice" | "mission"): Command {
         } else {
           const mission = findMission(missionsRoot, target);
           scopeAbsPath = mission.absPath;
+        }
+        const centralRoot = new ConfigStore().get("workspace.slices_root") as string;
+        if (!fs.existsSync(centralRoot) || fs.realpathSync(missionsRoot) !== fs.realpathSync(centralRoot)) {
+          throw new ScopeCliError({
+            fact: "project-root scopes can't be approved yet.",
+            consequence: "No approval request was sent; the daemon approval path only supports the central folder.",
+            action: `Use the central folder (${centralRoot}) for approval until project-root approval is supported.`,
+          });
         }
         const scopePath = path.relative(missionsRoot, scopeAbsPath).split(path.sep).join("/");
 

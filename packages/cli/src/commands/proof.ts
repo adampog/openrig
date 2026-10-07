@@ -223,7 +223,7 @@ checkboxes do not accept an item under the selected proof policy.
           });
         }
         const parentOpts = (command.parent?.opts() ?? {}) as { workspace?: string };
-        const missionsRoot = resolveMissionsRoot({ override: parentOpts.workspace });
+        const missionsRoot = resolveMissionsRoot({ override: parentOpts.workspace, slice: slicePath, mission: opts.mission });
         const slice = findSlice(missionsRoot, slicePath, opts.mission ?? null);
 
         // Resolve the artifact body.
