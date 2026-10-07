@@ -1,0 +1,91 @@
+version: "0.2"
+name: OmarchyTheme-build
+summary: >
+  The team that makes Omarchy themes: an orchestrator, an art director who owns the look,
+  implementation seats each fixed to one model (Jev picks the seat per task), an independent
+  QA seat, and bench seats the orchestrator starts when the work needs them. Launch it in the
+  themes folder: rig up rigs/OmarchyTheme-build/rig.yaml --cwd ~/Projects/omarchy-themes.
+
+culture_file: CULTURE.md
+
+# Claude seats run in Claude Code's auto mode; Codex seats keep the default sandbox.
+permission_policy: builtin:auto
+
+# Only the always-on seats are declared here, so `rig up` starts exactly these five.
+# The bench seats (dev.fable, dev.codex, dev.qwen) and the extra-builder template live in bench/.
+# The orchestrator adds one with `rig add` when it needs it; see CULTURE.md.
+pods:
+  - id: orch
+    label: Orchestration
+    members:
+      - id: lead
+        agent_ref: "local:../../packages/daemon/specs/agents/orchestration/orchestrator"
+        runtime: claude-code
+        model: opus
+        profile: default
+        cwd: "."
+    edges: []
+
+  - id: art
+    label: Art direction
+    members:
+      # A custom agent: its role guidance is agents/art-director/guidance/role.md.
+      - id: director
+        agent_ref: "local:agents/art-director"
+        runtime: claude-code
+        model: claude-fable-5-1
+        profile: default
+        cwd: "."
+    edges: []
+
+  - id: dev
+    label: Implementation
+    members:
+      # One implementation seat per Jev candidate, each fixed to its model. jev route picks
+      # one; builder (Opus) is the default seat. QA never builds.
+      - id: builder
+        agent_ref: "local:../../packages/daemon/specs/agents/development/implementer"
+        runtime: claude-code
+        model: opus
+        profile: default
+        cwd: "."
+      - id: sonnet
+        agent_ref: "local:../../packages/daemon/specs/agents/development/implementer"
+        runtime: claude-code
+        model: sonnet
+        profile: default
+        cwd: "."
+      # QA is on Claude here: Codex's sandbox could not use the GPU on 2026-10-05.
+      - id: qa
+        agent_ref: "local:../../packages/daemon/specs/agents/development/qa"
+        runtime: claude-code
+        model: sonnet
+        profile: default
+        cwd: "."
+    edges:
+      - kind: delegates_to
+        from: builder
+        to: qa
+      - kind: delegates_to
+        from: sonnet
+        to: qa
+
+edges:
+  - kind: delegates_to
+    from: orch.lead
+    to: art.director
+  - kind: delegates_to
+    from: orch.lead
+    to: dev.builder
+  - kind: delegates_to
+    from: orch.lead
+    to: dev.sonnet
+  - kind: delegates_to
+    from: orch.lead
+    to: dev.qa
+  - kind: can_observe
+    from: art.director
+    to: dev.builder
+  - kind: can_observe
+    from: art.director
+    to: dev.sonnet

@@ -1,0 +1,15 @@
+member:
+  id: qwen
+  agent_ref: "local:../../packages/daemon/specs/agents/development/implementer"
+  runtime: pi
+  model: macllm/mlx-community/Qwen3.6-35B-A3B-4bit
+  profile: default
+  cwd: WORKDIR
+  startup:
+    files:
+      - path: CULTURE.md
+        delivery_hint: guidance_merge
+        required: true
+        applies_on: [fresh_start, restore]
+edges:
+  - {kind: delegates_to, from: qwen, to: qa}

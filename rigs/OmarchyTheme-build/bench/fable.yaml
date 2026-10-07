@@ -1,0 +1,15 @@
+member:
+  id: fable
+  agent_ref: "local:../../packages/daemon/specs/agents/development/implementer"
+  runtime: claude-code
+  model: claude-fable-5-1
+  profile: default
+  cwd: WORKDIR
+  startup:
+    files:
+      - path: CULTURE.md
+        delivery_hint: guidance_merge
+        required: true
+        applies_on: [fresh_start, restore]
+edges:
+  - {kind: delegates_to, from: fable, to: qa}

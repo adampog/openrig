@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
 import type { EventBus } from "../event-bus.js";
-import { readProjectReadiness, resolveProjectRoot } from "./judgments.js";
+import { readProjectReadiness, resolveProjectRoot, type ProofRoot } from "./judgments.js";
 
 export interface ProofSourceWatch {
   close(): void;
@@ -13,13 +13,19 @@ export function proofSourceObservation(c: { get: (key: never) => unknown }) {
 }
 
 /** Push invalidation over the existing bus; existing client quiet refresh is the missed-event repair. */
-export function watchProofSources(missionsRoot: string, invalidate: () => void, bus: EventBus): ProofSourceWatch {
+export function watchProofSources(missionsRoot: string, invalidate: () => void, bus: EventBus, rootsOf?: () => ProofRoot[]): ProofSourceWatch {
+  // Every allowed mission root, re-read on each check so a catalog edit is noticed. Without
+  // `rootsOf` only the primary root counts, exactly as before.
+  const allRoots = (): string[] => {
+    const extra = rootsOf ? (() => { try { return rootsOf().map(r => r.root); } catch { return []; } })() : [];
+    return [missionsRoot, ...extra.filter(r => r !== missionsRoot)];
+  };
   const workspace = path.dirname(missionsRoot);
   let projectRoot = workspace;
   try { projectRoot = resolveProjectRoot(missionsRoot); } catch { /* Legacy roots retain their existing watch boundary. */ }
   // ponytail: bounded local workspaces use a full semantic read after a file burst.
   // Keep this workload measured; subtree indexing is warranted only when that bound is exceeded.
-  const basis = () => createHash("sha256").update(JSON.stringify(readProjectReadiness(missionsRoot).missions.map(m => [m.name, m.revision]))).digest("hex");
+  const basis = () => createHash("sha256").update(JSON.stringify(allRoots().map(root => [root, readProjectReadiness(root).missions.map(m => [m.name, m.revision])]))).digest("hex");
   let state: "watching" | "unavailable" = "unavailable";
   let revision = "unavailable", timer: NodeJS.Timeout | undefined;
   try { revision = basis(); state = "watching"; } catch { /* Direct reads name unavailable inputs; watching may recover them. */ }
@@ -45,6 +51,13 @@ export function watchProofSources(missionsRoot: string, invalidate: () => void, 
   };
   try {
     watchers.push(fs.watch(workspace, { recursive: true, persistent: false }, schedule));
+    // A registered project can live outside the workspace folder; its manifests and missions still count.
+    for (const extra of allRoots().slice(1)) {
+      const owner = (() => { try { return resolveProjectRoot(extra); } catch { return path.dirname(extra); } })();
+      const rel = path.relative(workspace, owner);
+      if (rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel))) continue; // already covered
+      watchers.push(fs.watch(owner, { recursive: true, persistent: false }, schedule));
+    }
     if (projectRoot !== workspace) {
       watchers.push(fs.watch(projectRoot, { recursive: false, persistent: false }, (_event, filename) => {
         if (filename === null || filename.toString() === "project.yaml") schedule();

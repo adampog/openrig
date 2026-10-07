@@ -67,17 +67,20 @@ export function mergeManagedBlock(
 
   if (replaceableIds.length > 0) {
     let updated = existing;
+    // The active block is written once: its first occurrence is replaced and any further copies
+    // (a file written twice by an earlier bug) are dropped.
+    const emitted = { done: false };
     for (const id of replaceableIds) {
       const candidateBegin = MANAGED_BLOCK_START(id);
       const candidateEnd = MANAGED_BLOCK_END(id);
       const regex = new RegExp(`${escapeRegex(candidateBegin)}[\\s\\S]*?${escapeRegex(candidateEnd)}`, "g");
-      updated = updated.replace(regex, id === blockId ? block : "");
+      updated = replaceBlockText(updated, regex, id === blockId ? block : "", emitted);
       // Legacy marker variant from prior installs — replace with the
       // OpenRig form (or strip when not the active block id).
       const legacyBegin = LEGACY_BLOCK_START(id);
       const legacyEnd = LEGACY_BLOCK_END(id);
       const legacyRegex = new RegExp(`${escapeRegex(legacyBegin)}[\\s\\S]*?${escapeRegex(legacyEnd)}`, "g");
-      updated = updated.replace(legacyRegex, id === blockId ? block : "");
+      updated = replaceBlockText(updated, legacyRegex, id === blockId ? block : "", emitted);
     }
     if (!updated.includes(begin) || !updated.includes(end)) {
       updated = `${updated.trim()}\n\n${block}`.trim();
@@ -118,6 +121,18 @@ export function stripManagedBlocks(content: string): string {
     .replace(/(?:\n|^)\s*<!-- BEGIN RIGGED MANAGED BLOCK: [\s\S]*?<!-- END RIGGED MANAGED BLOCK: [^>]+ -->\s*(?=\n|$)/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+// Replacement goes through a function, never a replacement string: culture text is arbitrary and a
+// string would give `$'`, `$&`, `$$`, `` $` `` and `$<digit>` in it their String.replace meaning
+// (the rest of the file, the match, a dollar sign...), splicing the file into the block.
+function replaceBlockText(text: string, regex: RegExp, replacement: string, emitted: { done: boolean }): string {
+  return text.replace(regex, () => {
+    if (replacement === "") return "";
+    if (emitted.done) return "";
+    emitted.done = true;
+    return replacement;
+  });
 }
 
 function escapeRegex(value: string): string {
