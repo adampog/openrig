@@ -169,6 +169,14 @@ describe("rig add", () => {
     expect(parsed.result.node.logicalId).toBe("infra.server2");
   });
 
+  it("--no-view is documented and reaches the add-member request", async () => {
+    expect(addMemberCommand().helpInformation()).toContain("--no-view");
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "add", "OmarchyTheme-build", "infra", fragmentPath, "--no-view"]);
+    });
+    expect(capturedBody).toMatchObject({ noView: true, member: { id: "server2" } });
+  });
+
   it("human output shows the launched member with its session", async () => {
     const { logs } = await captureLogs(async () => {
       await makeCmd().parseAsync(["node", "rig", "add", "rig-123", "infra", fragmentPath]);

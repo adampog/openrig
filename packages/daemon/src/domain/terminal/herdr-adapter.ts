@@ -385,6 +385,47 @@ export class HerdrAdapter implements TerminalProvider {
     }
   }
 
+  /** Append a new tab only. No wall means no view when adding a seat. */
+  async joinExistingWorkspace(label: string, view: ComposedView): Promise<OpenViewResult> {
+    const skipped: OpenViewResult = { provider: this.name, ok: true, opened: [], absent: [], degraded: [], pages: 0 };
+    if (!(await this.transport.probe()).alive) return skipped;
+    return await this.appendToWall(label, view, false) ?? skipped;
+  }
+
+  private async appendToWall(label: string, view: ComposedView, focus: boolean): Promise<OpenViewResult | null> {
+    const result: OpenViewResult = {
+      provider: this.name, ok: true, opened: [], absent: [...view.absent],
+      degraded: [...view.degraded], pages: 0,
+    };
+    const listed = await this.transport.request("workspace.list", {});
+    const workspaces = listed["workspaces"];
+    if (!Array.isArray(workspaces)) throw new Error("Herdr workspace.list returned no workspace list");
+    const matches = workspaces.filter(w => w && typeof w === "object" && w.label === label);
+    if (matches.length === 0) return null;
+    if (matches.length > 1) throw new Error(`Herdr has multiple workspaces labelled "${label}"; join skipped`);
+    const workspaceId = extractWorkspaceId(matches[0]);
+    if (!workspaceId) throw new Error(`Herdr workspace "${label}" has no workspace id; join skipped`);
+    const notes: string[] = [];
+    const plan = planHerdrLayout(view, this.newLaunchToken(), this.tabPrefix);
+    for (const [i, page] of plan.pages.entries()) {
+      const panes = view.pages[i]!;
+      const applied = await this.transport.request("layout.apply", {
+        workspace_id: workspaceId, tab_label: page.tabLabel, focus, root: page.root,
+      });
+      const tabId = extractTabId(applied);
+      if (!tabId) throw new Error("Herdr join returned no tab id; tile creation is unconfirmed (not retried)");
+      const gone = await exitedSeats(this.transport, workspaceId, tabId, panes, page.blanks, notes);
+      for (const pane of panes) {
+        if (gone.has(pane.seat)) result.degraded.push({ seat: pane.seat, host: HERDR_SURFACE_HOST, reason: HERDR_PANE_EXITED_REASON });
+        else result.opened.push(pane.seat);
+      }
+      result.pages++;
+    }
+    result.ok = result.absent.length === 0 && result.degraded.length === 0;
+    if (notes.length) result.notes = notes;
+    return result;
+  }
+
   async openView(view: ComposedView): Promise<OpenViewResult> {
     const absent: AbsentSeat[] = [...view.absent];
     const degraded: DegradedSeat[] = [...view.degraded];
@@ -404,6 +445,21 @@ export class HerdrAdapter implements TerminalProvider {
         error: "herdr control socket is not answering ping; is herdr running?",
         code: "herdr_unavailable",
       };
+    }
+
+    // TUI and web pod buttons share this path. Join the canonical rig wall if
+    // present; otherwise keep the explicit pod-open fresh-workspace behavior.
+    if (view.id.startsWith("pod:") && view.rigName && view.opened.length > 0) {
+      try {
+        const joined = await this.appendToWall(view.rigName, view, true);
+        if (joined) return joined;
+      } catch (err) {
+        // Never fall back to a fresh workspace after a failed or uncertain join.
+        const reason = `Herdr wall join unconfirmed: ${err instanceof Error ? err.message : String(err)}`;
+        degraded.push(...view.opened.map(pane => ({ seat: pane.seat, host: HERDR_SURFACE_HOST, reason })));
+        return { provider: this.name, ok: false, opened, absent, degraded,
+          pages: 0, code: "herdr_join_failed", error: reason };
+      }
     }
 
     const launchToken = this.newLaunchToken();
