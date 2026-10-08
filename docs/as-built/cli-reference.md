@@ -9,20 +9,20 @@ applies-when: |
   the source that implements a command. Use command help for invocation details.
 siblings: [README.md, codemap.md]
 prerequisite-reads: [../reference/help.md]
-last-verified-against-source: 30bf2ca06375680f1f8cbe68cc757e212d23dec6
-last-updated: 2026-10-03
+last-verified-against-source: 2caac7dd1bb16585138a6f7c1dd8b1f0752c49f7
+last-updated: 2026-10-05
 ---
 
 # CLI Reference — Registered Commands and Options
 
-Verified against source commit `30bf2ca06375680f1f8cbe68cc757e212d23dec6`.
+Verified against source commit `2caac7dd1bb16585138a6f7c1dd8b1f0752c49f7`.
 The inventory below comes from the actual Commander tree returned by
 [`createProgram()`](../../packages/cli/src/index.ts), not a grep of command
 strings or an installed CLI from a different commit.
 
-There are **85 top-level registrations**, **341 registered command objects**
+There are **87 top-level registrations**, **356 registered command objects**
 below `rig` (including groups and the hidden `restore apply` command), and
-**1,026 explicitly registered option objects**, including the root version
+**1,082 explicitly registered option objects**, including the root version
 option. Aliases do not add command objects; short/long spellings of one
 option do not add option objects. Commander-generated help is additional.
 These are source counts, not a claim about a deployed release.
@@ -33,7 +33,8 @@ Each table row lists one registered command, its positional arguments,
 command aliases, and its **own declared options**. `<value>` denotes a
 required positional/option value; `[value]` is optional; `...` is variadic.
 An option marked **required** was registered with Commander's mandatory
-option setting. Conditional requirements enforced by an action are not
+option setting. An option marked (repeatable) collects every value when it is
+given more than once. Conditional requirements enforced by an action are not
 encoded by this inventory.
 
 Use `rig <command> --help` for descriptions, choices, defaults, and examples.
@@ -49,23 +50,29 @@ route remain the source for result/error shape and side effects.
 
 ## Entry points and practical routes
 
-Bare `rig` opens the TUI when both stdin and stdout are terminals. Arguments,
+Bare `rig` opens the TUI, the status dashboard rather than an agent conversation, when both
+stdin and stdout are terminals. Arguments,
 pipes, and redirected streams follow normal CLI parsing.
 [`runFrontDoor` and `openMissionControl`](../../packages/cli/src/front-door.ts)
 own the entry behavior; [`tuiCommand`](../../packages/cli/src/commands/tui.ts)
-owns explicit TUI options. A daemon-down transport result can still open the
+owns explicit TUI options; `rig terminal open saved:kernel --window` opens a terminal view
+of the OpenRig TUI, the operator and the advisor (in a new tab or window, or the current
+Herdr session), and `rig tui --shared` is the dashboard-only fallback when that view cannot open. A daemon-down transport result can still open the
 recovery cockpit; it is not automatically a reason to exit before rendering.
 
 | Need | Start here |
 |---|---|
 | Install, upgrade, or make a first project | [Getting started](../reference/getting-started.md), then `rig setup --help` and `rig doctor --help`. |
 | Inspect live state and diagnose failures | `rig ps`, `rig health`, `rig doctor`; [health diagnosis](../reference/health-diagnosis.md). |
-| Define/start rigs and seats | `rig spec`, `rig agent`, `rig up`, `rig create`, `rig grow`; [RigSpec](../reference/rig-spec.md) and [AgentSpec](../reference/agent-spec.md). |
+| Define/start rigs and seats | `rig spec`, `rig agent`, `rig up`, `rig create`, `rig grow`, `rig seat continue`; [RigSpec](../reference/rig-spec.md) and [AgentSpec](../reference/agent-spec.md). |
 | Snapshot, restore, or hand over | `rig snapshot`, `rig restore`, `rig restore-check`, `rig restore-packet`, `rig handover`; [lifecycle source map](architecture/lifecycle-snapshot-restore.md). |
 | Find owned work or communicate | `rig queue`, `rig send`, `rig stream`, `rig chatroom`, `rig walk`; [coordination source map](architecture/coordination-primitive.md). |
 | Work with projects, missions, slices, and proof | `rig scope`, `rig proof`, `rig workflow`; [project workspace](../reference/project-workspace.md) and [SDLC conventions](../reference/sdlc-conventions.md). |
 | Read/project context and skills | `rig context`, `rig skill`, `rig package`; [context source map](architecture/plugin-agent-image-context-pack.md). |
 | Connect another host or human channel | `rig host`, `rig gateway`, `rig slack`; [Slack setup](../reference/slack-app-setup.md). |
+| Check, share, or start a rig bundle | `rig bundle check`, `rig bundle`, `rig up <GitHub folder link>`; [packaging source map](architecture/packaging-bootstrap-bundles.md). |
+| Find a specialist seat across rigs and hosts | `rig roster` (read-only). |
+| Read event, queue-transition, and tenure telemetry | `rig telemetry`. |
 
 Do not confuse `rig project`'s coordination/classification surface with
 `rig scope`'s project and work-tree commands. Likewise, `rig spec` manages
@@ -174,7 +181,7 @@ Root: `rig`; declared option: `-V, --version`.
 |---|---|---|
 | `rig gateway` | — | — |
 | `rig gateway human` | — | — |
-| `rig gateway human add <entityId>` | — | `--display-name <name>` **required**<br>`--binding <kind:connectorRef:secretsRef:role[:handle=<id>]>` **required**<br>`--delivery-class <A\|B\|C\|D>` **required**<br>`--away`<br>`--replace`<br>`--reason <reason>`<br>`--actor <actor>` |
+| `rig gateway human add <entityId>` | — | `--display-name <name>` **required**<br>`--binding <kind:connectorRef:secretsRef:role[:handle=<id>]>` **required** (repeatable)<br>`--delivery-class <A\|B\|C\|D>` **required**<br>`--away`<br>`--replace`<br>`--reason <reason>`<br>`--actor <actor>` |
 | `rig gateway human list` | — | `--json` |
 | `rig gateway human show <entityId>` | — | `--json` |
 | `rig gateway human set <entityId> <field> <value>` | — | `--reason <reason>`<br>`--actor <actor>` |
@@ -227,7 +234,7 @@ Root: `rig`; declared option: `-V, --version`.
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig bootstrap <spec>` | — | `--plan`<br>`--yes`<br>`--cwd <path>`<br>`--json` |
+| `rig bootstrap <spec>` | — | `--plan`<br>`--yes`<br>`--cwd <path>`<br>`--target <path>`<br>`--skip-version-check`<br>`--force`<br>`--json` |
 
 ### requirements
 
@@ -257,23 +264,25 @@ Root: `rig`; declared option: `-V, --version`.
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig adopt <path>` | — | `--bind <logicalId=tmuxSessionOrDiscoveryId>`<br>`--bindings-file <path>`<br>`--target-rig <rigId>`<br>`--rig-root <root>`<br>`--json` |
+| `rig adopt <path>` | — | `--bind <logicalId=tmuxSessionOrDiscoveryId>` (repeatable)<br>`--bindings-file <path>`<br>`--target-rig <rigId>`<br>`--rig-root <root>`<br>`--json` |
 
 ### bundle
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
 | `rig bundle` | — | — |
-| `rig bundle create <spec>` | — | `-o, --output <path>` **required**<br>`--name <name>`<br>`--bundle-version <ver>`<br>`--include-packages <refs...>`<br>`--rig-root <root>`<br>`--context-pack <dir>` (repeatable)<br>`--project-dir <dir>`<br>`--notes <text>`<br>`--min-daemon-version <ver>`<br>`--min-cli-version <ver>`<br>`--allow-drift`<br>`--json` |
-| `rig bundle inspect <path>` | — | `--json` |
-| `rig bundle install <path>` | — | `--plan`<br>`--yes`<br>`--target <root>`<br>`--cwd <path>`<br>`--skip-version-check`<br>`--force`<br>`--json` |
+| `rig bundle create <spec>` | — | `-o, --output <path>` **required**<br>`--name <name>`<br>`--bundle-version <ver>`<br>`--include-packages <refs...>`<br>`--rig-root <root>`<br>`--context-pack <dir>` (repeatable)<br>`--project-dir <dir>`<br>`--preset <name>`<br>`--seat <member=runtime>` (repeatable)<br>`--notes <text>`<br>`--min-daemon-version <ver>`<br>`--min-cli-version <ver>`<br>`--allow-drift`<br>`--json` |
+| `rig bundle configurations <spec>` | — | `--json` |
+| `rig bundle inspect <path>` | — | `--preset <name>`<br>`--seat <member=runtime>` (repeatable)<br>`--json` |
+| `rig bundle install <path>` | — | `--preset <name>`<br>`--seat <member=runtime>` (repeatable)<br>`--non-interruptive`<br>`--no-non-interruptive`<br>`--plan`<br>`--yes`<br>`--target <root>`<br>`--cwd <path>`<br>`--skip-version-check`<br>`--force`<br>`--json` |
+| `rig bundle check <folder>` | — | `--json` |
 | `rig bundle history` | — | `--rig <name>`<br>`--since <iso>`<br>`--json` |
 
 ### up
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig up <source>` | — | `--plan`<br>`--yes`<br>`--cwd <path>`<br>`--target <root>`<br>`--existing`<br>`--fresh <seats...>`<br>`--json`<br>`--host <id>` |
+| `rig up <source>` | — | `--non-interruptive`<br>`--no-non-interruptive`<br>`--plan`<br>`--yes`<br>`--cwd <path>`<br>`--target <root>`<br>`--preset <name>`<br>`--seat <member=runtime>` (repeatable)<br>`--existing`<br>`--fresh <seats...>`<br>`--json`<br>`--host <id>` |
 
 ### down
 
@@ -309,7 +318,16 @@ Root: `rig`; declared option: `-V, --version`.
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig ps` | — | `--json`<br>`--nodes`<br>`--full`<br>`--verbose`<br>`--limit <n>`<br>`--fields <list>`<br>`--summary`<br>`--filter <key=value>`<br>`--active`<br>`--running`<br>`-A, --all-rigs`<br>`--rig <name>`<br>`--session <name>`<br>`--include-archived`<br>`--host <id>`<br>`--all-hosts`<br>`--hosts <ids>` |
+| `rig ps` | — | `--json`<br>`--no-cleanup`<br>`--resources`<br>`--nodes`<br>`--full`<br>`--verbose`<br>`--limit <n>`<br>`--fields <list>`<br>`--summary`<br>`--filter <key=value>`<br>`--active`<br>`--running`<br>`-A, --all-rigs`<br>`--rig <name>`<br>`--session <name>`<br>`--include-archived`<br>`--host <id>`<br>`--all-hosts`<br>`--hosts <ids>` |
+
+### roster
+
+| Invocation | Aliases | Declared options |
+|---|---|---|
+| `rig roster` | — | — |
+| `rig roster list` | — | `--folder <path>`<br>`--json` |
+| `rig roster show <id>` | — | `--folder <path>`<br>`--json` |
+| `rig roster find <query>` | — | `--folder <path>`<br>`--json` |
 
 ### mcp
 
@@ -345,7 +363,7 @@ Root: `rig`; declared option: `-V, --version`.
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig send [session] [text]` | — | `--to <sessions>`<br>`--pod <name>`<br>`--rig <name>`<br>`--verify`<br>`--force`<br>`--wait-for-idle <seconds>`<br>`--raw`<br>`--dangerously-interact`<br>`--reason <text>`<br>`--host <id>`<br>`--from <session>`<br>`--context <ref>`<br>`--json` |
+| `rig send [session] [text]` | — | `--to <sessions>` (repeatable)<br>`--pod <name>`<br>`--rig <name>`<br>`--verify`<br>`--force`<br>`--wait-for-idle <seconds>`<br>`--raw`<br>`--dangerously-interact`<br>`--reason <text>`<br>`--host <id>`<br>`--from <session>`<br>`--context <ref>`<br>`--json` |
 
 ### stream
 
@@ -394,6 +412,10 @@ Root: `rig`; declared option: `-V, --version`.
 | `rig slack status` | — | `--json` |
 | `rig slack manifest` | — | `--url`<br>`--json` |
 | `rig slack verify` | — | `--json`<br>`--reason <reason>`<br>`--actor <actor>` |
+| `rig slack channel-map` | — | — |
+| `rig slack channel-map list` | — | `--json` |
+| `rig slack channel-map set <match> <channel>` | — | `--reason <reason>`<br>`--actor <actor>` |
+| `rig slack channel-map remove <match>` | — | `--reason <reason>`<br>`--actor <actor>` |
 | `rig slack enable` | — | `--reason <reason>`<br>`--actor <actor>` |
 | `rig slack disable` | — | `--reason <reason>` **required**<br>`--actor <actor>` |
 | `rig slack outbound` | — | `--json` |
@@ -436,7 +458,7 @@ Root: `rig`; declared option: `-V, --version`.
 | Invocation | Aliases | Declared options |
 |---|---|---|
 | `rig terminal` | — | — |
-| `rig terminal open <view>` | — | `--provider <name>`<br>`--json` |
+| `rig terminal open <view>` | — | `--provider <name>`<br>`--window`<br>`--expected-plan <id>`<br>`--json` |
 | `rig terminal views` | — | `--json` |
 | `rig terminal status` | — | `--provider <name>`<br>`--json` |
 
@@ -687,6 +709,15 @@ Root: `rig`; declared option: `-V, --version`.
 | `rig usage top` | — | `--window <duration>`<br>`--top <n>`<br>`--json` |
 | `rig usage series` | — | `--seat <session>`<br>`--lane <lane>`<br>`--since <iso>`<br>`--until <iso>`<br>`--limit <n>`<br>`--json` |
 
+### telemetry
+
+| Invocation | Aliases | Declared options |
+|---|---|---|
+| `rig telemetry` | — | — |
+| `rig telemetry events` | — | `--cursor <token>`<br>`--limit <n>`<br>`--json`<br>`--start <mode>`<br>`--node <id>`<br>`--rig <id>` |
+| `rig telemetry transitions` | — | `--cursor <token>`<br>`--limit <n>`<br>`--json`<br>`--start <mode>`<br>`--qitem <id>` |
+| `rig telemetry tenures <node-id>` | — | `--cursor <token>`<br>`--limit <n>`<br>`--json` |
+
 ### health
 
 | Invocation | Aliases | Declared options |
@@ -787,7 +818,7 @@ Root: `rig`; declared option: `-V, --version`.
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig setup` | — | `--dry-run`<br>`--json`<br>`--full`<br>`--policy <name>`<br>`--spec <path>` |
+| `rig setup` | — | `--dry-run`<br>`--json`<br>`--full`<br>`--no-herdr`<br>`--ghostty`<br>`--no-ghostty`<br>`--policy <name>`<br>`--spec <path>` |
 
 ### restore-check
 
@@ -800,7 +831,7 @@ Root: `rig`; declared option: `-V, --version`.
 | Invocation | Aliases | Declared options |
 |---|---|---|
 | `rig restore-packet` | — | — |
-| `rig restore-packet write` | — | `--source-session <session>`<br>`--source-jsonl <path>`<br>`--source-runtime <runtime>`<br>`--target <dir>` **required**<br>`--target-rig <rig>`<br>`--target-runtime <runtime>`<br>`--target-workspace-root <path>`<br>`--default-target-repo <path>`<br>`--role-pointer <path>`<br>`--current-work-summary <text>`<br>`--next-owner <name>`<br>`--caveat <text>`<br>`--authority-boundaries <text>`<br>`--source-trust-ranking <csv>`<br>`--generator-version <version>`<br>`--source-session-id-override <id>`<br>`--source-rig-override <rig>` |
+| `rig restore-packet write` | — | `--source-session <session>`<br>`--source-jsonl <path>`<br>`--source-runtime <runtime>`<br>`--target <dir>` **required**<br>`--target-rig <rig>`<br>`--target-runtime <runtime>`<br>`--target-workspace-root <path>`<br>`--default-target-repo <path>`<br>`--role-pointer <path>`<br>`--current-work-summary <text>`<br>`--next-owner <name>`<br>`--caveat <text>` (repeatable)<br>`--authority-boundaries <text>`<br>`--source-trust-ranking <csv>`<br>`--generator-version <version>`<br>`--source-session-id-override <id>`<br>`--source-rig-override <rig>` |
 | `rig restore-packet read <packet-dir>` | — | `--json` |
 | `rig restore-packet validate <packet-dir>` | — | `--json` |
 
@@ -834,9 +865,10 @@ Root: `rig`; declared option: `-V, --version`.
 | `rig seat handover <seat>` | — | `--source <source>`<br>`--reason <reason>`<br>`--operator <address>`<br>`--dry-run`<br>`--json` |
 | `rig seat switch-client <seat>` | — | `--to-window <n>`<br>`--client <id>`<br>`--json` |
 | `rig seat clear-attention <session>` | — | `--reason <text>`<br>`--json` |
-| `rig seat set-permissions <seat>` | — | `--mode <mode>` **required**<br>`--reason <text>` **required**<br>`--json` |
+| `rig seat set-permissions <seat>` | — | `--mode <mode>` **required**<br>`--reason <text>` **required**<br>`--operator <address>`<br>`--json` |
 | `rig seat set-model <seat>` | — | `--model <id>` **required**<br>`--reason <text>` **required**<br>`--operator <address>`<br>`--json` |
 | `rig seat launch <seat>` | — | `--fresh` **required**<br>`--reason <text>` **required**<br>`--stop`<br>`--operator <address>`<br>`--json` |
+| `rig seat continue <seat>` | — | `--json` |
 | `rig seat stop <seat>` | — | `--reason <text>` **required**<br>`--operator <address>`<br>`--json` |
 | `rig seat clean <seat>` | — | `--reason <text>` **required**<br>`--operator <address>`<br>`--json` |
 | `rig seat set-resume-token <session>` | — | `--token-stdin`<br>`--reason <text>` **required**<br>`--json` |
@@ -890,5 +922,5 @@ Root: `rig`; declared option: `-V, --version`.
 |---|---|---|
 | `rig proof` | — | `--workspace <path>` |
 | `rig proof show [scope]` | — | `--json` |
-| `rig proof judge <scope-item>` | — | `--verdict <verdict>` **required**<br>`--reason <text>` **required**<br>`--evidence <ref>`<br>`--subject <kind:ref>`<br>`--comparison <ref>`<br>`--revision <revision>`<br>`--operation-id <id>`<br>`--replace`<br>`--json` |
+| `rig proof judge <scope-item>` | — | `--verdict <verdict>` **required**<br>`--reason <text>` **required**<br>`--evidence <ref>` (repeatable)<br>`--subject <kind:ref>`<br>`--comparison <ref>`<br>`--revision <revision>`<br>`--operation-id <id>`<br>`--replace`<br>`--json` |
 | `rig proof add <slice-path>` | — | `--mission <name>`<br>`--artifact-type <type>` **required**<br>`--verdict <verdict>` **required**<br>`--candidate-sha <sha>` **required**<br>`--money-evidence <line>` **required**<br>`--slice-id <dot-id>`<br>`--file <path>`<br>`--body <text>`<br>`--name <filename>`<br>`--replace`<br>`--evidences <refs>`<br>`--self-check <text>`<br>`--media <refs>`<br>`--json` |

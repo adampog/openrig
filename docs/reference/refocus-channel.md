@@ -14,7 +14,7 @@ it is the mechanism that makes shipped chain files (see
 |---|---|---|---|
 | UserPromptSubmit | ✓ | ✓ | deliver due or on-demand context at a model-visible boundary |
 | Stop | ✓ | — | catch a long Claude turn crossing the growth threshold |
-| PostCompact | ✓ | ✓ | retain exact compaction due-state; deliver on the next prompt |
+| PostCompact | ✓ | ✓ | retain exact compaction due-state; deliver on the next actionable prompt |
 
 Claude's additional firing signal is **transcript growth** — not turns (one turn
 can burn 200k tokens across fifty tool calls) and not wall-clock (the failure is
@@ -25,11 +25,26 @@ redundant double-fire around Codex's own compaction cadence. Set
 `OPENRIG_REFOCUS_NOW=1` for an on-demand refocus and
 `OPENRIG_REFOCUS_ENABLED=0` to disable the feature. Fresh `SessionStart` is
 always a no-op: the default onboarding pack owns fresh orientation. Both
-runtimes retain `PostCompact` due-state for the next prompt. Otherwise the hook
-is a silent no-op, and it degrades to silence on unrelated hook errors. A
+runtimes retain `PostCompact` due-state for the next prompt. After a managed Claude
+compaction, the acknowledgement-only boundary and other prompts (for up to 10 minutes)
+are skipped without consuming that state, so the hook delivers on the restore request
+(after 10 minutes, on the next prompt);
+that request asks the seat to read the refocusing skill and consume the delivered
+traces rather than rerun them, and the read-depth audit accounts for them. Otherwise the hook
+is a no-op (it writes a stderr advisory when the transcript shrinks or the
+session has no identity), and it degrades to silence on unrelated hook errors.
+Both runtimes stop the hook after 5 seconds, and the content REF lookup gets 2;
+a slow REF shows as `REFOCUS CONTENT REF FAILED`. A
 configured REF resolution failure instead degrades
 loudly in the delivered payload while still completing the hook — a refocus
 must never break a seat's turn.
+
+Failed trace or configured-content resolution keeps refocus due. After three
+consecutive failed attempts for the same seat and occupant, the hook emits one
+idempotent issue-stream item tagged `issue,refocus`, visible through `rig stream
+list --tag refocus`. A successful delivery resets that failure episode. An
+unconfirmed stream write keeps the same item ID for the next failed attempt; it
+does not send a wake, change seat status, or prove the agent read the content.
 
 Because the hook runs at the seat's own turn boundaries, delivery to a
 RUNNING seat needs no relaunch, no operator action, and no message traffic:
@@ -44,8 +59,9 @@ Resolution order:
 1. `OPENRIG_REFOCUS_CONTENT_REF` — a path-like context-library ref resolved
    through `rig context get`, so refocus receives the same assembled bytes as
    on-demand pull. This wins when REF and FILE are both set.
-2. `OPENRIG_REFOCUS_CONTENT_FILE` — an operator-authored file (per-seat or
-   per-rig via spec env).
+2. `OPENRIG_REFOCUS_CONTENT_FILE` — an operator-authored file, set in the
+   environment the seat's harness runs in (rig and agent specs have no `env`
+   key).
 3. `$OPENRIG_HOME/refocus/REFOCUS.md` — the instance's standing content.
 4. The generic default at
    `skills/refocusing/references/refocus.md`: three project-neutral orientation
@@ -77,8 +93,13 @@ This automatic hook path is additive to one-shot manual injection through
 
 The chain files are the durable, altitude-addressed home of orientation
 content; the refocus channel is its delivery schedule. A practice added to a
-rig's `CRAFT.md` today reaches running seats through their next refocus
-pointer, and future installs through the shipped defaults
+rig's `LEARNED.md` today reaches running seats through their next refocus
+trace, which reads `LEARNED.md` at each topology level. The default light trace
+shows only about the first 800 characters of each `LEARNED.md` body, so a
+practice appended to a longer file reaches seats only with
+`OPENRIG_REFOCUS_DEPTH=full` or through the configured refocus content. A `CRAFT.md` practice
+reaches them only through the configured refocus content (REF or FILE), and future
+installs through the shipped defaults
 (discovery → curation → ship, per the convention doc).
 
 ## What a refocus is NOT

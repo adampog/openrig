@@ -472,10 +472,10 @@ function buildSliceShipCommand(): Command {
           planMissionMembershipRemove(sourceMission.absPath, sliceManifestRef(sourceMission.absPath, slice.absPath)),
           planMissionMembershipAdd(target.absPath, `slices/${newName}/slice.yaml`, nextMissionMembershipOrder(target.absPath)),
         ].filter((edit): edit is MissionCompositionEdit => edit !== null);
-        applyMissionCompositionEdits(edits);
-        let moveResult: ReturnType<typeof moveSlice> | null = null;
         const originalNode = slice.readmePath ? fs.readFileSync(slice.readmePath, "utf8") : null;
         const originalTargetNode = target.readmePath ? fs.readFileSync(target.readmePath, "utf8") : null;
+        applyMissionCompositionEdits(edits);
+        let moveResult: ReturnType<typeof moveSlice> | null = null;
         try {
           moveResult = moveSlice(slice.absPath, destAbs);
           assertScopeWritePaths(targetRoot, path.join(destAbs, "SPEC.md"), path.join(destAbs, "README.md"));
@@ -553,9 +553,9 @@ function buildSliceCloseCommand(): Command {
           sliceManifestRef(mission.absPath, slice.absPath),
         );
         const edits = compositionEdit ? [compositionEdit] : [];
+        const originalNode = slice.readmePath ? fs.readFileSync(slice.readmePath, "utf8") : null;
         applyMissionCompositionEdits(edits);
         let moveResult: ReturnType<typeof moveSlice> | null = null;
-        const originalNode = slice.readmePath ? fs.readFileSync(slice.readmePath, "utf8") : null;
         try {
           moveResult = moveSlice(slice.absPath, destAbs);
         } catch (error) {
@@ -642,10 +642,10 @@ function buildSliceMoveCommand(): Command {
           planMissionMembershipRemove(sourceMission.absPath, sliceManifestRef(sourceMission.absPath, slice.absPath)),
           planMissionMembershipAdd(target.absPath, `slices/${newName}/slice.yaml`, nextMissionMembershipOrder(target.absPath)),
         ].filter((edit): edit is MissionCompositionEdit => edit !== null);
-        applyMissionCompositionEdits(edits);
-        let moveResult: ReturnType<typeof moveSlice> | null = null;
         const originalNode = slice.readmePath ? fs.readFileSync(slice.readmePath, "utf8") : null;
         const originalTargetNode = target.readmePath ? fs.readFileSync(target.readmePath, "utf8") : null;
+        applyMissionCompositionEdits(edits);
+        let moveResult: ReturnType<typeof moveSlice> | null = null;
         try {
           moveResult = moveSlice(slice.absPath, destAbs);
           assertScopeWritePaths(targetRoot, path.join(destAbs, "SPEC.md"), path.join(destAbs, "README.md"));
@@ -1152,7 +1152,7 @@ function buildAuditCommand(): Command {
                 : null,
             });
 
-            if (!/^\d{2}-/.test(entry)) {
+            if (!/^\d{2,}-/.test(entry)) {
               sliceResult.findings.push({
                 kind: "id_convention_violation",
                 severity: "high",

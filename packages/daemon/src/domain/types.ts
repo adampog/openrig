@@ -638,7 +638,11 @@ export interface NodeInventoryEntry {
   nodeKind: "agent" | "infrastructure";
   runtime: string | null;
   sessionStatus: string | null;
+  // Current projection: an applicable identity failure down-ranks a running
+  // session to attention_required; the stored startup result stays unchanged.
   startupStatus: "pending" | "ready" | "attention_required" | "failed" | null;
+  /** Persisted startup outcome, before current identity projection. */
+  storedStartupStatus?: "pending" | "ready" | "attention_required" | "failed" | null;
   restoreOutcome: NodeRestoreOutcome;
   // OPR.0.4.3.06 — challenge-verified orientation, surfaced beside (never
   // folded into) startupStatus.
@@ -1166,6 +1170,8 @@ export interface WorkspaceSpec {
 }
 
 export interface RigSpec {
+  /** Authored launch-warning choice; an explicit launch option takes precedence. */
+  nonInterruptive?: boolean;
   version: string;
   name: string;
   summary?: string;
@@ -1280,6 +1286,7 @@ export type InstantiateOutcome =
   | { ok: false; code: "instantiate_error"; message: string }
   | { ok: false; code: "cycle_error"; message: string }
   | { ok: false; code: "service_boot_failed"; message: string }
+  | { ok: false; code: "compose_project_conflict"; message: string }
   // S5b (OPR.0.5.4.11) — the running-name guard refusal: a same-name rig is
   // RUNNING, so instantiation refuses before any create/launch. The message
   // teaches the running rig's identity and the supported alternatives.

@@ -33,7 +33,6 @@ import type { PersistedEvent, Snapshot } from "../src/domain/types.js";
 import { createFullTestDb } from "./helpers/test-app.js";
 import { AppliedLaunchObservationStore } from "../src/domain/applied-launch-observation-store.js";
 import { observeClaudePermission, observeCodexSandbox, observePiResourceTrust, observeOmpApprovalMode, type AppliedLaunchObservation } from "../src/domain/permission-drift.js";
-import { buildCodexResumeCore } from "../src/domain/native-resume-probe.js";
 import { SeatIdentityReconciler } from "../src/domain/seat-identity-reconciler.js";
 
 function setupDb(): Database.Database {
@@ -434,9 +433,13 @@ describe("RestoreOrchestrator", () => {
       undefined,
       node.id,
       "high",
+      false, // unchanged non-interruptive setting
+      false, // this is not the kernel
+      true, // derived team launch default
     );
 
-    // Codex forwards effort
+    // Codex forwards effort; the named profile remains authoritative.
+    db.prepare("UPDATE nodes SET codex_config_profile = 'profile1' WHERE id = ?").run(node.id);
     (orch as any).claudeResume.canResume = vi.fn(() => false);
     await (orch as any).attemptResume(
       node.id,
@@ -1097,7 +1100,8 @@ describe("RestoreOrchestrator", () => {
       resumeToken,
     });
     const tmux = { ...mockTmux(), getPaneCommand: vi.fn(async () => "node") } as unknown as TmuxAdapter;
-    const codexCommand = buildCodexResumeCore(resumeToken, "resume", false, "--add-dir /tmp/openrig-state");
+    // The observer reads ps argv after the shell has removed launch quoting.
+    const codexCommand = ["codex", "-p", "resume", "resume", "--add-dir", "/tmp/openrig-state", resumeToken].join(" ");
     const result = await createOrchestrator({
       tmux,
       codex: mockCodexResume({ ok: true }),
@@ -1128,7 +1132,7 @@ describe("RestoreOrchestrator", () => {
       resumeToken,
     });
     const tmux = { ...mockTmux(), getPaneCommand: vi.fn(async () => "node") } as unknown as TmuxAdapter;
-    const codexCommand = `${buildCodexResumeCore("different-thread", "resume", false, "--add-dir /tmp/openrig-state")} resume ${resumeToken}`;
+    const codexCommand = ["codex", "-p", "resume", "resume", "--add-dir", "/tmp/openrig-state", "different-thread", "resume", resumeToken].join(" ");
     const result = await createOrchestrator({
       tmux,
       codex: mockCodexResume({ ok: true }),
@@ -1855,7 +1859,7 @@ describe("RestoreOrchestrator", () => {
         expect(tmux.createSession).toHaveBeenCalledTimes(1);
         if (!lostOwnership) expect(db.prepare("SELECT status FROM sessions WHERE id = ?").get(latest.id)).toEqual({ status: "running" });
         expect(tmux.sendText).toHaveBeenCalledTimes(1); // launch command only, no startup replay
-        expect(tmux.sendText).toHaveBeenCalledWith("dev-owner@headerless", expect.stringContaining(`--dangerously-skip-permissions --resume ${token}`));
+        expect(tmux.sendText).toHaveBeenCalledWith("dev-owner@headerless", expect.stringContaining(`--dangerously-skip-permissions --resume '${token}'`));
         expect(tmux.sendKeys).toHaveBeenCalledTimes(1);
       }
     });
@@ -4188,6 +4192,31 @@ describe("RestoreOrchestrator", () => {
       expect(result.ok).toBe(true);
       const delivered = deliverStartup.mock.calls.flatMap((c) => (c[0] as Array<{ absolutePath: string }>).map((f) => f.absolutePath));
       expect(delivered.sort()).toEqual([`${RUNNING_SPECS}/rigs/launch/kernel/culture/CULTURE.md`, "/user-rig/CULTURE-default.md"].sort());
+    });
+
+    it("restores a stored first-project culture from the upgraded shipped tree", async () => {
+      const OLD_SPECS = "/old-openrig/lib/node_modules/@openrig/cli/daemon/specs";
+      const RUNNING_SPECS = path.resolve(import.meta.dirname, "../specs");
+      const { snap, deliverStartup, adapter } = seedPodAware(false);
+      const culture = {
+        path: "CULTURE.md", absolutePath: `${OLD_SPECS}/rigs/launch/first-project/CULTURE.md`,
+        ownerRoot: `${OLD_SPECS}/rigs/launch/first-project`, deliveryHint: "guidance_merge",
+        required: true, appliesOn: ["fresh_start", "restore"],
+      };
+      const fixed = updateSnapshotData(snap, (data) => {
+        for (const context of Object.values(data.nodeStartupContext)) context.resolvedStartupFiles = [culture];
+      });
+      const result = await createOrchestrator().restore(fixed.id, {
+        adapters: { "claude-code": adapter }, freshLogicalIds: ["dev.impl"],
+        fsOps: { exists: (p) => p.startsWith(RUNNING_SPECS) ? fs.existsSync(p) : notOld(p) },
+      });
+      expect(result.ok).toBe(true);
+      const delivered = deliverStartup.mock.calls.flatMap((c) => c[0] as Array<typeof culture>);
+      expect(delivered).toEqual([{
+        ...culture, absolutePath: `${RUNNING_SPECS}/rigs/launch/first-project/CULTURE.md`,
+        ownerRoot: `${RUNNING_SPECS}/rigs/launch/first-project`,
+      }]);
+      expect(fs.readFileSync(delivered[0]!.absolutePath, "utf8")).toContain("ask dev-check for an independent check");
     });
 
     it("same-native resume: replay stays contained (no startup files delivered), stored built-ins notwithstanding", async () => {
