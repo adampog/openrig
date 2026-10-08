@@ -1,4 +1,4 @@
-import { nonInterruptiveArgs, nonInterruptiveArg } from "./non-interruptive.js";
+import { operationalLaunchArgs, operationalLaunchArg } from "./kernel-authority.js";
 import nodePath from "node:path";
 import fs from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
@@ -16,7 +16,7 @@ import { assessNativeResumeProbe } from "../domain/native-resume-probe.js";
 import { observeClaudePaneProcess, type NativeProcessLister } from "../domain/native-process-lineage.js";
 import { mergeManagedBlock, DEFAULT_CLAUDE_MANAGED_BLOCK_FILE, type ClaudeManagedBlockFile } from "../domain/managed-blocks.js";
 import { shellQuote } from "./shell-quote.js";
-import { validateClaudeActivityHookDelivery } from "../domain/claude-activity-hooks.js";
+import { validateClaudeActivityHookDelivery, claudeActivityRelayPath, CLAUDE_ACTIVITY_RELAY_RELATIVE_PATH } from "../domain/claude-activity-hooks.js";
 import { observeClaudePermission } from "../domain/permission-drift.js";
 import { unresolvedClaudePermissionModes } from "../domain/native-permission-selection.js";
 import type { ClaudeManagedLaunch } from "../domain/claude-managed-launch.js";
@@ -260,7 +260,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     }
     const posture = claudePostureFlag(process.env, binding.launchPosture, binding.permissionMode);
     const appliedLaunch = observeClaudePermission(posture);
-    const permissionMode = posture + nonInterruptiveArg(this.runtime, binding);
+    const permissionMode = posture + operationalLaunchArg(this.runtime, binding);
     // OPR.0.5.3.1: classic-renderer env prefix (default on) → native scrollback for every
     // managed launch path (fresh/resume/fork). "" when overridden off → byte-identical command.
     const rendererPrefix = claudeClassicRendererEnvPrefix(process.env);
@@ -290,9 +290,12 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       if (!parentId) {
         return { ok: false, error: "claude-code fork: forkSource.value is required (parent native_id)" };
       }
-      const cmd = managed ? managed.command(["--permission-mode", binding.permissionMode!, ...nonInterruptiveArgs(this.runtime, binding), ...(model ? ["--model", model] : []), ...(effort ? ["--effort", effort] : []),
+      const cmd = managed ? managed.command(["--permission-mode", binding.permissionMode!, ...operationalLaunchArgs(this.runtime, binding), ...(model ? ["--model", model] : []), ...(effort ? ["--effort", effort] : []),
         "--resume", parentId, "--fork-session", "--name", opts.name])
-        : `${rendererPrefix}claude ${permissionMode}${modelArg}${effortArg} --resume ${parentId} --fork-session --name ${opts.name}`;
+        // The non-managed command text is parsed by the pane shell, so the
+        // parent id needs the same quoting as --model/--effort above (and as
+        // the codex fork path) — a hostile id must not leave --resume.
+        : `${rendererPrefix}claude ${permissionMode}${modelArg}${effortArg} --resume ${shellQuote(parentId)} --fork-session --name ${opts.name}`;
       const textResult = managed ? await this.tmux.sendShellCommand(binding.tmuxSession, cmd, managed.assertCurrent)
         : this.seatLaunchEnvironment
           ? await this.tmux.sendShellCommand(binding.tmuxSession, await this.seatLaunchEnvironment.command(binding.tmuxSession, cmd, { nodeId: binding.nodeId, generation: binding.launchGeneration, runtime: this.runtime }), undefined, { sourceInPane: true })
@@ -320,9 +323,9 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     }
 
     const generatedSessionId = opts.resumeToken ? null : this.sessionIdFactory();
-    const cmd = managed ? managed.command(["--permission-mode", binding.permissionMode!, ...nonInterruptiveArgs(this.runtime, binding), ...(model ? ["--model", model] : []), ...(effort ? ["--effort", effort] : []),
+    const cmd = managed ? managed.command(["--permission-mode", binding.permissionMode!, ...operationalLaunchArgs(this.runtime, binding), ...(model ? ["--model", model] : []), ...(effort ? ["--effort", effort] : []),
       ...(opts.resumeToken ? ["--resume", opts.resumeToken] : ["--session-id", generatedSessionId!]), "--name", opts.name]) : opts.resumeToken
-      ? `${rendererPrefix}claude ${permissionMode}${modelArg}${effortArg} --resume ${opts.resumeToken} --name ${opts.name}`
+      ? `${rendererPrefix}claude ${permissionMode}${modelArg}${effortArg} --resume ${shellQuote(opts.resumeToken)} --name ${opts.name}`
       : `${rendererPrefix}claude ${permissionMode}${modelArg}${effortArg} --session-id ${generatedSessionId} --name ${opts.name}`;
 
     const textResult = managed ? await this.tmux.sendShellCommand(binding.tmuxSession, cmd, managed.assertCurrent)
@@ -854,7 +857,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     // A user's own status line command wins; only OpenRig's collector command is installed or refreshed.
     // If this command's shape changes, keep the old shape recognised in isOwnedCollectorCommand, or
     // seats holding it will never be refreshed.
-    const collectorCmd = `node ${collectorDest} ${contextDir} ${providerUsageDir}`;
+    const collectorCmd = `node ${shellQuote(collectorDest)} ${shellQuote(contextDir)} ${shellQuote(providerUsageDir)}`;
     const current = statusLine["command"];
     if (typeof current === "string" && current.trim() !== "" && current !== collectorCmd && !isOwnedCollectorCommand(current)) return;
 
@@ -868,7 +871,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
    * to the desired `enabled` state, driven ONCE from the always-run `project()` seam.
    *
    * ENABLE (only when the relay SOURCE is readable): deliver `activity-relay.cjs` →
-   * `<cwd>/.openrig/hooks/scripts/` (mode preserved, 0755 from the source asset) and upsert
+   * the configured instance state directory (mode preserved, 0755 from the source asset) and upsert
    * the owned command for each relay event DERIVED from the canonical claude.json manifest
    * (compaction hooks excluded). If the source is missing, deliver NOTHING (no dangling
    * commands) and report `sourceMissing` so the caller can surface a warning + not claim
@@ -880,7 +883,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
    * untouched. Not `mergeJsonFragment` (additive union-by-key can't strip on disable).
    */
   private reconcileClaudeActivityHooks(cwd: string, enabled: boolean): ActivityHookOutcome {
-    const relayDest = nodePath.join(cwd, ".openrig", "hooks", "scripts", "activity-relay.cjs");
+    const relayDest = claudeActivityRelayPath(this.stateDir ?? undefined);
     const ownedCmd = `node ${shellQuote(relayDest)}`;
     const settingsPath = nodePath.join(cwd, ".claude", "settings.local.json");
 
@@ -937,7 +940,10 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     //    PREVALIDATED relay event (derived from the canonical manifest above).
     if (deliverable) {
       this.fs.mkdirp(nodePath.dirname(relayDest));
-      this.fs.copyFile(this.activityRelayPath!, relayDest);
+      // Sibling seats share this relay. Do not truncate identical bytes while a hook reads it.
+      if (!this.fs.exists(relayDest) || this.fs.readFile(relayDest) !== this.fs.readFile(this.activityRelayPath!)) {
+        this.fs.copyFile(this.activityRelayPath!, relayDest);
+      }
       this.preserveMode(this.activityRelayPath!, relayDest);
       for (const { event, timeout } of derivedEvents) {
         const groups = Array.isArray(hooks[event]) ? (hooks[event] as unknown[]) : [];
@@ -977,21 +983,26 @@ interface ActivityHookOutcome {
 // OpenRig-owned relay path suffix. Ownership is the EXACT `node <arg>` command whose single
 // argument ends with this path — a changed prefix still matches (replace, not duplicate); a
 // user command that merely contains the path (echo, or node with extra args) does NOT.
-const OWNED_RELAY_SUFFIX = "/.openrig/hooks/scripts/activity-relay.cjs";
+const LEGACY_OWNED_RELAY_SUFFIX = "/.openrig/hooks/scripts/activity-relay.cjs";
 
 function hookCommand(hook: unknown): string | undefined {
   return isPlainObject(hook) && typeof hook["command"] === "string" ? (hook["command"] as string) : undefined;
 }
 
-// OpenRig-owned context collector. provisionContextCollector writes exactly
-// `node <cwd>/.openrig/context-collector.cjs <contextDir> <providerUsageDir>`, unquoted; older
-// releases wrote the same command without `<providerUsageDir>`. Ownership is either shape with any
-// (possibly stale) paths, on one line. A command that merely contains the path, composed with `;`,
-// `&&`, a pipe or a newline, or naming another file such as `.cjs.backup`, is the user's.
+// OpenRig-owned collectors use canonical POSIX-quoted paths. Recognise older unquoted
+// three/four-token commands too, but preserve commands composed with shell operators or
+// extra arguments. Old unquoted paths containing spaces cannot be identified unambiguously.
 const OWNED_COLLECTOR_SUFFIX = nodePath.sep + nodePath.join(".openrig", "context-collector.cjs");
 
 function isOwnedCollectorCommand(cmd: string): boolean {
   if (/[\r\n]/.test(cmd)) return false;
+  const quoted = /^node ('(?:[^']|'"'"')*') ('(?:[^']|'"'"')*')(?: ('(?:[^']|'"'"')*'))?$/.exec(cmd.trim());
+  if (quoted) {
+    const tokens = quoted.slice(1).filter((token): token is string => token !== undefined);
+    const decoded = tokens.map(unquoteSingleShellToken);
+    if (decoded.some((value, index) => value === null || shellQuote(value) !== tokens[index])) return false;
+    return decoded[0]!.endsWith(OWNED_COLLECTOR_SUFFIX);
+  }
   const tokens = cmd.trim().split(/\s+/);
   if ((tokens.length !== 3 && tokens.length !== 4) || tokens[0] !== "node") return false;
   if (tokens.some((token) => /[;&|<>`$()'"\\]/.test(token))) return false;
@@ -1012,7 +1023,8 @@ function isOwnedRelayCommand(cmd: string | undefined): boolean {
   // args merely concatenate to text ending in the relay suffix (e.g. `node 'x' '<relay>'`), which
   // must never be recognised as owned and deleted.
   if (shellQuote(decoded) !== arg) return false;
-  return decoded.endsWith(OWNED_RELAY_SUFFIX);
+  return decoded.endsWith(LEGACY_OWNED_RELAY_SUFFIX)
+    || decoded.endsWith(`/${CLAUDE_ACTIVITY_RELAY_RELATIVE_PATH}`);
 }
 
 /** Decode ONE POSIX single-quoted shell token as produced by shellQuote (outer `'…'` with an

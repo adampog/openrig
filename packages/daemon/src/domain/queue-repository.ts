@@ -286,6 +286,11 @@ export interface QueueCreateInput {
    *  that thread can't be used (e.g. a live human gate, see hasLiveHumanGate), it posts
    *  top-level and the row records why. */
   replyTo?: string | null;
+  /** #822 — Slack inbound only: the item whose OpenRig thread a person's reply was typed in.
+   *  Stored as this row's replyTo, so an update that answers this row (--reply-to it) walks on
+   *  to that thread. It never steers this row's own posts: delivery reads replyTo on updates
+   *  only. An item that does not exist is dropped, never a reason to lose the message. */
+  inboundReplyTo?: string | null;
   /** #193 — 1–4 structured questions; accepted only with humanIntent "decision". */
   humanQuestions?: HumanQuestion[] | null;
   summary?: string | null;
@@ -966,7 +971,7 @@ export class QueueRepository {
   private deliverWakeIntentAfterCommit(outboxId: string): void {
     queueMicrotask(() => {
       void this.deliverWakeIntent(outboxId).catch((err) => {
-        console.error(`Auto-unpark wake delivery failed for ${outboxId}:`, err);
+        console.error(`Queue wake delivery failed for ${outboxId}:`, err);
       });
     });
   }
@@ -1401,7 +1406,21 @@ export class QueueRepository {
       throw destinationValidationError("destination_session", input.destinationSession, this.loadHumanRegistryFn);
     }
 
-    const txn = this.db.transaction(() => this.createInTransactionalContext(input));
+    let wakeStaged = false;
+    const txn = this.db.transaction(() => {
+      const created = this.createInTransactionalContext(input);
+      if (this.outbox && input.nudge !== false) {
+        try {
+          // A savepoint removes any partial intent when staging fails, while
+          // preserving ordinary create's existing acceptance of the task.
+          this.db.transaction(() => this.stageWakeIntent(created.qitemId, input.sourceSession, input.destinationSession, input.identityProvenance ?? null, input.nudge))();
+          wakeStaged = true;
+        } catch (err) {
+          this.recordNudgeAttempt(created.qitemId, `failed:wake not retained: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      return created;
+    });
     let id: string;
     let persistedEvent: PersistedEvent;
     try {
@@ -1450,7 +1469,15 @@ export class QueueRepository {
       throw err;
     }
     this.eventBus.notifySubscribers(persistedEvent);
-    await this.maybeNudge(id, input.destinationSession, input.nudge, input.sourceSession);
+    // The receipt acknowledges persistence, not terminal delivery. The intent
+    // survives a crash before the scheduled wake if staging succeeded. A staging
+    // failure is recorded on the row; callers without an outbox retain their
+    // existing best-effort path without claiming durability.
+    if (this.outbox) {
+      if (wakeStaged) this.deliverWakeIntentAfterCommit(`${WAKE_INTENT_PREFIX}${id}`);
+    } else {
+      await this.maybeNudge(id, input.destinationSession, input.nudge, input.sourceSession);
+    }
     return this.getByIdOrThrow(id);
   }
 
@@ -1582,8 +1609,10 @@ export class QueueRepository {
       this.db.prepare("UPDATE queue_items SET human_intent = ?, human_detail = ? WHERE qitem_id = ?")
         .run(input.humanIntent ?? null, input.humanDetail ?? null, id);
     }
-    if (input.replyTo != null) {
-      this.db.prepare("UPDATE queue_items SET reply_to = ? WHERE qitem_id = ?").run(input.replyTo, id);
+    const replyTo = input.replyTo
+      ?? (input.inboundReplyTo != null && this.hasReplyToColumn && this.getById(input.inboundReplyTo) ? input.inboundReplyTo : null);
+    if (replyTo != null) {
+      this.db.prepare("UPDATE queue_items SET reply_to = ? WHERE qitem_id = ?").run(replyTo, id);
     }
     if (humanQuestions) {
       this.db.prepare("UPDATE queue_items SET human_questions = ? WHERE qitem_id = ?").run(JSON.stringify(humanQuestions), id);
@@ -1791,9 +1820,9 @@ export class QueueRepository {
       this.eventBus.notifySubscribers(e.payload as import("./types.js").PersistedEvent);
     }
 
-    // W1-b: deliver the just-committed wake intent (marking it), or the pre-W1
-    // best-effort nudge when no intent store is attached. Post-commit only.
-    await this.deliverWakeForSuccessor(newId, input.toSession, input.nudge, input.fromSession);
+    // Closure and successor are persisted. Delivery is separate and recoverable
+    // from the committed intent; a slow terminal must not hold the receipt.
+    if (input.nudge !== false) this.deliverWakeIntentAfterCommit(`${WAKE_INTENT_PREFIX}${newId}`);
 
     return {
       closed: this.getByIdOrThrow(source.qitemId),
@@ -1963,9 +1992,8 @@ export class QueueRepository {
       this.eventBus.notifySubscribers(e.payload as import("./types.js").PersistedEvent);
     }
 
-    // W1-b: deliver the just-committed wake intent (marking it), or the pre-W1
-    // best-effort nudge when no intent store is attached. Post-commit only.
-    await this.deliverWakeForSuccessor(newId, input.toSession, input.nudge, input.fromSession);
+    // Return the persisted closure and successor without awaiting terminal delivery.
+    if (input.nudge !== false) this.deliverWakeIntentAfterCommit(`${WAKE_INTENT_PREFIX}${newId}`);
 
     return {
       closed: this.getByIdOrThrow(source.qitemId),
@@ -2199,7 +2227,7 @@ export class QueueRepository {
           .prepare(
             `UPDATE queue_items
                SET state = 'in-progress', ts_updated = ?, claimed_at = ?, closure_required_at = ?,
-                   claimed_by_generation_uuid = ?
+                   claimed_by_generation_uuid = ?, blocked_on = NULL
              WHERE qitem_id = ?`
           )
           .run(ts, ts, closureRequiredAt, claimedByGeneration, input.qitemId);
@@ -2207,7 +2235,7 @@ export class QueueRepository {
         this.db
           .prepare(
             `UPDATE queue_items
-               SET state = 'in-progress', ts_updated = ?, claimed_at = ?, closure_required_at = ?
+               SET state = 'in-progress', ts_updated = ?, claimed_at = ?, closure_required_at = ?, blocked_on = NULL
              WHERE qitem_id = ?`
           )
           .run(ts, ts, closureRequiredAt, input.qitemId);
@@ -2218,6 +2246,9 @@ export class QueueRepository {
         state: "in-progress",
         actorSession: input.destinationSession,
         transitionNote: "claimed",
+        // Preserve the former gate as an audit pointer without marking a closure
+        // or changing the note execution-view uses to exclude claim activity.
+        closureTarget: qitem.state === "blocked" ? qitem.blockedOn ?? undefined : undefined,
         identityProvenance: input.identityProvenance ?? null, // P21 §4 era-stamp
       });
 
@@ -2343,6 +2374,16 @@ export class QueueRepository {
     return { qitemId: input.qitemId, ...result };
   }
 
+  /** Internal read-only audit pointer for non-state receipts. Never search past a state write. */
+  retainedClaimBlocker(qitemId: string): string | undefined {
+    const latest = this.transitionLog.listForQitem(qitemId).at(-1);
+    // Explicit state writes do not carry this non-closure audit pointer. Do not
+    // search past one, even if an older claim still records a gate in history.
+    return latest?.state === "in-progress" && latest.closureReason === null
+      ? latest.closureTarget ?? undefined
+      : undefined;
+  }
+
   /**
    * Internal: closure validation + UPDATE + transition log + emit
    * queue.updated event. Caller is responsible for transaction wrapping
@@ -2397,6 +2438,9 @@ export class QueueRepository {
         state: qitem.state,
         actorSession: input.actorSession,
         transitionNote: input.transitionNote,
+        // A note-only append does not clear the claim's retained park gate.
+        // Carry its audit pointer so a later state write can end this chain.
+        closureTarget: qitem.state === "in-progress" ? this.retainedClaimBlocker(input.qitemId) : undefined,
         identityProvenance: input.identityProvenance ?? null,
       });
       const persistedEvent = this.eventBus.persistWithinTransaction({
@@ -2521,7 +2565,13 @@ export class QueueRepository {
     // enforcement is here at the write path — the `rig queue block` verb and
     // raw `update --state blocked` hit the same validator (no verb-only
     // enforcement). Blocking on another qitem requires nothing new (BR-1).
-    const effectiveBlockedOn = input.blockedOn ?? qitem.blockedOn;
+    // A claimed item has no current gate, but re-parking without --blocked-on
+    // retains the previous park's gate, as it did before claim cleared the row.
+    const previousClaimBlocker = input.state === "blocked" && qitem.state === "in-progress"
+      && input.blockedOn == null && qitem.blockedOn == null
+      ? this.retainedClaimBlocker(input.qitemId)
+      : null;
+    const effectiveBlockedOn = input.blockedOn ?? qitem.blockedOn ?? previousClaimBlocker ?? null;
     if (input.state === "blocked" && effectiveBlockedOn && this.getById(effectiveBlockedOn)?.humanIntent === "update") {
       throw new QueueRepositoryError("invalid_human_notification", "An informational update is not an approval dependency. Create a separate decision request if a human decision is needed.");
     }
@@ -2694,16 +2744,12 @@ export class QueueRepository {
       // OPR.0.5.8.1 S1 — start the interval at registration for EVERY explicit
       // `--wake-after` timer, not only provider-limit ones.
       //
-      // `isDue` treats a job with no `last_evaluation_at` as due immediately, so
-      // an unseeded timer fires on the scheduler's very first pass regardless of
-      // its interval: measured at 0.69s for a requested 20m and 0.77s for a
-      // requested 2h. The duration was never lost — `interval_seconds` held 1200
-      // and 7200 correctly — it simply was not the thing being measured against.
-      //
-      // S16 introduced this seeding for provider-limit parks only and recorded
-      // the narrow scope as deliberate. Widening it is the whole repair: the
-      // mechanism is unchanged and already proven by the provider-limit path, so
-      // this adds no scheduler and no per-wake bookkeeping.
+      // When this was written, `isDue` treated any job with no `last_evaluation_at`
+      // as due immediately, so an unseeded timer fired on the scheduler's first
+      // pass: measured at 0.69s for a requested 20m and 0.77s for a requested 2h.
+      // Since #801/#860 a never-evaluated periodic reminder measures its first
+      // interval from registration on its own, so this seed now sets the same
+      // start explicitly; it also gives the row's wake a real "last check" time.
       jobsRepo.recordEvaluation(job.jobId, job.registeredAt, false);
       parkWake = { kind: "timer", ref: job.jobId };
     } else if (input.state === "blocked" && effectiveBlockedOn?.startsWith("qitem-")) {
@@ -3133,9 +3179,15 @@ export class QueueRepository {
     if (!this.hasQueueTransitionsTable) return false;
     // Same trust rule as replyToChoiceFor: a pre-provenance schema reads every row as null.
     const provenance = this.hasTransitionProvenanceColumn ? " AND identity_provenance IS NULL" : "";
+    // #192: with a channel map the note carries a ` channel=<id>` suffix. Match the exact note, or
+    // the exact note followed by that suffix; a prefix compare, not LIKE (the note itself contains
+    // `_`), and the trailing space keeps thread 1.1 from matching 1.10.
+    const note = formatReplyToChoice({ kind: "thread", threadTs });
+    const withChannel = `${note} channel=`;
     return this.db.prepare(
-      `SELECT 1 FROM queue_transitions WHERE transition_note = ? AND actor_session = ?${provenance} LIMIT 1`,
-    ).get(formatReplyToChoice({ kind: "thread", threadTs }), REPLY_TO_CHOICE_ACTOR) !== undefined;
+      `SELECT 1 FROM queue_transitions
+        WHERE (transition_note = ? OR substr(transition_note, 1, ?) = ?) AND actor_session = ?${provenance} LIMIT 1`,
+    ).get(note, withChannel.length, withChannel, REPLY_TO_CHOICE_ACTOR) !== undefined;
   }
 
   private replyToFallbackFor(qitemId: string): string | null {
@@ -3386,6 +3438,7 @@ export class QueueRepository {
           state: qitem.state,
           actorSession: "daemon@system",
           transitionNote: "closure-overdue",
+          closureTarget: this.retainedClaimBlocker(qitemId),
         });
       }
       return this.eventBus.persistWithinTransaction({
@@ -3661,6 +3714,7 @@ export class QueueRepository {
         state: qitem.state,
         actorSession: "system:queue-fallback",
         transitionNote: `fallback-routed: ${originalDestination} → ${fallbackDestination} (${reason})`,
+        closureTarget: qitem.state === "in-progress" ? this.retainedClaimBlocker(qitemId) : undefined,
       });
 
       return this.eventBus.persistWithinTransaction({
