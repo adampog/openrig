@@ -89,7 +89,9 @@ for r in "${RUNNING[@]}"; do
     herdr workspace close "$id" >/dev/null
   done
   say "$r: opening wall"
-  rig terminal open "$r" >/dev/null || warn "rig terminal open $r failed"
+  # --provider herdr: without it the daemon guesses the hosting terminal from the caller's
+  # environment and refuses ("unknown") when rig-up runs from a plain shell or an agent.
+  rig terminal open "$r" --provider herdr >/dev/null || warn "rig terminal open $r failed"
 done
 
 # --- 3b. wall order: kernel first, then the other rigs ---------------------
