@@ -190,6 +190,33 @@ changes model: never type `/model` or `/effort` into a seat, and never answer a 
 - **The human's view.** `jev log` lists each task's pick, the seat and any fallback reason.
   `jev off` sends everything to the default seat until `jev on`.
 
+## Codebase navigation (graphify)
+
+This rig works a code repo; use graphify to navigate it instead of blind grep. graphify is
+installed at ~/.local/bin/graphify and builds a knowledge graph under graphify-out/.
+
+- At the start of work on the repo, if graphify-out/graph.json is absent, build it with
+  `graphify update .` (AST extraction and clustering, no LLM, no API cost).
+- Before the first build, where the working directory IS a git repo, add the OpenRig seat files
+  that land in it — `.agents/`, `.codex/`, `AGENTS.md`, `CLAUDE.md`, `.mcp.json`, `.openrig/` — and
+  `graphify-out/` to `.git/info/exclude` (local, uncommitted, changes no tracked file). This keeps
+  them out of both commits and the graph, so graphify indexes only the project's own code rather
+  than ranking the seat scaffolding above it.
+- For any codebase question — architecture, where a thing lives, how files relate — run
+  `graphify query "<question>"` first; `graphify path "A" "B"` for a relationship,
+  `graphify explain "X"` for a concept. These return a small scoped subgraph. Use grep only after
+  graphify has oriented you, or to read/edit specific lines.
+- Read graphify-out/GRAPH_REPORT.md for broad architecture and graphify-out/wiki/index.md for
+  navigation, when present.
+- Prefer `graphify explain`/`graphify path` on a named symbol over a broad architecture query; and
+  read the build config (`.ini`, `CMakeLists.txt`, `Makefile`) directly, because graphify indexes
+  code structure, not build configuration.
+- After changing code, run `graphify update .` to keep the graph current (AST-only, no API cost).
+- graphify-out/ is a local projection, never the human's product. It must never be committed or
+  pushed to the human's repo; the `.git/info/exclude` entry above guarantees that. Where the working
+  dir is a container folder holding per-project repos, graphify runs at that root and sits outside
+  the repos.
+
 ## Bench seats
 
 The human decided on 2026-10-05 that this rig's orchestrator starts and stops its own bench seats.

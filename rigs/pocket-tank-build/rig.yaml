@@ -1,0 +1,81 @@
+version: "0.2"
+name: pocket-tank-build
+summary: >
+  The team that builds and tests pocket-tank, the human's on-device LLM fish tank: an
+  orchestrator, implementation seats each fixed to one model (Jev picks the seat per task), an
+  independent QA seat, and bench seats the orchestrator starts when the work needs them. Work is
+  proven in software (the PC simulator, the ESP32-S3 firmware in QEMU, the model pipeline); flashing
+  a real board is the human's. Launch it in the repo:
+  rig up rigs/pocket-tank-build/rig.yaml --cwd ~/Projects/pocket-tank.
+
+culture_file: CULTURE.md
+
+# Claude seats run in Claude Code's auto mode; Codex seats keep the default sandbox.
+permission_policy: builtin:auto
+
+# Only the always-on seats are declared here, so `rig up` starts exactly these four.
+# The bench seats (hw.expert, ml.expert, dev.fable, dev.codex, dev.qwen) and the extra-builder
+# template live in bench/. The orchestrator adds one with `rig add` when it needs it; see
+# CULTURE.md. The hw and ml pods are declared empty so `rig add` has a pod to add to.
+pods:
+  - id: orch
+    label: Orchestration
+    members:
+      - id: lead
+        agent_ref: "local:../../packages/daemon/specs/agents/orchestration/orchestrator"
+        runtime: claude-code
+        model: opus
+        profile: default
+        cwd: "."
+    edges: []
+
+  - id: dev
+    label: Implementation
+    members:
+      # Implementation seats each fixed to their model. jev route picks one; core (Opus) is the
+      # default seat. QA never builds.
+      - id: core
+        agent_ref: "local:../../packages/daemon/specs/agents/development/implementer"
+        runtime: claude-code
+        model: opus
+        profile: default
+        cwd: "."
+      - id: sonnet
+        agent_ref: "local:../../packages/daemon/specs/agents/development/implementer"
+        runtime: claude-code
+        model: sonnet
+        profile: default
+        cwd: "."
+      - id: qa
+        agent_ref: "local:../../packages/daemon/specs/agents/development/qa"
+        runtime: codex
+        profile: default
+        cwd: "."
+    edges:
+      - kind: delegates_to
+        from: core
+        to: qa
+      - kind: delegates_to
+        from: sonnet
+        to: qa
+
+  - id: hw
+    label: Hardware
+    members: []
+    edges: []
+
+  - id: ml
+    label: Model
+    members: []
+    edges: []
+
+edges:
+  - kind: delegates_to
+    from: orch.lead
+    to: dev.core
+  - kind: delegates_to
+    from: orch.lead
+    to: dev.sonnet
+  - kind: delegates_to
+    from: orch.lead
+    to: dev.qa
