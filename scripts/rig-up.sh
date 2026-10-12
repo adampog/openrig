@@ -1,138 +1,144 @@
 #!/usr/bin/env bash
-# rig-up: bring the OpenRig fleet and its herdr walls back up.
-#   1. start the daemon + last-running rigs if nothing is running
-#   2. restore the kernel rig from its newest snapshot if it stayed stopped
-#   3. replace stale herdr workspaces (bare shells) with live ones, kernel on top
-#   4. open a herdr window if none is attached
-set -uo pipefail
+exec python3 - "$@" <<'PY_RIG_UP'
+#!/usr/bin/env python3
+"""Recover fleet walls without closing existing workspaces or mistaking partial for stopped."""
+import json, os, socket, subprocess, sys, time, shutil
 
-KERNEL=kernel
+failures = []
 
-say() { printf '\033[1m==>\033[0m %s\n' "$*"; }
-warn() { printf '\033[33mwarn:\033[0m %s\n' "$*" >&2; }
+def run(*args, timeout=10):
+    return subprocess.run(args, check=True, text=True, capture_output=True, timeout=timeout).stdout
 
-# Prints "name status rigId" for every non-archived rig; fails if the daemon is down.
-rigs() {
-  rig ps --json 2>/dev/null | python3 -c '
-import json, sys
-for r in json.load(sys.stdin):
-    if not r.get("isArchived"):
-        print(r["name"], r["status"], r["rigId"])' 2>/dev/null
-}
+def rows(*args):
+    data = json.loads(run(*args))
+    if isinstance(data, dict) and data.get('truncated'): raise ValueError('truncated inventory')
+    result = data.get('entries') if isinstance(data, dict) else data
+    if not isinstance(result, list):
+        raise ValueError('invalid list response')
+    return result
 
-running_rigs() { rigs | awk '$2 == "running" { print $1 }'; }
+def fleet():
+    return [r for r in rows('rig', 'ps', '--json', '--full') if not r.get('isArchived')]
 
-# Rigs that get a wall: running, or partial (some seats up, e.g. one slow to start).
-wall_rigs() { rigs | awk '$2 == "running" || $2 == "partial" { print $1 }'; }
+def nodes(name):
+    return rows('rig', 'ps', '--nodes', '--rig', name, '--json', '--full')
 
-# --- 1. fleet -------------------------------------------------------------
-if [[ -z "$(running_rigs)" ]]; then
-  say "No rigs running; starting daemon and last-running rigs"
-  rig start --last || warn "rig start --last exited non-zero"
-fi
+def identity(n):
+    return n.get('canonicalSessionName') or n.get('sessionName')
 
-# --- 2. kernel gotcha: --last can leave the kernel rig stopped ------------
-read -r kstatus kid < <(rigs | awk -v k="$KERNEL" '$1 == k { print $2, $3 }')
-if [[ -n "${kid:-}" && "$kstatus" != "running" ]]; then
-  snap=$(rig snapshot list "$kid" 2>/dev/null | awk '$3 == "complete" { print $1; exit }')
-  if [[ -n "$snap" ]]; then
-    say "Kernel rig is $kstatus; restoring from snapshot $snap"
-    rig restore "$snap" --rig "$kid" || warn "kernel restore exited non-zero"
-    # `rig restore` returns as soon as the daemon accepts it and restores the seats in the
-    # background. Wait for them, or step 3 runs before the kernel is up and opens no wall for it.
-    say "Waiting for the kernel's seats to come up"
-    for _ in $(seq 60); do
-      down=$(rig ps --nodes --rig "$KERNEL" --json 2>/dev/null | python3 -c '
-import json, sys
-print(sum(1 for n in json.load(sys.stdin) if n.get("sessionStatus") != "running"))' 2>/dev/null)
-      [[ "$down" == 0 ]] && break
-      sleep 2
-    done
-    [[ "${down:-1}" == 0 ]] || warn "kernel seats still coming up after 120s; opening its wall anyway"
-  else
-    warn "kernel rig is $kstatus and has no complete snapshot to restore"
-  fi
-fi
+def ready(expected, observed):
+    names = {identity(n) for n in expected}
+    current = {identity(n): n for n in observed}
+    return bool(names) and None not in names and all(
+        name in current and current[name].get('sessionStatus') == 'running'
+        and current[name].get('startupStatus') == 'ready' for name in names)
 
-mapfile -t RUNNING < <(wall_rigs)
-if (( ${#RUNNING[@]} == 0 )); then
-  warn "no rigs are running; nothing to open. Try: rig crash-cart"
-  exit 1
-fi
+def attached(expected):
+    names = {identity(n) for n in expected}
+    actual = {}
+    for line in run('tmux', 'list-sessions', '-F', '#{session_name} #{session_attached}').splitlines():
+        name, count = line.rsplit(' ', 1); actual[name] = int(count)
+    return bool(names) and None not in names and all(actual.get(n, 0) > 0 for n in names)
 
-# --- 3. herdr walls -------------------------------------------------------
-# Workspace ids whose label is the given rig name.
-workspaces_for() {
-  herdr workspace list 2>/dev/null | python3 -c '
-import json, sys
-for w in json.load(sys.stdin)["result"]["workspaces"]:
-    if w.get("label") == sys.argv[1]:
-        print(w["workspace_id"])' "$1" 2>/dev/null
-}
+def say(message):
+    print('==> ' + message, flush=True)
 
-# True when every tmux session of the rig has a client attached.
-all_attached() {
-  local out
-  out=$(tmux list-sessions -F '#{session_name} #{session_attached}' 2>/dev/null |
-    awk -v suffix="@$1" 'index($1, suffix) == length($1) - length(suffix) + 1') || return 1
-  [[ -n "$out" ]] && ! awk '$2 == 0 { found = 1 } END { exit !found }' <<<"$out"
-}
+def failed(message):
+    failures.append(message); print('warn: ' + message, file=sys.stderr, flush=True)
 
-for r in "${RUNNING[@]}"; do
-  mapfile -t ws < <(workspaces_for "$r")
-  if (( ${#ws[@]} == 1 )) && all_attached "$r"; then
-    say "$r: wall already live"
-    continue
-  fi
-  for id in "${ws[@]}"; do
-    say "$r: closing stale workspace $id"
-    herdr workspace close "$id" >/dev/null
-  done
-  say "$r: opening wall"
-  # --provider herdr: without it the daemon guesses the hosting terminal from the caller's
-  # environment and refuses ("unknown") when rig-up runs from a plain shell or an agent.
-  rig terminal open "$r" --provider herdr >/dev/null || warn "rig terminal open $r failed"
-done
+def main():
+    # A failed read is unknown, not permission to start a fleet.
+    started = False
+    try: rigs = fleet()
+    except Exception:
+        try: state = run('rig', 'daemon', 'status').strip()
+        except Exception: state = ''
+        # These exact installed-CLI verdicts distinguish absent from unknown/unhealthy.
+        if state not in ('Daemon stopped', 'Daemon PID is absent (stale state)'):
+            failed('fleet state unverified; inspect rig daemon status before recovery'); return 1
+        try:
+            say('Daemon confirmed stopped; starting last-running rigs')
+            run('rig', 'start', '--last', timeout=120); rigs = fleet(); started = True
+        except Exception: failed('rig start --last failed'); return 1
+    if not started and not any(r.get('status') in ('running', 'partial') for r in rigs):
+        say('No running or partial rigs; starting last-running rigs')
+        try: run('rig', 'start', '--last', timeout=120); rigs = fleet()
+        except Exception: failed('rig start --last failed'); return 1
+    kernel = next((r for r in rigs if r.get('name') == 'kernel'), None)
+    if kernel and kernel.get('status') == 'stopped':
+        try:
+            expected = nodes('kernel')
+            if not expected or any(not identity(n) for n in expected):
+                raise ValueError('kernel expected seat identities unavailable')
+            snapshots = run('rig', 'snapshot', 'list', kernel['rigId'])
+            snap = next((line.split()[0] for line in snapshots.splitlines()
+                         if len(line.split()) >= 3 and line.split()[2] == 'complete'), None)
+            if not snap: raise ValueError('no complete kernel snapshot')
+            run('rig', 'restore', snap, '--rig', kernel['rigId'], timeout=120)
+            deadline = time.monotonic() + 120
+            while not ready(expected, nodes('kernel')):
+                if time.monotonic() >= deadline: raise TimeoutError('kernel readiness timed out')
+                time.sleep(2)
+            rigs = fleet()
+        except Exception as e: failed('kernel recovery incomplete: ' + type(e).__name__)
+    walls = [r for r in rigs if r.get('status') in ('running', 'partial')]
+    if not walls: failed('no running or partial rigs to open'); return 1
+    for r in sorted(walls, key=lambda r: r['name'] != 'kernel'):
+        name = r['name']
+        try:
+            expected = nodes(name)
+            if not expected or any(not identity(n) for n in expected):
+                raise ValueError('expected seats unavailable')
+            spaces = json.loads(run('herdr', 'workspace', 'list'))['result']['workspaces']
+            matches = [w for w in spaces if w.get('label') == name]
+            if matches and ready(expected, expected) and attached(expected):
+                say(name + ': wall already live'); continue
+            # Labels do not prove ownership of every tab. Preserve old workspaces.
+            if matches: say(name + ': preserving existing workspace(s); opening recovery wall')
+            run('rig', 'terminal', 'open', name, '--provider', 'herdr', timeout=120)
+            if not ready(expected, nodes(name)) or not attached(expected):
+                raise ValueError('wall opened but complete ready/attached seats not verified')
+            say(name + ': wall verified')
+        except Exception as e: failed(name + ': wall recovery incomplete: ' + type(e).__name__)
+    # Reordering and spawning windows are intentionally left to the human when recovery
+    # has failures; neither can turn a failed recovery into success.
+    if not failures:
+        try:
+            path = os.path.expanduser('~/.config/herdr/herdr.sock')
+            def call(method, params):
+                with socket.socket(socket.AF_UNIX) as s:
+                    s.settimeout(5); s.connect(path)
+                    s.sendall((json.dumps({'id':'rig-up','method':method,'params':params})+'\n').encode())
+                    buf = b''
+                    while not buf.endswith(b'\n'):
+                        chunk=s.recv(65536)
+                        if not chunk: raise ValueError('incomplete Herder response')
+                        buf+=chunk
+                        if len(buf)>1024*1024: raise ValueError('oversized Herder response')
+                    reply=json.loads(buf)
+                    if reply.get('error'): raise ValueError('Herder operation failed')
+                    return reply['result']
+            spaces = call('workspace.list', {})['workspaces']
+            for index, r in enumerate(sorted(walls,key=lambda r:r['name']!='kernel')):
+                matches=[w for w in spaces if w.get('label')==r['name']]
+                # Ambiguous duplicates are preserved and never chosen for movement.
+                if len(matches)==1: call('workspace.move',{'workspace_id':matches[0]['workspace_id'],'insert_index':index})
+        except Exception: failed('could not verify Herder wall ordering')
+    if not failures:
+        try:
+            processes = subprocess.run(['pgrep', '-x', 'herdr', '-a'], text=True, capture_output=True, timeout=5)
+            has_window = any(' server' not in line for line in processes.stdout.splitlines())
+            if not has_window:
+                if os.environ.get('WAYLAND_DISPLAY') and shutil.which('uwsm'):
+                    subprocess.Popen(['uwsm','app','--','xdg-terminal-exec','herdr'],
+                                     start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    say('Opening a Herder window')
+                else: say('No Herder window attached; run: herdr')
+        except Exception: failed('could not open Herder window')
+    try: print(run('rig', 'ps'))
+    except Exception: failed('final fleet read failed')
+    return 1 if failures else 0
 
-# --- 3b. wall order: kernel first, then the other rigs ---------------------
-# herdr appends a new workspace at the end and has no CLI verb to reorder, so ask its
-# socket API (workspace.move) to put the rig walls in order at the top of the list.
-order_walls() {
-  python3 - "$KERNEL" "$@" <<'PYEOF' 2>/dev/null
-import json, os, socket, sys
-kernel, rigs = sys.argv[1], sys.argv[2:]
-want = [kernel] + [r for r in rigs if r != kernel]
-path = os.path.expanduser("~/.config/herdr/herdr.sock")
-def call(method, params):
-    s = socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(path)
-    s.sendall((json.dumps({"id": "rig-up", "method": method, "params": params}) + "\n").encode())
-    buf = b""
-    while not buf.endswith(b"\n"):
-        chunk = s.recv(65536)
-        if not chunk: break
-        buf += chunk
-    s.close()
-    return json.loads(buf)
-spaces = call("workspace.list", {})["result"]["workspaces"]
-index = 0
-for label in want:
-    ids = [w["workspace_id"] for w in spaces if w.get("label") == label]
-    if ids:
-        call("workspace.move", {"workspace_id": ids[0], "insert_index": index})
-        index += 1
-PYEOF
-}
-order_walls "${RUNNING[@]}" || warn "could not order the herdr walls (kernel first)"
+if __name__ == '__main__': sys.exit(main())
 
-# --- 4. herdr window ------------------------------------------------------
-if ! pgrep -x herdr -a | grep -qv ' server'; then
-  if [[ -n "${WAYLAND_DISPLAY:-}" ]] && command -v uwsm >/dev/null; then
-    say "Opening a herdr window"
-    setsid uwsm app -- xdg-terminal-exec herdr >/dev/null 2>&1 &
-  else
-    say "No herdr window attached; run: herdr"
-  fi
-fi
-
-echo
-rig ps
+PY_RIG_UP
