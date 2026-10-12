@@ -122,6 +122,28 @@ test("a busy pane (a foreground job, an editor, a tmux client of an unknown sess
   }
 });
 
+test("incomplete or malformed process information never counts as an idle shell (null, missing, zero, string and boolean pids)", () => {
+  const bad = [
+    { shell_pid: null, foreground_processes: [{ name: "bash", argv: ["bash"] }] }, // null == missing pid in Python
+    { shell_pid: null, foreground_processes: [{ name: "bash", pid: null, argv: ["bash"] }] },
+    { foreground_processes: [{ name: "bash", argv: ["bash"] }] },
+    { shell_pid: 10, foreground_processes: [{ name: "bash", argv: ["bash"] }] },
+    { shell_pid: 0, foreground_processes: [{ name: "bash", pid: 0 }] },
+    { shell_pid: "10", foreground_processes: [{ name: "bash", pid: "10" }] },
+    { shell_pid: true, foreground_processes: [{ name: "bash", pid: true }] },
+    { shell_pid: 10, foreground_processes: [{ pid: 10 }] },
+    { shell_pid: 10, foreground_processes: ["bash"] },
+    { shell_pid: 10, foreground_processes: [] },
+    { shell_pid: 10, foreground_processes: [{ name: "bash", pid: 10 }, null] },
+  ];
+  const kinds = py(`print(json.dumps([m.pane_kind(x, set()) for x in ${J(bad)}]))`);
+  assert.deepEqual(kinds, bad.map(() => "unknown"));
+  for (const proc of bad) {
+    const w = { w: W("wInc", "openrig-build"), panes: [pane("c1", "orch.lead")], procs: { c1: proc } };
+    assert.deepEqual(plan(build(liveWall, w)).close, [], JSON.stringify(proc));
+  }
+});
+
 test("a workspace with no listed panes, or a pane reporting an agent at work, is kept", () => {
   const empty = { w: W("wEmpty", "openrig-build"), panes: [], procs: {} };
   const working = { w: W("wWork", "openrig-build"), panes: [pane("k1", "orch.lead", "working")], procs: { k1: shell() } };

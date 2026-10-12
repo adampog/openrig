@@ -70,18 +70,22 @@ def attached(expected):
 
 def pane_kind(proc, live):
     """Classify one pane from `herdr pane process-info` (the `process_info` object) and the live
-    tmux session names. Only 'idle-shell' is dead; anything unclear is treated as not dead."""
+    tmux session names. Only 'idle-shell' is dead, and only on complete evidence: a real shell
+    pid and a real pid and name for every foreground process. Anything missing or malformed is
+    'unknown', which is never closed."""
+    def pid(v): return isinstance(v, int) and not isinstance(v, bool) and v > 0
     try:
         fg = proc['foreground_processes']; shell_pid = proc['shell_pid']
     except Exception: return 'unknown'
-    if not isinstance(fg, list) or not fg: return 'unknown'
+    if not isinstance(fg, list) or not fg or not pid(shell_pid): return 'unknown'
+    if not all(isinstance(p, dict) and pid(p.get('pid')) and isinstance(p.get('name'), str) and p['name'] for p in fg): return 'unknown'
     for p in fg:
         argv = p.get('argv') or []
         if os.path.basename(argv[0] if argv else '') == 'tmux':
             args = argv[1:]
             target = next((args[i + 1] for i, a in enumerate(args[:-1]) if a == '-t'), None)
             return 'attached-live' if target in live else 'tmux-other'
-    if all(p.get('name') in SHELLS and p.get('pid') == shell_pid for p in fg): return 'idle-shell'
+    if all(p['name'] in SHELLS and p['pid'] == shell_pid for p in fg): return 'idle-shell'
     return 'busy'
 
 def bare_prompt(text):
