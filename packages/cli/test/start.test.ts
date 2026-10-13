@@ -5,7 +5,7 @@
 import { describe, it, expect, vi, beforeAll, afterAll, beforeEach } from "vitest";
 import http from "node:http";
 import { Command } from "commander";
-import { startCommand } from "../src/commands/start.js";
+import { startCommand, isExplicitlyDown } from "../src/commands/start.js";
 import { DaemonClient } from "../src/client.js";
 import { STATE_FILE, type LifecycleDeps, type DaemonState } from "../src/daemon-lifecycle.js";
 
@@ -73,6 +73,12 @@ describe("rig start (OPR.0.3.4.1)", () => {
           const data = handler ? handler(req, body) : [];
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(data));
+          return;
+        }
+        const nodesMatch = method === "GET" && url.match(/^\/api\/rigs\/([^/]+)\/nodes$/);
+        if (nodesMatch && routes["/api/rigs/:id/nodes"]) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(routes["/api/rigs/:id/nodes"]!(req, { _rigId: nodesMatch[1] })));
           return;
         }
         if (method === "GET" && url.match(/^\/api\/rigs\/[^/]+$/)) {
@@ -185,6 +191,91 @@ describe("rig start (OPR.0.3.4.1)", () => {
     expect(applyBodies[0]!._rigIdRoute).toBe("rig-1");
     const output = logs.join("\n");
     expect(output).toContain("my-rig");
+  });
+
+  // ---- --last respects `rig down` (S4-start-last-respects-down) ----
+
+  // Stopped rigs with restore-usable snapshots. "downed" was taken down with `rig down`
+  // (every seat's latest session is exited). "crashed" was running when the daemon stopped
+  // (the boot reconciler left its seats detached). Both report a non-running lifecycleState.
+  function setupStoppedRigs(rigs: Array<{ id: string; name: string; statuses: Array<string | null> }>) {
+    routes["/api/rigs/summary"] = () => rigs.map((r) => ({ id: r.id, name: r.name, nodeCount: r.statuses.length, lifecycleState: "recoverable" })) as unknown as Record<string, unknown>;
+    routes["/api/rigs/:id"] = () => ({ sessions: [] });
+    routes["/api/rigs/:id/nodes"] = (_req, body) => {
+      const rig = rigs.find((r) => r.id === body._rigId)!;
+      return rig.statuses.map((sessionStatus, i) => ({ logicalId: `dev.seat${i}`, sessionStatus })) as unknown as Record<string, unknown>;
+    };
+    routes["/api/rigs/:id/up"] = (_req, body) => {
+      const rig = rigs.find((r) => r.id === body._rigId)!;
+      if (body.plan === true) {
+        return {
+          status: "plan", mode: "restore", rigId: rig.id, rigName: rig.name,
+          snapshot: { id: `snap-${rig.id}`, kind: "auto-pre-down", createdAt: "2026-06-14T11:00:00Z" },
+          wouldCaptureCurrentState: false,
+          nodes: [{ logicalId: "dev.seat0", intendedAction: "resume-original" }],
+          mutated: false,
+        };
+      }
+      return { status: "restored", rigId: rig.id, rigName: rig.name, rigResult: "fully_restored", nodes: [{ logicalId: "dev.seat0", status: "resumed" }], warnings: [] };
+    };
+  }
+  const DOWNED = { id: "rig-down", name: "downed", statuses: ["exited", "exited"] };
+  const CRASHED = { id: "rig-crash", name: "crashed", statuses: ["detached", "detached"] };
+  const appliedRigIds = () => upBodies.filter((b) => b.plan !== true && b._rigIdRoute).map((b) => b._rigIdRoute);
+
+  it("--last does NOT restore a rig taken down with rig down, and DOES restore a rig detached at the last stop", async () => {
+    setupStoppedRigs([DOWNED, CRASHED]);
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "start", "--last"]);
+    });
+    expect(appliedRigIds()).toEqual(["rig-crash"]);
+    expect(exitCode).toBeUndefined();
+    const output = logs.join("\n");
+    expect(output).toContain("downed: was taken down, so --last leaves it down");
+    expect(output).toContain("rig start --rigs downed");
+  });
+
+  it("--last with only a downed rig restores nothing, exits clean, and --json names it in keptDown", async () => {
+    setupStoppedRigs([DOWNED]);
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "start", "--last", "--json"]);
+    });
+    expect(appliedRigIds()).toEqual([]);
+    expect(exitCode).toBeUndefined();
+    const parsed = JSON.parse(logs.find((l) => l.trim().startsWith("{"))!);
+    expect(parsed.keptDown).toEqual(["downed"]);
+    expect(parsed.restoredRigs).toEqual([]);
+  });
+
+  it("--last still restores a rig with one seat stopped on purpose and the rest detached", async () => {
+    setupStoppedRigs([{ id: "rig-mixed", name: "mixed", statuses: ["exited", "detached"] }]);
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "start", "--last"]);
+    });
+    expect(appliedRigIds()).toEqual(["rig-mixed"]);
+  });
+
+  it("--all and --rigs still restore a rig that was taken down", async () => {
+    setupStoppedRigs([DOWNED, CRASHED]);
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "start", "--all"]);
+    });
+    expect(appliedRigIds().sort()).toEqual(["rig-crash", "rig-down"]);
+    upBodies = [];
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "start", "--rigs", "downed"]);
+    });
+    expect(appliedRigIds()).toEqual(["rig-down"]);
+  });
+
+  it("isExplicitlyDown: only all-exited or never-launched seats count as down", () => {
+    expect(isExplicitlyDown([{ sessionStatus: "exited" }, { sessionStatus: "exited" }])).toBe(true);
+    expect(isExplicitlyDown([{ sessionStatus: "exited" }, { sessionStatus: null }])).toBe(true);
+    expect(isExplicitlyDown([{ sessionStatus: "exited" }, { sessionStatus: "detached" }])).toBe(false);
+    expect(isExplicitlyDown([{ sessionStatus: "detached" }])).toBe(false);
+    expect(isExplicitlyDown([{ sessionStatus: "running" }, { sessionStatus: "exited" }])).toBe(false);
+    expect(isExplicitlyDown([{ sessionStatus: "unknown" }])).toBe(false);
+    expect(isExplicitlyDown([])).toBe(false);
   });
 
   it("--all restores all candidates with ZERO prompts", async () => {

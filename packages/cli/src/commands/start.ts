@@ -58,6 +58,18 @@ export interface StartCandidate {
   nodeCount: number;
   lastActivity: string | null;
   preview: PlanPreviewResponse | null;
+  /** True when every seat's latest session is exited or was never launched: the rig was taken
+   *  down on purpose (`rig down`, or each seat stopped). False when unknown. */
+  explicitlyDown: boolean;
+}
+
+// `rig down` and `rig seat stop` leave a seat's latest session `exited`. A daemon stop, crash or
+// reboot leaves it `detached` (the boot reconciler never rewrites `exited`). The rig-level
+// lifecycleState folds both into stopped/recoverable, so read the per-seat session status.
+const DOWN_SESSION_STATUSES = new Set<string | null>(["exited", null]);
+
+export function isExplicitlyDown(nodes: Array<{ sessionStatus?: string | null }>): boolean {
+  return nodes.length > 0 && nodes.every((n) => DOWN_SESSION_STATUSES.has(n.sessionStatus ?? null));
 }
 
 /** Default interactive [y/N] prompt (same shape as up.ts, reused for the TTY path). */
@@ -163,7 +175,7 @@ Examples:
     depsOverride ?? { lifecycleDeps: realDeps(), clientFactory: (url: string) => new DaemonClient(url) };
 
   cmd
-    .option("--last", "Headless: restore all rigs that were last running (zero prompts)")
+    .option("--last", "Headless: restore the rigs that were running when the daemon last stopped; a rig taken down with rig down stays down (zero prompts)")
     .option("--all", "Headless: restore all rigs with restore-usable snapshots (zero prompts)")
     .option("--rigs <names...>", "Headless: restore only the named rigs (zero prompts)")
     .option("--json", "JSON output for agents")
@@ -310,6 +322,13 @@ Examples:
               lastActivity = dates.length > 0 ? dates[dates.length - 1]! : null;
             } catch { /* degrade: lastActivity stays null */ }
 
+            // Fail open: when the seat statuses cannot be read, the rig stays a candidate.
+            let explicitlyDown = false;
+            try {
+              const nodesRes = await client.get<Array<{ sessionStatus?: string | null }>>(`/api/rigs/${encodeURIComponent(rig.id)}/nodes`);
+              if (nodesRes.status === 200 && Array.isArray(nodesRes.data)) explicitlyDown = isExplicitlyDown(nodesRes.data);
+            } catch { /* degrade: explicitlyDown stays false */ }
+
             candidates.push({
               rigId: rig.id,
               rigName: rig.name,
@@ -317,6 +336,7 @@ Examples:
               nodeCount: rig.nodeCount ?? 0,
               lastActivity,
               preview,
+              explicitlyDown,
             });
           } else if (planRes.status === 404) {
             // no_snapshot or not found — this rig is not a candidate (expected exclusion).
@@ -354,8 +374,16 @@ Examples:
 
       // ---- PHASE 4: selection (id-grounded, rev1 BLOCKING b4c6ada4) ----
       let selectedCandidates: StartCandidate[];
-      if (opts.all || opts.last) {
+      // --last restores what was running at the last daemon stop. A rig that was taken down on
+      // purpose stays down; --all and --rigs still restore it.
+      const keptDown = opts.last && !opts.all ? candidates.filter((c) => c.explicitlyDown) : [];
+      if (opts.all) {
         selectedCandidates = [...candidates];
+      } else if (opts.last) {
+        selectedCandidates = candidates.filter((c) => !c.explicitlyDown);
+        if (!opts.json) {
+          for (const c of keptDown) console.log(`  ${c.rigName}: was taken down, so --last leaves it down (rig start --rigs ${c.rigName} restores it)`);
+        }
       } else if (opts.rigs) {
         selectedCandidates = candidates.filter((c) => opts.rigs!.includes(c.rigName));
         const missing = opts.rigs.filter((n) => !candidates.some((c) => c.rigName === n));
@@ -404,6 +432,17 @@ Examples:
 
       if (selectedCandidates.length === 0) {
         if (!opts.json) console.log("No rigs selected for restore.");
+        else if (opts.last) {
+          console.log(JSON.stringify({
+            status: previewErrors.length > 0 ? "started_with_errors" : "started",
+            uiUrl,
+            candidates: candidates.map((c) => ({ rigName: c.rigName, lifecycleState: c.lifecycleState })),
+            keptDown: keptDown.map((c) => c.rigName),
+            restoredRigs: [],
+            previewErrors: previewErrors.length > 0 ? previewErrors : undefined,
+          }));
+        }
+        if (opts.last && previewErrors.length > 0) process.exitCode = 1;
         return;
       }
 
@@ -535,6 +574,7 @@ Examples:
           status: previewErrors.length > 0 ? "started_with_errors" : "started",
           uiUrl,
           candidates: candidates.map((c) => ({ rigName: c.rigName, lifecycleState: c.lifecycleState })),
+          keptDown: keptDown.length > 0 ? keptDown.map((c) => c.rigName) : undefined,
           restoredRigs: results,
           previewErrors: previewErrors.length > 0 ? previewErrors : undefined,
         }));
