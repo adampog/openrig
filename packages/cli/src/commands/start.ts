@@ -58,18 +58,29 @@ export interface StartCandidate {
   nodeCount: number;
   lastActivity: string | null;
   preview: PlanPreviewResponse | null;
-  /** True when every seat's latest session is exited or was never launched: the rig was taken
-   *  down on purpose (`rig down`, or each seat stopped). False when unknown. */
-  explicitlyDown: boolean;
+  /** What the seats say about the last daemon stop; `--last` restores only `was_running`. */
+  lastStop: LastStopState;
 }
+
+/**
+ * `was_running`: at least one seat's latest session is neither exited nor absent.
+ * `down`: every seat is exited or was never launched (`rig down`, or each seat stopped).
+ * `unknown`: the seat statuses could not be read.
+ */
+export type LastStopState = "was_running" | "down" | "unknown";
 
 // `rig down` and `rig seat stop` leave a seat's latest session `exited`. A daemon stop, crash or
 // reboot leaves it `detached` (the boot reconciler never rewrites `exited`). The rig-level
 // lifecycleState folds both into stopped/recoverable, so read the per-seat session status.
-const DOWN_SESSION_STATUSES = new Set<string | null>(["exited", null]);
-
-export function isExplicitlyDown(nodes: Array<{ sessionStatus?: string | null }>): boolean {
-  return nodes.length > 0 && nodes.every((n) => DOWN_SESSION_STATUSES.has(n.sessionStatus ?? null));
+export function lastStopState(nodes: unknown): LastStopState {
+  if (!Array.isArray(nodes)) return "unknown";
+  let wasRunning = false;
+  for (const node of nodes) {
+    const status = node && typeof node === "object" ? (node as { sessionStatus?: unknown }).sessionStatus : undefined;
+    if (status !== null && typeof status !== "string") return "unknown";
+    if (status !== null && status !== "exited") wasRunning = true;
+  }
+  return wasRunning ? "was_running" : "down";
 }
 
 /** Default interactive [y/N] prompt (same shape as up.ts, reused for the TTY path). */
@@ -322,12 +333,11 @@ Examples:
               lastActivity = dates.length > 0 ? dates[dates.length - 1]! : null;
             } catch { /* degrade: lastActivity stays null */ }
 
-            // Fail open: when the seat statuses cannot be read, the rig stays a candidate.
-            let explicitlyDown = false;
+            let lastStop: LastStopState = "unknown";
             try {
-              const nodesRes = await client.get<Array<{ sessionStatus?: string | null }>>(`/api/rigs/${encodeURIComponent(rig.id)}/nodes`);
-              if (nodesRes.status === 200 && Array.isArray(nodesRes.data)) explicitlyDown = isExplicitlyDown(nodesRes.data);
-            } catch { /* degrade: explicitlyDown stays false */ }
+              const nodesRes = await client.get<unknown>(`/api/rigs/${encodeURIComponent(rig.id)}/nodes`);
+              if (nodesRes.status === 200) lastStop = lastStopState(nodesRes.data);
+            } catch { /* lastStop stays unknown; --last reports it and does not restore the rig */ }
 
             candidates.push({
               rigId: rig.id,
@@ -336,7 +346,7 @@ Examples:
               nodeCount: rig.nodeCount ?? 0,
               lastActivity,
               preview,
-              explicitlyDown,
+              lastStop,
             });
           } else if (planRes.status === 404) {
             // no_snapshot or not found — this rig is not a candidate (expected exclusion).
@@ -375,12 +385,19 @@ Examples:
       // ---- PHASE 4: selection (id-grounded, rev1 BLOCKING b4c6ada4) ----
       let selectedCandidates: StartCandidate[];
       // --last restores what was running at the last daemon stop. A rig that was taken down on
-      // purpose stays down; --all and --rigs still restore it.
-      const keptDown = opts.last && !opts.all ? candidates.filter((c) => c.explicitlyDown) : [];
+      // purpose stays down, and so does one whose seats could not be read (reported as an error).
+      // --all and --rigs still restore either.
+      const lastOnly = Boolean(opts.last && !opts.all);
+      const keptDown = lastOnly ? candidates.filter((c) => c.lastStop === "down") : [];
       if (opts.all) {
         selectedCandidates = [...candidates];
       } else if (opts.last) {
-        selectedCandidates = candidates.filter((c) => !c.explicitlyDown);
+        selectedCandidates = candidates.filter((c) => c.lastStop === "was_running");
+        for (const c of candidates.filter((x) => x.lastStop === "unknown")) {
+          const message = `could not read its seat statuses, so --last did not restore it (rig start --rigs ${c.rigName} restores it)`;
+          previewErrors.push({ rigId: c.rigId, rigName: c.rigName, code: "seat_status_unavailable", message });
+          if (!opts.json) console.error(`  ${c.rigName}: ${message}`);
+        }
         if (!opts.json) {
           for (const c of keptDown) console.log(`  ${c.rigName}: was taken down, so --last leaves it down (rig start --rigs ${c.rigName} restores it)`);
         }

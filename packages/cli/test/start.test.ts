@@ -5,7 +5,7 @@
 import { describe, it, expect, vi, beforeAll, afterAll, beforeEach } from "vitest";
 import http from "node:http";
 import { Command } from "commander";
-import { startCommand, isExplicitlyDown } from "../src/commands/start.js";
+import { startCommand, lastStopState } from "../src/commands/start.js";
 import { DaemonClient } from "../src/client.js";
 import { STATE_FILE, type LifecycleDeps, type DaemonState } from "../src/daemon-lifecycle.js";
 
@@ -151,6 +151,8 @@ describe("rig start (OPR.0.3.4.1)", () => {
       { id: "rig-1", name, nodeCount: 2, lifecycleState },
     ];
     routes["/api/rigs/:id"] = () => ({ sessions: [{ lastSeenAt: "2026-06-14T12:00:00Z" }] });
+    // What a reboot leaves: seats detached, so --last sees a rig that was running.
+    routes["/api/rigs/:id/nodes"] = () => [{ logicalId: "dev.impl", sessionStatus: "detached" }, { logicalId: "dev.qa", sessionStatus: "detached" }] as unknown as Record<string, unknown>;
     // Both plan preview AND apply go through the id-based route.
     routes["/api/rigs/:id/up"] = (_req, body) => {
       if (body.plan === true) {
@@ -268,14 +270,48 @@ describe("rig start (OPR.0.3.4.1)", () => {
     expect(appliedRigIds()).toEqual(["rig-down"]);
   });
 
-  it("isExplicitlyDown: only all-exited or never-launched seats count as down", () => {
-    expect(isExplicitlyDown([{ sessionStatus: "exited" }, { sessionStatus: "exited" }])).toBe(true);
-    expect(isExplicitlyDown([{ sessionStatus: "exited" }, { sessionStatus: null }])).toBe(true);
-    expect(isExplicitlyDown([{ sessionStatus: "exited" }, { sessionStatus: "detached" }])).toBe(false);
-    expect(isExplicitlyDown([{ sessionStatus: "detached" }])).toBe(false);
-    expect(isExplicitlyDown([{ sessionStatus: "running" }, { sessionStatus: "exited" }])).toBe(false);
-    expect(isExplicitlyDown([{ sessionStatus: "unknown" }])).toBe(false);
-    expect(isExplicitlyDown([])).toBe(false);
+  it.each([
+    ["an error object instead of the seat list", () => ({ error: "inventory unavailable" })],
+    ["a seat with no sessionStatus", () => [{ logicalId: "dev.seat0" }, { logicalId: "dev.seat1", sessionStatus: "detached" }]],
+    ["no inventory route (404)", undefined],
+  ])("--last does NOT restore a rig when its seat statuses are unreadable (%s), and reports it with exit 1", async (_label, nodes) => {
+    setupStoppedRigs([DOWNED, CRASHED]);
+    const crashedNodes = routes["/api/rigs/:id/nodes"]!;
+    if (nodes) routes["/api/rigs/:id/nodes"] = (req, body) => (body._rigId === "rig-down" ? nodes() : crashedNodes(req, body)) as unknown as Record<string, unknown>;
+    else delete routes["/api/rigs/:id/nodes"];
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "start", "--last", "--json"]);
+    });
+    // The readable, detached rig is still restored; the unreadable one never is.
+    expect(appliedRigIds()).toEqual(nodes ? ["rig-crash"] : []);
+    expect(exitCode).toBe(1);
+    const parsed = JSON.parse(logs.find((l) => l.trim().startsWith("{"))!);
+    expect(parsed.status).toBe("started_with_errors");
+    const unreadable = parsed.previewErrors.filter((e: { code: string }) => e.code === "seat_status_unavailable").map((e: { rigName: string }) => e.rigName);
+    expect(unreadable).toEqual(nodes ? ["downed"] : ["downed", "crashed"]);
+  });
+
+  it("--all still restores a rig whose seat statuses are unreadable", async () => {
+    setupStoppedRigs([DOWNED]);
+    routes["/api/rigs/:id/nodes"] = () => ({ error: "inventory unavailable" });
+    const { exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "start", "--all"]);
+    });
+    expect(appliedRigIds()).toEqual(["rig-down"]);
+    expect(exitCode).toBeUndefined();
+  });
+
+  it("lastStopState: was_running needs a seat that neither exited nor never launched; unreadable is unknown", () => {
+    expect(lastStopState([{ sessionStatus: "exited" }, { sessionStatus: "exited" }])).toBe("down");
+    expect(lastStopState([{ sessionStatus: "exited" }, { sessionStatus: null }])).toBe("down");
+    expect(lastStopState([])).toBe("down");
+    expect(lastStopState([{ sessionStatus: "exited" }, { sessionStatus: "detached" }])).toBe("was_running");
+    expect(lastStopState([{ sessionStatus: "detached" }])).toBe("was_running");
+    expect(lastStopState([{ sessionStatus: "running" }, { sessionStatus: "exited" }])).toBe("was_running");
+    expect(lastStopState({ error: "inventory unavailable" })).toBe("unknown");
+    expect(lastStopState(undefined)).toBe("unknown");
+    expect(lastStopState([{ sessionStatus: "detached" }, {}])).toBe("unknown");
+    expect(lastStopState([null])).toBe("unknown");
   });
 
   it("--all restores all candidates with ZERO prompts", async () => {
@@ -653,6 +689,8 @@ describe("rig start (OPR.0.3.4.1)", () => {
         if (method === "GET" && url === "/healthz") { res.writeHead(200).end(JSON.stringify({ ok: true })); return; }
         if (method === "GET" && url === "/api/kernel/status") { res.writeHead(200).end(JSON.stringify({ kernel_state: "ready" })); return; }
         if (method === "GET" && url === "/api/rigs/summary") { res.writeHead(200).end(JSON.stringify(routes["/api/rigs/summary"]!(req, body))); return; }
+        // The seat is detached (what the summary above reports), so --last attempts the restore.
+        if (method === "GET" && url.match(/^\/api\/rigs\/[^/]+\/nodes$/)) { res.writeHead(200).end(JSON.stringify([{ logicalId: "w", sessionStatus: "detached" }])); return; }
         if (method === "GET" && url.match(/^\/api\/rigs\/[^/]+$/)) { res.writeHead(200).end(JSON.stringify({ sessions: [] })); return; }
         const rigUpMatch2 = method === "POST" && url.match(/^\/api\/rigs\/([^/]+)\/up$/);
         if (rigUpMatch2) {
@@ -697,6 +735,8 @@ describe("rig start (OPR.0.3.4.1)", () => {
         if (method === "GET" && url === "/healthz") { res.writeHead(200).end(JSON.stringify({ ok: true })); return; }
         if (method === "GET" && url === "/api/kernel/status") { const h = routes["/api/kernel/status"]; res.writeHead(200).end(JSON.stringify(h ? h(req, body) : { kernel_state: "ready" })); return; }
         if (method === "GET" && url === "/api/rigs/summary") { const h = routes["/api/rigs/summary"]; res.writeHead(200).end(JSON.stringify(h ? h(req, body) : [])); return; }
+        const nodesMatch3 = method === "GET" && url.match(/^\/api\/rigs\/([^/]+)\/nodes$/);
+        if (nodesMatch3 && routes["/api/rigs/:id/nodes"]) { res.writeHead(200).end(JSON.stringify(routes["/api/rigs/:id/nodes"]!(req, { _rigId: nodesMatch3[1] }))); return; }
         if (method === "GET" && url.match(/^\/api\/rigs\/[^/]+$/)) { const h = routes["/api/rigs/:id"]; res.writeHead(200).end(JSON.stringify(h ? h(req, body) : { sessions: [] })); return; }
         if (method === "POST" && url === "/api/up") { upBodies.push(body); const h = routes["/api/up"]; const d = h ? h(req, body) : {}; res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(d)); return; }
         const rigUpRestore = method === "POST" && url.match(/^\/api\/rigs\/([^/]+)\/up$/);
