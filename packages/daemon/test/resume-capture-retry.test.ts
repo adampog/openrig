@@ -13,7 +13,7 @@ afterEach(() => { vi.useRealTimers(); for (const root of roots.splice(0)) fs.rmS
 const identity = "Sun Sep  6 23:52:32 2026";
 const token = "019d45c3-e909-7152-b52e-34edab4070ed";
 const session = { sessionId: "session-1", sessionName: "codex@rig", runtime: "codex", resumeType: null, resumeToken: null };
-function fixture() {
+function fixture(reason?: string) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "resume-capture-retry-")); roots.push(home);
   const codexHome = path.join(home, ".codex"); fs.mkdirSync(codexHome);
   const logsPath = path.join(codexHome, "logs_2.sqlite");
@@ -31,8 +31,8 @@ function fixture() {
   const registry = { updateResumeToken: vi.fn(() => true), markResumeProbeResult: vi.fn(), isForkClaimingHeldToken: () => false,
     findResumeContextByName: () => ({ sessionId: session.sessionId }) } as unknown as SessionRegistry;
   const refresher = new ResumeMetadataRefresher({
-    sessionRegistry: registry, tmuxAdapter: { getPanePid: async () => 900 } as TmuxAdapter,
-    listProcesses: () => [{ pid: 900, ppid: 1, command: "bash" }, { pid: 901, ppid: 900, command: "codex", startedAt: identity }],
+    sessionRegistry: registry, tmuxAdapter: { getPanePid: async () => reason === "no_pane_pid" ? null : 900 } as TmuxAdapter,
+    listProcesses: () => reason === "no_codex_descendant" ? [] : [{ pid: 900, ppid: 1, command: "bash" }, { pid: 901, ppid: 900, command: "codex", startedAt: identity }],
     codexHome, homeDir: home, log: line => lines.push(line), sleep: async () => {},
   });
   return { add, lines, registry, refresher, logsPath };
@@ -106,11 +106,9 @@ describe("S11 Codex capture diagnostics and retry", () => {
     expect(await capture).toBeUndefined();
   });
   it.each(["no_pane_pid", "no_codex_descendant", "no_cli_thread", "sqlite_unreadable"])("reports %s without raw exception data", async reason => {
-    const f = fixture();
+    const f = fixture(reason);
     if (reason === "no_cli_thread") f.add(token, "exec");
     if (reason === "sqlite_unreadable") fs.writeFileSync(f.logsPath, "not sqlite");
-    if (reason === "no_pane_pid") (f.refresher as any).tmuxAdapter.getPanePid = async () => null;
-    if (reason === "no_codex_descendant") (f.refresher as any).listProcesses = () => [];
     expect(await f.refresher.captureCodexThreadId(session.sessionName, { attempts: 1 })).toBeUndefined();
     expect(f.lines).toEqual([`[resume-capture] codex@rig: ${reason}`]);
   });
