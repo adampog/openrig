@@ -295,7 +295,7 @@ describe("rig start (OPR.0.3.4.1)", () => {
     expect(parsed.previewErrors).toBeUndefined();
     expect(parsed.warnings).toEqual([{
       rigId: "rig-unreadable", rigName: "unreadable", code: "seat_status_unreadable",
-      message: "could not read its seat statuses, so --last restored it as if it had been running",
+      message: "selected for restore because its seat statuses could not be read",
     }]);
     expect(parsed.keptDown).toEqual([]);
 
@@ -304,7 +304,7 @@ describe("rig start (OPR.0.3.4.1)", () => {
     expect(human.exitCode).toBeUndefined();
     expect(appliedRigIds().sort()).toEqual(["rig-crashed", "rig-unreadable"]);
     const output = human.logs.join("\n");
-    expect(output).toContain("  unreadable: could not read its seat statuses, so --last restored it as if it had been running");
+    expect(output).toContain("  unreadable: selected for restore because its seat statuses could not be read");
     expect(output).not.toContain("crashed: could not read");
   });
 
@@ -323,7 +323,7 @@ describe("rig start (OPR.0.3.4.1)", () => {
     const { logs, exitCode } = await runStart("--last");
     expect(appliedRigIds()).toEqual(["rig-crashed"]);
     expect(exitCode).toBeUndefined();
-    expect(logs.join("\n")).toContain(`  ${rig.name}: taken down with rig down, so --last leaves it down. Bring it back: rig start --rigs ${rig.name}`);
+    expect(logs.join("\n")).toContain(`  ${rig.name}: stopped on purpose (with rig down or rig seat stop), so --last leaves it down. Bring it back: rig start --rigs ${rig.name}`);
 
     upBodies = [];
     const json = await runStart("--last", "--json");
@@ -341,7 +341,7 @@ describe("rig start (OPR.0.3.4.1)", () => {
     expect(appliedRigIds()).toEqual([]);
     expect(exitCode).toBeUndefined();
     const output = logs.join("\n");
-    expect(output).toContain("  downed: taken down with rig down, so --last leaves it down. Bring it back: rig start --rigs downed");
+    expect(output).toContain("  downed: stopped on purpose (with rig down or rig seat stop), so --last leaves it down. Bring it back: rig start --rigs downed");
     expect(output).toContain("No rigs selected for restore.");
     expect(output.indexOf("downed: taken down")).toBeLessThan(output.indexOf("No rigs selected"));
 

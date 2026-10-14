@@ -182,7 +182,7 @@ export function startCommand(depsOverride?: StartDeps): Command {
     .addHelpText("after", `
 Examples:
   rig start                         Interactive: daemon + kernel + pick-and-restore
-  rig start --last                  Headless: restore everything that was running, except rigs taken down with rig down
+  rig start --last                  Headless: restore everything that was running, except rigs stopped on purpose
   rig start --all                   Headless: restore all rigs with restore-usable snapshots
   rig start --rigs prod-rig dev-rig Headless: restore only the named rigs
 `);
@@ -190,7 +190,7 @@ Examples:
     depsOverride ?? { lifecycleDeps: realDeps(), clientFactory: (url: string) => new DaemonClient(url) };
 
   cmd
-    .option("--last", "Headless: restore all rigs that were last running; a rig taken down with rig down stays down (zero prompts)")
+    .option("--last", "Headless: restore all rigs that were last running; a rig stopped on purpose (with rig down or rig seat stop) stays down (zero prompts)")
     .option("--all", "Headless: restore all rigs with restore-usable snapshots (zero prompts)")
     .option("--rigs <names...>", "Headless: restore only the named rigs (zero prompts)")
     .option("--json", "JSON output for agents")
@@ -405,12 +405,12 @@ Examples:
       } else if (opts.last) {
         selectedCandidates = candidates.filter((c) => c.lastStop !== "down");
         for (const c of candidates.filter((x) => x.lastStop === "unknown")) {
-          const message = "could not read its seat statuses, so --last restored it as if it had been running";
+          const message = "selected for restore because its seat statuses could not be read";
           warnings.push({ rigId: c.rigId, rigName: c.rigName, code: "seat_status_unreadable", message });
           if (!opts.json) console.error(`  ${c.rigName}: ${message}`);
         }
         if (!opts.json) {
-          for (const c of keptDown) console.log(`  ${c.rigName}: taken down with rig down, so --last leaves it down. Bring it back: ${restoreCommand(c)}`);
+          for (const c of keptDown) console.log(`  ${c.rigName}: stopped on purpose (with rig down or rig seat stop), so --last leaves it down. Bring it back: ${restoreCommand(c)}`);
         }
       } else if (opts.rigs) {
         selectedCandidates = candidates.filter((c) => opts.rigs!.includes(c.rigName));
