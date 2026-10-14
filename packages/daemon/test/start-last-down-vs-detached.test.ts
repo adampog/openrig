@@ -1,6 +1,7 @@
-// S4-start-last-respects-down — the seat status `rig start --last` reads to tell a rig that was
-// taken down from one that was running when the daemon stopped. Both project the same rig-level
-// lifecycle, so the CLI reads the node inventory's sessionStatus (GET /api/rigs/:rigId/nodes).
+// S4-start-last-respects-down — the per-seat difference between a rig taken down with `rig down`
+// and one whose tmux sessions were lost (the boot reconciler marks each session detached). Both
+// project the same rig-level lifecycle, so `rig start --last` reads the seats from
+// GET /api/rigs/:rigId/nodes (intentionallyStopped, recorded by `rig down` since #1254).
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type Database from "better-sqlite3";
 import { createDb } from "../src/db/connection.js";
@@ -16,7 +17,7 @@ import { deriveRigLifecycleState } from "../src/domain/ps-projection.js";
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
 import type { SnapshotCapture } from "../src/domain/snapshot-capture.js";
 
-// Every tmux session is gone: what a `rig down` kill and a host reboot both leave behind.
+// Every tmux session is gone: what a `rig down` kill and lost tmux sessions both leave behind.
 function goneTmux(): TmuxAdapter {
   return {
     killSession: vi.fn(async () => ({ ok: true })),
@@ -25,7 +26,7 @@ function goneTmux(): TmuxAdapter {
   } as unknown as TmuxAdapter;
 }
 
-describe("rig down leaves seats exited; a daemon stop leaves them detached", () => {
+describe("rig down leaves seats exited; when tmux is lost, the boot reconciler marks them detached", () => {
   let db: Database.Database;
   let rigRepo: RigRepository;
   let sessionRegistry: SessionRegistry;

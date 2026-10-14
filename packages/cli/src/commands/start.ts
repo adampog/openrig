@@ -58,29 +58,33 @@ export interface StartCandidate {
   nodeCount: number;
   lastActivity: string | null;
   preview: PlanPreviewResponse | null;
-  /** What the seats say about the last daemon stop; `--last` restores only `was_running`. */
-  lastStop: LastStopState;
+  /** What the seats say about the last stop; read only under `--last`, where `down` is kept down. */
+  lastStop: LastStopState | null;
 }
 
 /**
- * `was_running`: at least one seat's latest session is neither exited nor absent.
- * `down`: every seat is exited or was never launched (`rig down`, or each seat stopped).
+ * `down`: at least one seat was launched and every launched seat carries the recorded stop
+ * intent (`intentionallyStopped`, set by `rig down` and `rig seat stop`).
+ * `was_running`: anything else, including a plain `exited` without the intent, a seat the boot
+ * reconciler marked `detached` when tmux was lost, and a daemon that does not report the intent.
  * `unknown`: the seat statuses could not be read.
  */
 export type LastStopState = "was_running" | "down" | "unknown";
 
-// `rig down` and `rig seat stop` leave a seat's latest session `exited`. A daemon stop, crash or
-// reboot leaves it `detached` (the boot reconciler never rewrites `exited`). The rig-level
-// lifecycleState folds both into stopped/recoverable, so read the per-seat session status.
 export function lastStopState(nodes: unknown): LastStopState {
   if (!Array.isArray(nodes)) return "unknown";
-  let wasRunning = false;
+  let launched = 0;
+  let allStoppedOnPurpose = true;
   for (const node of nodes) {
-    const status = node && typeof node === "object" ? (node as { sessionStatus?: unknown }).sessionStatus : undefined;
-    if (status !== null && typeof status !== "string") return "unknown";
-    if (status !== null && status !== "exited") wasRunning = true;
+    if (!node || typeof node !== "object" || !("sessionStatus" in node)) return "unknown";
+    const { sessionStatus, intentionallyStopped } = node as { sessionStatus: unknown; intentionallyStopped?: unknown };
+    if (sessionStatus !== null && typeof sessionStatus !== "string") return "unknown";
+    if (intentionallyStopped !== undefined && typeof intentionallyStopped !== "boolean") return "unknown";
+    if (sessionStatus === null) continue; // never launched: neutral
+    launched++;
+    if (intentionallyStopped !== true) allStoppedOnPurpose = false;
   }
-  return wasRunning ? "was_running" : "down";
+  return launched > 0 && allStoppedOnPurpose ? "down" : "was_running";
 }
 
 /** Default interactive [y/N] prompt (same shape as up.ts, reused for the TTY path). */
@@ -178,7 +182,7 @@ export function startCommand(depsOverride?: StartDeps): Command {
     .addHelpText("after", `
 Examples:
   rig start                         Interactive: daemon + kernel + pick-and-restore
-  rig start --last                  Headless: restore everything that was running
+  rig start --last                  Headless: restore everything that was running, except rigs taken down with rig down
   rig start --all                   Headless: restore all rigs with restore-usable snapshots
   rig start --rigs prod-rig dev-rig Headless: restore only the named rigs
 `);
@@ -186,7 +190,7 @@ Examples:
     depsOverride ?? { lifecycleDeps: realDeps(), clientFactory: (url: string) => new DaemonClient(url) };
 
   cmd
-    .option("--last", "Headless: restore the rigs that were running when the daemon last stopped; a rig taken down with rig down stays down (zero prompts)")
+    .option("--last", "Headless: restore all rigs that were last running; a rig taken down with rig down stays down (zero prompts)")
     .option("--all", "Headless: restore all rigs with restore-usable snapshots (zero prompts)")
     .option("--rigs <names...>", "Headless: restore only the named rigs (zero prompts)")
     .option("--json", "JSON output for agents")
@@ -312,6 +316,10 @@ Examples:
       // Guard BLOCKING bfed4ce3: track preview errors so they are not collapsed
       // into a clean empty-candidate result.
       const previewErrors: Array<{ rigId: string; rigName: string; code: string; message: string }> = [];
+      // Not errors: the run still succeeds. Only --last adds them (seat_status_unreadable).
+      const warnings: Array<{ rigId: string; rigName: string; code: string; message: string }> = [];
+      // --all wins over --last; only --last reads the seats.
+      const lastOnly = Boolean(opts.last && !opts.all);
       for (const rig of allSummaries) {
         if (rig.name === "kernel") continue;
         const lifecycleState = rig.restoreLifecycleState ?? rig.lifecycleState;
@@ -333,11 +341,14 @@ Examples:
               lastActivity = dates.length > 0 ? dates[dates.length - 1]! : null;
             } catch { /* degrade: lastActivity stays null */ }
 
-            let lastStop: LastStopState = "unknown";
-            try {
-              const nodesRes = await client.get<unknown>(`/api/rigs/${encodeURIComponent(rig.id)}/nodes`);
-              if (nodesRes.status === 200) lastStop = lastStopState(nodesRes.data);
-            } catch { /* lastStop stays unknown; --last reports it and does not restore the rig */ }
+            let lastStop: LastStopState | null = null;
+            if (lastOnly) {
+              lastStop = "unknown";
+              try {
+                const nodesRes = await client.get<unknown>(`/api/rigs/${encodeURIComponent(rig.id)}/nodes`);
+                if (nodesRes.status === 200) lastStop = lastStopState(nodesRes.data);
+              } catch { /* lastStop stays unknown; --last restores the rig with a warning */ }
+            }
 
             candidates.push({
               rigId: rig.id,
@@ -368,6 +379,7 @@ Examples:
           console.log(JSON.stringify({
             status: previewErrors.length > 0 ? "started_with_errors" : "started",
             candidates: [],
+            keptDown: lastOnly ? [] : undefined,
             restoredRigs: [],
             previewErrors: previewErrors.length > 0 ? previewErrors : undefined,
           }));
@@ -384,22 +396,21 @@ Examples:
 
       // ---- PHASE 4: selection (id-grounded, rev1 BLOCKING b4c6ada4) ----
       let selectedCandidates: StartCandidate[];
-      // --last restores what was running at the last daemon stop. A rig that was taken down on
-      // purpose stays down, and so does one whose seats could not be read (reported as an error).
-      // --all and --rigs still restore either.
-      const lastOnly = Boolean(opts.last && !opts.all);
+      // --last keeps down a rig whose every launched seat carries the recorded stop intent, and
+      // names the command that brings it back. Any other rig, including one whose seats could not
+      // be read (a warning, not an error), is restored as --all would. --all and --rigs restore all.
       const keptDown = lastOnly ? candidates.filter((c) => c.lastStop === "down") : [];
       if (opts.all) {
         selectedCandidates = [...candidates];
       } else if (opts.last) {
-        selectedCandidates = candidates.filter((c) => c.lastStop === "was_running");
+        selectedCandidates = candidates.filter((c) => c.lastStop !== "down");
         for (const c of candidates.filter((x) => x.lastStop === "unknown")) {
-          const message = `could not read its seat statuses, so --last did not restore it (rig start --rigs ${c.rigName} restores it)`;
-          previewErrors.push({ rigId: c.rigId, rigName: c.rigName, code: "seat_status_unavailable", message });
+          const message = "could not read its seat statuses, so --last restored it as if it had been running";
+          warnings.push({ rigId: c.rigId, rigName: c.rigName, code: "seat_status_unreadable", message });
           if (!opts.json) console.error(`  ${c.rigName}: ${message}`);
         }
         if (!opts.json) {
-          for (const c of keptDown) console.log(`  ${c.rigName}: was taken down, so --last leaves it down (rig start --rigs ${c.rigName} restores it)`);
+          for (const c of keptDown) console.log(`  ${c.rigName}: taken down with rig down, so --last leaves it down. Bring it back: ${restoreCommand(c)}`);
         }
       } else if (opts.rigs) {
         selectedCandidates = candidates.filter((c) => opts.rigs!.includes(c.rigName));
@@ -449,17 +460,17 @@ Examples:
 
       if (selectedCandidates.length === 0) {
         if (!opts.json) console.log("No rigs selected for restore.");
-        else if (opts.last) {
+        else if (lastOnly) {
           console.log(JSON.stringify({
             status: previewErrors.length > 0 ? "started_with_errors" : "started",
             uiUrl,
             candidates: candidates.map((c) => ({ rigName: c.rigName, lifecycleState: c.lifecycleState })),
-            keptDown: keptDown.map((c) => c.rigName),
+            keptDown: keptDown.map(keptDownEntry),
             restoredRigs: [],
             previewErrors: previewErrors.length > 0 ? previewErrors : undefined,
           }));
         }
-        if (opts.last && previewErrors.length > 0) process.exitCode = 1;
+        if (lastOnly && previewErrors.length > 0) process.exitCode = 1;
         return;
       }
 
@@ -591,9 +602,10 @@ Examples:
           status: previewErrors.length > 0 ? "started_with_errors" : "started",
           uiUrl,
           candidates: candidates.map((c) => ({ rigName: c.rigName, lifecycleState: c.lifecycleState })),
-          keptDown: keptDown.length > 0 ? keptDown.map((c) => c.rigName) : undefined,
+          keptDown: lastOnly ? keptDown.map(keptDownEntry) : undefined,
           restoredRigs: results,
           previewErrors: previewErrors.length > 0 ? previewErrors : undefined,
+          warnings: warnings.length > 0 ? warnings : undefined,
         }));
       }
 
@@ -608,6 +620,14 @@ Examples:
     });
 
   return cmd;
+}
+
+function restoreCommand(c: StartCandidate): string {
+  return `rig start --rigs ${c.rigName}`;
+}
+
+function keptDownEntry(c: StartCandidate): { rigName: string; restoreCommand: string } {
+  return { rigName: c.rigName, restoreCommand: restoreCommand(c) };
 }
 
 function summarizeReadiness(c: StartCandidate): string {
