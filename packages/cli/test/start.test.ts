@@ -343,7 +343,7 @@ describe("rig start (OPR.0.3.4.1)", () => {
     const output = logs.join("\n");
     expect(output).toContain("  downed: stopped on purpose (with rig down or rig seat stop), so --last leaves it down. Bring it back: rig start --rigs downed");
     expect(output).toContain("No rigs selected for restore.");
-    expect(output.indexOf("downed: taken down")).toBeLessThan(output.indexOf("No rigs selected"));
+    expect(output.indexOf("downed: stopped on purpose")).toBeLessThan(output.indexOf("No rigs selected"));
 
     const json = await runStart("--last", "--json");
     expect(json.exitCode).toBeUndefined();
