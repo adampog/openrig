@@ -362,8 +362,8 @@ rig start --json             # JSON output for agents
 ```
 
 `rig start --last` keeps down a rig that was stopped on purpose (`rig down` or `rig seat stop`).
-Bring it back with `rig start --rigs <rig>`. A rig whose stop intent cannot be read is still
-attempted as before, with a warning.
+Bring it back with `rig start --rigs <rig>`. A rig whose seat statuses can't be read is still
+attempted, with a warning (`seat_status_unreadable`).
 
 Framing: `rig start` is the RECOVERY entry point, not the getting-started
 hero. The fresh-user boot hero remains `rig up <team>` (typically
