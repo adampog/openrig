@@ -152,7 +152,14 @@ Root: `rig`; declared option: `-V, --version`.
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig status` | — | — |
+| `rig status` | — | `--json` |
+
+`rig status --json` prints one object: `daemon`, `kernel`, `workspaceRoot`, `rigs` and `cmux`.
+`daemon.reachable` has three values. `true`: the daemon answered its health probe (it may still
+report `healthy: false`, and may carry a `reason` and `eventLoop` evidence). `false`: positively down
+(`state` is `stopped` or `stale`). `null`: not confirmed (`state` is `unverified`, or `running`
+with `reason: "unresponsive"` because `/healthz` did not answer). When `reachable` is not `true`,
+the sections that were not read are `null`.
 
 ### snapshot
 
@@ -636,11 +643,11 @@ Root: `rig`; declared option: `-V, --version`.
 | `rig policy permissions list` | — | `--spec <path>`<br>`--json` |
 | `rig policy permissions show <nameOrRef>` | — | `--spec <path>`<br>`--json` |
 | `rig policy permissions current` | — | `--spec <path>` **required**<br>`--json` |
-| `rig policy permissions apply <name>` | — | `--spec <path>` **required**<br>`--json` |
+| `rig policy permissions apply <name>` | — | `--spec <path>`<br>`--seat <seat>`<br>`--reason <text>`<br>`--operator <address>`<br>`--json` |
 | `rig policy list` | — | `--spec <path>`<br>`--json` |
 | `rig policy show <nameOrRef>` | — | `--spec <path>`<br>`--json` |
 | `rig policy current` | — | `--spec <path>` **required**<br>`--json` |
-| `rig policy apply <name>` | — | `--spec <path>` **required**<br>`--json` |
+| `rig policy apply <name>` | — | `--spec <path>`<br>`--seat <seat>`<br>`--reason <text>`<br>`--operator <address>`<br>`--json` |
 
 ### whoami
 
@@ -794,7 +801,7 @@ Root: `rig`; declared option: `-V, --version`.
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig launch <rigId> [nodeRef]` | — | `--seats <ids>`<br>`--hold-reason <reason>`<br>`--snapshot-id <id>`<br>`--retry-startup-from <member-file>`<br>`--rig-root <path>`<br>`--plan`<br>`--json`<br>`--host <id>` |
+| `rig launch <rig> [nodeRef]` | — | `--seats <ids>`<br>`--hold-reason <reason>`<br>`--snapshot-id <id>`<br>`--retry-startup-from <member-file>`<br>`--rig-root <path>`<br>`--plan`<br>`--json`<br>`--host <id>` |
 
 ### remove
 

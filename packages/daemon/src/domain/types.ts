@@ -34,6 +34,8 @@ export interface Node {
   runtime: string | null;
   model: string | null;
   effort?: string | null;
+  /** OPR.0.7.0.7: the seat's explicit effort choice (rig seat set-effort); null = none. */
+  effortChoice?: string | null;
   codexConfigProfile?: string | null;
   /** OPR.0.4.8.3 Seam B: attached permission_policy REF (builtin:<name> or spec-relative custom
    *  path), or null when none is attached (= the floor). */
@@ -131,7 +133,9 @@ export type RigEvent =
   // S5 (OPR.0.5.4.7) — seat-lifecycle audit trail: the three supported seat verbs each persist
   // their mutation with actor + reason in the same transaction as the mutation itself.
   | { type: "node.model_changed"; rigId: string; nodeId: string; logicalId: string; from: string | null; to: string; reason: string; operator: string | null }
+  | { type: "node.effort_changed"; rigId: string; nodeId: string; logicalId: string; from: string | null; to: string | null; reason: string; operator: string | null }
   | { type: "node.permissions_changed"; rigId: string; nodeId: string; from: unknown; to: unknown; actor: string; reason: string; source: "seat_selection"; effect: "future_launches_only" }
+  | { type: "node.policy_changed"; rigId: string; nodeId: string; logicalId: string; from: string | null; to: string; launchPosture: "floor" | "full_bypass" | "auto"; reason: string; operator: string }
   | { type: "session.stopped"; rigId: string; nodeId: string; sessionName: string; reason: string; operator: string | null }
   | { type: "session.cleaned"; rigId: string; nodeId: string; sessionName: string | null; reason: string; operator: string | null; actions: { sessionsExited: string[]; bindingCleared: boolean } }
   | { type: "node.launched"; rigId: string; nodeId: string; logicalId: string; sessionName: string }
@@ -178,7 +182,7 @@ export type RigEvent =
   // token value is intentionally omitted; this is observability, NOT a
   // secret-boundary control — resume tokens are not treated as secret per the
   // 2026-07-02 founder ruling).
-  | { type: "session.resume_token_captured"; rigId: string; nodeId: string; sessionName: string; sessionId: string; runtime: string; outcome: "captured" | "preserved" | "skipped"; resumeType?: string; provenance?: "adoption"; reason?: "missing_sidecar" | "parse_error" | "probe_timeout" | "invalid_token" | "stale_sidecar" | "higher_rank_present"; redacted: true }
+  | { type: "session.resume_token_captured"; rigId: string; nodeId: string; sessionName: string; sessionId: string; runtime: string; outcome: "captured" | "preserved" | "skipped"; resumeType?: string; provenance?: "adoption"; reason?: "missing_sidecar" | "parse_error" | "probe_timeout" | "process_unreadable" | "invalid_token" | "stale_sidecar" | "higher_rank_present"; redacted: true }
   | { type: "seat.attention_cleared"; rigId: string; nodeId: string; sessionName: string; from: string; to: "ready"; clearedBy: "evidence" | "operator_attestation"; evidence?: { kind: string; state?: string; reason?: string }; reason?: string; previousError: string | null }
   | { type: "rig.imported"; rigId: string; specName: string; specVersion: string }
   // Package events (cross-rig, no rigId)
@@ -219,8 +223,8 @@ export type RigEvent =
   | { type: "pod.created"; rigId: string; podId: string; namespace: string; label: string }
   | { type: "pod.deleted"; rigId: string; podId: string }
   | { type: "node.startup_pending"; rigId: string; nodeId: string; startupProof?: StartupProofSelection }
-  | { type: "node.startup_ready"; rigId: string; nodeId: string; submission?: { status: "unverified" | "staged"; reasons: string[]; warning?: string; diagnostics?: StartupSubmissionDiagnostic[] } }
-  | { type: "node.startup_failed"; rigId: string; nodeId: string; error: string; sessionId?: string; freshContextPending?: boolean; submissionDiagnostics?: StartupSubmissionDiagnostic[] }
+  | { type: "node.startup_ready"; rigId: string; nodeId: string; previousStatus?: "failed" | "attention_required"; submission?: { status: "unverified" | "staged"; reasons: string[]; warning?: string; diagnostics?: StartupSubmissionDiagnostic[] } }
+  | { type: "node.startup_failed"; rigId: string; nodeId: string; error: string; sessionId?: string; freshContextPending?: boolean; submissionDiagnostics?: StartupSubmissionDiagnostic[]; stage?: StartupFailureStage; hasPendingWork?: boolean; requestedResumeToken?: string | null; requestedResumeType?: string | null }
   // OPR.0.4.3.06 — startup proof (challenge-verified orientation). Append-only.
   // `node.startup_challenged` freezes this launch's challenge ground truth
   // (challengeId + contractHash; the expected answer is recomputed, never
@@ -530,6 +534,8 @@ export type AgentActivityEvidenceSource =
   | "session_registry";
 
 export interface AgentActivity {
+  turnId?: string | null;
+
   state: AgentActivityState;
   reason: string;
   evidenceSource: AgentActivityEvidenceSource;
@@ -897,6 +903,22 @@ export interface StartupBlock {
   files: StartupFile[];
   actions: StartupAction[];
 }
+
+export type StartupFailureStage =
+  | "permission_selection"
+  | "proof_selection"
+  | "projection"
+  | "pre_launch_files"
+  | "persistence"
+  | "harness_launch"
+  | "readiness_check"
+  | "initial_prompt"
+  | "restore_preload"
+  | "post_launch_files"
+  | "after_files"
+  | "after_ready"
+  | "post_delivery_readiness"
+  | "identity_verification";
 
 export interface LifecycleDefaults {
   executionMode: "interactive_resident";

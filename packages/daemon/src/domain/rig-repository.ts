@@ -312,6 +312,16 @@ export class RigRepository {
     ).run(provenance.origin, provenance.resolvedTarget, provenance.declaringDir, provenance.launchPosture, nodeId);
   }
 
+  /** Re-point an EXISTING seat's own permission_policy REF (`rig policy apply --seat`); the caller
+   *  writes its resolved provenance through setNodePolicyProvenance in the same transaction. Restore,
+   *  resume and launches that read the stored seat use that provenance. A later launch from a spec that
+   *  declares a policy rewrites the provenance but not this ref, so the two can then differ: this ref
+   *  is what `rig export` emits, not necessarily the policy the seat launched with. */
+  setNodePermissionPolicy(nodeId: string, permissionPolicy: string): void {
+    if (!this.hasNodeColumn("permission_policy")) return;
+    this.db.prepare("UPDATE nodes SET permission_policy = ? WHERE id = ?").run(permissionPolicy, nodeId);
+  }
+
   /** Seam B (R2) — read a node's persisted policy provenance; null when none attached
    *  (or pre-057 DB). Restore consumers re-derive posture from this without the spec. */
   getNodePolicyProvenance(nodeId: string): {
@@ -481,6 +491,14 @@ export class RigRepository {
       .prepare("UPDATE nodes SET effort = ? WHERE id = ?")
       .run(effort, nodeId);
     return result.changes > 0;
+  }
+
+  /** OPR.0.7.0.7: write or clear (null) a seat's explicit effort choice. Returns false when
+   *  the column isn't available or no row matched, so a caller never reports a change from it. */
+  setNodeEffortChoice(nodeId: string, choice: string | null): boolean {
+    if (!this.hasNodeColumn("effort_choice")) return false;
+    return this.db.prepare("UPDATE nodes SET effort_choice = ? WHERE id = ?")
+      .run(choice, nodeId).changes > 0;
   }
 
   clearNodeEffort(nodeId: string): boolean {
@@ -733,6 +751,7 @@ export class RigRepository {
       runtime: row.runtime,
       model: row.model,
       effort: row.effort ?? null,
+      effortChoice: row.effort_choice ?? null,
       codexConfigProfile: row.codex_config_profile ?? null,
       permissionPolicy: row.permission_policy ?? null,
       cwd: row.cwd,
@@ -822,6 +841,7 @@ interface NodeRow {
   runtime: string | null;
   model: string | null;
   effort?: string | null;
+  effort_choice?: string | null;
   codex_config_profile?: string | null;
   permission_policy?: string | null;
   cwd: string | null;

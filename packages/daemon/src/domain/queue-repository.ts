@@ -3099,6 +3099,17 @@ export class QueueRepository {
     });
   }
 
+  /** The transition that closed a row: the first of the trailing run in its current closed state.
+   *  Later notes and delivery receipts on a closed row repeat that state, so the latest transition
+   *  is not the close. Null while the row is still active (pending, in-progress, blocked). */
+  closingTransition(qitemId: string, currentState: string): ReturnType<QueueTransitionLog["listForQitem"]>[number] | null {
+    if (isBlockerLive(currentState)) return null;
+    const transitions = this.transitionLog.listForQitem(qitemId);
+    let closing = null;
+    for (let i = transitions.length - 1; i >= 0 && transitions[i]!.state === currentState; i--) closing = transitions[i]!;
+    return closing;
+  }
+
   /** Read-only scope-aware RECENT projection. Normalization and its hard cap
    * live with the append-only transition log; the repository owns the public
    * queue-domain door. */
@@ -3318,6 +3329,17 @@ export class QueueRepository {
   private replyToFallbackFor(qitemId: string): string | null {
     const choice = this.replyToChoiceFor(qitemId);
     return choice?.kind === "fallback" ? describeReplyToFallback(choice) : null;
+  }
+
+  /** The parked query's obligation face: open rows to one destination, newest first, without the per-row
+   *  projections list() derives (pickup, waiting view, delivery ledger), which this read never uses. */
+  listOpenObligations(destinationSession: string, limit: number): Array<{ qitemId: string; state: "pending" | "in-progress" | "blocked"; summary: string | null }> {
+    const rows = this.db.prepare(
+      `SELECT qitem_id, state${this.hasSummaryColumn ? ", summary" : ""} FROM queue_items
+        WHERE destination_session = ? AND state IN ('pending', 'in-progress', 'blocked')
+        ORDER BY ts_created DESC LIMIT ?`,
+    ).all(destinationSession, limit) as Array<{ qitem_id: string; state: "pending" | "in-progress" | "blocked"; summary?: string | null }>;
+    return rows.map((r) => ({ qitemId: r.qitem_id, state: r.state, summary: r.summary ?? null }));
   }
 
   list(opts: QueueListOptions & { compact: true }): CompactQueueItem[];
