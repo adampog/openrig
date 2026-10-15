@@ -44,7 +44,6 @@ interface ResumeMetadataRefresherDeps {
   homeDir?: string;
   codexHome?: string;
   log?: (line: string) => void;
-  now?: () => number;
   // OPR.0.4.3.20 FR-4 — the Claude status-line sidecar reader, for null-fill of a
   // Claude session's resume token from live state during snapshot refresh.
   // Optional + structurally typed (older wirings/tests omit it → Claude null-fill
@@ -61,9 +60,8 @@ interface ResumeMetadataRefresherDeps {
 
 export class ResumeMetadataRefresher {
   private readonly stopped = new AbortController();
-  private readonly captures = new Map<string, { sessionId: string; reasons: Set<string>; firstAttemptAt: number; laterTicks: number }>();
+  private readonly captures = new Map<string, { sessionId: string; reasons: Set<string> }>();
   private readonly log: (line: string) => void;
-  private readonly now: () => number;
   private sessionRegistry: SessionRegistry;
   private tmuxAdapter: TmuxAdapter;
   private listProcesses: () => Array<{ pid: number; ppid: number; command: string }> | Promise<Array<{ pid: number; ppid: number; command: string }>>;
@@ -80,7 +78,6 @@ export class ResumeMetadataRefresher {
   constructor(deps: ResumeMetadataRefresherDeps) {
     this.sessionRegistry = deps.sessionRegistry;
     this.log = deps.log ?? console.log;
-    this.now = deps.now ?? Date.now;
     this.tmuxAdapter = deps.tmuxAdapter;
     this.listProcesses = deps.listProcesses ?? defaultListProcesses;
     this.resolveHomeDirByPid = deps.resolveHomeDirByPid ?? defaultResolveHomeDirByPid;
@@ -147,7 +144,6 @@ export class ResumeMetadataRefresher {
     for (const session of sessions) {
       if (this.stopped.signal.aborted) return;
       if (session.runtime === "codex") {
-        const captureState = this.captureState(session.sessionName, session.sessionId);
         const sessionCaptureOpts = { ...captureOpts, sessionId: session.sessionId };
         if (session.resumeToken) {
           // OPR.0.4.3.20 FR-6.1 — lightweight equal-value freshness RE-STAMP on the
@@ -168,10 +164,6 @@ export class ResumeMetadataRefresher {
           continue;
         }
 
-        // Keep discovery alive indefinitely, without a burst of probes for old null tokens.
-        // Present-token freshness reads above retain their existing cadence.
-        if (fillNullOnly && this.now() - captureState.firstAttemptAt >= 60_000
-          && ++captureState.laterTicks % 5 !== 0) continue;
         const threadId = await this.captureCodexThreadId(session.sessionName, sessionCaptureOpts);
         // A fork's pending id: only its own new conversation may fill it, never one an earlier
         // row (its parent or predecessor) holds; that stays honestly pending.
@@ -277,7 +269,7 @@ export class ResumeMetadataRefresher {
     const id = sessionId ?? this.sessionRegistry.findResumeContextByName?.(sessionTarget)?.sessionId ?? sessionTarget;
     let state = this.captures.get(sessionTarget);
     if (!state || state.sessionId !== id) {
-      state = { sessionId: id, reasons: new Set<string>(), firstAttemptAt: this.now(), laterTicks: 0 };
+      state = { sessionId: id, reasons: new Set<string>() };
       this.captures.set(sessionTarget, state);
     }
     return state;
@@ -347,9 +339,12 @@ export class ResumeMetadataRefresher {
       if (token) { report("captured"); return token; }
       report(ctrl.signal.aborted ? "probe_timeout" : reason, ctrl.signal.aborted ? undefined : count);
       return undefined;
-    } catch {
-      if (!this.stopped.signal.aborted) report("process_unreadable");
-      return undefined;
+    } catch (error) {
+      if (this.stopped.signal.aborted) return undefined;
+      // Report the redacted reason once, then let the failure reach the caller as it always did
+      // (teardown records "Resume metadata refresh failed"; adoption swallows it).
+      report("process_unreadable");
+      throw error;
     } finally {
       clearTimeout(timer);
       ctrl.signal.removeEventListener("abort", onAbort);

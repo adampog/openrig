@@ -65,13 +65,13 @@ describe("S11 Codex capture diagnostics and retry", () => {
     expect(f.lines.join("\n")).not.toContain(token.slice(0, 8));
     console.log(f.lines.join("\n"));
   });
-  it("S11-4: null discovery makes one attempt on every configured tick, with no time minimum", async () => {
-    let now = 0; const read = vi.fn(() => undefined);
+  it("S11-4: null discovery makes one attempt on every configured tick, with no tick-count or time minimum", async () => {
+    const read = vi.fn(() => undefined);
     const registry = { isForkClaimingHeldToken: () => false, updateResumeToken: vi.fn(), markResumeProbeResult: vi.fn() } as unknown as SessionRegistry;
     const refresher = new ResumeMetadataRefresher({ sessionRegistry: registry,
       tmuxAdapter: { getPanePid: async () => 900 } as TmuxAdapter,
       listProcesses: () => [{ pid: 901, ppid: 900, command: "codex" }],
-      readCodexThreadIdByPid: read, now: () => now, log: () => {}, sleep: async () => {},
+      readCodexThreadIdByPid: read, log: () => {}, sleep: async () => {},
     });
     // Right after an adoption attempt (full 8-try loop), the very next tick still attempts once.
     await refresher.captureCodexThreadId(session.sessionName);
@@ -81,11 +81,9 @@ describe("S11 Codex capture diagnostics and retry", () => {
     // A manual null-fill is the same path: one attempt each, at any spacing.
     await refresher.refresh([session], { fillNullOnly: true });
     expect(read).toHaveBeenCalledTimes(2);
-    for (const interval of [1_000, 15_000, 300_000]) {
-      read.mockClear();
-      for (let tick = 1; tick <= 30; tick++) { now += interval; await refresher.refresh([session], { fillNullOnly: true }); }
-      expect(read).toHaveBeenCalledTimes(30);
-    }
+    read.mockClear();
+    for (let tick = 1; tick <= 30; tick++) await refresher.refresh([session], { fillNullOnly: true });
+    expect(read).toHaveBeenCalledTimes(30);
     // Existing FR-6.1 freshness reads for present tokens remain unchanged.
     read.mockReturnValue(token);
     await refresher.refresh([{ ...session, resumeToken: token }], { fillNullOnly: true });
