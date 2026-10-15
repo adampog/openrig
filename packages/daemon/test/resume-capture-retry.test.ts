@@ -65,25 +65,67 @@ describe("S11 Codex capture diagnostics and retry", () => {
     expect(f.lines.join("\n")).not.toContain(token.slice(0, 8));
     console.log(f.lines.join("\n"));
   });
-  it("S11-4: null discovery retries every tick in its first minute, then every fifth tick indefinitely", async () => {
+  it("S11-4: null discovery makes one attempt on every configured tick, with no time minimum", async () => {
     let now = 0; const read = vi.fn(() => undefined);
     const registry = { isForkClaimingHeldToken: () => false, updateResumeToken: vi.fn(), markResumeProbeResult: vi.fn() } as unknown as SessionRegistry;
     const refresher = new ResumeMetadataRefresher({ sessionRegistry: registry,
       tmuxAdapter: { getPanePid: async () => 900 } as TmuxAdapter,
       listProcesses: () => [{ pid: 901, ppid: 900, command: "codex" }],
-      readCodexThreadIdByPid: read, now: () => now, log: () => {},
+      readCodexThreadIdByPid: read, now: () => now, log: () => {}, sleep: async () => {},
     });
-    for (let tick = 0; tick < 4; tick++) { now = tick * 15_000; await refresher.refresh([session], { fillNullOnly: true }); }
-    expect(read).toHaveBeenCalledTimes(4);
-    for (let tick = 1; tick <= 25; tick++) {
-      now = 60_000 + tick * 300_000;
-      await refresher.refresh([session], { fillNullOnly: true });
-      expect(read).toHaveBeenCalledTimes(4 + Math.floor(tick / 5));
+    // Right after an adoption attempt (full 8-try loop), the very next tick still attempts once.
+    await refresher.captureCodexThreadId(session.sessionName);
+    read.mockClear();
+    await refresher.refresh([session], { fillNullOnly: true });
+    expect(read).toHaveBeenCalledTimes(1);
+    // A manual null-fill is the same path: one attempt each, at any spacing.
+    await refresher.refresh([session], { fillNullOnly: true });
+    expect(read).toHaveBeenCalledTimes(2);
+    for (const interval of [1_000, 15_000, 300_000]) {
+      read.mockClear();
+      for (let tick = 1; tick <= 30; tick++) { now += interval; await refresher.refresh([session], { fillNullOnly: true }); }
+      expect(read).toHaveBeenCalledTimes(30);
     }
     // Existing FR-6.1 freshness reads for present tokens remain unchanged.
     read.mockReturnValue(token);
     await refresher.refresh([{ ...session, resumeToken: token }], { fillNullOnly: true });
     expect(registry.markResumeProbeResult).toHaveBeenCalledWith(session.sessionId, "resumable");
+  });
+  it("S11-6: a pending fork id is filled only by its own conversation, never one another row holds", async () => {
+    let held = true; const update = vi.fn(() => true);
+    const registry = { isForkClaimingHeldToken: () => held, updateResumeToken: update, markResumeProbeResult: vi.fn() } as unknown as SessionRegistry;
+    const refresher = new ResumeMetadataRefresher({ sessionRegistry: registry,
+      tmuxAdapter: { getPanePid: async () => 900 } as TmuxAdapter,
+      listProcesses: () => [{ pid: 901, ppid: 900, command: "codex" }],
+      readCodexThreadIdByPid: () => token, log: () => {},
+    });
+    await refresher.refresh([session], { fillNullOnly: true });
+    expect(update).not.toHaveBeenCalled();
+    held = false;
+    await refresher.refresh([session], { fillNullOnly: true });
+    expect(update).toHaveBeenCalledWith(session.sessionId, "codex_id", token, "scrape");
+  });
+  it("S11-7: a discovery failure is logged once without its text, then reaches the caller as on main", async () => {
+    const lines: string[] = [];
+    const refresher = new ResumeMetadataRefresher({ sessionRegistry: { isForkClaimingHeldToken: () => false } as unknown as SessionRegistry,
+      tmuxAdapter: { getPanePid: async () => 900 } as TmuxAdapter,
+      listProcesses: () => { throw new Error("ps exploded " + token); }, log: line => lines.push(line) });
+    await expect(refresher.refresh([session], { fillNullOnly: true })).rejects.toThrow("ps exploded");
+    expect(lines).toEqual(["[resume-capture] codex@rig: process_unreadable"]);
+    expect(lines.join("\n")).not.toContain("exploded");
+    expect(lines.join("\n")).not.toContain(token);
+  });
+  it("S11-8: a discovery failure while stopping neither logs it nor throws", async () => {
+    const lines: string[] = [];
+    let release!: () => void;
+    const refresher = new ResumeMetadataRefresher({ sessionRegistry: {} as SessionRegistry,
+      tmuxAdapter: { getPanePid: async () => 900 } as TmuxAdapter,
+      listProcesses: () => new Promise((_, reject) => { release = () => reject(new Error("late")); }), log: line => lines.push(line) });
+    const capture = refresher.captureCodexThreadId(session.sessionName);
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    refresher.stop(); release();
+    expect(await capture).toBeUndefined();
+    expect(lines).toEqual(["[resume-capture] codex@rig: shutdown"]);
   });
   it("S11-5: shutdown cancels an unresolved adoption read, with retry by a new refresher", async () => {
     const read = vi.fn(() => new Promise<string | undefined>(() => {}));
