@@ -31,7 +31,6 @@ const CMD = {
   restart: (id) => `rig seat launch ${id}@esp32-firmware-build --fresh --reason "<why>"`,
   remove: `rig remove "$RIG_ID" dev.<id>`,
   count: `rig ps --nodes --rig esp32-firmware-build --json | jq -r '.[] | select(.sessionStatus=="running") | .logicalId' | grep -cE "^(dev\\.(fable|codex|qwen|extra.*)|hw\\.expert)$"`,
-  startNoView: (pod, seat) => `rig add "$RIG_ID" ${pod} <(sed "s|WORKDIR|$PWD|" "$RIG_ROOT/bench/${seat}.yaml") --rig-root "$RIG_ROOT" --no-view`,
   queueDest: (id) => `rig queue list --destination ${id}@esp32-firmware-build --json`,
   queueSrc: (id) => `rig queue list --source ${id}@esp32-firmware-build --json`,
 };
@@ -123,7 +122,7 @@ try {
   console.log("authored four-seat plan:", corePlan.stdout.trim(), corePlan.stderr.trim());
   check("original four-seat definition plans without launching", corePlan.code === 0 && corePlan.json?.status === "planned" && (await psNodes()).length === 0);
 
-  for (const c of [CMD.rigId, CMD.start("<pod>", "<seat>"), CMD.startNoView("<pod>", "<seat>"), CMD.extra, CMD.stop("<id>"), CMD.restart("<id>"), CMD.remove, CMD.count, CMD.queueDest("<id>"), CMD.queueSrc("<id>")]) {
+  for (const c of [CMD.rigId, CMD.start("<pod>", "<seat>"), CMD.extra, CMD.stop("<id>"), CMD.restart("<id>"), CMD.remove, CMD.count, CMD.queueDest("<id>"), CMD.queueSrc("<id>")]) {
     check(`culture carries command: ${c.slice(0, 70)}`, culture.includes(c));
   }
   const up = await rig("up", join(rigDir, "rig.yaml"), "--cwd", planDir, "--json");
@@ -137,8 +136,8 @@ try {
   check("default builder receives implementer role", /# Role: Implementer/.test(await capture(`dev-firmware@${RIG_NAME}`)));
 
   for (const [pod, id, model] of bench) {
-    // One bench seat at a time; exercise the documented --no-view variant too.
-    const command = id === "codex" ? CMD.startNoView(pod, id) : CMD.start(pod, id);
+    // One bench seat at a time.
+    const command = CMD.start(pod, id);
     const added = await sh(command, cwdOf(`${pod}-${id}`));
     check(`culture command adds ${pod}.${id}`, added.code === 0, (added.stdout + added.stderr).trim().slice(0, 300));
     check(`${pod}.${id} receives culture`, agentsMd(`${pod}-${id}`).includes(`${RIG_NAME} culture`));
@@ -171,7 +170,7 @@ try {
   // Negative control pins why every bench fragment has its own culture startup entry.
   const bare = join(scaffold.root, "bare.yaml");
   writeFileSync(bare, stringify({ member: { id: "bare", agent_ref: "local:../../packages/daemon/specs/agents/research/analyst", runtime: "stub", profile: "default", cwd: cwdOf("hw-bare") } }));
-  const control = await rigJson("add", rigId, "hw", bare, "--rig-root", rigDir, "--no-view");
+  const control = await rigJson("add", rigId, "hw", bare, "--rig-root", rigDir);
   check("control without startup lacks rig culture", control.code === 0 && !agentsMd("hw-bare").includes(`${RIG_NAME} culture`) && agentsMd("hw-bare").includes("OpenRig default culture"));
   await rig("remove", rigId, "hw.bare");
   const extra = await sh(CMD.extra.replace("<model>", "sonnet").replace("<id>", "extra1"), cwdOf("dev-extra1"));

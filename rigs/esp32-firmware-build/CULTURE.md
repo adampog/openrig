@@ -1,3 +1,18 @@
+<!-- BEGIN TWO-SEAT-OVERRIDE-20261019 -->
+# Two-seat restore — 2026-10-19
+
+Alan authorized this rig to run exactly two seats. This dated instruction supersedes legacy multi-seat, bench, Jev routing and QA-only role text for these seats.
+
+- orch.lead: Claude Code, model opus; owns planning, scope and independent review/checks of the exact builder candidate.
+- dev.qa: existing Codex conversation retained under its stable name; now owns implementation, builds and repairs. It does not approve its own work.
+- Use seat-local sub-agents for parallel, exploratory and throwaway work. Do not add persistent seats.
+- Keep the existing project/hardware boundaries. Resuming the rig authorizes checking the queue/docs, not new hardware, flash or publish work.
+
+On resume run `rig whoami --json`, then read this note, `docs/seat-history/README.md` and current job/mission stop notes. Retired histories are uncommitted under `docs/seat-history/retired-20261019/`. Preserve original native conversations and handover gaps honestly.
+
+Hardware, flashing, serial/device access, radios, publishing and pushes require Alan's explicit authorization for the specific action.
+<!-- END TWO-SEAT-OVERRIDE-20261019 -->
+
 # esp32-firmware-build culture
 
 This team builds and tests the human's own adampog/firmware fork of Bruce, C++/PlatformIO ESP32 firmware. The human owns the chips and authorized personal research and testing at home. The job is compiling board environments and running the repository's own native/unit tests. Agents do not operate radios or author new offensive capability on their own. The human owns intent, hardware actions and judgment.
@@ -89,12 +104,6 @@ First add: use pod dev with file fable, codex or qwen; pod hw with file expert. 
 
 ```sh
 rig add "$RIG_ID" <pod> <(sed "s|WORKDIR|$PWD|" "$RIG_ROOT/bench/<seat>.yaml") --rig-root "$RIG_ROOT"
-```
-
-A successful add joins only the new seat to an already open exact-label rig wall, in a fresh tab without changing focus. With no wall, it opens nothing. Append --no-view when managing views yourself; it suppresses all Herdr access, including probing:
-
-```sh
-rig add "$RIG_ID" <pod> <(sed "s|WORKDIR|$PWD|" "$RIG_ROOT/bench/<seat>.yaml") --rig-root "$RIG_ROOT" --no-view
 ```
 
 Extra builder (chosen model opus, sonnet or a full model ID):

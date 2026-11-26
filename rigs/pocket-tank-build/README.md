@@ -50,7 +50,7 @@ node --import tsx rigs/pocket-tank-build/proof/bench-proof.mjs
 The last command runs the rig on a private daemon with stub seats (`npm run build` first). It checks that only the
 four always-on seats start, that each bench seat and an extra builder get the rig's culture and their role guidance
 when started with the commands in CULTURE.md, that the recorded models and runtimes match the tables above, and that
-stop, restart and removal work. It adds every seat with `--no-view`, so it never reaches Herdr.
+stop, restart and removal work.
 
 ## Launch it
 
