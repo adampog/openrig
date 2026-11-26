@@ -37,7 +37,7 @@ export function projectSliceFromListEntry(slice: SliceListEntry): ProjectSliceRo
     name: slice.name,
     displayName: slice.displayName,
     readiness: slice.readiness,
-    status: slice.readiness?.configured ? `proof ${slice.readiness.state}` : slice.status,
+    status: slice.status === "closed" ? "closed" : slice.readiness?.configured ? `proof ${slice.readiness.state}` : slice.status,
     rawStatus: slice.rawStatus,
     qitemCount: slice.qitemCount,
     hasProofPacket: slice.hasProofPacket,
@@ -58,6 +58,7 @@ export function isRecentProjectActivity(
 }
 
 export function isCurrentProjectSlice(slice: ProjectSliceRow, now = Date.now()): boolean {
+  if (slice.status === "closed") return slice.qitemCount > 0;
   if (slice.readiness?.configured) return true;
   if (slice.qitemCount > 0) return true;
   if (slice.status === "blocked") return true;
@@ -125,8 +126,14 @@ export function reconcileMissionStatus(
   now = Date.now(),
   readiness?: ProofReadiness,
 ): ReconciledMissionStatus {
-  if (readiness && slices.some(s => s.readiness?.configured)) {
+  if (readiness && slices.some(s => s.status !== "closed" && s.readiness?.configured)) {
     const declared = readiness.historicalStatus ?? authored;
+    if (declared && readiness.state === "ready") {
+      const { state, label } = normalizeAuthored(declared);
+      // Readiness alone cannot declare a mission complete. Once the authored
+      // completion also has accepted proof, show that completed state normally.
+      if (state === "shipped") return { state, label, source: "authored" };
+    }
     return { state: declared ? normalizeAuthored(declared).state : "active", label: `${declared ? `declared ${declared} · ` : ""}proof ${readiness.state}`, source: declared ? "authored" : "derived" };
   }
   if (authored !== null && authored.trim().length > 0) {

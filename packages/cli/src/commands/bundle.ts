@@ -6,7 +6,7 @@ import { Command } from "commander";
 import { DaemonClient } from "../client.js";
 import { getDaemonStatus, getDaemonUrl , daemonStatusGuard} from "../daemon-lifecycle.js";
 import { realDeps } from "./daemon.js";
-import { isGitHubBundleLink, importGitHubBundle, bundleIdentityLines, printBundleLinkError, rigSpecName } from "../lib/bundle-source.js";
+import { isGitHubBundleLink, importGitHubBundle, bundleIdentityLines, printBundleLinkError, rigSpecName, writeBundleBuildReceipt } from "../lib/bundle-source.js";
 import { checkBundleFolder } from "../lib/bundle-check.js";
 import type { StatusDeps } from "./status.js";
 import { showBundleBehaviourBeforeAction } from "../bundle-behaviour.js";
@@ -46,7 +46,8 @@ export function bundleInstallError(data: Record<string, unknown>, includeWarning
 }
 
 /**
- * Build the provenance block the CLI sends to /api/bundles/create. Reads
+ * Read full local build provenance. Only --include-builder-identity sends
+ * hostname and session name to /api/bundles/create. Reads
  * hostname, session name (from canonical OPENRIG_SESSION_NAME env), and
  * CLI version at call time. Operator notes come from the --notes flag.
  * Daemon adds daemonVersion server-side.
@@ -78,6 +79,7 @@ export function bundleCommand(depsOverride?: StatusDeps): Command {
     .requiredOption("-o, --output <path>", "Output path for .rigbundle")
     .option("--name <name>", "Bundle name (default: the rig's name in rig.yaml)")
     .option("--bundle-version <ver>", "Bundle version", "0.1.0")
+    .option("--include-login-files", "Include harness login files only if recipients should have them and their owner agrees (for example, an internal test bundle); record exact paths in the manifest")
     .option("--include-packages <refs...>", "Package refs to include (default: all from spec)")
     .option("--rig-root <root>", "Root directory for pod-aware resolution")
     .option("--context-pack <dir>", "Carry the context pack in <dir> (its manifest.yaml and declared files), which may sit outside the rig folder; repeatable", (dir: string, dirs: string[]) => [...dirs, dir], [] as string[])
@@ -85,15 +87,22 @@ export function bundleCommand(depsOverride?: StatusDeps): Command {
     .option("--preset <name>", "Build one of the configurations the bundle declares in configurations.yaml (for example all-claude)")
     .option("--seat <member=runtime>", "Use this runtime for one seat, within what configurations.yaml allows (pod.member=runtime); repeatable", (v: string, all: string[]) => [...all, v], [] as string[])
     .option("--notes <text>", "Operator notes captured in bundle provenance metadata")
+    .option("--include-builder-identity", "Include the builder hostname and seat session in bundle.yaml as well as the private local build receipt")
     .option("--min-daemon-version <ver>", "Minimum daemon version required to install this bundle (Item 2 compatibility)")
     .option("--min-cli-version <ver>", "Minimum CLI version required to install this bundle (Item 2 compatibility)")
-    .option("--allow-drift", "Bundle a spec that disagrees with the running rig of the same name; the divergence is stamped into bundle provenance")
+    .option("--allow-drift", "Bundle a spec that disagrees with the running rig of the same name; the divergence is stamped into bundle provenance. Pool agents aren't counted as drift")
     .option("--json", "JSON output")
-    .action(async (spec: string, opts: { output: string; name?: string; bundleVersion: string; includePackages?: string[]; rigRoot?: string; contextPack?: string[]; projectDir?: string; preset?: string; seat?: string[]; notes?: string; minDaemonVersion?: string; minCliVersion?: string; allowDrift?: boolean; json?: boolean }) => {
+    .action(async (spec: string, opts: { output: string; name?: string; bundleVersion: string; includePackages?: string[]; includeLoginFiles?: boolean; rigRoot?: string; contextPack?: string[]; projectDir?: string; preset?: string; seat?: string[]; notes?: string; includeBuilderIdentity?: boolean; minDaemonVersion?: string; minCliVersion?: string; allowDrift?: boolean; json?: boolean }) => {
       const deps = getDepsF();
+      const buildProvenance = buildClientProvenance(opts.notes);
+      const provenance = { ...buildProvenance };
+      if (!opts.includeBuilderIdentity) {
+        delete provenance.sourceHost;
+        delete provenance.authorSession;
+      }
       if (isGitHubBundleLink(spec)) {
         try {
-          const { res } = await importGitHubBundle(spec, deps, { ...opts, provenance: buildClientProvenance(opts.notes) });
+          const { res } = await importGitHubBundle(spec, deps, { ...opts, provenance, buildProvenance });
           if (opts.json) console.log(JSON.stringify(res.data));
           else if (res.status >= 400) console.error(res.data.error ?? "Create failed");
           else {
@@ -152,15 +161,21 @@ export function bundleCommand(depsOverride?: StatusDeps): Command {
       const res = await client.post<Record<string, unknown>>("/api/bundles/create", {
         specPath, bundleName, bundleVersion: opts.bundleVersion, outputPath: nodePath.resolve(opts.output),
         includePackages: opts.includePackages,
+        ...(opts.includeLoginFiles ? { includeLoginFiles: true } : {}),
         rigRoot,
         ...(opts.contextPack?.length ? { contextPackDirs: opts.contextPack.map((dir) => nodePath.resolve(dir)) } : {}),
         ...(opts.projectDir ? { projectDir: nodePath.resolve(opts.projectDir) } : {}),
         ...(chosen ? { configuration: { id: chosen.configurationId, ...(chosen.preset ? { preset: chosen.preset } : {}) } } : {}),
-        provenance: buildClientProvenance(opts.notes),
+        provenance,
         ...(hasCompatibility ? { compatibility } : {}),
         ...(opts.allowDrift ? { allowDrift: true } : {}),
       }, { timeoutMs: 120_000 });
       if (stagingDir) fs.rmSync(stagingDir, { recursive: true, force: true });
+      if (res.status < 400) {
+        const bundlePath = nodePath.resolve(opts.output);
+        const warning = writeBundleBuildReceipt(`${bundlePath}.build.json`, bundlePath, res.data, buildProvenance);
+        if (warning) res.data.warning = [res.data.warning, warning].filter(Boolean).join("; ");
+      }
 
       if (opts.json) {
         console.log(JSON.stringify(res.data));
@@ -257,6 +272,7 @@ export function bundleCommand(depsOverride?: StatusDeps): Command {
       console.log(`Digest valid: ${res.data["digestValid"]}`);
       const ir = res.data["integrityResult"] as Record<string, unknown>;
       console.log(`Integrity: ${ir["passed"] ? "PASS" : "FAIL"}`);
+      for (const error of (ir["errors"] as string[] | undefined) ?? []) console.error(error);
       // What install will add before any seat launches
       const packs = m["contextPacks"] as string[] | undefined;
       if (packs?.length) console.log(`Context packs: ${packs.join(", ")}`);
@@ -393,6 +409,10 @@ export function bundleCommand(depsOverride?: StatusDeps): Command {
         console.error(res.data["error"] ?? "History fetch failed");
         process.exitCode = 2;
         return;
+      }
+      // An advisory (e.g. a since that isn't a date or time) goes to stderr, so stdout stays the listing.
+      for (const advisory of Array.isArray(res.data["advisories"]) ? res.data["advisories"] : []) {
+        console.error(`Note: ${advisory}`);
       }
       const records = Array.isArray(res.data["records"]) ? res.data["records"] as Array<Record<string, unknown>> : [];
       if (records.length === 0) {

@@ -124,12 +124,71 @@ function removeSentinel(payload, env = process.env) {
   if (p) { try { fs.unlinkSync(p); } catch { /* best-effort cleanup */ } }
 }
 
+function writeJsonAtomic(filePath, value) {
+  const tmp = `${filePath}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  fs.renameSync(tmp, filePath);
+}
+
+// The PreCompact hook's packet build for this compaction, as the sentinel names it. Null for a sentinel from a hook
+// before the background build, which keeps the older behaviour.
+function packetJobOf(sentinel) {
+  const job = sentinel && sentinel.data.packetJob;
+  return job && typeof job === "object" && typeof job.jobId === "string" && typeof job.resultPath === "string" ? job : null;
+}
+
+function readJobResult(job) {
+  try {
+    const result = JSON.parse(fs.readFileSync(job.resultPath, "utf8"));
+    return result && result.jobId === job.jobId ? result : null;
+  } catch {
+    return null;
+  }
+}
+
+// Only the current build's marker counts. The seat's marker file can still hold an earlier compaction's marker, or one a
+// slower, older build wrote late; the current build's own result carries its marker either way.
+function markerForJob(job, marker, payload, env = process.env) {
+  if (marker && marker.data.jobId === job.jobId) return marker;
+  const result = readJobResult(job);
+  if (!result || result.ok !== true || !result.marker || typeof result.marker !== "object") return null;
+  return { filePath: path.join(markerDir(env), `${sessionKey(payload, env)}.json`), data: { ...result.marker } };
+}
+
+// What the current build is doing while it has no marker: building, failed, or ended without either.
+function packetJobState(job) {
+  const result = readJobResult(job);
+  const informational = "This is informational, not an action request.";
+  if (result && result.ok === false) {
+    return { state: "failed", text: `OpenRig compaction restore: the restore packet build failed: ${String(result.reason || "unknown error").slice(0, 500)}. ${informational} When OpenRig asks you to restore, fall back to the JSONL restore (claude-compaction-restore skill).` };
+  }
+  let running = false;
+  if (Number.isInteger(job.pid)) { try { process.kill(job.pid, 0); running = true; } catch { running = false; } }
+  return running
+    ? { state: "building", text: `OpenRig compaction restore: the restore packet is still being built (started ${job.startedAt || "at the PreCompact hook"}); its marker appears when it's done, and a later prompt delivers it. ${informational} If OpenRig asks you to restore before then, restore from your restore map, or fall back to the JSONL restore (claude-compaction-restore skill).` }
+    : { state: "ended", text: `OpenRig compaction restore: the restore packet build ended without a packet or a recorded failure. ${informational} When OpenRig asks you to restore, fall back to the JSONL restore (claude-compaction-restore skill).` };
+}
+
+// Each state is reported once. Which one was last reported is kept in the build's own file, never in the sentinel, so a
+// newer compaction's sentinel is never rewritten.
+function alreadyReported(job, state) {
+  if (typeof job.reportPath !== "string") return false;
+  try { return JSON.parse(fs.readFileSync(job.reportPath, "utf8")).state === state; } catch { return false; }
+}
+
+function noteReported(job, state) {
+  if (typeof job.reportPath !== "string") return;
+  try { writeJsonAtomic(job.reportPath, { jobId: job.jobId, state, reportedAt: nowIso() }); } catch { /* reported again next time */ }
+}
+
 function writeMarker(marker) {
-  fs.writeFileSync(marker.filePath, `${JSON.stringify(marker.data, null, 2)}\n`, "utf8");
+  writeJsonAtomic(marker.filePath, marker.data);
 }
 
 function buildRestoreContext(marker) {
-  const outputDir = firstString(marker.data.outputDir) || "/tmp/claude-compaction-restore";
+  // A marker names its packet. One that doesn't points at the explicit or launch-granted packet folder, else the home's.
+  const outputDir = firstString(marker.data.outputDir) || firstString(process.env.OPENRIG_COMPACTION_OUT_ROOT)
+    || firstString(process.env.OPENRIG_COMPACTION_PACKET_ROOT) || path.join(openrigHome(), "run", "compaction-restore");
   const ack = firstString(marker.data.expectedAck) || "restored from packet at <path>; resumed at step <X>";
   const postInstruction = firstString(marker.data.postCompactInstruction);
   const restoreMapPath = firstString(marker.data.restoreMapPath);
@@ -177,22 +236,55 @@ function hookEventName(payload) {
   ) || "UserPromptSubmit";
 }
 
+// --- seat project boundary: keep this block identical in every script that has it ---
+// A Claude started from inside a seat (its shell, its Bash tool) inherits the seat's environment, so it loads this plugin
+// and its hooks would act as the seat. OpenRig tells the plugin the seat's launch project in OPENRIG_SEAT_PROJECT_DIR;
+// Claude's own CLAUDE_PROJECT_DIR is fixed for the life of a Claude and names the project it was started in (unlike the
+// hook payload's cwd, which follows a `cd`). The seat's effects run only when the two name the same folder. Spellings of
+// one folder (a symlink, a trailing slash, letter case on a case-insensitive disk) count as the same, and a missing
+// variable (an older or manual launch, a runtime without CLAUDE_PROJECT_DIR) leaves the hook doing what it always did.
+function runsForThisSeatsProject(env = process.env) {
+  const launch = env.OPENRIG_SEAT_PROJECT_DIR;
+  const project = env.CLAUDE_PROJECT_DIR;
+  if (!launch || !project) return true;
+  const canonical = (dir) => {
+    const absolute = path.resolve(dir);
+    // .native gives the case the disk has (plain realpathSync keeps the case the path was typed in), which is what Claude's
+    // CLAUDE_PROJECT_DIR carries on a case-insensitive filesystem such as macOS's default.
+    try { return fs.realpathSync.native(absolute); } catch { return absolute; }
+  };
+  return canonical(launch) === canonical(project);
+}
+// --- end seat project boundary ---
+
 async function main() {
+  // A Claude started elsewhere inside this seat is not the seat: leave its markers alone.
+  if (!runsForThisSeatsProject()) return;
   const payload = parseJson(await readStdin());
   const eventName = hookEventName(payload);
-  const marker = findMarker(payload);
+  const found = findSentinel(payload);
+  const sentinel = found && premiseMatches(found.data, payload) ? found : null;
+  const job = packetJobOf(sentinel);
+  let marker = findMarker(payload);
+  if (job) marker = markerForJob(job, marker, payload);
   if (!marker) {
     // R5 absent-when-needed: LOUD iff a matching expected-sentinel is present (a compaction
     // WAS expected for this seat/session — the PreCompact hook drops the sentinel FIRST) but
     // the marker is absent/unresolvable (write failed / hook died partway / packet lost).
-    // No sentinel = no hook = policy off = silent by construction. Stderr, so it never
-    // pollutes the additionalContext stdout.
-    const sentinel = findSentinel(payload);
-    if (sentinel && premiseMatches(sentinel.data, payload)) {
-      process.stderr.write(
-        "OpenRig compaction restore: a restore packet was EXPECTED for this session but its marker is missing or unresolvable — the PreCompact write may have failed. Fall back to the JSONL restore (claude-compaction-restore skill).\n",
-      );
+    // No sentinel = no hook = policy off = silent by construction.
+    if (!sentinel) return;
+    if (!job) {
+      process.stderr.write("OpenRig compaction restore: a restore packet was EXPECTED for this session but its marker is missing or unresolvable — the PreCompact write may have failed. Fall back to the JSONL restore (claude-compaction-restore skill).\n");
+      return;
     }
+    // The current build's state reaches the agent as context, once per state. PostCompact can't carry context.
+    const status = packetJobState(job);
+    if (eventName === "PostCompact" || alreadyReported(job, status.state)) return;
+    noteReported(job, status.state);
+    process.stdout.write(`${JSON.stringify({
+      continue: true,
+      hookSpecificOutput: { hookEventName: eventName, additionalContext: status.text },
+    })}\n`);
     return;
   }
 
@@ -209,6 +301,12 @@ async function main() {
   }
 
   if (marker.data.deliveryCount && marker.data.deliveryCount > 0) {
+    return;
+  }
+
+  // A build's marker is delivered only while the sentinel names that build. With no sentinel, it was written late by a
+  // build that is no longer current (the current one was delivered and its sentinel cleared).
+  if (!job && marker.data.jobId) {
     return;
   }
 

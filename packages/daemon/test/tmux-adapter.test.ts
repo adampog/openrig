@@ -1,6 +1,24 @@
 import { describe, it, expect, vi } from "vitest";
-import { TmuxAdapter } from "../src/adapters/tmux.js";
-import type { ExecFn, TmuxResult } from "../src/adapters/tmux.js";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, relative, resolve } from "node:path";
+import { TmuxAdapter, defaultTmuxFileOps, escapeTmuxCommandSeparator, isStagedSendScriptPath, tmuxStagingDir } from "../src/adapters/tmux.js";
+import type { ExecFn, TmuxResult, TmuxFileOps, ArgvExecFn } from "../src/adapters/tmux.js";
+import { DeliveryGuardError, type SeatDeliveryGuard } from "../src/domain/seat-delivery-guard.js";
+
+// These existing tests assert logical tmux commands. Model source-file consumption here;
+// tmux-credential-environment tests observe the raw process boundary and real tmux instead.
+function adapterFor(exec: ExecFn, files: TmuxFileOps = defaultTmuxFileOps(), argv?: ArgvExecFn): TmuxAdapter {
+  const content = new Map<string, string>();
+  const adapter = new TmuxAdapter(async command => {
+    const file = [...content.keys()].find(p => command.endsWith(p) || command.endsWith("'" + p + "'"));
+    return exec(command.includes("source-file ") && file ? "tmux " + content.get(file)!.trimEnd() : command);
+  }, { ...files, writeFile: async (p, body, opts) => { await files.writeFile(p, body, opts); content.set(p, body); } }, argv);
+  // #3253: the calls pinned here are a daemon's that has already checked its server's bus once (on Linux, a daemon's
+  // first launch runs startServer first; tmux-server-systemd-scope.test.ts covers that).
+  (adapter as unknown as { sessionBusRestorePending: boolean }).sessionBusRestorePending = false;
+  return adapter;
+}
 
 const NO_SERVER_ERROR = new Error("no server running on /tmp/tmux-1000/default");
 
@@ -17,6 +35,69 @@ function mockExec(responses: Record<string, { stdout?: string; error?: Error }>)
     return Promise.resolve("");
   };
 }
+
+describe("TmuxAdapter.listSessionClientTerminals", () => {
+  it("lists each attached client's terminal and its reported type", async () => {
+    const adapter = adapterFor(mockExec({ "list-clients": { stdout: "/dev/ttys011|rex 0.0.1793890641-gaf0c20\n/dev/ttys012|\n" } }));
+    expect(await adapter.listSessionClientTerminals("op@kernel")).toEqual([
+      { tty: "/dev/ttys011", termtype: "rex 0.0.1793890641-gaf0c20" },
+      { tty: "/dev/ttys012", termtype: "" },
+    ]);
+  });
+
+  it("is empty when the session or the server is gone, so the caller can stop looking", async () => {
+    for (const error of [new Error("can't find session: op@kernel"), NO_SERVER_ERROR,
+      new Error("error connecting to /private/tmp/tmux-501/x (No such file or directory)")]) {
+      expect(await adapterFor(mockExec({ "list-clients": { error } })).listSessionClientTerminals("op@kernel")).toEqual([]);
+    }
+  });
+
+  it("is null when tmux fails for another reason", async () => {
+    const adapter = adapterFor(mockExec({ "list-clients": { error: new Error("command timed out") } }));
+    expect(await adapter.listSessionClientTerminals("op@kernel")).toBeNull();
+  });
+});
+
+describe("TmuxAdapter.lastClientActivity (#3076)", () => {
+  const activity = (stdout: string) => adapterFor(mockExec({ "list-clients": { stdout } })).lastClientActivity("op@kernel");
+
+  it("is the latest activity of a writable client, in milliseconds", async () => {
+    expect(await activity("0|1790000100\n0|1790000105\n")).toBe(1790000105000);
+  });
+
+  it("does not count a read-only client (a viewer tile)", async () => {
+    expect(await activity("1|1790000200\n0|1790000100\n")).toBe(1790000100000);
+    expect(await activity("1|1790000200\n")).toBeNull();
+  });
+
+  it("counts an attach as recent activity: a key in the same second as the attach can't be told apart from it", async () => {
+    // tmux would report client_created == client_activity for both an attach alone and an attach plus a key that second.
+    expect(await activity("0|1790000300\n")).toBe(1790000300000);
+  });
+
+  it("is null with no client", async () => {
+    expect(await activity("")).toBeNull();
+    expect(await activity("\n")).toBeNull();
+  });
+
+  it("throws on a row it can't read, alone or next to a readable one, so the guard holds", async () => {
+    for (const stdout of ["0|abc\n", "0|0\n", "0\n", "2|1790000100\n", "0|1790000000|1790000100\n", "0|1790000100\n0|abc\n"]) {
+      await expect(activity(stdout)).rejects.toThrow();
+    }
+  });
+
+  it("throws when tmux can't say", async () => {
+    for (const error of [new Error("can't find session: op@kernel"), NO_SERVER_ERROR, new Error("command timed out")]) {
+      await expect(adapterFor(mockExec({ "list-clients": { error } })).lastClientActivity("op@kernel")).rejects.toThrow();
+    }
+  });
+
+  it("asks tmux for the read-only flag and the activity of each client of the session", async () => {
+    const commands: string[] = [];
+    await adapterFor(async command => { commands.push(command); return ""; }).lastClientActivity("op@kernel");
+    expect(commands.some(c => c.includes("list-clients") && c.includes("#{client_readonly}|#{client_activity}"))).toBe(true);
+  });
+});
 
 describe("TmuxAdapter", () => {
   it("starts only an empty terminal server and reconciles repeated requests", async () => {
@@ -134,6 +215,16 @@ describe("TmuxAdapter", () => {
     });
   });
 
+  describe("serverStartTime", () => {
+    it("reads the server's start time through the exact session, and null when it can't be read", async () => {
+      const exec = vi.fn<ExecFn>().mockResolvedValue("1792810800\n");
+      expect(await new TmuxAdapter(exec).serverStartTime("my-session")).toBe(1792810800);
+      expect(exec.mock.calls[0]![0]).toBe("tmux display-message -p -t '=my-session' '#{start_time}'");
+      expect(await new TmuxAdapter(mockExec({ "display-message": { error: NO_SERVER_ERROR } })).serverStartTime("my-session")).toBeNull();
+      expect(await new TmuxAdapter(mockExec({ "display-message": { stdout: "\n" } })).serverStartTime("my-session")).toBeNull();
+    });
+  });
+
   describe("listPanes", () => {
     it("calls exec with exact tmux list-panes command and format string", async () => {
       const exec = vi.fn<ExecFn>().mockResolvedValue("");
@@ -237,7 +328,7 @@ describe("TmuxAdapter", () => {
 
     it("throws on generic unrecognized exec error", async () => {
       const adapter = new TmuxAdapter(mockExec({
-        "has-session": { error: new Error("Command failed with exit code 127") },
+        "has-session": { error: Object.assign(new Error("Command failed with exit code 127"), { execStderr: "" }) },
       }));
       await expect(adapter.hasSession("any-session")).rejects.toThrow("exit code 127");
     });
@@ -297,66 +388,110 @@ describe("TmuxAdapter", () => {
 
       expect(await adapter.hasSessionEnv("missing", "OPENRIG_URL")).toBeNull();
     });
+
+    it("reads several names from one listing, with the same reading, returning only the names asked for", async () => {
+      const exec = vi.fn<ExecFn>().mockResolvedValue([
+        "OPENRIG_URL=http://127.0.0.1:7433",
+        "OPENRIG_ACTIVITY_HOOK_TOKEN=",
+        "RIGGED_URL=   ",
+        "-RIGGED_ACTIVITY_HOOK_TOKEN",
+        "OPENRIG_RUNTIME=",
+        "OPENRIG_RUNTIME=claude-code",
+        "OPENRIG_URL_EXTRA=yes",
+        "SECRET_TOKEN=sk-private-value",
+      ].join("\n"));
+      const adapter = new TmuxAdapter(exec);
+      const names = ["OPENRIG_URL", "RIGGED_URL", "OPENRIG_PORT", "RIGGED_PORT", "OPENRIG_ACTIVITY_HOOK_TOKEN", "RIGGED_ACTIVITY_HOOK_TOKEN", "OPENRIG_RUNTIME", "RIGGED_RUNTIME"];
+      const presence = await adapter.hasSessionEnvBatch("seat@rig", names);
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(exec).toHaveBeenCalledWith("tmux show-environment -t '=seat@rig'");
+      expect(presence).toEqual({ OPENRIG_URL: true, RIGGED_URL: false, OPENRIG_PORT: false, RIGGED_PORT: false,
+        OPENRIG_ACTIVITY_HOOK_TOKEN: false, RIGGED_ACTIVITY_HOOK_TOKEN: false, OPENRIG_RUNTIME: true, RIGGED_RUNTIME: false });
+      expect(JSON.stringify(presence)).not.toMatch(/sk-private|127\.0\.0\.1|claude-code|SECRET|EXTRA/);
+      // Fresh each call: no cache between reads.
+      exec.mockResolvedValueOnce("RIGGED_PORT=7433");
+      expect(await adapter.hasSessionEnvBatch("seat@rig", ["OPENRIG_URL", "RIGGED_PORT"])).toEqual({ OPENRIG_URL: false, RIGGED_PORT: true });
+      expect(exec).toHaveBeenCalledTimes(2);
+    });
+
+    it("compares launch variables once and returns differing names without their values", async () => {
+      const exec = vi.fn<ExecFn>().mockResolvedValue("MATCH=kept\nNPM_TOKEN=pane-value\nCLAUDE_CONFIG_DIR=/pane\n");
+      const adapter = new TmuxAdapter(exec);
+      const names = await adapter.differingSessionEnv("seat@rig", { MATCH: "kept", NPM_TOKEN: "synthetic-unrelated-secret-2853", MISSING: "also-private", CLAUDE_CONFIG_DIR: "/running" });
+      expect(names).toEqual(["MISSING", "NPM_TOKEN"]);
+      expect(JSON.stringify(names)).not.toMatch(/pane-value|synthetic-unrelated-secret|also-private/);
+      expect(exec).toHaveBeenCalledTimes(1);
+      exec.mockRejectedValueOnce(new Error("private failure"));
+      expect(await adapter.differingSessionEnv("seat@rig", { NPM_TOKEN: "private" })).toBeNull();
+    });
+
+    it("makes every requested name unknown when the one listing fails, and lets no error text through", async () => {
+      const exec = vi.fn<ExecFn>().mockRejectedValue(new Error("can't find session: token=sk-private-value"));
+      const presence = await new TmuxAdapter(exec).hasSessionEnvBatch("missing", ["OPENRIG_URL", "OPENRIG_RUNTIME"]);
+      expect(presence).toEqual({ OPENRIG_URL: null, OPENRIG_RUNTIME: null });
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(presence)).not.toContain("sk-private");
+    });
   });
 
   describe("createSession", () => {
     it("calls exec with exact command (name + cwd, both quoted)", async () => {
-      const exec = vi.fn<ExecFn>().mockResolvedValue("");
-      const adapter = new TmuxAdapter(exec);
+      const exec = vi.fn<ExecFn>().mockImplementation(async (cmd) => cmd.startsWith("tmux new-session") ? "%1\n" : ""); // new-session -P prints its pane
+      const adapter = adapterFor(exec);
 
       await adapter.createSession("r01-dev1-impl", "/home/user/code");
 
       expect(exec.mock.calls.map((c) => c[0]).slice(1)).toEqual(["tmux show-environment -g"]); // clean server: nothing to exclude
       expect(exec.mock.calls[0]![0]).toBe(
-        "tmux new-session -d -s 'r01-dev1-impl' -c '/home/user/code' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS='"
+        "tmux new-session -d -s 'r01-dev1-impl' -c '/home/user/code' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS=' -P -F '#{pane_id}'"
       );
     });
 
     it("with cwd containing spaces: path is quoted", async () => {
-      const exec = vi.fn<ExecFn>().mockResolvedValue("");
-      const adapter = new TmuxAdapter(exec);
+      const exec = vi.fn<ExecFn>().mockImplementation(async (cmd) => cmd.startsWith("tmux new-session") ? "%1\n" : ""); // new-session -P prints its pane
+      const adapter = adapterFor(exec);
 
       await adapter.createSession("r01-dev1-impl", "/home/user/my project/code");
 
       expect(exec.mock.calls.map((c) => c[0]).slice(1)).toEqual(["tmux show-environment -g"]); // clean server: nothing to exclude
       expect(exec.mock.calls[0]![0]).toBe(
-        "tmux new-session -d -s 'r01-dev1-impl' -c '/home/user/my project/code' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS='"
+        "tmux new-session -d -s 'r01-dev1-impl' -c '/home/user/my project/code' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS=' -P -F '#{pane_id}'"
       );
     });
 
     it("with shell-sensitive session name: name is quoted", async () => {
-      const exec = vi.fn<ExecFn>().mockResolvedValue("");
-      const adapter = new TmuxAdapter(exec);
+      const exec = vi.fn<ExecFn>().mockImplementation(async (cmd) => cmd.startsWith("tmux new-session") ? "%1\n" : ""); // new-session -P prints its pane
+      const adapter = adapterFor(exec);
 
       await adapter.createSession("r01-dev's session", "/tmp");
 
       expect(exec.mock.calls.map((c) => c[0]).slice(1)).toEqual(["tmux show-environment -g"]); // clean server: nothing to exclude
       expect(exec.mock.calls[0]![0]).toBe(
-        "tmux new-session -d -s 'r01-dev'\"'\"'s session' -c '/tmp' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS='"
+        "tmux new-session -d -s 'r01-dev'\"'\"'s session' -c '/tmp' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS=' -P -F '#{pane_id}'"
       );
     });
 
     it("without cwd omits -c flag", async () => {
-      const exec = vi.fn<ExecFn>().mockResolvedValue("");
-      const adapter = new TmuxAdapter(exec);
+      const exec = vi.fn<ExecFn>().mockImplementation(async (cmd) => cmd.startsWith("tmux new-session") ? "%1\n" : ""); // new-session -P prints its pane
+      const adapter = adapterFor(exec);
 
       await adapter.createSession("r01-dev1-impl");
 
       expect(exec.mock.calls.map((c) => c[0]).slice(1)).toEqual(["tmux show-environment -g"]); // clean server: nothing to exclude
       expect(exec.mock.calls[0]![0]).toBe(
-        "tmux new-session -d -s 'r01-dev1-impl' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS='"
+        "tmux new-session -d -s 'r01-dev1-impl' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS=' -P -F '#{pane_id}'"
       );
     });
 
     it("returns { ok: true } on success", async () => {
-      const adapter = new TmuxAdapter(mockExec({ "new-session": { stdout: "" } }));
+      const adapter = adapterFor(mockExec({ "new-session": { stdout: "" } }));
       const result: TmuxResult = await adapter.createSession("r01-dev1-impl");
       expect(result).toEqual({ ok: true });
     });
 
     it("with env map constructs -e flags for each key=value", async () => {
       const exec = vi.fn<ExecFn>().mockResolvedValue("");
-      const adapter = new TmuxAdapter(exec);
+      const adapter = adapterFor(exec);
 
       await adapter.createSession("dev-impl@rig", "/tmp", {
         OPENRIG_NODE_ID: "node123",
@@ -372,18 +507,18 @@ describe("TmuxAdapter", () => {
 
     it("without env still works as before", async () => {
       const exec = vi.fn<ExecFn>().mockResolvedValue("");
-      const adapter = new TmuxAdapter(exec);
+      const adapter = adapterFor(exec);
 
       await adapter.createSession("r01-test", "/tmp");
 
       const cmd = exec.mock.calls[0]![0] as string;
       expect(cmd).toContain("-e 'OPENRIG_TRANSCRIPTS_LINES='");
-      expect(cmd).toBe("tmux new-session -d -s 'r01-test' -c '/tmp' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS='");
+      expect(cmd).toBe("tmux new-session -d -s 'r01-test' -c '/tmp' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS=' -P -F '#{pane_id}'");
     });
 
     it("returns { ok: false, code: 'duplicate_session' } on duplicate", async () => {
       const err = new Error("duplicate session: r01-dev1-impl");
-      const adapter = new TmuxAdapter(mockExec({ "new-session": { error: err } }));
+      const adapter = adapterFor(mockExec({ "new-session": { error: err } }));
       const result = await adapter.createSession("r01-dev1-impl");
       expect(result.ok).toBe(false);
       if (!result.ok) {
@@ -475,6 +610,53 @@ describe("TmuxAdapter", () => {
       );
     });
 
+    // tmux ends its command at an argument ending in an unescaped `;` (commandsOf in
+    // adapters/tmux-control.ts, pinned against real tmux in test/tmux-control-native.test.ts). Quoting
+    // protects the shell, not tmux, so a trailing `;` is escaped rather than the key being refused.
+    it("escapes a key that ends in a semicolon, so tmux keeps it as one argument", async () => {
+      const exec = vi.fn<ExecFn>().mockResolvedValue("");
+      const adapter = new TmuxAdapter(exec);
+
+      await adapter.sendKeys("r01-dev1-impl", ["x;", "run-shell", "C-c"]);
+
+      expect(exec).toHaveBeenCalledOnce();
+      expect(exec.mock.calls[0]![0]).toBe(
+        "tmux send-keys -t 'r01-dev1-impl' 'x\\;' 'run-shell' 'C-c'"
+      );
+    });
+
+    it("escapes every trailing semicolon unconditionally, so each key arrives byte for byte", async () => {
+      const exec = vi.fn<ExecFn>().mockResolvedValue("");
+      const adapter = new TmuxAdapter(exec);
+
+      // tmux checks only the character before a final `;`: backslash means it drops the `;` and turns
+      // that backslash into `;`, anything else ends the command. One backslash added either way, so
+      // `x\;` arrives as `x\;` rather than losing its backslash. Raw strings here so the backslashes
+      // in this expectation are the ones the transport carries.
+      await adapter.sendKeys("r01-dev1-impl", [String.raw`x\;`, String.raw`x\\;`]);
+
+      expect(exec.mock.calls[0]![0]).toBe(String.raw`tmux send-keys -t 'r01-dev1-impl' 'x\\;' 'x\\\;'`);
+
+      // And the property that matters: what tmux's own parser makes of each escaped argument is the
+      // key that was sent. tmux drops the final `;` and turns the one backslash before it into `;`.
+      const asTmuxReads = (arg: string) => (arg.endsWith("\\;") ? `${arg.slice(0, -2)};` : arg);
+      for (const key of ["x;", String.raw`x\;`, String.raw`x\\;`, ";", "Enter"]) {
+        expect(asTmuxReads(escapeTmuxCommandSeparator(key)), key).toBe(key);
+      }
+    });
+
+    it("keeps the vocabulary a caller may send, punctuation included", async () => {
+      const exec = vi.fn<ExecFn>().mockResolvedValue("");
+      const adapter = new TmuxAdapter(exec);
+
+      const result = await adapter.sendKeys("r01-dev1-impl", ["/", "?", ":", "M-Left", "F12", "a-b"]);
+
+      expect(result).toEqual({ ok: true });
+      expect(exec.mock.calls[0]![0]).toBe(
+        "tmux send-keys -t 'r01-dev1-impl' '/' '?' ':' 'M-Left' 'F12' 'a-b'"
+      );
+    });
+
     it("returns { ok: true } on success", async () => {
       const adapter = new TmuxAdapter(mockExec({ "send-keys": { stdout: "" } }));
       const result: TmuxResult = await adapter.sendKeys("r01-dev1-impl", ["Enter"]);
@@ -489,6 +671,134 @@ describe("TmuxAdapter", () => {
       if (!result.ok) {
         expect(result.code).toBe("session_not_found");
       }
+    });
+  });
+
+  // #2090, reported by @Mydudeclaps. tmux 3.7 and 3.8 refuse every send-keys, `-l` included, while the target client
+  // is read-only (`tmux attach -r`): cmd_send_keys_exec checks CLIENT_READONLY before it reads a key. load-buffer and
+  // paste-buffer have no such check. This mock refuses send-keys the way that source does.
+  describe("sendKeys under a read-only tmux client", () => {
+    const TARGET = { nodeId: "n1", session: "dev@rig", occupant: "o1", pane: "%1" };
+
+    function readOnlyTmux() {
+      const exec = vi.fn<ExecFn>(async (cmd: string) => {
+        if (cmd.startsWith("tmux send-keys")) throw new Error(`Command failed: ${cmd}\nclient is read-only`);
+        if (cmd.startsWith("tmux list-panes")) return "%1|0|/w|80|24|1\n";
+        return "";
+      });
+      const writeFile = vi.fn(async () => {});
+      const files: TmuxFileOps = { writeFile, unlink: async () => {}, tmpName: () => "/tmp/cr.txt", bufferName: () => "cr" };
+      return { exec, writeFile, files, cmds: () => exec.mock.calls.map(([cmd]) => cmd) };
+    }
+
+    function guard(beforeInput: (identity: string, submit?: boolean) => Promise<void>) {
+      return {
+        maybeTarget: () => TARGET, target: () => TARGET, ownsLifecycle: () => false,
+        checkInput: vi.fn(), noteSubmitted: vi.fn(), notePasted: async () => {}, attachInputInspection: () => {},
+        input: (_name: string, fn: () => Promise<unknown>) => fn(), humanInput: (_name: string, fn: () => Promise<unknown>) => fn(),
+        needsInputCheck: () => true, beforeInput: vi.fn(beforeInput),
+      };
+    }
+
+    it.each(["Enter", "C-m"])("a lone %s reaches the pane as a carriage return through the unbracketed paste", async (key) => {
+      const tmux = readOnlyTmux();
+      expect(await new TmuxAdapter(tmux.exec, tmux.files).sendKeys("dev@rig", [key])).toEqual({ ok: true });
+      expect(tmux.writeFile).toHaveBeenCalledWith("/tmp/cr.txt", "\r", { mode: 0o600, flag: "wx" });
+      expect(tmux.cmds()).toEqual([
+        `tmux send-keys -t 'dev@rig' '${key}'`,
+        "tmux load-buffer -b 'cr' '/tmp/cr.txt'",
+        "tmux paste-buffer -t 'dev@rig' -b 'cr' -d -r",
+      ]);
+    });
+
+    it.each([{ keys: ["C-c", "Enter"] }, { keys: ["Enter", "Enter"] }, { keys: ["C-c"] }])("other key lists keep the refusal ($keys)", async ({ keys }) => {
+      const tmux = readOnlyTmux();
+      expect(await new TmuxAdapter(tmux.exec, tmux.files).sendKeys("dev@rig", keys))
+        .toMatchObject({ ok: false, message: expect.stringContaining("client is read-only") });
+      expect(tmux.cmds().filter(cmd => !cmd.startsWith("tmux send-keys"))).toEqual([]);
+    });
+
+    it("another refusal of a lone Enter is not retried", async () => {
+      const exec = vi.fn<ExecFn>(async (cmd: string) => { throw new Error(`Command failed: ${cmd}\ncan't find session: dev@rig`); });
+      expect(await new TmuxAdapter(exec).sendKeys("dev@rig", ["Enter"])).toMatchObject({ ok: false, code: "session_not_found" });
+      expect(exec).toHaveBeenCalledOnce();
+    });
+
+    it("the paste waits for the same checks to pass again, then records the submit", async () => {
+      const tmux = readOnlyTmux();
+      const adapter = new TmuxAdapter(tmux.exec, tmux.files);
+      const seat = guard(async () => {});
+      adapter.deliveryGuard = seat as unknown as SeatDeliveryGuard;
+      const beforeKeys = vi.fn(async () => {}); const beforeInput = vi.fn();
+      expect(await adapter.sendKeys("dev@rig", ["Enter"], beforeInput, { beforeKeys })).toEqual({ ok: true });
+      expect(seat.beforeInput.mock.calls).toEqual([["dev@rig", true], ["dev@rig", true]]);
+      expect(beforeKeys).toHaveBeenCalledTimes(2);
+      expect(beforeInput).toHaveBeenCalledTimes(2);
+      expect(seat.checkInput).toHaveBeenCalledTimes(2);
+      expect(seat.noteSubmitted).toHaveBeenCalledOnce();
+      expect(tmux.cmds().filter(cmd => !cmd.startsWith("tmux list-panes"))).toEqual([
+        "tmux send-keys -t '%1' 'Enter'",
+        "tmux load-buffer -b 'cr' '/tmp/cr.txt'",
+        "tmux paste-buffer -t '%1' -b 'cr' -d -r",
+      ]);
+    });
+
+    it("input that changes between the refusal and the paste stops the carriage return", async () => {
+      const tmux = readOnlyTmux();
+      const adapter = new TmuxAdapter(tmux.exec, tmux.files);
+      let checks = 0;
+      const seat = guard(async () => {
+        checks += 1;
+        if (checks === 2) throw new DeliveryGuardError("draft_present", "Someone started typing; no input written.");
+      });
+      adapter.deliveryGuard = seat as unknown as SeatDeliveryGuard;
+      expect(await adapter.sendKeys("dev@rig", ["Enter"]))
+        .toEqual({ ok: false, code: "draft_present", message: "Someone started typing; no input written." });
+      expect(checks).toBe(2);
+      expect(tmux.cmds().some(cmd => cmd.startsWith("tmux paste-buffer"))).toBe(false);
+      expect(tmux.cmds()).toContain("tmux delete-buffer -b 'cr'");
+      expect(seat.noteSubmitted).not.toHaveBeenCalled();
+    });
+
+    it("input typed while the carriage return's re-check awaits the caller's checks stops it (#3076)", async () => {
+      const tmux = readOnlyTmux();
+      const adapter = new TmuxAdapter(tmux.exec, tmux.files);
+      let composer = "notice";
+      const seat = guard(async () => {
+        if (composer !== "notice") throw new DeliveryGuardError("draft_input_changed", "The input changed; Enter was not sent.");
+      });
+      adapter.deliveryGuard = seat as unknown as SeatDeliveryGuard;
+      let calls = 0;
+      const beforeKeys = vi.fn(async () => { calls += 1; if (calls === 2) composer = "notice PERSONDRAFT-k7"; });
+      expect(await adapter.sendKeys("dev@rig", ["Enter"], undefined, { beforeKeys }))
+        .toEqual({ ok: false, code: "draft_input_changed", message: "The input changed; Enter was not sent." });
+      expect(tmux.cmds().some(cmd => cmd.startsWith("tmux paste-buffer"))).toBe(false);
+      expect(tmux.cmds()).toContain("tmux delete-buffer -b 'cr'");
+      expect(seat.noteSubmitted).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("sendKeys reads the input after the caller's waiting checks (#3076)", () => {
+    const TARGET = { nodeId: "n1", session: "dev@rig", occupant: "o1", pane: "%1" };
+
+    it("a draft typed while beforeKeys awaits stops the Enter, and nothing reaches the pane", async () => {
+      const exec = vi.fn<ExecFn>(async (cmd: string) => cmd.startsWith("tmux list-panes") ? "%1|0|/w|80|24|1\n" : "");
+      const adapter = new TmuxAdapter(exec);
+      let composer = "notice";
+      const seat = {
+        maybeTarget: () => TARGET, target: () => TARGET, ownsLifecycle: () => false,
+        checkInput: vi.fn(), noteSubmitted: vi.fn(), notePasted: async () => {}, attachInputInspection: () => {},
+        input: (_name: string, fn: () => Promise<unknown>) => fn(), humanInput: (_name: string, fn: () => Promise<unknown>) => fn(),
+        needsInputCheck: () => true,
+        beforeInput: vi.fn(async () => {
+          if (composer !== "notice") throw new DeliveryGuardError("draft_input_changed", "The input changed; Enter was not sent.");
+        }),
+      };
+      adapter.deliveryGuard = seat as unknown as SeatDeliveryGuard;
+      const result = await adapter.sendKeys("dev@rig", ["Enter"], undefined, { beforeKeys: async () => { composer = "notice PERSONDRAFT-k7"; } });
+      expect(result).toEqual({ ok: false, code: "draft_input_changed", message: "The input changed; Enter was not sent." });
+      expect(exec.mock.calls.map(([cmd]) => cmd).some(cmd => cmd.startsWith("tmux send-keys"))).toBe(false);
+      expect(seat.noteSubmitted).not.toHaveBeenCalled();
     });
   });
 
@@ -530,7 +840,9 @@ describe("TmuxAdapter", () => {
 
       const result = await adapter.killSession("r01-dev1-impl");
 
-      expect(result).toEqual({ ok: false, code: "unknown", message: "permission denied" });
+      // The unguarded stop reports how far it got, so a caller can tell a
+      // no-effect failure from an uncertain one (#2940).
+      expect(result).toEqual({ ok: false, code: "unknown", message: "permission denied", stopPhase: "detach_attempted" });
       expect(exec.mock.calls.map((call) => call[0])).toEqual([
         "tmux detach-client -s '=r01-dev1-impl'",
       ]);
@@ -685,13 +997,13 @@ describe("TmuxAdapter", () => {
 
   describe("canonical session names with @", () => {
     it("createSession + sendKeys with @ in name produce correct quoted commands", async () => {
-      const exec = vi.fn<ExecFn>().mockResolvedValue("");
-      const adapter = new TmuxAdapter(exec);
+      const exec = vi.fn<ExecFn>().mockImplementation(async (cmd) => cmd.startsWith("tmux new-session") ? "%1\n" : ""); // new-session -P prints its pane
+      const adapter = adapterFor(exec);
 
       // createSession with canonical name
       await adapter.createSession("dev-impl@auth-feats", "/home/user/code");
       expect(exec.mock.calls[0]![0]).toBe(
-        "tmux new-session -d -s 'dev-impl@auth-feats' -c '/home/user/code' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS='"
+        "tmux new-session -d -s 'dev-impl@auth-feats' -c '/home/user/code' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS=' -P -F '#{pane_id}'"
       );
 
       // sendKeys targeting canonical name
@@ -761,6 +1073,102 @@ describe("TmuxAdapter", () => {
     });
   });
 
+  describe("isPaneInMode", () => {
+    it("reads #{pane_in_mode} from the exact pane target", async () => {
+      const exec: ExecFn = vi.fn(async () => "1\n") as unknown as ExecFn;
+      const adapter = new TmuxAdapter(exec);
+      expect(await adapter.isPaneInMode("dev-impl@my-rig")).toBe(true);
+      expect(exec).toHaveBeenCalledWith(`tmux display-message -p -t '=dev-impl@my-rig:' "#{pane_in_mode}"`);
+    });
+
+    it("returns false outside copy mode", async () => {
+      const adapter = new TmuxAdapter(async () => "0\n");
+      expect(await adapter.isPaneInMode("%0")).toBe(false);
+    });
+
+    it("treats any mode count above 0 as in a mode", async () => {
+      expect(await new TmuxAdapter(async () => "2\n").isPaneInMode("%0")).toBe(true);
+    });
+
+    it("returns null on error or unexpected output", async () => {
+      expect(await new TmuxAdapter(async () => { throw new Error("no server"); }).isPaneInMode("%0")).toBeNull();
+      expect(await new TmuxAdapter(async () => "\n").isPaneInMode("%0")).toBeNull();
+    });
+  });
+
+  describe("cancelPaneMode", () => {
+    it("leaves every mode the pane is in with one copy-mode -q", async () => {
+      const exec: ExecFn = vi.fn(async () => "") as unknown as ExecFn;
+      const adapter = new TmuxAdapter(exec);
+      expect(await adapter.cancelPaneMode("%0")).toEqual({ ok: true });
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(exec).toHaveBeenCalledWith("tmux copy-mode -q -t %0");
+    });
+
+    it("falls back to send-keys -X cancel where copy-mode has no -q (tmux before 3.1a)", async () => {
+      const exec = vi.fn(async (command: string) => {
+        if (command.startsWith("tmux copy-mode")) throw new Error("unknown flag -q");
+        return "";
+      });
+      const adapter = new TmuxAdapter(exec as unknown as ExecFn);
+      expect(await adapter.cancelPaneMode("%0")).toEqual({ ok: true });
+      expect(exec.mock.calls.map(([command]) => command)).toEqual(["tmux copy-mode -q -t %0", "tmux send-keys -t '%0' '-X' 'cancel'"]);
+    });
+
+    it("keeps both reasons when copy-mode -q and the fallback both fail", async () => {
+      const exec = vi.fn(async (command: string) => {
+        throw new Error(command.startsWith("tmux copy-mode") ? "unknown flag -q" : "not in a mode");
+      });
+      const result = await new TmuxAdapter(exec as unknown as ExecFn).cancelPaneMode("%0");
+      expect(result).toMatchObject({ ok: false, message: "copy-mode -q: unknown flag -q; send-keys -X cancel: not in a mode" });
+    });
+
+    describe("under the input guard", () => {
+      const TARGET = { nodeId: "n1", session: "dev@rig", occupant: "o1", pane: "%1" };
+      const HUMAN = "Human input arrived during this delivery. No further automatic input was written.";
+
+      // copy-mode -q waits until released, then fails (as on tmux before 3.1a); the guard refuses once a person has typed.
+      function guarded() {
+        let human = false;
+        let release!: () => void;
+        const pending = new Promise<void>((done) => { release = done; });
+        const exec = vi.fn<ExecFn>(async (cmd: string) => {
+          if (cmd.startsWith("tmux list-panes")) return "%1|0|/w|80|24|1\n";
+          if (cmd.startsWith("tmux copy-mode")) { await pending; throw new Error(`Command failed: ${cmd}\nunknown flag -q`); }
+          return "";
+        });
+        const checkInput = vi.fn(() => { if (human) throw new DeliveryGuardError("draft_input_changed", HUMAN); });
+        const adapter = new TmuxAdapter(exec);
+        adapter.deliveryGuard = {
+          maybeTarget: () => TARGET, target: () => TARGET, ownsLifecycle: () => false, needsInputCheck: () => false, checkInput,
+          input: (_name: string, fn: () => Promise<unknown>) => fn(), attachInputInspection: () => {},
+        } as unknown as SeatDeliveryGuard;
+        const cmds = () => exec.mock.calls.map(([cmd]) => cmd).filter((cmd) => !cmd.startsWith("tmux list-panes"));
+        return { adapter, checkInput, cmds, release, type: () => { human = true; } };
+      }
+
+      it("input that arrives while copy-mode -q is pending stops the -X cancel fallback", async () => {
+        const g = guarded();
+        const result = g.adapter.cancelPaneMode("dev@rig");
+        await vi.waitFor(() => expect(g.cmds()).toEqual(["tmux copy-mode -q -t %1"]));
+        g.type();
+        g.release();
+        expect(await result).toEqual({ ok: false, code: "draft_input_changed", message: HUMAN });
+        expect(g.checkInput).toHaveBeenCalledTimes(2);
+        expect(g.cmds()).toEqual(["tmux copy-mode -q -t %1"]);
+      });
+
+      it("with no input meanwhile, the fallback goes out after the guard is checked again", async () => {
+        const g = guarded();
+        const result = g.adapter.cancelPaneMode("dev@rig");
+        g.release();
+        expect(await result).toEqual({ ok: true });
+        expect(g.checkInput).toHaveBeenCalledTimes(2);
+        expect(g.cmds()).toEqual(["tmux copy-mode -q -t %1", "tmux send-keys -t '%1' '-X' 'cancel'"]);
+      });
+    });
+  });
+
   describe("capturePaneContent", () => {
     it("calls exact tmux capture-pane command with shell quoting", async () => {
       const exec: ExecFn = vi.fn(async () => "line 1\nline 2\n") as unknown as ExecFn;
@@ -777,6 +1185,13 @@ describe("TmuxAdapter", () => {
       const adapter = new TmuxAdapter(exec);
 
       expect(await adapter.capturePaneContent("%0")).toBeNull();
+    });
+
+    it("joins soft-wrapped lines only when requested, retaining the capture bound", async () => {
+      const exec: ExecFn = vi.fn(async () => "logical line\n") as unknown as ExecFn;
+      const adapter = new TmuxAdapter(exec);
+      expect(await adapter.capturePaneContent("%5", 30, { joinWrappedLines: true })).toBe("logical line\n");
+      expect(exec).toHaveBeenCalledWith("tmux capture-pane -p -J -t '%5' -S -30");
     });
 
     it("uses custom line count", async () => {
@@ -1010,6 +1425,12 @@ describe("TmuxAdapter", () => {
   // seeds a new subscriber with the CURRENT VISIBLE SCREEN + cursor so a live
   // terminal paints immediately instead of staying blank until next output.
   describe("capturePaneScreen (visible screen, NOT scrollback)", () => {
+    it("can retain styling without adding scrollback", async () => {
+      const exec = vi.fn<ExecFn>().mockResolvedValue("styled frame");
+      await new TmuxAdapter(exec).capturePaneScreen("worker@rig", { escapeSequences: true });
+      expect(exec.mock.calls[0]![0]).toBe("tmux capture-pane -p -e -t '=worker@rig:'");
+    });
+
     it("calls `tmux capture-pane -p -t <pane>` with NO -S flag (scrollback would reintroduce row drift)", async () => {
       const exec = vi.fn<ExecFn>().mockResolvedValue("row a\nrow b\n");
       const adapter = new TmuxAdapter(exec);
@@ -1181,49 +1602,96 @@ describe("TmuxAdapter", () => {
   // Seat-handover cutover (plan 411c43de): the successor RESUMES INTO THE SAME PANE via respawn-pane,
   // so native scrollback survives (predecessor history stays above the successor boot).
   describe("parent-session identity on a tmux server that already carries it", () => {
-    const POLLUTED = "CLAUDECODE=1\nCLAUDE_EFFORT=max\nHERDR_PANE_ID=p9\nCLAUDE_CODE_USE_BEDROCK=1\nPATH=/usr/bin\n-REMOVED\n";
+    const POLLUTED = "CLAUDECODE=1\nCLAUDE_EFFORT=max\nHERDR_PANE_ID=p9\nHC_SCOPE=s-9\nHC_SESSION=work\nCLAUDE_CODE_USE_BEDROCK=1\nPATH=/usr/bin\n-REMOVED\n";
+    // new-session reports the pane it created (-P -F '#{pane_id}'); only that pane is restarted.
     const execWithGlobal = (global: string) =>
-      vi.fn<ExecFn>(async (cmd: string) => (cmd === "tmux show-environment -g" ? global : ""));
+      vi.fn<ExecFn>(async (cmd: string) => (cmd === "tmux show-environment -g" ? global : cmd.startsWith("tmux new-session") ? "%9\n" : ""));
 
     it("createSession marks only the listed names removed for this session, keeps explicit seat values, and restarts the fresh pane", async () => {
       const exec = execWithGlobal(POLLUTED);
-      expect(await new TmuxAdapter(exec).createSession("dev-impl@rig", "/w", { HERDR_PANE_ID: "explicit" })).toEqual({ ok: true });
+      expect(await adapterFor(exec).createSession("dev-impl@rig", "/w", { HERDR_PANE_ID: "explicit", HC_SESSION: "seat-core" })).toEqual({ ok: true });
       expect(exec.mock.calls.map((c) => c[0]).slice(1)).toEqual([
         "tmux show-environment -g",
         "tmux set-environment -t =dev-impl@rig -r CLAUDECODE",
+        "tmux set-environment -t =dev-impl@rig -r HC_SCOPE",
         "tmux set-environment -t =dev-impl@rig -r CLAUDE_EFFORT",
-        "tmux respawn-pane -k -t =dev-impl@rig: -c /w",
+        "tmux respawn-pane -k -t %9 -c /w",
       ]);
     });
 
     it("createSession keeps CLAUDE_EFFORT when no parent Claude Code session is present", async () => {
       const exec = execWithGlobal("CLAUDE_EFFORT=high\nHERDR_ENV=1\n");
-      await new TmuxAdapter(exec).createSession("s", undefined);
+      await adapterFor(exec).createSession("s", undefined);
       expect(exec.mock.calls.map((c) => c[0]).slice(2)).toEqual([
         "tmux set-environment -t =s -r HERDR_ENV",
-        "tmux respawn-pane -k -t =s:",
+        "tmux respawn-pane -k -t %9",
       ]);
+    });
+
+    it("createSession restarts no pane, and warns, when new-session reports no pane id", async () => {
+      const exec = vi.fn<ExecFn>(async (cmd: string) => (cmd === "tmux show-environment -g" ? POLLUTED : ""));
+      const result = await adapterFor(exec).createSession("s", undefined);
+      expect(result).toMatchObject({ ok: true, warnings: [expect.stringContaining("no pane id")] });
+      expect(exec.mock.calls.some(([cmd]) => cmd.startsWith("tmux respawn-pane"))).toBe(false);
     });
 
     it("respawnPane marks the names removed on the pane's session before the respawn, without -k", async () => {
       const exec = execWithGlobal(POLLUTED);
-      await new TmuxAdapter(exec).respawnPane("%3", "codex", { env: { OPENRIG_NODE_ID: "n" } });
+      await adapterFor(exec).respawnPane("%3", "codex", { env: { OPENRIG_NODE_ID: "n" } });
       expect(exec.mock.calls.map((c) => c[0])).toEqual([
         "tmux show-environment -g",
         "tmux set-environment -t %3 -r CLAUDECODE",
         "tmux set-environment -t %3 -r HERDR_PANE_ID",
+        "tmux set-environment -t %3 -r HC_SCOPE",
         "tmux set-environment -t %3 -r CLAUDE_EFFORT",
         "tmux respawn-pane -t '%3' -e 'OPENRIG_NODE_ID=n' 'codex'",
       ]);
     });
 
-    it("an unreadable global environment leaves the launch as it was", async () => {
+    // An unreadable global environment can't show whether the seat inherits an identity: the launch
+    // goes ahead as before (no pane restarted), and the warning says the cleanup didn't happen.
+    it("an unreadable global environment leaves the launch as it was, with a warning", async () => {
+      const exec = vi.fn<ExecFn>(async (cmd: string) => {
+        if (cmd === "tmux show-environment -g") throw new Error("unsupported");
+        return cmd.startsWith("tmux new-session") ? "%9\n" : "";
+      });
+      const result = await adapterFor(exec).createSession("s", undefined);
+      expect(result).toMatchObject({ ok: true, warnings: [expect.stringContaining("unsupported")] });
+      expect(exec).toHaveBeenCalledTimes(2);
+    });
+
+    it("respawnPane still respawns, with a warning, when the global environment is unreadable", async () => {
       const exec = vi.fn<ExecFn>(async (cmd: string) => {
         if (cmd === "tmux show-environment -g") throw new Error("unsupported");
         return "";
       });
-      expect(await new TmuxAdapter(exec).createSession("s", undefined)).toEqual({ ok: true });
-      expect(exec).toHaveBeenCalledTimes(2);
+      const result = await adapterFor(exec).respawnPane("%3", "codex");
+      expect(result).toMatchObject({ ok: true, warnings: [expect.stringContaining("unsupported")] });
+      expect(exec.mock.calls.at(-1)![0]).toBe("tmux respawn-pane -t '%3' 'codex'");
+    });
+
+    // #771 review: the cleanup fails open. A tmux error there leaves a launch that works today
+    // working, and says so as a launch warning.
+    it.each(["set-environment", "respawn-pane"])("createSession still succeeds, with a warning, when the cleanup's %s fails", async (failing) => {
+      const exec = vi.fn<ExecFn>(async (cmd: string) => {
+        if (cmd.startsWith("tmux new-session")) return "%9\n";
+        if (cmd === "tmux show-environment -g") return POLLUTED;
+        if (cmd.startsWith(`tmux ${failing}`)) throw new Error(`${failing} refused`);
+        return "";
+      });
+      const result = await adapterFor(exec).createSession("s", "/w");
+      expect(result).toMatchObject({ ok: true, warnings: [expect.stringContaining(`${failing} refused`)] });
+    });
+
+    it("respawnPane still respawns, with a warning, when the cleanup fails", async () => {
+      const exec = vi.fn<ExecFn>(async (cmd: string) => {
+        if (cmd === "tmux show-environment -g") return POLLUTED;
+        if (cmd.startsWith("tmux set-environment")) throw new Error("set-environment refused");
+        return "";
+      });
+      const result = await adapterFor(exec).respawnPane("%3", "codex");
+      expect(result).toMatchObject({ ok: true, warnings: [expect.stringContaining("set-environment refused")] });
+      expect(exec.mock.calls.at(-1)![0]).toBe("tmux respawn-pane -t '%3' 'codex'");
     });
   });
 
@@ -1233,7 +1701,7 @@ describe("TmuxAdapter", () => {
       // The cutover terminates the retiree FIRST (graceful exit + remain-on-exit), then respawns the
       // now-dead pane with NO -k — which PRESERVES the predecessor history above the successor boot.
       const exec = vi.fn<ExecFn>().mockResolvedValue("");
-      const adapter = new TmuxAdapter(exec);
+      const adapter = adapterFor(exec);
 
       await adapter.respawnPane("%3", "openrig-agent --resume tok");
 
@@ -1244,7 +1712,7 @@ describe("TmuxAdapter", () => {
 
     it("with env + cwd injects -c and -e flags (successor self-identifies in the reused pane), command stays last", async () => {
       const exec = vi.fn<ExecFn>().mockResolvedValue("");
-      const adapter = new TmuxAdapter(exec);
+      const adapter = adapterFor(exec);
 
       await adapter.respawnPane("%3", "openrig-agent --resume tok", {
         cwd: "/w",
@@ -1259,7 +1727,7 @@ describe("TmuxAdapter", () => {
 
     it("with NO command re-runs the pane's default login shell (omits the trailing command arg)", async () => {
       const exec = vi.fn<ExecFn>().mockResolvedValue("");
-      const adapter = new TmuxAdapter(exec);
+      const adapter = adapterFor(exec);
 
       await adapter.respawnPane("%3", undefined, {
         cwd: "/w",
@@ -1273,7 +1741,7 @@ describe("TmuxAdapter", () => {
     });
 
     it("classifies a write error (no server) as a failure", async () => {
-      const adapter = new TmuxAdapter(mockExec({ "respawn-pane": { error: NO_SERVER_ERROR } }));
+      const adapter = adapterFor(mockExec({ "respawn-pane": { error: NO_SERVER_ERROR } }));
       const result = await adapter.respawnPane("%3", "cmd");
       expect(result.ok).toBe(false);
     });
@@ -1335,5 +1803,72 @@ describe("TmuxAdapter", () => {
       const res = await adapter.signalPaneProcess("%3", "KILL");
       expect(res.ok).toBe(false);
     });
+  });
+});
+
+describe("TmuxAdapter pane-local options (in-place restart)", () => {
+  it("reads a pane's own option exactly: unset is null, an empty value stays empty, spaces are kept", async () => {
+    const outputs: Record<string, string> = { "remain-on-exit": "", "@empty": "\n", "@spaced": "  on \n" };
+    const adapter = new TmuxAdapter(async (cmd) => outputs[cmd.split(" ").at(-1)!.replace(/'/g, "")] ?? "");
+    expect(await adapter.getPaneLocalOption("%1", "remain-on-exit")).toBeNull();
+    expect(await adapter.getPaneLocalOption("%1", "@empty")).toBe("");
+    expect(await adapter.getPaneLocalOption("%1", "@spaced")).toBe("  on ");
+  });
+
+  it("an unreadable option is undefined, and restoring null unsets the pane's own value", async () => {
+    const calls: string[] = [];
+    const failing = new TmuxAdapter(async () => { throw new Error("no server"); });
+    expect(await failing.getPaneLocalOption("%1", "remain-on-exit")).toBeUndefined();
+    const adapter = new TmuxAdapter(async (cmd) => { calls.push(cmd); return ""; });
+    expect(await adapter.restorePaneOption("%1", "remain-on-exit", null)).toEqual({ ok: true });
+    expect(await adapter.restorePaneOption("%1", "remain-on-exit", "on")).toEqual({ ok: true });
+    expect(calls.map((cmd) => cmd.replace(/'/g, ""))).toEqual([
+      "tmux set-option -p -u -t %1 remain-on-exit",
+      "tmux set-option -p -t %1 remain-on-exit on",
+    ]);
+  });
+});
+
+describe("staged files", () => {
+  // Every file the adapter stages (launch scripts, environment files, the scope marker, private configs, paste buffers)
+  // takes its name from tmpName.
+  it("are staged in the OpenRig home's runtime folder, created owner-only, and keep their mode and cleanup", async () => {
+    const home = mkdtempSync(join(tmpdir(), "tmux-staging-home-"));
+    vi.stubEnv("OPENRIG_HOME", home);
+    try {
+      const files = defaultTmuxFileOps();
+      const file = files.tmpName();
+      expect(dirname(file)).toBe(join(home, "run", "tmux-staging"));
+      expect(tmuxStagingDir()).toBe(dirname(file));
+      expect(isStagedSendScriptPath(file)).toBe(true);
+      // The folder is made by the write, inside the caller's error handling.
+      expect(existsSync(dirname(file))).toBe(false);
+      await files.writeFile(file, "exec true\n", { mode: 0o600, flag: "wx" });
+      expect(statSync(dirname(file)).mode & 0o777).toBe(0o700);
+      expect(statSync(file).mode & 0o777).toBe(0o600);
+      await files.unlink(file);
+      expect(existsSync(file)).toBe(false);
+      expect(files.tmpName()).not.toBe(file);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("are staged at an absolute path when the OpenRig home is given relative, as run/seat-bin resolves it", async () => {
+    const home = mkdtempSync(join(tmpdir(), "tmux-staging-relative-"));
+    vi.stubEnv("OPENRIG_HOME", relative(process.cwd(), home));
+    try {
+      const files = defaultTmuxFileOps();
+      const file = files.tmpName();
+      expect(dirname(file)).toBe(resolve(home, "run", "tmux-staging"));
+      expect(isStagedSendScriptPath(file)).toBe(true);
+      await files.writeFile(file, "exec true\n", { mode: 0o600, flag: "wx" });
+      expect(existsSync(file)).toBe(true);
+      await files.unlink(file);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

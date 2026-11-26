@@ -23,7 +23,7 @@ function snapshot(tokens: "missing" | "resolved" | "unavailable", manifest = tru
       configuration: { enabled: false, channel: null, inboundDestination: null, outboundDestinations: [], postLevel: "NOTICE", interruptLevel: "ALERT", botToken: tokens, appToken: tokens },
       running: { state: "active", activatedAt: null, outboundReady: false, inboundReady: false, inboundState: "idle", applied: "matching" },
       state: "disabled", nextAction: tokens === "missing" ? "rig slack manifest --url" : "rig slack enable",
-      verification: { state: "none", at: null, actor: null }, registry: { state: "available", path: null }, humans: [],
+      registry: { state: "available", path: null }, humans: [],
     },
   } as FleetSnapshot;
 }
@@ -137,7 +137,9 @@ describe("Print link to copy — emitted bytes and normal return", () => {
   });
 
   it("a value that contains a line break is still printed as one line", () => {
-    expect(printForCopyText("l", "a\nb\r\nc").split("\r\n")).toContain("abc");
+    // A line break is a control byte, and control bytes become spaces rather than disappearing: two
+    // fields a break separated must not run together in what the operator copies.
+    expect(printForCopyText("l", "a\nb\r\nc").split("\r\n")).toContain("a b  c");
   });
 });
 

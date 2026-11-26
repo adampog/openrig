@@ -7,6 +7,9 @@ import {
   type ObligationRow,
 } from "../src/domain/parked-query.js";
 import type { ArbitratedSeatState } from "../src/domain/activity-taxonomy.js";
+import { TMUX_GENERIC_RUNG_INVENTORY } from "../src/domain/activity-taxonomy.js";
+import { SeatActivityService } from "../src/domain/seat-activity-service.js";
+import type { TmuxAdapter } from "../src/adapters/tmux.js";
 
 // OPR.0.5.5.19 A7 — the parked query, RED-first and both-sided (AM-3). At base no
 // surface answers "are we parked?" — these pins define the derived diagnosis with
@@ -56,6 +59,8 @@ describe("S19 A7 — the derived diagnosis, both park causes", () => {
     expect(d.parked).toBe(true);
     expect(d.activity.value).toBe("idle-at-prompt");
     expect(d.activity.confidence).toBe("oracle");
+    // #1933: when the arbitrated state last changed, which for a stopped seat is when it began waiting.
+    expect(d.activity.since).toBe("2026-08-26T23:00:00.000Z");
     expect(d.obligations.openCount).toBe(1);
     expect(d.obligations.items[0]!.qitemId).toBe("qitem-1");
     expect(d.reason).toMatch(/idle/i);
@@ -66,6 +71,20 @@ describe("S19 A7 — the derived diagnosis, both park causes", () => {
     const d = diagnoseSeatParked(deps(state, [pendingRow]), SEAT);
     expect(d.parked).toBe(true);
     expect(d.reason).toMatch(/needs.input|permission/i);
+  });
+
+  it("usage-limit park: a typed limit reads unknown but stopped, so open work is PARKED with the reset named; an empty board isn't", () => {
+    const usageLimit = { rung: "lifecycle-hooks" as const, observedAt: "2026-08-26T23:00:00.000Z", resetsAt: "2026-08-27T12:00:00.000Z" };
+    const state = oracleState({ activity: "unknown", decidedBy: "lifecycle-hooks", usageLimit });
+    const d = diagnoseSeatParked(deps(state, [pendingRow]), SEAT);
+    expect(d.parked).toBe(true);
+    expect(d.activity.value).toBe("unknown");
+    expect(d.reason).toContain("at its usage limit (resets 2026-08-27T12:00:00.000Z)");
+    expect(diagnoseSeatParked(deps(oracleState({ activity: "unknown", usageLimit: { ...usageLimit, resetsAt: null } }), [pendingRow]), SEAT).reason)
+      .toContain("at its usage limit (no reset stated)");
+    expect(diagnoseSeatParked(deps(state, []), SEAT).parked).toBe(false);
+    // Unknown with no typed limit (a limit that couldn't be read back after a restart) still supports no verdict.
+    expect(diagnoseSeatParked(deps(oracleState({ activity: "unknown", decidedBy: null }), [pendingRow]), SEAT).parked).toBe("indeterminate");
   });
 
   it("working with obligations is NOT parked", () => {
@@ -133,6 +152,20 @@ describe("S19 A7 — the derived diagnosis, both park causes", () => {
 });
 
 describe("S19 A7 — AM-3: both-sided confidence, named scope, limit guard", () => {
+  it("does not diagnose a parked owner from an expired tmux sample", async () => {
+    let now = Date.parse("2026-08-26T23:00:00Z");
+    let signal: number | null = now / 1000 - 30;
+    const tmux = { readPaneLastActivity: async () => signal } as unknown as TmuxAdapter;
+    const service = new SeatActivityService({ tmux, defaultWindowSeconds: 3, now: () => new Date(now) });
+    service.declareRungInventory(SEAT, TMUX_GENERIC_RUNG_INVENTORY);
+    await service.pollSeat(SEAT.sessionName);
+    const query = { ...deps(null, [pendingRow]), getSeatState: (id: string) => service.getSeatState(id) };
+    expect(diagnoseSeatParked(query, SEAT).parked).toBe(true);
+    signal = null;
+    now += 60_000;
+    await service.pollSeat(SEAT.sessionName);
+    expect(diagnoseSeatParked(query, SEAT).parked).toBe("indeterminate");
+  });
   it("activity UNKNOWN → the verdict is INDETERMINATE, never a guessed NOT-PARKED", () => {
     const d = diagnoseSeatParked(deps(oracleState({ activity: "unknown", decidedBy: null }), [pendingRow]), SEAT);
     expect(d.parked).toBe("indeterminate");

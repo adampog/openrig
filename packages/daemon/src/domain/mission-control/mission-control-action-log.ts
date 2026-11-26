@@ -23,11 +23,16 @@ export const MISSION_CONTROL_VERBS = [
   // parked qitem (state=blocked on a human seat). NON-CLOSURE: blocked →
   // in-progress only; the decision text lands in queue_transitions.
   "resolve",
+  // answer: the person's answer to an ask addressed to them (a choice or their words), recorded on that row and
+  // returned to the asking seat as Slack's answers are.
+  "answer",
 ] as const;
 
 export type MissionControlVerb = (typeof MISSION_CONTROL_VERBS)[number];
 
 export interface MissionControlActionRecordInput {
+  /** Reserved by a composing transactional writer; ordinary callers let the log allocate it. */
+  actionId?: string;
   actionVerb: MissionControlVerb;
   qitemId: string | null;
   actorSession: string;
@@ -132,7 +137,7 @@ export class MissionControlActionLog {
         { actionVerb: input.actionVerb },
       );
     }
-    const actionId = ulid();
+    const actionId = input.actionId ?? ulid();
     const baseCols = [
       actionId,
       input.actionVerb,
@@ -183,6 +188,14 @@ export class MissionControlActionLog {
       auditNotes: input.auditNotes ?? null,
       identityProvenance: input.identityProvenance ?? null,
     };
+  }
+
+  /** Exact all-history reconciliation; unrelated later actions cannot evict a committed operation. */
+  findOperation(qitemId: string, operation: string): MissionControlActionEntry | null {
+    const row = this.db.prepare(`SELECT * FROM mission_control_actions WHERE qitem_id = ?
+      AND json_valid(audit_notes_json) AND json_extract(audit_notes_json, '$.operation') = ? ORDER BY rowid LIMIT 1`)
+      .get(qitemId, operation) as ActionRow | undefined;
+    return row ? rowToEntry(row) : null;
   }
 
   listRecent(limit = 50): MissionControlActionEntry[] {

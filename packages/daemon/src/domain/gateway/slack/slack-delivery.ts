@@ -13,17 +13,19 @@
 //   - delivered-ok additionally marks the qitemId seen (slice-11: seen ONLY after success) and
 //     releases the driver's in-flight guard.
 
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { postChatMessage, getUploadURLExternal, uploadBytesExternal, completeUploadExternal, fetchRecentMessageTexts, type FetchImpl } from "./slack-api.js";
 import {
-  buildOutboundMessage, attributionFromSession, reconcileToken, redactSecrets, splitForSlack,
+  buildOutboundMessage, attributionFromSession, CODE_FENCE_ROOM, openFenceAfter, reconcileToken, redactSecrets, splitForSlack,
   HumanMessageShapeError, SLACK_SECTION_CAP, SLACK_TEXT_CAP, type SlackMediaRef,
 } from "./message.js";
 import type { SeenStore } from "./state-store.js";
 import type { OutboundDecision } from "../protocol.js";
 import type { SubsystemDeliverFn, SubsystemDeliveryOutcome } from "../gateway-subsystem.js";
 import type { OutboundPostPayload } from "./outbound-driver.js";
+import { resolveAllowedAbsoluteFile, FilePathSafetyError, type AllowlistRoot } from "../../files/path-safety.js";
 
 export interface SubsystemSlackDeliveryOpts {
   botToken: string;
@@ -40,8 +42,17 @@ export interface SubsystemSlackDeliveryOpts {
    *  (no map) nothing is recorded and the channel is resolved as before. */
   pinChannel?: boolean;
   sourceLabel: string; // host/box/rig — from config, never hardcoded (item 7)
+  /** Human-row previews; absent defaults off. */
+  unfurl?: "on" | "off";
+  /** This daemon's machine name, read per post, shown after a seat sender (message.ts `machine`). */
+  machine?: () => string | null;
+  machineFallback?: string;
   bodyExcerpt?: number;
   fetchImpl?: FetchImpl;
+  /** The owning gateway run's stop signal. When the wire stops (restart, disable,
+   *  shutdown) a rate-limit wait inside postChatMessage rejects instead of sleeping
+   *  on: a stale retry must never post after a replay already owns the decision. */
+  stopSignal?: AbortSignal;
   /** decisionId-keyed delivered-store (idempotent redelivery: replay re-acks, never re-posts). */
   delivered: SeenStore;
   /** H — decisionId-keyed ATTEMPTED-store, marked BEFORE the HTTP post. A retry of an attempted
@@ -67,6 +78,9 @@ export interface SubsystemSlackDeliveryOpts {
    *  reaction on that message can reach them. A throw retains the
    *  delivery like any receipt failure; the replay reconciles the message by marker and records it again. */
   onPostedPart?: (payload: OutboundPostPayload, messageTs: string, threadTs: string, channel: string) => void;
+  /** #2234: Slack posted a reply to `threadTs` as a new top-level message, so that thread's root is gone. The message is
+   *  then recorded as a root through `onPostedRoot`. */
+  onThreadMissing?: (payload: OutboundPostPayload, threadTs: string, channel: string) => void;
   /** OPR.0.5.6.14 — the transport-failure receipt hook: a failed post writes
    *  the row's transport-failed ledger transition (class + API error), so a
    *  delivery failure is as legible on the row as a success. `partlyPosted` marks an ask whose
@@ -81,18 +95,27 @@ export interface SubsystemSlackDeliveryOpts {
    *  for hermetic tests; default reads the filesystem (LOCAL_ATTACHMENT_EXT, at most
    *  LOCAL_ATTACHMENT_MAX_BYTES). Return null = not a local attachment; { skipped } = an
    *  attachment that can't be sent (logged, the text still delivers). */
-  readLocalImage?: (refPath: string) => LocalAttachment | null;
+  readLocalImage?: (refPath: string, scope?: AttachmentScope) => LocalAttachment | null;
+  /** The daemon's shared roots (files.allowlist), read when a scoped writer's evidence is attached. Absent: none, so such
+   *  evidence isn't attached. */
+  filesAllowlist?: () => AllowlistRoot[];
   log?: (msg: string) => void;
 }
 
+/** The shared roots a scoped writer's evidence must be read from: the daemon's roots its grant names. */
+export interface AttachmentScope { roots: AllowlistRoot[] }
+
 const LOCAL_IMAGE_EXT = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"]);
-/** Local evidence files uploaded into the thread: images, video (Slack plays mp4/webm/mov inline)
- *  and PDF. Wider than LOCAL_IMAGE_EXT, which gates https Block Kit image blocks. */
+/** Local evidence types uploaded into the thread, including images, videos and PDFs. */
 const LOCAL_ATTACHMENT_EXT = new Set([...LOCAL_IMAGE_EXT, ".mp4", ".webm", ".mov", ".pdf"]);
 /** Well under Slack's 1 GB per-file limit, and bounded for a daemon that holds the bytes in memory. */
 export const LOCAL_ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024;
 export type LocalAttachment = { bytes: Uint8Array; filename: string } | { skipped: string };
 const TRANSPORT_FAILURE_RECEIPT_PREFIX = "::transport-failure-receipt::";
+const INVALID_BLOCKS_CLASS = "slack-invalid-blocks";
+/** Slack answered 2xx but its body couldn't be read: the post may be in the channel. */
+export const POSSIBLY_POSTED_CLASS = "possibly-posted";
+const PAYLOAD_ATTEMPT_PREFIX = "::payload-attempt::";
 /** #192: `<decisionId>::channel::<channel>` in the attempted store = the channel this post's first
  *  attempt was decided for (see pinChannel). Keyed like the transport-failure receipt. */
 const CHANNEL_DECIDED_PREFIX = "::channel::";
@@ -112,8 +135,8 @@ function firstAttemptChannel(opts: SubsystemSlackDeliveryOpts, attempted: Set<st
 }
 const TRANSPORT_FAILURE_RECEIPT_REPAIRED = "::repaired";
 
-function transportFailureReceiptKey(decisionId: string, failureClass: string, detail: string): string {
-  const encoded = Buffer.from(JSON.stringify([failureClass, detail]), "utf8").toString("base64url");
+function transportFailureReceiptKey(decisionId: string, failureClass: string, detail: string, payloadHash?: string): string {
+  const encoded = Buffer.from(JSON.stringify(payloadHash ? [failureClass, detail, payloadHash] : [failureClass, detail]), "utf8").toString("base64url");
   return `${decisionId}${TRANSPORT_FAILURE_RECEIPT_PREFIX}${encoded}`;
 }
 
@@ -142,17 +165,31 @@ function pendingTransportFailureReceipt(
  *  of at most LOCAL_ATTACHMENT_MAX_BYTES, readable — else null (not an attachment), or { skipped }
  *  when it is an attachment that can't be sent (too large, missing, unreadable), so the miss is
  *  logged rather than silent. */
-export function defaultReadLocalImage(refPath: string): LocalAttachment | null {
+export function defaultReadLocalImage(refPath: string, scope?: AttachmentScope): LocalAttachment | null {
   if (!path.isAbsolute(refPath)) return null;
   if (!LOCAL_ATTACHMENT_EXT.has(path.extname(refPath).toLowerCase())) return null;
+  // A scoped writer's evidence is read only inside the roots its grant names, judged now, at the read: the reference
+  // as written must sit under one of them and its real target must stay there (the file reader's own containment).
+  // That real file is then opened without following a final link and checked to still be the file at that real path,
+  // so a link swapped in after the check isn't followed out of the root.
+  let file = refPath;
+  if (scope) {
+    try {
+      file = resolveAllowedAbsoluteFile(scope.roots, refPath);
+    } catch (e) {
+      if (!(e instanceof FilePathSafetyError)) throw e;
+      return { skipped: e.code === "stat_failed" ? "missing or unreadable" : "outside the shared roots its writer may read" };
+    }
+  }
   // The path is resolved ONCE: open it, then stat and read that same descriptor, so the file checked is the file
   // sent. O_NONBLOCK keeps the open from waiting on a FIFO (refused below as not a regular file), and the read is
   // bounded by the size just checked.
   let fd: number | null = null;
   try {
-    fd = fs.openSync(refPath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (scope ? fs.constants.O_NOFOLLOW : 0));
     const st = fs.fstatSync(fd);
     if (!st.isFile()) return { skipped: "not a regular file" };
+    if (scope && !stillAt(file, st)) return { skipped: "outside the shared roots its writer may read" };
     if (st.size > LOCAL_ATTACHMENT_MAX_BYTES) {
       return { skipped: `${st.size} bytes is over the ${LOCAL_ATTACHMENT_MAX_BYTES}-byte attachment cap` };
     }
@@ -165,47 +202,57 @@ export function defaultReadLocalImage(refPath: string): LocalAttachment | null {
     }
     return { bytes: read === bytes.length ? bytes : bytes.subarray(0, read), filename: path.basename(refPath) };
   } catch (e) {
-    return { skipped: `unreadable (${(e as NodeJS.ErrnoException).code ?? "error"})` };
+    const code = (e as NodeJS.ErrnoException).code;
+    // A final link where the checked real file was: it changed after the check, and isn't followed.
+    if (scope && code === "ELOOP") return { skipped: "outside the shared roots its writer may read" };
+    return { skipped: `unreadable (${code ?? "error"})` };
   } finally {
     if (fd !== null) fs.closeSync(fd);
   }
 }
 
-/** #47 — only an https evidenceRef with an image-like extension may ride as a Block Kit
- *  `image` block (extension set mirrors LOCAL_IMAGE_EXT). Slack rejects the ENTIRE
- *  message with `invalid_blocks` when an image block's URL is not a real image (e.g. a
- *  GitLab issue link or a PROOF.md URL — both explicitly documented evidenceRef uses),
- *  so a non-image https ref must never become an image block. Query strings and
- *  fragments are stripped before the extension check. */
-export function isHttpsImageRef(ref: unknown): boolean {
-  if (typeof ref !== "string") return false;
-  const url = ref.trim();
-  if (!/^https:\/\/\S+$/.test(url)) return false;
+/** The roots a scoped writer's evidence is attached from: the daemon's shared roots its grant names, recorded with the
+ *  reference. Undefined for a writer with no root grant (and for a decision recorded before roots were). */
+function attachmentScope(opts: SubsystemSlackDeliveryOpts, q: OutboundPostPayload): AttachmentScope | undefined {
+  const roots = q.evidenceRefRoots;
+  return Array.isArray(roots) ? { roots: (opts.filesAllowlist?.() ?? []).filter((root) => roots.includes(root.name)) } : undefined;
+}
+
+/** Whether the opened file is still the one at this real path, with no link anywhere on the way to it. */
+function stillAt(realPath: string, opened: fs.Stats): boolean {
   try {
-    return LOCAL_IMAGE_EXT.has(path.extname(new URL(url).pathname).toLowerCase());
+    if (fs.realpathSync(realPath) !== realPath) return false;
+    const now = fs.statSync(realPath);
+    return now.dev === opened.dev && now.ino === opened.ino;
   } catch {
     return false;
   }
 }
 
-/** #47 — split an evidenceRef into an image attachment vs. a plain link. An explicit
- *  `media` array stays fully caller-controlled; otherwise an image-looking https
- *  evidenceRef becomes a Block Kit image and a non-image https evidenceRef becomes a
- *  plain link (rendered by buildEvidenceLink, never an image block). Local refs keep
- *  their existing handling (image upload flow / clean skip). */
-export function evidenceAttachment(
+/** Slack requires publicly hosted URLs for image blocks. An HTTPS evidence ref
+ * may need private network access, so render it as a link. Explicit media and
+ * local file uploads have their own rendering paths. */
+function evidenceAttachment(
   media: unknown,
   evidenceRef: unknown,
-  summary: string | null | undefined,
 ): { mediaRefs: SlackMediaRef[] | undefined; evidenceLink: string | undefined } {
   if (Array.isArray(media)) return { mediaRefs: media as SlackMediaRef[], evidenceLink: undefined };
   if (typeof evidenceRef !== "string") return { mediaRefs: undefined, evidenceLink: undefined };
   const ref = evidenceRef.trim();
-  if (isHttpsImageRef(ref)) {
-    return { mediaRefs: [{ imageUrl: ref, altText: summary ?? "attachment" }], evidenceLink: undefined };
-  }
   if (/^https:\/\/\S+$/.test(ref)) return { mediaRefs: undefined, evidenceLink: ref };
   return { mediaRefs: undefined, evidenceLink: undefined };
+}
+
+/** A sleep that rejects the moment the owning gateway run stops: the inline rate-limit
+ *  retry inside postChatMessage must never outlive the run that started it, or a restart
+ *  would leave both the stale retry and the replay's post in flight for one decision. */
+export function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) { reject(new Error("gateway stopped during rate-limit wait")); return; }
+    const onAbort = () => { clearTimeout(timer); reject(new Error("gateway stopped during rate-limit wait")); };
+    const timer = setTimeout(() => { signal.removeEventListener("abort", onAbort); resolve(); }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 /** Build the subsystem DeliverFn. Contract mirrors the retired connector handleDecision. */
@@ -217,7 +264,7 @@ function deliverSinglePart(opts: SubsystemSlackDeliveryOpts, markEpisode = true)
       log(`delivery: decision ${decision.decisionId} already delivered — re-ack, no re-post`);
       return { ok: true };
     }
-    const q = (decision.payload ?? {}) as OutboundPostPayload & { media?: SlackMediaRef[] };
+    const q = (decision.payload ?? {}) as DeliveryPart;
     // #192: the channel first, from this post's record when it has one, so the thread below is
     // chosen inside the channel the post actually goes to (and went to, on a retry).
     const pinned = firstAttemptChannel(opts, opts.attempted.load(), decision.decisionId);
@@ -226,8 +273,11 @@ function deliverSinglePart(opts: SubsystemSlackDeliveryOpts, markEpisode = true)
       try {
         opts.attempted.mark(`${decision.decisionId}${CHANNEL_DECIDED_PREFIX}${channel}`, "channel-decided");
       } catch (e) {
-        log(`channel record FAILED for ${q.qitemId ?? decision.decisionId}: ${(e as Error).message} — retained, nothing posted`);
-        return { ok: false, class: "channel-unrecorded", detail: (e as Error).message };
+        if (!q.possibleRepeat) {
+          log(`channel record FAILED for ${q.qitemId ?? decision.decisionId}: ${(e as Error).message} — retained, nothing posted`);
+          return { ok: false, class: "channel-unrecorded", detail: (e as Error).message };
+        }
+        log(`channel record FAILED for ${q.qitemId ?? decision.decisionId}: ${(e as Error).message} — posting once, marked as a possible repeat`);
       }
     }
     const threadTs = opts.resolveThreadTs?.(q, channel);
@@ -243,8 +293,10 @@ function deliverSinglePart(opts: SubsystemSlackDeliveryOpts, markEpisode = true)
         return { ok: false, class: "receipt-failed", detail: pendingFailure.error };
       }
       try {
-        if (!opts.onTransportFailed) throw new Error("transport-failure receipt hook is unavailable");
-        opts.onTransportFailed(q, pendingFailure.failureClass, pendingFailure.detail);
+        if (!opts.onTransportFailed && pendingFailure.failureClass !== INVALID_BLOCKS_CLASS) {
+          throw new Error("transport-failure receipt hook is unavailable");
+        }
+        opts.onTransportFailed?.(q, pendingFailure.failureClass, pendingFailure.detail);
         opts.attempted.mark(
           `${pendingFailure.key}${TRANSPORT_FAILURE_RECEIPT_REPAIRED}`,
           "transport-failure-receipt-repaired",
@@ -255,12 +307,101 @@ function deliverSinglePart(opts: SubsystemSlackDeliveryOpts, markEpisode = true)
       }
     }
 
+    // Only render before reconciliation when comparing a known rejection. Other
+    // attempts still reconcile first, including a landed message that no longer renders (#899).
+    // A rejection is recorded against the plain render, so a repeat note can't make a rejected payload look new.
+    const renders = new Map<string, ReturnType<typeof buildOutboundMessage>>();
+    // Qualify/read once per attempt, lazily at render. The note and upload describe the same snapshot even if a
+    // reference changes while Slack is posting; an already-landed decision normally reconciles without a file read.
+    let attachmentRead = false;
+    let attachment: ReturnType<typeof defaultReadLocalImage> = null;
+    const localAttachment = () => {
+      if (!attachmentRead) {
+        attachmentRead = true;
+        attachment = q.evidenceRef && !/^https:\/\//.test(String(q.evidenceRef))
+          ? (opts.readLocalImage ?? defaultReadLocalImage)(String(q.evidenceRef), attachmentScope(opts, q)) : null;
+      }
+      return attachment;
+    };
+    const render = (possibleRepeat = false, stateUnconfirmed = false, quietUnreadable = false) => {
+      const cached = renders.get(`${possibleRepeat}:${stateUnconfirmed}:${quietUnreadable}`);
+      if (cached) return cached;
+      const { mediaRefs, evidenceLink } = evidenceAttachment(q.media, q.evidenceRef);
+      const local = localAttachment();
+      const evidenceNotAttached = !!local && "skipped" in local && local.skipped === "outside the shared roots its writer may read";
+      const built = buildOutboundMessage(
+        {
+          qitemId: q.qitemId ?? decision.decisionId,
+          ownerNotificationKind: q.ownerNotificationKind,
+          summary: q.summary,
+          body: q.body,
+          humanQuestions: q.humanQuestions,
+          sharedChannel: q.sharedChannel,
+          destinationSession: q.destinationSession ?? decision.entityBindingRef,
+          // #1013 — a gate parked on a human seat renders the question, not the agent packet.
+          state: q.state,
+          tags: q.tags,
+          evidenceRef: q.evidenceRef,
+          bodyOpenFence: q.bodyOpenFence,
+        },
+        {
+          sourceLabel: opts.sourceLabel,
+          bodyExcerpt: opts.bodyExcerpt,
+          mediaRefs,
+          evidenceLink,
+          // A1.2 — attribution rides every post; identity stays the app's own (postChatMessage
+          // structurally cannot carry username/icon overrides — the customize-absence rail).
+          attribution: attributionFromSession(q.sourceSession),
+          machine: opts.machine?.() ?? undefined,
+          machineFallback: opts.machineFallback,
+          mentionUserId: opts.resolveMentionUserId?.(q),
+          // fix-r3 — the reconcile identity, reserved outside the clamp budget (same function
+          // the scan above matches: one identity, same bytes, both sides).
+          reconcileMarker: reconcileToken(decision.decisionId),
+          possibleRepeat,
+          stateUnconfirmed,
+          quietUnreadable,
+          evidenceNotAttached,
+        },
+      );
+      renders.set(`${possibleRepeat}:${stateUnconfirmed}:${quietUnreadable}`, built);
+      return built;
+    };
+    const postInput = (possibleRepeat = false) => {
+      const shown = render(possibleRepeat, q.stateUnconfirmed === true, q.quietUnreadable === true);
+      const unfurl = opts.unfurl === "on";
+      return { channel, text: shown.text, blocks: shown.blocks, thread_ts: threadTs, unfurl_links: unfurl, unfurl_media: unfurl };
+    };
+    const payloadHash = () => createHash("sha256").update(JSON.stringify({ channel, text: render().text, blocks: render().blocks, thread_ts: threadTs })).digest("hex");
+    const failurePrefix = `${decision.decisionId}${TRANSPORT_FAILURE_RECEIPT_PREFIX}`;
+    const hasRejection = [...attempted.keys()].some((key) => {
+      if (!key.startsWith(failurePrefix) || key.endsWith(TRANSPORT_FAILURE_RECEIPT_REPAIRED)) return false;
+      try { return JSON.parse(Buffer.from(key.slice(failurePrefix.length), "base64url").toString("utf8"))[0] === INVALID_BLOCKS_CLASS; }
+      catch { return false; }
+    });
+    const rejectedHash = (hash: string) => attempted.has(transportFailureReceiptKey(decision.decisionId, INVALID_BLOCKS_CLASS, "invalid_blocks", hash));
+    const rejected = () => hasRejection && rejectedHash(payloadHash());
+    const reject = (): SubsystemDeliveryOutcome => {
+      // Keep the receipt after repair, but block only the exact rejected wire payload.
+      try { opts.onTransportFailed?.(q, INVALID_BLOCKS_CLASS, "invalid_blocks"); }
+      catch (error) { return { ok: false, class: "receipt-failed", detail: (error as Error).message }; }
+      return { ok: false, class: INVALID_BLOCKS_CLASS, detail: "invalid_blocks" };
+    };
+    const attemptPrefix = `${decision.decisionId}${PAYLOAD_ATTEMPT_PREFIX}`;
+    if (hasRejection) {
+      const lastAttempt = [...attempted.keys()].reverse().find((key) => key.startsWith(attemptPrefix));
+      const lastHash = lastAttempt?.slice(attemptPrefix.length).split("::")[0];
+      // A newer correction may have landed despite a lost response. An older
+      // rejection cannot settle that ambiguity, even if rendering reverts.
+      if ((!lastHash || rejectedHash(lastHash)) && rejected()) return reject();
+    }
+
     // H — RECONCILE-BY-MARKER before any RESEND: if this decision was attempted before, the
     // prior outcome is ambiguous (a timeout may have posted). Search where the message would
     // live (the thread, else channel history) for the message's STRUCTURAL identity; FOUND →
-    // already delivered, record + ack, never repost. An initial unreadable request
-    // retains the decision. A partial scan warns and keeps main's at-least-once
-    // retry trade-off rather than indefinitely stranding a human notification.
+    // already delivered, record + ack, never repost. A scan that can't be read, or reads
+    // only part of the history, is not proof either way: it warns and posts once
+    // (at least once) rather than indefinitely stranding a human notification.
     // fix-r3 (R2 exactly-once): the identity is reconcileToken(decisionId) — a bounded,
     // decision-scoped token the renderer reserves OUTSIDE the clamp budget, so it is
     // GUARANTEED present in the scanned top-level text at any ordinary length, and ordinary
@@ -268,12 +409,9 @@ function deliverSinglePart(opts: SubsystemSlackDeliveryOpts, markEpisode = true)
     // decisionId in a delimited form). Producer and scanner call the same function: one
     // identity, same bytes, both sides.
     const marker = reconcileToken(decision.decisionId);
+    let possibleRepeat = q.possibleRepeat === true;
     if (attempted.has(decision.decisionId)) {
       const scan = await fetchRecentMessageTexts(opts.botToken, channel, threadTs, opts.fetchImpl, undefined, undefined, marker);
-      if (!scan.ok) {
-        log(`reconcile scan failed for ${decision.decisionId} (${scan.error}) — retained, no blind repost`);
-        return { ok: false, class: "reconcile-unreadable", detail: scan.error };
-      }
       const matched = scan.messages.find((m) => m.text.includes(marker));
       if (matched) {
         log(`reconcile: marker "${marker}" FOUND at ts=${matched.ts || "(missing)"} — prior ambiguous post landed; ack without repost`);
@@ -308,57 +446,51 @@ function deliverSinglePart(opts: SubsystemSlackDeliveryOpts, markEpisode = true)
         }
         return { ok: true };
       }
-      if (scan.incomplete) {
-        log(`reconcile WARNING: incomplete scan for ${decision.decisionId}: ${scan.incomplete} — marker not located; attempting one post`);
+      const incomplete = scan.ok ? scan.incomplete : scan.error ?? "reconcile scan failed";
+      if (incomplete) {
+        log(`reconcile WARNING: incomplete scan for ${decision.decisionId}: ${incomplete} — marker not located; attempting one post`);
+        possibleRepeat = true;
       } else {
         log(`reconcile: marker "${marker}" absent — safe to send`);
       }
     }
 
-    // Rendered only when a post is about to happen: a message already found by its marker above is
-    // acknowledged even if it would no longer render (#899: a changed sender label after it landed).
-    // M1 A5b (carried over from the retired sweep): an alert's evidenceRef IS the artifact the
-    // human judges. #47 — it rides as a Block Kit image ONLY when it looks like an image;
-    // a non-image https ref rides as a plain link instead (Slack's invalid_blocks rejects
-    // the whole message when an image block's URL is not a real image).
-    const { mediaRefs, evidenceLink } = evidenceAttachment(q.media, q.evidenceRef, q.summary);
-    const payload = buildOutboundMessage(
-      {
-        qitemId: q.qitemId ?? decision.decisionId,
-        summary: q.summary,
-        body: q.body,
-        humanQuestions: q.humanQuestions,
-        destinationSession: q.destinationSession ?? decision.entityBindingRef,
-      },
-      {
-        sourceLabel: opts.sourceLabel,
-        bodyExcerpt: opts.bodyExcerpt,
-        mediaRefs,
-        evidenceLink,
-        // A1.2 — attribution rides every post; identity stays the app's own (postChatMessage
-        // structurally cannot carry username/icon overrides — the customize-absence rail).
-        attribution: attributionFromSession(q.sourceSession),
-        mentionUserId: opts.resolveMentionUserId?.(q),
-        // fix-r3 — the reconcile identity, reserved outside the clamp budget (same function
-        // the scan above matches: one identity, same bytes, both sides).
-        reconcileMarker: reconcileToken(decision.decisionId),
-      },
-    );
+    if (rejected()) return reject();
 
+    const input = postInput(possibleRepeat);
     // Marked ATTEMPTED durably BEFORE the post: from here any outcome is ambiguous until 2xx.
-    opts.attempted.mark(decision.decisionId, "attempted");
+    try {
+      opts.attempted.mark(decision.decisionId, "attempted");
+    } catch (e) {
+      // Only a post the gateway already marked as a possible repeat goes on without its attempt record.
+      if (!q.possibleRepeat) throw e;
+      log(`attempt record FAILED for ${q.qitemId ?? decision.decisionId}: ${(e as Error).message} — posting once, marked as a possible repeat`);
+    }
+    if (hasRejection) {
+      // Unique ids preserve attempt order in the store's Set, including retries
+      // of the same correction. Ordinary posts need no extra record.
+      opts.attempted.mark(`${attemptPrefix}${payloadHash()}::${randomUUID()}`, "payload-attempted");
+    }
+    const stopSignal = opts.stopSignal;
     const res = await postChatMessage(
       opts.botToken,
-      { channel, text: payload.text, blocks: payload.blocks, thread_ts: threadTs },
+      input,
       opts.fetchImpl,
+      undefined,
+      stopSignal ? (ms: number) => abortableSleep(ms, stopSignal) : undefined,
     );
     if (!res.ok) {
-      const failureClass = res.status === 0 ? "transport" : `http-${res.status}`;
+      const permanent = res.status === 200 && res.error === "invalid_blocks";
+      // An unreadable 2xx may have posted: the replay reconciles by marker before any resend, as for a lost response.
+      const failureClass = permanent ? INVALID_BLOCKS_CLASS
+        : res.responseUnreadable ? POSSIBLY_POSTED_CLASS
+        : res.status === 0 ? "transport" : `http-${res.status}`;
+      if (permanent) log(`Slack rejected ${q.qitemId ?? decision.decisionId}: invalid_blocks — permanent failure; this payload will not be reposted`);
       // Persist the receipt input before the row write. A throwing row write
       // stays repairable across restart and blocks any later resend until the
       // authoritative transition lands.
-      if (opts.onTransportFailed) {
-        const receiptKey = transportFailureReceiptKey(decision.decisionId, failureClass, res.error ?? "");
+      if (opts.onTransportFailed || permanent) {
+        const receiptKey = transportFailureReceiptKey(decision.decisionId, failureClass, res.error ?? "", permanent ? payloadHash() : undefined);
         let receiptRetained = false;
         let retentionError: string | undefined;
         try {
@@ -369,13 +501,16 @@ function deliverSinglePart(opts: SubsystemSlackDeliveryOpts, markEpisode = true)
           log(`transport-failed receipt backup FAILED for ${q.qitemId ?? decision.decisionId}: ${retentionError} — authoritative row write still attempted`);
         }
         try {
-          opts.onTransportFailed(q, failureClass, res.error ?? "");
+          opts.onTransportFailed?.(q, failureClass, res.error ?? "");
         } catch (e) {
           const disposition = receiptRetained
             ? "retained for repair before resend"
             : `NOT retained; backup failed first: ${retentionError}`;
           log(`transport-failed receipt write FAILED for ${q.qitemId ?? decision.decisionId}: ${(e as Error).message} — ${disposition}`);
           return { ok: false, class: "receipt-failed", detail: (e as Error).message };
+        }
+        if (permanent && !receiptRetained) {
+          return { ok: false, class: "receipt-failed", detail: `permanent Slack rejection could not be retained: ${retentionError}` };
         }
         if (receiptRetained) {
           try {
@@ -395,10 +530,14 @@ function deliverSinglePart(opts: SubsystemSlackDeliveryOpts, markEpisode = true)
     // write that throws after a successful post is a clean retained outcome
     // (never an escaped throw); the replay reconciles by marker — the message
     // IS in the channel — and retries the idempotent receipt without reposting.
+    // #2234: record where Slack actually put the message, not where it was asked to. Without the posted message in its
+    // answer, the requested placement stands.
+    const placedThreadTs = res.threadTs === undefined ? threadTs : res.threadTs ?? undefined;
     try {
-      if (threadTs === undefined) opts.onPostedRoot?.(q, res.ts, channel);
-      else opts.onPostedPart?.(q, res.ts, threadTs, channel);
-      opts.onPosted?.(q, res.ts, threadTs);
+      if (threadTs !== undefined && placedThreadTs === undefined) opts.onThreadMissing?.(q, threadTs, channel);
+      if (placedThreadTs === undefined) opts.onPostedRoot?.(q, res.ts, channel);
+      else opts.onPostedPart?.(q, res.ts, placedThreadTs, channel);
+      opts.onPosted?.(q, res.ts, placedThreadTs);
     } catch (e) {
       log(`receipt write FAILED after successful post for ${q.qitemId ?? decision.decisionId}: ${(e as Error).message} — retained; replay reconciles by marker and retries the idempotent receipt`);
       return { ok: false, class: "receipt-failed", detail: (e as Error).message };
@@ -412,19 +551,15 @@ function deliverSinglePart(opts: SubsystemSlackDeliveryOpts, markEpisode = true)
       opts.release?.(key);
     }
 
-    // G — a LOCAL image evidenceRef (the founder screenshot) rides the EXTERNAL-UPLOAD flow
-    // into the conversation thread (files.upload is sunset). Upload failure is fail-VISIBLE
-    // but does NOT fail the decision: the text delivered; failing here would replay the whole
-    // post and duplicate the human notification (the H red). https refs already rode as Block
-    // Kit image blocks above; refs that are not attachments (e.g. a PROOF.md path) are a clean
-    // skip, and an attachment that can't be sent is logged.
-    const local = q.evidenceRef && !/^https:\/\//.test(String(q.evidenceRef))
-      ? (opts.readLocalImage ?? defaultReadLocalImage)(String(q.evidenceRef))
-      : null;
+    // Local attachments use Slack's external upload flow in the conversation thread.
+    // HTTPS evidence already appeared as a link in the posted message. Unsupported
+    // local files are skipped. A failed upload is logged without reposting the decision.
+    // A writer whose roots were recorded with the reference (a scoped grant) has it attached only from inside them.
+    const local = localAttachment();
     if (local && "skipped" in local) {
       log(`ATTACHMENT skipped for ${q.qitemId ?? decision.decisionId}: ${path.basename(String(q.evidenceRef))} ${local.skipped} (text delivered; attachment missing)`);
     } else if (local) {
-      const intoThread = threadTs ?? res.ts;
+      const intoThread = placedThreadTs ?? res.ts;
       const up = await getUploadURLExternal(opts.botToken, local.filename, local.bytes.length, opts.fetchImpl);
       if (up.ok && up.uploadUrl && up.fileId) {
         const put = await uploadBytesExternal(up.uploadUrl, local.bytes, opts.fetchImpl);
@@ -450,7 +585,7 @@ function deliverSinglePart(opts: SubsystemSlackDeliveryOpts, markEpisode = true)
   };
 }
 
-type DeliveryPart = OutboundPostPayload & { media?: SlackMediaRef[] };
+type DeliveryPart = OutboundPostPayload & { media?: SlackMediaRef[]; bodyOpenFence?: string };
 
 /** #897 — the most Slack messages one ask may post: the primary plus its thread replies. */
 export const MAX_HUMAN_MESSAGE_PARTS = 20;
@@ -473,10 +608,10 @@ function recordedPlan(attempted: Set<string>, decisionId: string): DeliveryPlan 
 
 /** Whether an ask's first message can already be in Slack; later parts post only after it lands. It can be if
  *  it was delivered or its receipt was kept, or if it was attempted and a scan finds its marker or reads only
- *  part of the history. An unreadable scan is reported, so the caller retains the ask instead of guessing. */
+ *  part of the history or can't be read at all. */
 async function firstMessageMayHaveLanded(
   opts: SubsystemSlackDeliveryOpts, q: DeliveryPart, decisionId: string, firstId: string,
-): Promise<"found" | "maybe" | "absent" | { unreadable: string }> {
+): Promise<"found" | "maybe" | "absent"> {
   if (opts.delivered.load().has(firstId)) return "found";
   const attempted = opts.attempted.load();
   if ([...attempted.keys()].some((key) => key.startsWith(`${decisionId}::primary-receipt::`))) return "found";
@@ -487,9 +622,8 @@ async function firstMessageMayHaveLanded(
   // channel's thread. With no map this is the default channel, as before.
   const channel = firstAttemptChannel(opts, attempted, firstId) ?? opts.resolveChannel?.(q) ?? opts.channel;
   const scan = await fetchRecentMessageTexts(opts.botToken, channel, opts.resolveThreadTs?.(q, channel), opts.fetchImpl, undefined, undefined, marker);
-  if (!scan.ok) return { unreadable: scan.error ?? "reconcile scan failed" };
   if (scan.messages.some((m) => m.text.includes(marker))) return "found";
-  return scan.incomplete ? "maybe" : "absent";
+  return !scan.ok || scan.incomplete ? "maybe" : "absent";
 }
 
 /** The pieces splitForSlack cut, replayed from their recorded lengths; undefined if they no longer add up. */
@@ -506,12 +640,12 @@ function partIdFor(decisionId: string, count: number, index: number): string {
 
 /** Render one part exactly as deliverSinglePart will, throwing HumanMessageShapeError if it can't. */
 function renderPart(opts: SubsystemSlackDeliveryOpts, q: DeliveryPart, part: DeliveryPart, index: number, partId: string) {
-  // #47 — preflight must mirror deliverSinglePart exactly: the same evidenceRef
-  // split (image attachment vs. plain link) so the shape check sees the true payload.
-  const partEvidence = evidenceAttachment(part.media, part.evidenceRef, part.summary);
+  const partEvidence = evidenceAttachment(part.media, part.evidenceRef);
   return buildOutboundMessage(part, {
     sourceLabel: opts.sourceLabel,
     attribution: attributionFromSession(part.sourceSession),
+    machine: opts.machine?.() ?? undefined,
+    machineFallback: opts.machineFallback,
     mentionUserId: index === 0 ? opts.resolveMentionUserId?.(q) : undefined,
     reconcileMarker: reconcileToken(partId),
     mediaRefs: partEvidence.mediaRefs,
@@ -528,7 +662,7 @@ function splitIntoParts(opts: SubsystemSlackDeliveryOpts, q: DeliveryPart, decis
   // A part's room is what its subject, options, evidence, sender and marker leave of both limits.
   const roomFor = (part: DeliveryPart, index: number, reserve = 0): number => {
     const frame = renderPart(opts, q, { ...part, body: "" }, index, partIdFor(decisionId, 2, index));
-    return Math.min(SLACK_SECTION_CAP, SLACK_TEXT_CAP - frame.text.length - 1) - reserve;
+    return Math.min(SLACK_SECTION_CAP, SLACK_TEXT_CAP - frame.text.length - 1) - reserve - CODE_FENCE_ROOM;
   };
   const primary: DeliveryPart = { ...q, humanDetail: undefined };
   // A retry replays its first attempt's cuts, so no piece moves between the parts already posted and the rest.
@@ -542,8 +676,14 @@ function splitIntoParts(opts: SubsystemSlackDeliveryOpts, q: DeliveryPart, decis
   // A brief that fits keeps the usual note; only a brief that continues says so.
   const note = body.length > 1 ? CONTINUES_NOTE : DETAIL_NOTE;
   const parts: DeliveryPart[] = [{ ...primary, body: body[0] ? `${body[0]}\n\n${note}` : note }];
-  for (let k = 1; k < body.length; k++) parts.push({ ...reply(`Continued (${k + 1} of ${body.length})`), body: body[k] });
-  detail.forEach((piece, j) => parts.push({ ...reply(`Supplemental detail (${j + 1} of ${detail.length})`), body: piece }));
+  // A piece cut inside a code fence keeps rendering as code in the next part.
+  const fences = (pieces: string[]) => { let open = ""; return pieces.map((piece) => { const start = open; open = openFenceAfter(piece, open); return start; }); };
+  const bodyFences = fences(body);
+  for (let k = 1; k < body.length; k++) parts.push({ ...reply(`Continued (${k + 1} of ${body.length})`), body: body[k], bodyOpenFence: bodyFences[k] });
+  // #1013 — a detail piece carries the human's own content, never the agent packet, so the
+  // parked-gate state must not ride it (the gate check would eat its body like the packet's).
+  const detailFences = fences(detail);
+  detail.forEach((piece, j) => parts.push({ ...reply(`Supplemental detail (${j + 1} of ${detail.length})`), body: piece, state: null, bodyOpenFence: detailFences[j] }));
   if (parts.length > MAX_HUMAN_MESSAGE_PARTS) {
     throw new HumanMessageShapeError(`This brief needs ${parts.length} Slack messages (maximum ${MAX_HUMAN_MESSAGE_PARTS}). Shorten it, or put the long part in a file and link it.`);
   }
@@ -555,14 +695,49 @@ function splitIntoParts(opts: SubsystemSlackDeliveryOpts, q: DeliveryPart, decis
  * existing attempted/delivered stores and marker reconciler own each stable part.
  * Preflight ALL parts before posting; the episode receipt is written only after
  * every required part. A restart retries missing parts and the final receipt. */
-export function subsystemSlackDeliver(opts: SubsystemSlackDeliveryOpts): SubsystemDeliverFn {
-  return async (decision) => {
+/** Whether an earlier attempt of this exact decision may already be in Slack, answered without posting anything:
+ *  `unattempted` (never tried, or nothing of it recorded), or the reconciler's own verdict on its first message. A gate
+ *  that would hold, trim or ack a decision asks this first, so a post that landed but lost its response is reconciled
+ *  rather than sent again in another form. `found` means the whole post: for a post split into parts, a found first
+ *  part with the post not yet recorded complete is `partial` (later parts may still be missing). */
+export async function deliveryLanding(opts: SubsystemSlackDeliveryOpts, decision: OutboundDecision):
+  Promise<"unattempted" | "found" | "partial" | "maybe" | "absent"> {
+  if (opts.delivered.load().has(decision.decisionId)) return "found";
+  const attempted = opts.attempted.load();
+  const multipart = `${decision.decisionId}:part:1`;
+  const firstId = attempted.has(decision.decisionId) ? decision.decisionId : attempted.has(multipart) ? multipart : null;
+  if (!firstId) return "unattempted";
+  const first = await firstMessageMayHaveLanded(opts, (decision.payload ?? {}) as DeliveryPart, decision.decisionId, firstId);
+  return first === "found" && firstId === multipart ? "partial" : first;
+}
+
+/** Whether a post split into parts was started (its first part attempted) but isn't recorded complete. No Slack read. */
+export function multipartUnfinished(opts: SubsystemSlackDeliveryOpts, decision: OutboundDecision): boolean {
+  return !opts.delivered.load().has(decision.decisionId) && opts.attempted.load().has(`${decision.decisionId}:part:1`);
+}
+
+/** Whether any attempt of this decision was made (its single message or its first part). No Slack read. */
+export function wasAttempted(opts: SubsystemSlackDeliveryOpts, decision: OutboundDecision): boolean {
+  const attempted = opts.attempted.load();
+  return attempted.has(decision.decisionId) || attempted.has(`${decision.decisionId}:part:1`);
+}
+
+export type SubsystemSlackDeliverFn = SubsystemDeliverFn & {
+  landing: (decision: OutboundDecision) => ReturnType<typeof deliveryLanding>;
+  unfinished: (decision: OutboundDecision) => boolean;
+  attempted: (decision: OutboundDecision) => boolean;
+};
+
+export function subsystemSlackDeliver(opts: SubsystemSlackDeliveryOpts): SubsystemSlackDeliverFn {
+  const fn: SubsystemDeliverFn = async (decision) => {
     if (opts.delivered.load().has(decision.decisionId)) return { ok: true };
     const q = (decision.payload ?? {}) as DeliveryPart;
     let parts: DeliveryPart[] = q.humanDetail
       ? [
           { ...q, humanDetail: undefined, body: `${q.body ?? ""}\n\n${DETAIL_NOTE}` },
-          { ...q, humanDetail: undefined, humanQuestions: undefined, summary: `Supplemental detail: ${q.summary ?? ""}`, body: q.humanDetail, media: [], evidenceRef: null },
+          // #1013 — the supplemental part carries the gate's own human detail; the parked-gate
+          // state must not ride it, or the gate check would eat this body the way it eats the packet.
+          { ...q, humanDetail: undefined, humanQuestions: undefined, summary: `Supplemental detail: ${q.summary ?? ""}`, body: q.humanDetail, media: [], evidenceRef: null, state: null },
         ]
       : [q];
     // #897 — the first attempt decides the shape from the real render and records it; a retry renders
@@ -573,7 +748,9 @@ export function subsystemSlackDeliver(opts: SubsystemSlackDeliveryOpts): Subsyst
     const authored = parts;
     /** The parts a plan renders to, preflighted; with no plan, decide one from the real render. */
     const choose = (kept?: DeliveryPlan) => {
-      const mention = kept ? kept.mention : opts.resolveMentionUserId?.(q);
+      // A post marked as made without the person's quiet hours never mentions them, whatever a recovered read or a saved
+      // plan would say: it's permission to deliver, not to alert. The plan's cuts and part ids stay as they are.
+      const mention = q.quietUnreadable ? undefined : kept ? kept.mention : opts.resolveMentionUserId?.(q);
       const planned: SubsystemSlackDeliveryOpts = { ...opts, resolveMentionUserId: () => mention };
       // A kept plan checks only the parts still to post: delivered parts are acknowledged, never rendered again.
       const delivered = kept ? opts.delivered.load() : new Set<string>();
@@ -614,7 +791,6 @@ export function subsystemSlackDeliver(opts: SubsystemSlackDeliveryOpts): Subsyst
         // whole ask was one message that is found in Slack, which is simply delivered.
         const firstId = partIdFor(decision.decisionId, recorded.body ? 2 : authored.length, 0);
         const landed = await firstMessageMayHaveLanded(opts, q, decision.decisionId, firstId);
-        if (typeof landed === "object") return { ok: false, class: "reconcile-unreadable", detail: landed.unreadable };
         if (landed !== "absent") partlyPosted = true;
         if (landed === "found" && !recorded.body && authored.length === 1) {
           // #899 — the one message is the whole ask, and it is in Slack: acknowledge it through the
@@ -636,7 +812,11 @@ export function subsystemSlackDeliver(opts: SubsystemSlackDeliveryOpts): Subsyst
     const { planned } = chosen;
     if (!recorded || replanned) {
       try { opts.attempted.mark(`${decision.decisionId}${DELIVERY_PLAN}${Buffer.from(JSON.stringify(chosen.plan)).toString("base64url")}`, "delivery-plan"); }
-      catch (error) { return { ok: false, class: "receipt-failed", detail: `delivery plan not kept: ${(error as Error).message}` }; }
+      catch (error) {
+        // A post the gateway already marked as a possible repeat keeps its plan in memory for this one attempt.
+        if (!q.possibleRepeat) return { ok: false, class: "receipt-failed", detail: `delivery plan not kept: ${(error as Error).message}` };
+        (opts.log ?? (() => {}))(`delivery plan record FAILED for ${q.qitemId ?? decision.decisionId}: ${(error as Error).message} — posting once, marked as a possible repeat`);
+      }
     }
     const partId = (index: number) => partIdFor(decision.decisionId, parts.length, index);
     if (parts.length === 1) return deliverSinglePart(planned)(decision);
@@ -652,6 +832,9 @@ export function subsystemSlackDeliver(opts: SubsystemSlackDeliveryOpts): Subsyst
       }
       const outcome = await deliverSinglePart({
         ...planned,
+        onTransportFailed: opts.onTransportFailed
+          ? (_part, failureClass, detail) => opts.onTransportFailed!(q, failureClass, detail, index > 0)
+          : undefined,
         resolveMentionUserId: index === 0 ? planned.resolveMentionUserId : undefined,
         resolveThreadTs: index === 0 ? opts.resolveThreadTs : () => primary!.threadTs ?? primary!.messageTs,
         // #192: a supplemental part goes where the primary went (its recorded channel), never to a
@@ -659,7 +842,9 @@ export function subsystemSlackDeliver(opts: SubsystemSlackDeliveryOpts): Subsyst
         resolveChannel: index === 0
           ? opts.resolveChannel
           : (part) => firstAttemptChannel(opts, opts.attempted.load(), partId(0)) ?? opts.resolveChannel?.(part) ?? opts.channel,
-        onPostedRoot: index === 0 ? opts.onPostedRoot : undefined,
+        // #2234: a later part has the primary's thread, so this fires only when Slack posted it top-level because that root was
+        // deleted between parts. It then opens a root of its own for the same conversation, as a single part does.
+        onPostedRoot: opts.onPostedRoot,
         onPosted: (_part, messageTs, threadTs) => {
           if (index !== 0) return;
           if (messageTs === "reconciled") throw new Error("Primary reconciliation has no Slack timestamp; multipart delivery remains incomplete.");
@@ -683,4 +868,9 @@ export function subsystemSlackDeliver(opts: SubsystemSlackDeliveryOpts): Subsyst
       return { ok: false, class: "receipt-failed", detail: (error as Error).message };
     }
   };
+  return Object.assign(fn, {
+    landing: (decision: OutboundDecision) => deliveryLanding(opts, decision),
+    unfinished: (decision: OutboundDecision) => multipartUnfinished(opts, decision),
+    attempted: (decision: OutboundDecision) => wasAttempted(opts, decision),
+  });
 }

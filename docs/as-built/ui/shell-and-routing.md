@@ -10,8 +10,8 @@ applies-when: |
   mounts, or how the shared detail drawer and event consumption work.
 siblings: [topology.md, project-and-for-you.md, library-specs-and-design-system.md]
 prerequisite-reads: [../README.md]
-last-verified-against-source: 2caac7dd1bb16585138a6f7c1dd8b1f0752c49f7
-last-updated: 2026-10-05
+last-verified-against-source: e8f0ab340db773392ec8be75b072d1c0f3068a50
+last-updated: 2026-10-08
 ---
 
 # UI Shell, Routing, Drawer System
@@ -21,7 +21,7 @@ operator surface. Brand/visual rules live in `docs/DESIGN.md` (pointer from
 `library-specs-and-design-system.md`); this module is how the shell is
 assembled and what routes it mounts.
 
-> Verified against source at `2caac7dd`; package version 0.6.7. UI
+> Verified against source at `e8f0ab34`; package version 0.6.7. UI
 > footprint is **304** source files (`packages/ui/src`, `.ts`+`.tsx`,
 > non-test; 235 at the previous stamp `7eaf524c`). The web UI is in
 > maintenance mode (`docs/reference/developing.md`).
@@ -80,7 +80,7 @@ rather than acting as a generic file browser.
 ## 3. Route model
 
 > The route table below is derived from `packages/ui/src/routes.tsx` at
-> `2caac7dd` (605 lines). Each line number is the route's
+> `e8f0ab34` (605 lines). Each line number is the route's
 > `createRoute(` line. The exported route tree is assembled at
 > `routes.tsx:539` (`export const routeTree = rootRoute.addChildren([`);
 > it holds 54 routes.
@@ -181,7 +181,11 @@ UI event consumption is centralized through one shared `/api/events`
 connection (`lib/topology-events.ts`) so related surfaces avoid duplicate
 SSE connections. Current consumers: For You feed hydration, topology
 activity rings + hot-potato movement, the activity feed/system surfaces,
-and rig event surfaces. `useGlobalEvents` reports whether that connection
+and rig event surfaces. That connection carries stored events only:
+`view.changed` is delivered on the live view streams (`/api/views/sse`) and
+is not stored, so it no longer appears in the activity feed, as a For You
+observation card or in the telemetry export (entries stored by older
+versions still replay until an events retention, a separate change, removes them). `useGlobalEvents` reports whether that connection
 is up and refetches review, slice and mission data on reconnect and on
 `proof.*` events. Reduced-motion preference is honoured for pulse/packet
 animation. (Daemon SSE surfaces: `/api/events`, `/api/stream/watch`,

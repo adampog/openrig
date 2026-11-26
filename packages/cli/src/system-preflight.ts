@@ -1,10 +1,12 @@
 import net from "node:net";
+import { execSync } from "node:child_process";
 import { accessSync, mkdirSync, constants } from "node:fs";
 import { dirname } from "node:path";
 import type { ConfigStore, RiggedConfig } from "./config-store.js";
 import type { DaemonStatus } from "./daemon-lifecycle.js";
 import { buildTmuxControlFailure, probeTmuxControlAsync } from "./tmux-health.js";
 import { classifyNodeVersion } from "./node-support.js";
+import { isBlockedConnectionCode } from "./daemon-reachability.js";
 
 export interface PreflightCheck {
   name: string;
@@ -19,6 +21,14 @@ export interface PreflightCheck {
 export interface PreflightResult {
   ready: boolean;
   checks: PreflightCheck[];
+}
+
+/** Run a preflight probe with its stderr captured, not echoed. Without `stdio`, `execSync` also copies the child's
+ *  stderr to the terminal, so a first `rig daemon start` printed tmux's "error connecting to … (No such file or
+ *  directory)" for the ordinary no-server case. The text still reaches the probe in the thrown error, so a real tmux
+ *  failure is still classified and reported. */
+export async function quietPreflightExec(cmd: string): Promise<string> {
+  return execSync(cmd, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] });
 }
 
 interface PreflightDeps {
@@ -40,22 +50,23 @@ interface WritableHomeCheckDeps {
   checkWritable?: (path: string) => void;
 }
 
-function checkPort(host: string, port: number): Promise<boolean> {
-  if (port <= 0) return Promise.resolve(true); // port 0 is always available
+function checkPort(host: string, port: number): Promise<"available" | "occupied" | { blocked: string }> {
+  if (port <= 0) return Promise.resolve("available"); // port 0 is always available
   return new Promise((resolve) => {
     const socket = new net.Socket();
     socket.setTimeout(1000);
     socket.on("connect", () => {
       socket.destroy();
-      resolve(false); // port is in use
+      resolve("occupied"); // port is in use
     });
-    socket.on("error", () => {
+    socket.on("error", (error) => {
       socket.destroy();
-      resolve(true); // port is available
+      const code = (error as NodeJS.ErrnoException).code;
+      resolve(isBlockedConnectionCode(code) ? { blocked: code } : "available");
     });
     socket.on("timeout", () => {
       socket.destroy();
-      resolve(true); // timeout = nothing listening
+      resolve("available"); // timeout = nothing listening
     });
     socket.connect(port, host);
   });
@@ -167,12 +178,16 @@ export class SystemPreflight {
       (status.host ?? "127.0.0.1") === effectiveHost &&
       status.port === effectivePort;
 
-    if (daemonOnSameEndpoint) {
+    if (daemonOnSameEndpoint && isBlockedConnectionCode(status.probeErrorCode)) {
+      checks.push({ name: "port_available", ok: true, warning: `Port availability could not be checked: the connection was blocked (${status.probeErrorCode}). A daemon may still be running.` });
+    } else if (daemonOnSameEndpoint) {
       // Our daemon is already running on this exact endpoint — skip
       checks.push({ name: "port_available", ok: true });
     } else {
       const available = await checkPort(effectiveHost, effectivePort);
-      if (available) {
+      if (typeof available === "object") {
+        checks.push({ name: "port_available", ok: true, warning: `Port availability could not be checked: the connection was blocked (${available.blocked}). A daemon may still be running.` });
+      } else if (available === "available") {
         checks.push({ name: "port_available", ok: true });
       } else {
         checks.push({

@@ -11,8 +11,8 @@ applies-when: |
   compatibility limits that still describe the shipped system.
 siblings: [daemon-core.md, coordination-primitive.md]
 prerequisite-reads: [../README.md, daemon-core.md]
-last-verified-against-source: 2caac7dd1bb16585138a6f7c1dd8b1f0752c49f7
-last-updated: 2026-10-05
+last-verified-against-source: e8f0ab340db773392ec8be75b072d1c0f3068a50
+last-updated: 2026-10-08
 ---
 
 # Architecture Invariants, Event System, Compatibility Notes
@@ -21,7 +21,7 @@ This module collects the cross-cutting invariants that do not belong to any
 single subsystem: the architecture rules the codebase holds itself to, the
 event-system shape, and the intentional compatibility limits.
 
-> Verified against source at main `2caac7dd1bb16585138a6f7c1dd8b1f0752c49f7`. Each count below sits beside the
+> Verified against source at main `e8f0ab340db773392ec8be75b072d1c0f3068a50`. Each count below sits beside the
 > command that produces it; run the command from the repository root to refresh
 > it.
 
@@ -61,19 +61,20 @@ system-level invariants.
     `monotonicFactory()`. Restore does not pick the newest session by max
     ULID; it resolves the active occupant recorded in the snapshot
     (`resolveActiveSnapshotSession`, `active-occupant.ts:74`, called at
-    `restore-orchestrator.ts:767` and `:964`).
+    `restore-orchestrator.ts:774` and `:971`).
 13. Readiness checking is a retry loop with exponential backoff and
     configurable timeout, using adapter-specific probes (Claude TUI
     indicator, Codex ready message, terminal immediate).
 14. Restore outcome states are a fixed set (`RestoreNodeResult.status`,
     `types.ts:475`): `resumed`, `rebuilt`, `fresh-primed`,
     `awaiting-decision`, `attention_required`, `failed`, plus
-    `operator_recovered` (set only by later reconciliation) and `fresh`
-    (retained only for the legacy continuity-restoring skip path). `rebuilt` =
-    new process assembled from artifacts.
+    `operator_recovered` (set only by later reconciliation), `fresh`
+    (retained only for the legacy continuity-restoring skip path) and
+    `left_attached` (a seat joined with `rig attach` as an external CLI, which
+    restore leaves as it is). `rebuilt` = new process assembled from artifacts.
 15. Restore honesty: a failed resume stops loudly as `awaiting-decision`, with
     the blank session rolled back and no session running
-    (`restore-orchestrator.ts:1048`). No automatic fresh fallback. Fresh launch
+    (`restore-orchestrator.ts:1055`). No automatic fresh fallback. Fresh launch
     is explicit follow-up only (`rig up --fresh <seats...>`,
     `packages/cli/src/commands/up.ts:99`).
 16. Post-command handoff required on `up`, `down`, `restore`,
@@ -136,7 +137,7 @@ comments:
   caller's opt-in to wait, and a failed wait returns without sending. Otherwise
   only positive evidence of an open
   picker or approval prompt refuses a send; a busy or unknown seat gets the
-  message with an advisory warning (`session-transport.ts:1402`–`1408`). The
+  message with an advisory warning (`session-transport.ts:1427`–`1433`). The
   audited `--dangerously-interact` override is the only way past an open prompt.
 - **Non-interruptive mode is per-launch flags only.** It never changes
   permissions or native settings files, applies only to full-bypass Claude Code
@@ -213,15 +214,40 @@ inside a caller-managed transaction, `eventBus.persistWithinTransaction(...)`
 (`event-bus.ts:70`) with subscribers notified after commit — across domain
 services (`stream-store.ts`, `workflow-runtime.ts`, `restore-orchestrator.ts`,
 `node-launcher.ts`, etc.) and route handlers. The event log is append-only and
-SQLite-backed.
+SQLite-backed, and it holds stored events only. `view.changed`, which the view
+event bridge (`view-event-bridge.ts`) produces for each queue, inbox, proof or project-classification change,
+is transient: `eventBus.publishTransient(...)` delivers it to the live
+subscribers without a row, without a `seq` of its own and without moving the
+notify watermark. It carries `transient: true` and, as its `seq`, the `seq` of
+the stored event that caused it.
+
+Upgrade note: `view.changed` rows stored by older versions stay in the log, so
+`/api/events` replays and the telemetry export still return them until an events retention
+(a separate change) removes them.
 
 SSE delivery surfaces include the following. The daemon has **11**
 `streamSSE(` call sites across **10** files in `packages/daemon/src/routes/`
 (`git grep -o 'streamSSE(' -- packages/daemon/src/routes | wc -l`;
 `git grep -l 'streamSSE(' -- packages/daemon/src/routes | wc -l`).
 
-- `GET /api/events` — global stream of all events (`server.ts:730`
-  `app.route("/api/events", eventsRoute)`).
+- `GET /api/events` — global stream of the stored events (`server.ts:730`
+  `app.route("/api/events", eventsRoute)`); `?rigId=` keeps one rig's.
+  Transient events (`view.changed`) are not stored, so they appear here
+  neither live nor in a replay. Each event's SSE `id` is its `seq`. Before going live, a connection replays
+  stored events, read and written 500 at a time (`routes/events.ts`):
+  - with a `Last-Event-ID` header (an `EventSource` sends it when it
+    reconnects), every event after that `seq`, whatever `replay` says;
+  - otherwise `?replay=<n>`: the newest `n` events (of the rig, with
+    `rigId`); `replay=0` starts from now; `replay=all`, no `replay`, a
+    count past the log's size, or any other value, replays the whole log.
+
+  Either way the replay ends at the newest event stored as the connection
+  subscribes; the events stored meanwhile were buffered and follow it, each
+  once and in order, before the stream goes live.
+- `GET /api/views/sse` (alias `/api/views/watch`) and
+  `GET /api/views/:viewName/sse` — `view.changed`, live only (`routes/views.ts`).
+  An event's `id` there is the `seq` of the stored event that caused it, so it
+  repeats across the views one change touches; it is not a replay cursor.
 - `GET /api/stream/watch` — new stream items (`routes/stream.ts:194`).
 - `GET /api/queue/watch` — queue/inbox coordination events
   (`routes/queue.ts:1054`, with a `/sse` alias at `:1055`).
@@ -266,9 +292,15 @@ Intentional limits that still describe the shipped system:
 5. `rig ask` transcript search prefers `rg`, falls back to `grep -E`
    (`history-query.ts:252`, `:267`); quality/perf varies by backend.
 6. Chat is rig-scoped only — no cross-rig channels or DMs.
-7. `--verify` on `rig send` checks pane content for message visibility, not
-   agent acknowledgement: it compares occurrences of the message's first 40
-   characters before and after the send (`session-transport.ts:1580`–`1583`).
+7. `--verify` on `rig send` reports what the pane shows, not agent
+   acknowledgement. By default it compares the message (whole for a
+   header-carrying send, the first 40 characters for a raw one) in captures
+   before and after the send, leaving out the current input box; with
+   `transport.verify_input_box` on, Claude Code and Codex sends are verified
+   only for a seat proven idle before the paste and on input-box evidence; a
+   busy or unknown seat reads unconfirmed (`transport-and-transcripts.md` §3
+   step 5).
+   When it cannot confirm, it reports `rendered-unconfirmed`, not a failure.
 8. Terminal node readiness is shell-ready only — no service health probes.
 9. Managed-app service surfaces are descriptive only — OpenRig does not
    auto-inject service URLs/tokens into agent prompts beyond authored

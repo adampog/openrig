@@ -1,6 +1,6 @@
 ---
 name: openrig-skills
-description: "Use when you're operating OpenRig and need the right skill or context for fleet recovery, seat handover, new-seat orientation, a watchdog wake, cross-host reach to an agent on another machine, rig packaging, an OpenRig upgrade, systematic debugging, queue triage, or implementation planning; also use when you don't know what applies or nothing is projected on cold boot."
+description: "Use when an agent running inside OpenRig needs the right skill or context for fleet recovery, seat handover, new-seat orientation, a watchdog wake, cross-host reach to an agent on another machine, rig packaging, an OpenRig upgrade, systematic debugging, queue triage, or implementation planning; also when the agent doesn't know what applies or nothing is projected on cold boot. Installing, starting or updating OpenRig, getting back to a team or bringing a stopped one back from a person's own session is the rigs skill."
 allowed-tools: Bash(rig:*)
 metadata:
   openrig:
@@ -53,7 +53,7 @@ These are auto-delivered to every rig; their name+description are already in you
 - **openrig-user** — you need a `rig` CLI command (send / queue / ps / whoami / scope / broadcast). The daily CLI surface.
 - **applying-a-permission-policy** — a rig or seat has a permission policy attached, or you're setting one up: translate it into the live harness configuration.
 - **claude-compaction-restore** — you just compacted (Claude). Restore from durable evidence before resuming real work.
-- **delegating-work** — deciding who should do a task: you, a spawned subagent, or a durable peer seat that already holds the context.
+- **delegating-work** — deciding who should do a task (you, a spawned subagent, or a durable peer seat that already holds the context), and how to brief the agent you hand it to, which depends on the model it runs.
 - **loading-addressable-markdown** — a task names Markdown as `path#h2-slug` or `path#h2-slug/h3-slug` outside the context-pack library.
 - **session-compaction-and-restore** — preparing for, or recovering from, compaction (any runtime). The write- and read-side protocol.
 - **queue-handoff** — you're passing durable work to another seat or ending your turn. The queue is the work ledger, not chat.
@@ -87,11 +87,12 @@ These ship in the OpenRig repo and reach a seat when its profile selects them. T
 - **watchdog** — monitoring or recovering a seat (health, restore, stuck state).
 - **session-source-fork** — forking a session's source/context.
 - **context-engineering** — designing context systems. Provisional and non-normative: current OpenRig skills, explicit rulings, and measured practice outrank it on any conflict.
+- **working-with-an-openrig-team** — a person's own agent in an app (Claude Code, Codex, Cursor, VS Code) works with their team through `rig mcp serve`: hand work over, follow it, answer the team's questions, read results. The `openrig` app plugin loads it; a seat helping someone connect an app can open it with `rig context get skills/core/working-with-an-openrig-team/SKILL.md`.
 
 Pod handbooks (load when you're in that pod):
 - **orchestration-team** — you're orchestrating a rig: dispatching, monitoring, keeping the loop moving.
 - **development-team** — you're on the dev pod: building and shipping product changes.
-- **review-team** — you're reviewing: fresh scrutiny, anti-slop, empirical verification.
+- **review-team** — you're reviewing: fresh scrutiny, anti-slop, grounded findings.
 - **oversight-team** — you're in an oversight pod: monitor boundaries and route findings without taking over the work.
 
 Product-management craft (load when shaping/reviewing work):
@@ -106,7 +107,7 @@ Product-management craft (load when shaping/reviewing work):
 ### Vendored craft — load when you're coding (ships with upstream provenance)
 General engineering skills OpenRig ships as vendored copies. Open when the task matches; they carry "modified by OpenRig" provenance.
 
-- **verification-before-completion** — about to claim done / passing / fixed: run the check and read the output first.
+- **verification-before-completion** — about to claim done / passing / fixed: have evidence that applies to the candidate you name first.
 - **systematic-debugging** — debugging: find the root cause before the fix.
 - **agent-browser** — driving a browser (screenshot / screencast) from an agent.
 - **frontend-design** — designing frontend / UI.

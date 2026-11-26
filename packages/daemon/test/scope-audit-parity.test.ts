@@ -27,6 +27,7 @@ const PRODUCTION_CODE_ROOTS = [
 const NOTES_RESOLVER_FILES = new Set([
   "packages/cli/src/lib/scope/scope-fs.ts",
   "packages/daemon/src/domain/scope/node-file.ts",
+  "packages/daemon/assets/plugins/openrig-core/skills/refocusing/scripts/trace-to-root.py",
 ]);
 const CODE_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".cjs", ".mjs", ".py"]);
 
@@ -201,11 +202,12 @@ describe("mission notes resolver parity", () => {
 });
 
 describe("shipped refocus notes resolution", () => {
-  it("uses the real CLI resolver for every locked outcome and reports command failure honestly", () => {
+  it("preserves every locked notes outcome without calling an unavailable CLI resolver", () => {
     const root = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "scope-notes-refocus-"));
     const workNode = path.join(root, "work-node");
     const bin = path.join(root, "bin");
     const rig = path.join(bin, "rig");
+    const calls = path.join(root, "rig-calls");
     const currentPath = path.join(workNode, "NOTES.md");
     const legacyPath = path.join(workNode, "MISSION_NOTES.md");
     fs.mkdirSync(workNode, { recursive: true });
@@ -218,6 +220,7 @@ const { scopeCommand } = await import(pathToFileURL(process.env.OPENRIG_TEST_SCO
 await scopeCommand().parseAsync(process.argv);
 `, "utf8");
     fs.writeFileSync(rig, `#!/bin/sh
+printf '%s\\n' "$*" >> "$OPENRIG_TEST_SCOPE_CALLS"
 if [ "\${OPENRIG_TEST_SCOPE_RESOLVE_FAIL:-}" = "1" ] && [ "$1" = "scope" ] && [ "$2" = "resolve-notes" ]; then
   printf '%s\n' 'forced resolver failure' >&2
   exit 23
@@ -232,6 +235,7 @@ exec "$OPENRIG_TEST_NODE" --import tsx "$OPENRIG_TEST_SCOPE_LAUNCHER" "$@"
       OPENRIG_TEST_NODE: process.execPath,
       OPENRIG_TEST_SCOPE_COMMAND: path.join(REPO_ROOT, "packages/cli/src/commands/scope.ts"),
       OPENRIG_TEST_SCOPE_LAUNCHER: launcher,
+      OPENRIG_TEST_SCOPE_CALLS: calls,
       OPENRIG_WORKSPACE_ROOT: workNode,
     } as NodeJS.ProcessEnv;
 
@@ -271,7 +275,8 @@ exec "$OPENRIG_TEST_NODE" --import tsx "$OPENRIG_TEST_SCOPE_LAUNCHER" "$@"
       expect(missing.status).toBe(0);
       expect(missing.stdout).toContain(`NOTES GAP — no readable mission notes at ${resolvedWorkNode}`);
 
-      const failed = spawnSync("python3", [
+      fs.writeFileSync(currentPath, "current notes\n", "utf8");
+      const local = spawnSync("python3", [
         TRACE_TO_ROOT,
         "--trees", "work",
         "--depth", "full",
@@ -281,9 +286,11 @@ exec "$OPENRIG_TEST_NODE" --import tsx "$OPENRIG_TEST_SCOPE_LAUNCHER" "$@"
         encoding: "utf8",
         env: { ...baseEnv, OPENRIG_TEST_SCOPE_RESOLVE_FAIL: "1" },
       });
-      expect(failed.status).toBe(0);
-      expect(failed.stdout).toContain("NOTES RESOLUTION GAP — resolver command exited 23");
-      expect(failed.stdout).not.toContain("NOTES GAP — no readable mission notes");
+      expect(local.status).toBe(0);
+      expect(local.stdout).toContain("current notes");
+      expect(local.stdout).not.toContain("NOTES RESOLUTION GAP");
+      expect(local.stdout).not.toContain("NOTES GAP — no readable mission notes");
+      expect(fs.existsSync(calls) ? fs.readFileSync(calls, "utf8") : "").not.toContain("scope resolve-notes");
     } finally {
       if (fs.existsSync(currentPath)) fs.chmodSync(currentPath, 0o600);
       fs.rmSync(root, { recursive: true, force: true });
@@ -406,5 +413,51 @@ describeDf("PM dogfood #1 — twin verdict parity: authored README vs pristine P
       .filter((f) => f.kind === "mini_requirements_missing_or_malformed" || f.kind === "proof_contract_missing_or_malformed")
       .map((f) => f.kind);
     expectDf(conventionKinds).toEqual([]); // RED pre-fix: both findings fire
+  });
+});
+
+describeDf("#2727 in-place closure missing_proof audit parity", () => {
+  const AUTHORED_SPEC = "# S\n## Intent\nauthored intent\n## Mini-requirements\n1. first requirement\n## Proof contract\n- [ ] promised deliverable\n";
+
+  itDf("both twins exempt non-delivery in-place closures from missing_proof while still flagging unproved done slices", async () => {
+    const mod = await import(path.join(REPO_ROOT, "packages/cli/src/lib/scope/scope-audit.ts"));
+    const cliClassify = mod.classifyScopeItem as typeof daemonClassifier;
+
+    for (const status of ["closed-deferred", "closed-superseded", "closed-wontfix", "closed-stale"]) {
+      const input: ScopeAuditInput = {
+        id: "OPR.99.0.3.1",
+        path: "/fix/missions/m1/slices/01-non-delivery",
+        readmeFrontmatterRaw: `id: OPR.99.0.3.1\nstatus: ${status}`,
+        progressFileExists: true,
+        readmeOnlyMarker: false,
+        isActiveRelease: true,
+        level: "slice",
+        readmeContent: AUTHORED_SPEC,
+        proofFileExists: false,
+        proofDirExists: false,
+        proofDirHasEntries: false,
+        hasProofPacket: false,
+      };
+      const cliRes = cliClassify(input);
+      const daemonRes = daemonClassifier(input);
+      expectDf(daemonRes).toEqual(cliRes);
+      expectDf(daemonRes.findings.map((f) => f.kind), status).not.toContain("missing_proof");
+    }
+
+    const doneUnproved: ScopeAuditInput = {
+      id: "OPR.99.0.3.2",
+      path: "/fix/missions/m1/slices/02-done",
+      readmeFrontmatterRaw: "id: OPR.99.0.3.2\nstatus: done",
+      progressFileExists: true,
+      readmeOnlyMarker: false,
+      isActiveRelease: true,
+      level: "slice",
+      readmeContent: AUTHORED_SPEC,
+      proofFileExists: false,
+      proofDirExists: false,
+      proofDirHasEntries: false,
+      hasProofPacket: false,
+    };
+    expectDf(daemonClassifier(doneUnproved).findings.map((f) => f.kind)).toContain("missing_proof");
   });
 });

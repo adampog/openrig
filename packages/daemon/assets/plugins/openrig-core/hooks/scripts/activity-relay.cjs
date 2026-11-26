@@ -1,6 +1,11 @@
 #!/usr/bin/env node
 "use strict";
 
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
 // OpenRig activity-relay hook script.
 // Reads a hook event payload from stdin, normalizes it, and POSTs to the
 // OpenRig daemon's /api/activity/hooks endpoint for real-time UI seat-status.
@@ -41,7 +46,87 @@ function firstString(...values) {
   return null;
 }
 
-function buildOpenRigPayload(providerPayload, env = process.env, now = () => new Date()) {
+// #2702: the conversation this event belongs to. A harness started inside a seat (a Codex helper a Claude seat runs, or
+// a Claude a Codex seat runs) inherits the seat's environment and so posts as the seat; the daemon tells it apart by
+// whether the transcript is the seat's runtime's own. Whether the runtime sent transcript_path is kept apart from its
+// value, as on session identity (#1524). claudeHook is whether CLAUDE_PROJECT_DIR is set: the marker Claude Code gives
+// its hook commands, and also the LSP, status line and MCP processes it starts. Neither Codex nor OpenRig sets it, so
+// it's evidence that a Claude Code process ran this, not proof. Only whether it is set is sent.
+// A Claude permission request's report keeps its fixed field list (below).
+function conversationFields(providerPayload, env) {
+  const sessionId = firstString(providerPayload.session_id, providerPayload.sessionId);
+  const transcriptPathPresent = Object.prototype.hasOwnProperty.call(providerPayload, "transcript_path");
+  return {
+    ...(sessionId ? { sessionId } : {}),
+    transcriptPathPresent,
+    ...(transcriptPathPresent ? { transcriptPath: providerPayload.transcript_path } : {}),
+    claudeHook: firstString(env.CLAUDE_PROJECT_DIR) !== null,
+  };
+}
+
+// #3513: the Remote Control session Claude Code is connected to, which it sets in its hook subprocesses as
+// CLAUDE_CODE_BRIDGE_SESSION_ID while Remote Control is connected (documented from v2.1.199). A well-formed id is
+// reported as is; an unset or empty variable as null (the daemon counts that as a disconnect only for a conversation
+// that earlier reported a session); a malformed value is left out, as no claim. Claude seats only.
+function remoteControlFields(runtime, env) {
+  if (runtime !== "claude-code") return {};
+  const value = firstString(env.CLAUDE_CODE_BRIDGE_SESSION_ID);
+  if (value === null) return { remoteControlSessionId: null };
+  return /^session_[A-Za-z0-9]{1,128}$/.test(value) ? { remoteControlSessionId: value } : {};
+}
+
+// The prompt the harness received at UserPromptSubmit, as a fingerprint and byte length, with Claude's own prompt id
+// when it sends one: enough for the daemon to match it to a message OpenRig wrote, without the prompt leaving this
+// process. Any other event, or a prompt that isn't a string, adds nothing.
+function promptBoundaryFields(hookEvent, providerPayload) {
+  if (hookEvent !== "UserPromptSubmit" || typeof providerPayload.prompt !== "string") return {};
+  const bytes = Buffer.from(providerPayload.prompt, "utf8");
+  const nativePromptId = firstString(providerPayload.prompt_id);
+  return {
+    promptSha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+    promptBytes: bytes.length,
+    ...(nativePromptId && /^[A-Za-z0-9_-]{1,128}$/.test(nativePromptId) ? { nativePromptId } : {}),
+  };
+}
+
+/** JSON with every object's keys sorted, so the same value reads the same however a harness ordered its keys. */
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value === undefined ? null : value);
+}
+
+/** One Claude tool call's fingerprint: its conversation, its actor (the main session or a subagent), its tool and its exact
+ *  input, hashed. Claude's PermissionRequest carries no tool-call id, so this is how a permission ask and the tool call that
+ *  later completes are matched: by content, within one conversation. The permission-answer hook computes the same value for
+ *  its ask. Only the hash leaves this process. */
+function claudeToolCallFingerprint(sessionId, agentId, toolName, toolInput) {
+  if (typeof sessionId !== "string" || !sessionId || typeof toolName !== "string" || !toolName) return null;
+  const key = `${sessionId}\0${typeof agentId === "string" && agentId ? agentId : "main"}\0${toolName}\0${canonicalJson(toolInput)}`;
+  return crypto.createHash("sha256").update(key, "utf8").digest("hex").slice(0, 32);
+}
+
+// A Claude PostToolBatch: the fingerprint of each tool call in the batch (at most 64), so the daemon can tell a waiting
+// permission ask that its tool call completed (answered in the seat's terminal). No tool input or result leaves the relay.
+function toolCallFingerprintFields(runtime, hookEvent, providerPayload) {
+  if (runtime !== "claude-code" || hookEvent !== "PostToolBatch" || !Array.isArray(providerPayload.tool_calls)) return {};
+  try {
+    const sessionId = firstString(providerPayload.session_id);
+    const agentId = firstString(providerPayload.agent_id);
+    const fingerprints = providerPayload.tool_calls.slice(0, 64)
+      .map((call) => call && typeof call === "object" ? claudeToolCallFingerprint(sessionId, agentId, call.tool_name, call.tool_input) : null)
+      .filter(Boolean);
+    return fingerprints.length ? { toolCallFingerprints: fingerprints } : {};
+  } catch {
+    return {};
+  }
+}
+
+// The route this run reports by, so the daemon can count one event once per route: "plugin" for the plugin's hook
+// (started with --from-plugin), "managed" for the settings or managed hook copy.
+function buildOpenRigPayload(providerPayload, env = process.env, now = () => new Date(), argv = process.argv) {
   const sessionName = firstString(env.OPENRIG_SESSION_NAME, env.RIGGED_SESSION_NAME);
   const nodeId = firstString(env.OPENRIG_NODE_ID, env.RIGGED_NODE_ID);
   const runtime = firstString(env.OPENRIG_RUNTIME, env.RIGGED_RUNTIME);
@@ -56,15 +141,48 @@ function buildOpenRigPayload(providerPayload, env = process.env, now = () => new
 
   if ((!sessionName && !nodeId) || !runtime || !hookEvent) return null;
 
-  const subtype = firstString(
-    providerPayload.subtype,
-    providerPayload.notification_type,
-    providerPayload.notificationType,
-    providerPayload.tool_name,
-    providerPayload.toolName,
-    providerPayload.source,
-    providerPayload.matcher
-  );
+  if (runtime === "claude-code" && hookEvent === "PermissionRequest") {
+    // Passive observation only: discard all native tool data before transport. An absent/broken
+    // sanitizer loses detail rather than affecting approval or the existing activity hooks.
+    let descriptor = "Tool: details withheld";
+    let suggestions = { state: "unavailable", entries: [], unsupported: false, size_cut: false };
+    try {
+      descriptor = require("./permission-stop-descriptor.cjs").buildPermissionStopDescriptor(providerPayload);
+    } catch { /* Withhold details. No provider decision is ever returned. */ }
+    try {
+      suggestions = require("./permission-stop-descriptor.cjs").buildPermissionRuleSuggestions(providerPayload);
+    } catch { /* Optional rule evidence is unavailable, not an approval or a native absence claim. */ }
+    const actor = providerPayload.agent_id;
+    return { sessionName, nodeId, runtime, generation, hookEvent,
+      ...(actor == null ? { hookAgentId: null }
+        : typeof actor === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(actor) ? { hookAgentId: actor } : {}),
+      permissionStopDescriptor: descriptor, permissionRuleSuggestions: suggestions, occurredAt: now().toISOString(),
+      relayRoute: argv.includes("--from-plugin") ? "plugin" : "managed" };
+  }
+
+  if (runtime === "claude-code" && (hookEvent === "Elicitation" || hookEvent === "ElicitationResult")) {
+    // Observation and settlement only: the server's message, schema, form fields and the person's response never leave
+    // the relay, and nothing is returned to answer, cancel or change the request.
+    const actor = providerPayload.agent_id;
+    return { sessionName, nodeId, runtime, generation, hookEvent,
+      ...(actor == null ? { hookAgentId: null }
+        : typeof actor === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(actor) ? { hookAgentId: actor } : {}),
+      occurredAt: now().toISOString(), relayRoute: argv.includes("--from-plugin") ? "plugin" : "managed" };
+  }
+
+  // StopFailure has a typed error field. Never infer it from rendered error text,
+  // a tool name, or another event's subtype; those are not provider failures.
+  const subtype = runtime === "claude-code" && hookEvent === "StopFailure"
+    ? firstString(providerPayload.error)
+    : firstString(
+      providerPayload.subtype,
+      providerPayload.notification_type,
+      providerPayload.notificationType,
+      providerPayload.tool_name,
+      providerPayload.toolName,
+      providerPayload.source,
+      providerPayload.matcher
+    );
 
   return {
     sessionName,
@@ -73,7 +191,142 @@ function buildOpenRigPayload(providerPayload, env = process.env, now = () => new
     generation,
     hookEvent,
     subtype,
+    // Claude's main session omits agent_id; subagents and in-process teammates carry it.
+    // Keep that distinction for permission completion, without forwarding tool inputs/results.
+    ...(runtime === "claude-code" && (hookEvent === "Notification" || hookEvent === "PostToolBatch")
+      && (providerPayload.agent_id == null || firstString(providerPayload.agent_id))
+      ? { hookAgentId: firstString(providerPayload.agent_id) } : {}),
+    turnId: firstString(providerPayload.turn_id, providerPayload.turnId),
+    ...promptBoundaryFields(hookEvent, providerPayload),
+    ...toolCallFingerprintFields(runtime, hookEvent, providerPayload),
     occurredAt: now().toISOString(),
+    relayRoute: argv.includes("--from-plugin") ? "plugin" : "managed",
+    ...limitResetField(runtime, hookEvent, subtype, providerPayload, now),
+    ...conversationFields(providerPayload, env),
+    ...remoteControlFields(runtime, env),
+  };
+}
+
+// #99: a Claude usage limit says when it resets only in its rendered text ("You've hit your weekly limit ·
+// resets Nov 10, 4pm (America/Sao_Paulo)"). The typed error still decides THAT the seat is limited; the text
+// is read here, on the seat's machine and in its time zone, only for WHEN, and only the instant leaves the
+// relay: never the text itself.
+function limitResetField(runtime, hookEvent, subtype, providerPayload, now) {
+  if (runtime !== "claude-code" || hookEvent !== "StopFailure" || subtype !== "rate_limit") return {};
+  for (const value of [providerPayload.last_assistant_message, providerPayload.error_details]) {
+    if (typeof value !== "string") continue;
+    const resetsAt = claudeLimitResetAt(value.slice(0, 2000), now());
+    if (resetsAt) return { resetsAt };
+  }
+  return {};
+}
+
+const RESET_MAX_MS = 8 * 24 * 3600 * 1000;
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+const RESET_EPOCH_RE = /usage limit reached\|(\d{10})\b/i;
+// Each unit must be a whole word ("2 months" is not "2 m"), and a "resets in" fragment is read only this way.
+const RESET_IN_LEAD_RE = /\bresets?\s+in\b/i;
+const RESET_IN_RE = /\bresets?\s+in\s+(?:(\d+)\s*(?:d|days?)\b\s*)?(?:(\d+)\s*(?:h|hrs?|hours?)\b\s*)?(?:(\d+)\s*(?:m|mins?|minutes?)\b)?/i;
+// A zone, when the text opens one, must be closed: "4pm (Not/AZone" is truncated, not local time.
+const RESET_AT_RE = /\bresets?\s+(?:at\s+|on\s+)?(?:([a-z]{3})[a-z]*\.?\s+(\d{1,2}),?\s+(?:at\s+)?)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b(?:\s*(\()([^)\n]{0,64})(\))?)?/i;
+
+/** The reset instant a Claude usage-limit message states, as an ISO string, or null when it states none
+ *  this can read. A wall-clock time without a zone is the seat's local time, which is what Claude renders. */
+function claudeLimitResetAt(text, nowDate) {
+  const nowMs = nowDate.getTime();
+  if (!Number.isFinite(nowMs) || typeof text !== "string") return null;
+  let resetMs = null;
+  const epoch = RESET_EPOCH_RE.exec(text);
+  if (epoch) {
+    resetMs = Number(epoch[1]) * 1000;
+  } else if (RESET_IN_LEAD_RE.test(text)) {
+    const relative = RESET_IN_RE.exec(text);
+    // The whole fragment must be read: nothing numeric may follow what was, across a separator either
+    // ("in 2h 30x", "in 2h, 30x" and "in 2h and 30x" are not two hours).
+    if (!relative || !(relative[1] || relative[2] || relative[3])
+      || /^(?:\s|[,;&+]|and\b)*\d/i.test(text.slice(relative.index + relative[0].length))) return null;
+    resetMs = nowMs + ((Number(relative[1] || 0) * 24 + Number(relative[2] || 0)) * 60 + Number(relative[3] || 0)) * 60_000;
+  } else {
+    const wall = RESET_AT_RE.exec(text);
+    if (wall) resetMs = wallClockReset(wall, nowMs);
+  }
+  if (resetMs === null || !Number.isFinite(resetMs) || resetMs <= nowMs || resetMs > nowMs + RESET_MAX_MS) return null;
+  return new Date(resetMs).toISOString();
+}
+
+function wallClockReset(match, nowMs) {
+  const [, monthName, day, hourText, minuteText, meridiem, zoneOpen, zoneText, zoneClose] = match;
+  if (zoneOpen && (!zoneClose || !zoneText.trim())) return null; // a truncated or empty zone: no reset
+  const hour12 = Number(hourText);
+  const minute = Number(minuteText || 0);
+  if (hour12 < 1 || hour12 > 12 || minute > 59) return null;
+  const hour = (hour12 % 12) + (meridiem.toLowerCase() === "pm" ? 12 : 0);
+  const zone = zoneText ? zoneText.trim() : null;
+  let toUtc;
+  try {
+    toUtc = zone ? zonedClock(zone) : localClock();
+  } catch {
+    return null; // a zone this runtime doesn't know: no reset rather than a guessed one
+  }
+  const today = toUtc.partsAt(nowMs);
+  if (monthName) {
+    const month = MONTHS.indexOf(monthName.toLowerCase());
+    if (month < 0) return null;
+    for (const year of [today.year, today.year + 1]) {
+      if (!isCalendarDay(year, month, Number(day))) continue; // "Feb 30" names no day; never roll it into March
+      const at = toUtc.instant(year, month, Number(day), hour, minute);
+      if (Number.isNaN(at)) return null;
+      if (at > nowMs) return at;
+    }
+    return null;
+  }
+  const at = toUtc.instant(today.year, today.month, today.day, hour, minute);
+  if (Number.isNaN(at)) return null; // ambiguous today: never advance a day on a guess
+  return at > nowMs ? at : toUtc.instant(today.year, today.month, today.day + 1, hour, minute);
+}
+
+function isCalendarDay(year, month, day) {
+  return Number.isInteger(day) && day >= 1 && day <= new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+}
+
+function localClock() {
+  return wallClock(
+    (ms) => { const d = new Date(ms); return { year: d.getFullYear(), month: d.getMonth(), day: d.getDate(), hour: d.getHours(), minute: d.getMinutes() }; },
+    (ms) => -new Date(ms).getTimezoneOffset() * 60_000,
+  );
+}
+
+function zonedClock(timeZone) {
+  const format = new Intl.DateTimeFormat("en-US", { timeZone, hourCycle: "h23", year: "numeric", month: "numeric",
+    day: "numeric", hour: "numeric", minute: "numeric", second: "numeric" });
+  const partsAt = (ms) => {
+    const parts = Object.fromEntries(format.formatToParts(new Date(ms)).map((part) => [part.type, Number(part.value)]));
+    return { year: parts.year, month: parts.month - 1, day: parts.day, hour: parts.hour, minute: parts.minute, second: parts.second };
+  };
+  const offsetAt = (ms) => {
+    const p = partsAt(ms);
+    return Date.UTC(p.year, p.month, p.day, p.hour, p.minute, p.second) - Math.floor(ms / 1000) * 1000;
+  };
+  return wallClock(partsAt, offsetAt);
+}
+
+/** A clock whose instant() is the one moment a wall time names, or NaN when it names none (skipped by a DST jump) or
+ *  two (repeated by a DST fall-back): the message doesn't say which, so no reset rather than a guess a day off. */
+function wallClock(partsAt, offsetAt) {
+  return {
+    partsAt,
+    instant: (year, month, day, hour, minute) => {
+      const asUtc = Date.UTC(year, month, day, hour, minute);
+      const want = new Date(asUtc); // normalizes a day past the month's end (tomorrow)
+      const matches = new Set();
+      for (const probe of [asUtc - 14 * 3600_000, asUtc, asUtc + 14 * 3600_000]) {
+        const candidate = asUtc - offsetAt(probe);
+        const p = partsAt(candidate);
+        if (p.year === want.getUTCFullYear() && p.month === want.getUTCMonth() && p.day === want.getUTCDate()
+          && p.hour === want.getUTCHours() && p.minute === want.getUTCMinutes()) matches.add(candidate);
+      }
+      return matches.size === 1 ? [...matches][0] : NaN;
+    },
   };
 }
 
@@ -117,27 +370,47 @@ function resolveEndpoint(env = process.env) {
   return { baseUrl, token };
 }
 
-async function postHookPayload(payload, env = process.env) {
-  const { baseUrl, token } = resolveEndpoint(env);
-  if (!baseUrl || !token || !payload || typeof fetch !== "function") return;
+// #3416 (2): node:http rather than the global fetch. This script runs once per hook event, and the first fetch call
+// loads Node's bundled HTTP client (undici), which more than doubles the CPU of a run; node:http is already in the binary.
+// The post carries the same JSON body and bearer token, waits at most 1.5 s for the answer, closes the connection when the
+// answer arrives, and swallows every error.
+const POST_TIMEOUT_MS = 1500;
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 1500);
-  try {
-    await fetch(new URL("/api/activity/hooks", baseUrl).toString(), {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "authorization": `Bearer ${token}`,
-      },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-  } catch {
-    // Provider hooks must not block the agent loop if OpenRig is unavailable.
-  } finally {
-    clearTimeout(timeout);
-  }
+function postHookPayload(payload, env = process.env) {
+  const { baseUrl, token } = resolveEndpoint(env);
+  if (!baseUrl || !token || !payload) return Promise.resolve();
+  return new Promise((resolve) => {
+    let request = null;
+    const timer = setTimeout(() => { if (request) request.destroy(); resolve(); }, POST_TIMEOUT_MS);
+    const done = () => { clearTimeout(timer); resolve(); };
+    try {
+      const url = new URL("/api/activity/hooks", baseUrl);
+      const client = url.protocol === "http:" ? require("node:http") : url.protocol === "https:" ? require("node:https") : null;
+      if (!client) return done();
+      const body = Buffer.from(JSON.stringify(payload), "utf8");
+      // A fresh connection, closed after the answer: nothing pooled keeps this short-lived process waiting.
+      request = client.request(url, {
+        method: "POST",
+        agent: false,
+        headers: {
+          "content-type": "application/json",
+          "authorization": `Bearer ${token}`,
+          "content-length": body.length,
+        },
+      }, (response) => {
+        // As with fetch, the answer's arrival ends the post. Its body is not needed, so the connection closes here: a
+        // daemon that sends headers and then stalls can't hold the hook past the answer.
+        response.on("error", () => {});
+        request.destroy();
+        done();
+      });
+      // Provider hooks must not block the agent loop if OpenRig is unavailable.
+      request.on("error", done);
+      request.end(body);
+    } catch {
+      done();
+    }
+  });
 }
 
 function buildSessionIdentityPayload(providerPayload, env = process.env, now = () => new Date()) {
@@ -154,26 +427,162 @@ function buildSessionIdentityPayload(providerPayload, env = process.env, now = (
   const sessionName = firstString(env.OPENRIG_SESSION_NAME, env.RIGGED_SESSION_NAME);
   const nodeId = firstString(env.OPENRIG_NODE_ID, env.RIGGED_NODE_ID);
   const runtime = firstString(env.OPENRIG_RUNTIME, env.RIGGED_RUNTIME);
+  const generation = firstString(env.OPENRIG_OCCUPANT_GENERATION, env.RIGGED_OCCUPANT_GENERATION);
+  // How this session began (startup, resume, clear or compact). The daemon tells a resumed
+  // conversation's new id from a /clear by it; it is absent from runtimes that do not report it.
+  const source = firstString(providerPayload.source);
+  // Set only on the command OpenRig sends to resume this seat, so the daemon can tell the process
+  // it launched from another Claude sharing the seat's environment.
+  const resumeLaunch = firstString(env.OPENRIG_RESUME_LAUNCH);
 
   if ((!sessionName && !nodeId) || !runtime) return null;
+
+  // #1524 (a): whether the runtime sent transcript_path, and its raw value. Codex sends an explicit null for a
+  // thread it never persists; the daemon tells that apart from an absent key, an empty string or a malformed value.
+  const transcriptPathPresent = Object.prototype.hasOwnProperty.call(providerPayload, "transcript_path");
 
   return {
     eventFamily: "session_identity",
     sessionName,
     nodeId,
     runtime,
+    generation,
     hookEvent,
+    source,
+    resumeLaunch,
+    // The daemon finds the Claude that ran this hook from its parent chain.
+    hookPid: process.pid,
     sessionId,
+    transcriptPathPresent,
+    ...(transcriptPathPresent ? { transcriptPath: providerPayload.transcript_path } : {}),
+    claudeHook: firstString(env.CLAUDE_PROJECT_DIR) !== null,
     occurredAt: now().toISOString(),
+    ...remoteControlFields(runtime, env),
   };
 }
 
-async function main() {
-  const providerPayload = parseJson(await readStdin());
-  const payload = buildOpenRigPayload(providerPayload);
-  await postHookPayload(payload);
+// #1077 — whether this is the first SessionStart of the launch OpenRig armed (OPENRIG_RESUME_LAUNCH
+// for this occupant generation). Recorded on local disk before anything is posted, so a first hook
+// whose post never reaches the daemon still makes every later one (an in-process /resume, a child
+// sharing the environment) report false. Any error reports false.
+function claimFirstLaunchHook(resumeLaunch, generation, dir = path.join(os.tmpdir(), `openrig-resume-launch-${uid()}`)) {
+  if (!resumeLaunch || !generation) return false;
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const key = crypto.createHash("sha256").update(`${generation}\0${resumeLaunch}`).digest("hex");
+    fs.closeSync(fs.openSync(path.join(dir, key), "wx", 0o600));
+    return true;
+  } catch {
+    return false;
+  }
+}
 
+function uid() {
+  try { return typeof process.getuid === "function" ? String(process.getuid()) : "user"; } catch { return "user"; }
+}
+
+// OpenRig also copies this script into a seat's own settings.local.json hooks (the claude_activity_hooks resource), so a
+// seat that loads this plugin as well would post every event twice. The plugin's manifest starts the plugin's run with
+// --from-plugin; that run looks at the seat's project settings.local.json and exits only when the OpenRig copy is
+// registered there for this very event. The settings copy is started without that argument and always reports, and so does
+// a seat whose settings have no such entry (the resource is optional) or a plugin installed on its own, so a seat reports
+// each event once either way. Anything unreadable, missing or different counts as "not registered": a seat is never silent.
+const SETTINGS_RELAY_TAIL = "state/claude-activity-hooks/activity-relay.cjs";
+
+// Keep this finite Node-command grammar in parity with parseManagedClaudeNodeCommand.
+// Canonical POSIX quotes and literal unquoted words only, optionally after one leading `exec` (the shape OpenRig writes
+// since #3416; the one without it is an earlier version's); no expansion or other wrappers.
+function settingsRelayPath(command) {
+  if (/[\r\n]/.test(command)) return null;
+  const token = /'(?:[^']|'"'"')*'|[-A-Za-z0-9_./:@%+=,]+/.source;
+  const m = new RegExp(`^(${token})[ \t]+(${token})$`).exec(command.trim().replace(/^exec[ \t]+/, ""));
+  if (!m) return null;
+  const decode = token => token.startsWith("'") ? token.slice(1, -1).split(`'"'"'`).join("'") : token;
+  const quote = value => "'" + value.replace(/'/g, `'"'"'`) + "'";
+  const executable = decode(m[1]);
+  const relay = decode(m[2]);
+  if (m.slice(1).some(token => token.startsWith("'") && quote(decode(token)) !== token)) return null;
+  if (!path.isAbsolute(relay) || !relay.endsWith(`/${SETTINGS_RELAY_TAIL}`)) return null;
+  if (executable !== "node" && (!path.isAbsolute(executable) || !/^node(?:\.exe)?$/i.test(path.basename(executable)))) return null;
+  return { executable, relay };
+}
+
+function interpreterAvailable(executable, env) {
+  const candidates = executable === "node"
+    ? typeof env.PATH === "string" ? env.PATH.split(path.delimiter).map(dir => path.resolve(dir || ".", "node")) : []
+    : [executable];
+  return candidates.some(candidate => {
+    try { fs.accessSync(candidate, fs.constants.X_OK); return fs.statSync(candidate).isFile(); }
+    catch { return false; }
+  });
+}
+
+// A settings entry only silences this run if it would really report: the file it names is there and is this very script.
+// A missing script, or a different one at that path (a no-op, a stale copy from an older install), reports from the plugin.
+function isThisScript(file) {
+  try { return Buffer.compare(fs.readFileSync(file), fs.readFileSync(__filename)) === 0; } catch { return false; }
+}
+
+function settingsRelayReports(hookEvent, providerPayload, env = process.env) {
+  const projectDir = firstString(env.CLAUDE_PROJECT_DIR, providerPayload && providerPayload.cwd);
+  if (!projectDir || !hookEvent) return false;
+  try {
+    const settings = JSON.parse(fs.readFileSync(path.join(projectDir, ".claude", "settings.local.json"), "utf8"));
+    const groups = settings && settings.hooks && settings.hooks[hookEvent];
+    // A group with a matcher may not run for this event, so only an unrestricted group (no matcher, "" or "*") counts;
+    // OpenRig writes its group without one. Anything else reports, at worst twice, never not at all.
+    const unrestricted = (group) => group.matcher === undefined || group.matcher === "" || group.matcher === "*";
+    return Array.isArray(groups) && groups.some((group) => group && unrestricted(group) && Array.isArray(group.hooks)
+      && group.hooks.some((hook) => {
+        const relay = hook && typeof hook.command === "string" ? settingsRelayPath(hook.command) : null;
+        return relay !== null && interpreterAvailable(relay.executable, env) && isThisScript(relay.relay);
+      }));
+  } catch {
+    return false;
+  }
+}
+
+function pluginRunIsRedundant(providerPayload, argv = process.argv, env = process.env) {
+  if (!argv.includes("--from-plugin")) return false;
+  const hookEvent = firstString(providerPayload.hookEvent, providerPayload.hookEventName, providerPayload.hook_event_name, providerPayload.event, providerPayload.eventName);
+  // Codex activity has one producer: OpenRig's managed inline hooks. The plugin supplies refocus and skills, but its
+  // activity entries are no-ops. Do not infer merged native hook state here or bypass a person's inline-hook disable.
+  if (firstString(env.OPENRIG_RUNTIME, env.RIGGED_RUNTIME) === "codex") return true;
+  return settingsRelayReports(hookEvent, providerPayload, env);
+}
+
+// --- seat project boundary: keep this block identical in every script that has it ---
+// A Claude started from inside a seat (its shell, its Bash tool) inherits the seat's environment, so it loads this plugin
+// and its hooks would act as the seat. OpenRig tells the plugin the seat's launch project in OPENRIG_SEAT_PROJECT_DIR;
+// Claude's own CLAUDE_PROJECT_DIR is fixed for the life of a Claude and names the project it was started in (unlike the
+// hook payload's cwd, which follows a `cd`). The seat's effects run only when the two name the same folder. Spellings of
+// one folder (a symlink, a trailing slash, letter case on a case-insensitive disk) count as the same, and a missing
+// variable (an older or manual launch, a runtime without CLAUDE_PROJECT_DIR) leaves the hook doing what it always did.
+function runsForThisSeatsProject(env = process.env) {
+  const launch = env.OPENRIG_SEAT_PROJECT_DIR;
+  const project = env.CLAUDE_PROJECT_DIR;
+  if (!launch || !project) return true;
+  const canonical = (dir) => {
+    const absolute = path.resolve(dir);
+    // .native gives the case the disk has (plain realpathSync keeps the case the path was typed in), which is what Claude's
+    // CLAUDE_PROJECT_DIR carries on a case-insensitive filesystem such as macOS's default.
+    try { return fs.realpathSync.native(absolute); } catch { return absolute; }
+  };
+  return canonical(launch) === canonical(project);
+}
+// --- end seat project boundary ---
+
+async function main() {
+  // Before anything is read, posted or recorded: a Claude started elsewhere inside this seat is not the seat.
+  if (!runsForThisSeatsProject()) return;
+  const providerPayload = parseJson(await readStdin());
+  if (pluginRunIsRedundant(providerPayload)) return;
+  const payload = buildOpenRigPayload(providerPayload);
   const identityPayload = buildSessionIdentityPayload(providerPayload, process.env);
+  if (identityPayload && identityPayload.resumeLaunch) {
+    identityPayload.resumeLaunchFirst = claimFirstLaunchHook(identityPayload.resumeLaunch, identityPayload.generation);
+  }
+  await postHookPayload(payload);
   if (identityPayload) {
     await postHookPayload(identityPayload);
   }
@@ -185,8 +594,14 @@ if (require.main === module) {
 
 module.exports = {
   buildOpenRigPayload,
+  claudeLimitResetAt,
+  claudeToolCallFingerprint,
+  claimFirstLaunchHook,
   buildSessionIdentityPayload,
   parseJson,
   postHookPayload,
   resolveEndpoint,
+  pluginRunIsRedundant,
+  settingsRelayReports,
+  settingsRelayPath,
 };

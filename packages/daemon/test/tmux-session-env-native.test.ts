@@ -2,9 +2,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { exec, execFile } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { promisify } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 import { TmuxAdapter } from "../src/adapters/tmux.js";
+import { TMUX_CREDENTIAL_ENV_KEYS } from "../src/adapters/tmux-credential-env.js";
 import { shellQuote } from "../src/adapters/shell-quote.js";
 import { SeatLaunchEnvironment } from "../src/domain/seat-launch-environment.js";
 
@@ -15,6 +17,7 @@ async function withServer(mode: "shell" | "argv", check: (adapter: TmuxAdapter, 
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "tmux-env-"));
   const socket = path.join(home, "owned.sock");
   const env = { ...process.env, HOME: home };
+  for (const key of [...TMUX_CREDENTIAL_ENV_KEYS, ...Object.keys(env).filter(key => key.startsWith("OPENRIG_RUN_GRANT_"))]) delete env[key];
   delete env.TMUX;
   delete env.TMUX_TMPDIR;
   const tmux = async (args: string[]) => (await runFile("tmux", ["-S", socket, ...args], { env })).stdout;
@@ -65,6 +68,66 @@ describe.skipIf(process.platform === "win32")("native tmux session launch enviro
         expect(await adapter.getSessionEnv("worker", "OPENRIG_NODE_ID")).toBe("own-node");
         expect(await adapter.getSessionEnv("=worker", "OPENRIG_NODE_ID")).toBe("literal-node");
         expect(await adapter.getSessionEnv(id, "OPENRIG_NODE_ID")).toBe("own-node");
+      });
+    });
+
+    // What a pane started in the session afterwards would have in its environment.
+    const nextPaneEnv = async (home: string, tmux: (args: string[]) => Promise<string>, session: string) => {
+      const file = path.join(home, `next-${Math.random().toString(36).slice(2)}.env`);
+      await tmux(["new-window", "-d", "-t", `=${session}:`, `env > ${shellQuote(file)}.part && mv ${shellQuote(file)}.part ${shellQuote(file)}`]);
+      for (let i = 0; i < 50 && !fs.existsSync(file); i++) await new Promise(r => setTimeout(r, 100));
+      return fs.readFileSync(file, "utf8").split("\n");
+    };
+
+    it(`${mode}: unsetting a name gives later panes the server's value, except the launching session's identity, which stays removed`, async () => {
+      await withServer(mode, async (adapter, home, tmux) => {
+        await tmux(["set-environment", "-g", "CLAUDECODE", "1"]);
+        await tmux(["set-environment", "-g", "CLAUDE_EFFORT", "from-parent"]);
+        await tmux(["set-environment", "-g", "PLAIN_NAME", "from-server"]);
+        await tmux(["set-environment", "-t", "=worker-long", "CLAUDE_EFFORT", "one-off"]);
+        await tmux(["set-environment", "-t", "=worker-long", "PLAIN_NAME", "one-off"]);
+        await adapter.unsetSessionEnv("worker-long", "CLAUDE_EFFORT");
+        await adapter.unsetSessionEnv("worker-long", "PLAIN_NAME");
+        const env = await nextPaneEnv(home, tmux, "worker-long");
+        expect(env).toContain("PLAIN_NAME=from-server");
+        expect(env.some(line => line.startsWith("CLAUDE_EFFORT="))).toBe(false);
+      });
+    });
+
+    it(`${mode}: unsetting credential names never reveals a server-global value`, async () => {
+      await withServer(mode, async (adapter, home, tmux) => {
+        const keys = [...TMUX_CREDENTIAL_ENV_KEYS, "OPENRIG_RUN_GRANT_SYNTHETIC"];
+        const seedConfig = path.join(home, "seed-global-credentials.conf");
+        const seed = keys.map(key => `set-environment -g ${key} ${randomBytes(24).toString("hex")}`).join("\n");
+        fs.writeFileSync(seedConfig, `${seed}\n`, { mode: 0o600 });
+        await tmux(["source-file", seedConfig]);
+
+        for (const key of keys) {
+          await adapter.setSessionEnv("worker-long", key, randomBytes(24).toString("hex"));
+          await adapter.unsetSessionEnv("worker-long", key);
+        }
+
+        const resultFile = path.join(home, "credential-presence.json");
+        const probe = path.join(home, "credential-presence.cjs");
+        fs.writeFileSync(probe,
+          `const fs=require("node:fs");const keys=${JSON.stringify(keys)};`
+            + `const present=Object.fromEntries(keys.map(key=>[key,Object.hasOwn(process.env,key)]));`
+            + `fs.writeFileSync(${JSON.stringify(resultFile)},JSON.stringify(present));\n`,
+          { mode: 0o600 });
+        await tmux(["new-window", "-d", "-t", "=worker-long:", `${shellQuote(process.execPath)} ${shellQuote(probe)}`]);
+        for (let i = 0; i < 50 && !fs.existsSync(resultFile); i++) await new Promise(r => setTimeout(r, 100));
+        const present = JSON.parse(fs.readFileSync(resultFile, "utf8")) as Record<string, boolean>;
+        expect(present).toEqual(Object.fromEntries(keys.map(key => [key, false])));
+      });
+    });
+
+    it(`${mode}: a CLAUDE_EFFORT that is user configuration (no parent Claude Code session) is inherited as before`, async () => {
+      await withServer(mode, async (adapter, home, tmux) => {
+        await tmux(["set-environment", "-g", "-u", "CLAUDECODE"]); // the test runner may itself be inside Claude Code
+        await tmux(["set-environment", "-g", "CLAUDE_EFFORT", "user-setting"]);
+        await tmux(["set-environment", "-t", "=worker-long", "CLAUDE_EFFORT", "one-off"]);
+        await adapter.unsetSessionEnv("worker-long", "CLAUDE_EFFORT");
+        expect(await nextPaneEnv(home, tmux, "worker-long")).toContain("CLAUDE_EFFORT=user-setting");
       });
     });
 

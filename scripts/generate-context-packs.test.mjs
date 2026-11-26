@@ -1,5 +1,5 @@
 // OPR.0.5.3.7 R2 — tests for the package-time context-pack generator.
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, readdirSync, symlinkSync, lstatSync } from "node:fs";
@@ -18,6 +18,15 @@ const { EXCLUDES } = await import(pathToFileURL(join(HERE, "mirror-skills.mjs"))
 const REAL_SKILLS = join(REPO, "packages/daemon/specs/agents/shared/skills");
 const REAL_PLUGIN_SKILLS = join(REPO, "packages/daemon/assets/plugins/openrig-core/skills");
 const REAL_STATIC_PACKS = join(REPO, "packages/daemon/context-packs-src");
+// The leak guard's term lists live outside the repository: the static-pack runs name a fixture file holding the terms
+// these tests plant.
+const LEAK_RULES_DIR = mkdtempSync(join(tmpdir(), "packs-leak-rules-"));
+const LEAK_RULES = join(LEAK_RULES_DIR, "rules.json");
+writeFileSync(LEAK_RULES, JSON.stringify({
+  path_prefixes: ["private-root/"], seat_and_rig_patterns: ["@private-rig"], host_patterns: ["private-host"],
+  charged_terms: ["private-term"], internal_path_globs: ["**/internal/**"], allowed_context_substrings: ["do not ship"],
+}));
+after(() => rmSync(LEAK_RULES_DIR, { recursive: true, force: true }));
 
 // Independent computation of the mirror's exclude-only ship set on a real tree —
 // the discriminator that catches any narrowing of the projection (r2 HIGH-1).
@@ -75,6 +84,7 @@ test("generates a valid, daemon-parseable pack per skill; SKILL.md is the instru
       description: "Write the test first.",
       files: {
         "anti-patterns.md": "# anti-patterns\n",
+        "notes..md": "# Literal filename dots\n",
         "helper.sh": "#!/bin/sh\necho no\n",
         "example.ts": "export const x = 1;\n",
         "feedback.md": "internal\n",       // mirror EXCLUDE
@@ -101,6 +111,8 @@ test("generates a valid, daemon-parseable pack per skill; SKILL.md is the instru
     const paths = m2.files.map((f) => f.path);
     assert.ok(paths.includes("SKILL.md"));
     assert.ok(paths.includes("anti-patterns.md"));
+    assert.ok(paths.includes("notes..md"));
+    assert.equal(readFileSync(join(out, "skills/process/tdd/notes..md"), "utf8"), "# Literal filename dots\n");
     assert.ok(paths.includes("helper.sh"), "helper.sh must be packed (mirror ship set)");
     assert.ok(paths.includes("example.ts"), "example.ts must be packed (mirror ship set)");
     assert.ok(existsSync(join(out, "skills/process/tdd/helper.sh")), "helper.sh must be copied");
@@ -116,20 +128,25 @@ test("MALFORMED PROJECTION FAILS THE BUILD — a '..' content path is rejected a
   const { source, out, base } = scratch();
   try {
     skill(source, "core/ok", { name: "ok", description: "fine", files: {} });
-    // a content file whose name forges a traversal segment: the daemon parser
-    // rejects the resulting files[].path, and the generator must fail the build.
-    skill(source, "core/bad", { name: "bad", description: "trap", files: { "notes..md": "x" } });
+    // A whole '..' segment in a declared static-pack path is traversal.
+    // Literal dots within a filename are valid (covered by the generation test).
+    const staticSource = join(base, "static");
+    const packDir = join(staticSource, "bad");
+    mkdirSync(packDir, { recursive: true });
+    writeFileSync(join(packDir, "manifest.yaml"),
+      'name: bad\nversion: "0"\ntaxonomy: world\nfiles:\n  - path: "../escape.md"\n    role: reference\n');
     let failed = false;
     try {
-      run(source, out);
+      runWithStatic(source, staticSource, out);
     } catch (err) {
       failed = true;
       assert.equal(err.status, 1, "exit code must be 1 (build failure)");
       assert.match(String(err.stderr), /FAILING THE BUILD/);
+      assert.match(String(err.stderr), /no '\.\.' segments/);
     }
     assert.ok(failed, "generator must exit non-zero on a malformed projection");
     // and it must NOT have written a partial/invalid library
-    assert.ok(!existsSync(join(out, "skills/core/bad")), "no invalid pack should be written");
+    assert.ok(!existsSync(join(out, "bad")), "no invalid pack should be written");
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
@@ -273,6 +290,7 @@ function runWithStatic(source, staticSource, out, args = []) {
       ...process.env,
       OPENRIG_SKILLS_SOURCE: source,
       OPENRIG_STATIC_PACKS_SOURCE: staticSource,
+      OPENRIG_LEAK_GUARD_RULES: LEAK_RULES,
       OPENRIG_PACKS_OUT: out,
       OPENRIG_PACKAGE_VERSION: "0.5.3",
     },
@@ -282,7 +300,7 @@ function runWithStatic(source, staticSource, out, args = []) {
 function staticWorldPack(root, rel, { withCharged = false } = {}) {
   const dir = join(root, rel);
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, "a.md"), `# A\n\nalpha body${withCharged ? " for the founder" : ""}\n`);
+  writeFileSync(join(dir, "a.md"), `# A\n\nalpha body${withCharged ? " for the private-term" : ""}\n`);
   writeFileSync(join(dir, "b.md"), "# B\n\nbeta body\n");
   writeFileSync(
     join(dir, "manifest.yaml"),
@@ -350,11 +368,11 @@ function expectStaticLeakFailure(base, mutate, label) {
   assert.ok(failed, `${label}: must fail the build`);
 }
 
-test("STATIC PACK LEAK GUARD runs the FULL committed authority: charged term, path prefix, AND seat/rig identity each FAIL THE BUILD", () => {
+test("STATIC PACK LEAK GUARD runs the full term lists: charged term, path prefix, AND seat/rig identity each FAIL THE BUILD", () => {
   for (const [label, content] of [
-    ["charged term", "# A\n\nalpha body for the founder\n"],
-    ["internal path prefix", "# A\n\nsee openrig-work/skills for the library\n"],
-    ["instance seat/rig identity", "# A\n\nroute it to dev50@v-openrig-build when done\n"],
+    ["charged term", "# A\n\nalpha body for the private-term\n"],
+    ["internal path prefix", "# A\n\nsee private-root/skills for the library\n"],
+    ["instance seat/rig identity", "# A\n\nroute it to dev50@private-rig when done\n"],
   ]) {
     const base = mkdtempSync(join(tmpdir(), "s05-leak-"));
     try {
@@ -370,7 +388,7 @@ test("STATIC PACK SIDECARS are part of the leak boundary regardless of suffix", 
   try {
     expectStaticLeakFailure(
       base,
-      (dir) => writeFileSync(join(dir, "PROVENANCE.yaml"), "source: openrig-work/rigs/private\n"),
+      (dir) => writeFileSync(join(dir, "PROVENANCE.yaml"), "source: private-root/rigs/private\n"),
       "renamed provenance sidecar",
     );
   } finally {
@@ -388,7 +406,7 @@ test("STATIC SOURCE provenance sidecars cannot hide beside, rather than inside, 
     staticWorldPack(staticSrc, "world/install");
     writeFileSync(
       join(staticSrc, "PROVENANCE-world-install.yaml"),
-      "source: openrig-work/rigs/private\n",
+      "source: private-root/rigs/private\n",
     );
 
     let failure;
@@ -400,7 +418,7 @@ test("STATIC SOURCE provenance sidecars cannot hide beside, rather than inside, 
     assert.ok(failure, "a root-level provenance sidecar must be inside the scanned boundary");
     assert.equal(failure.status, 1);
     assert.match(String(failure.stderr), /PROVENANCE-world-install\.yaml/);
-    assert.match(String(failure.stderr), /openrig-work\//i);
+    assert.match(String(failure.stderr), /private-root\//i);
     assert.ok(!existsSync(out), "no projection may be written after provenance refusal");
   } finally {
     rmSync(base, { recursive: true, force: true });
@@ -595,8 +613,8 @@ test("HELP ADDRESSES: every guide address taught in help.md resolves through the
     runProduction(out);
     const helpSource = readFileSync(join(REPO, "docs/reference/help.md"), "utf8");
     const refDir = join(out, "reference");
-    assert.deepEqual(readdirSync(refDir).sort(), ["getting-started.md", "instance-layout.md", "manifest.yaml", "rig-spec.md", "whats-new.md"]);
-    for (const f of ["getting-started.md", "instance-layout.md", "rig-spec.md", "whats-new.md"]) {
+    assert.deepEqual(readdirSync(refDir).sort(), ["acp-agents.md", "getting-started.md", "instance-layout.md", "manifest.yaml", "product-journey-sdlc.md", "rig-spec.md", "tmux-servers.md", "whats-new.md"]);
+    for (const f of ["acp-agents.md", "getting-started.md", "instance-layout.md", "product-journey-sdlc.md", "rig-spec.md", "tmux-servers.md", "whats-new.md"]) {
       assert.ok(!lstatSync(join(refDir, f)).isSymbolicLink(), `${f} ships as a real file`);
       assert.equal(readFileSync(join(refDir, f), "utf8"), readFileSync(join(REPO, "docs/reference", f), "utf8"));
     }
@@ -611,6 +629,19 @@ test("HELP ADDRESSES: every guide address taught in help.md resolves through the
       "reference/whats-new.md",
     ]);
     assert.deepEqual(await unresolvedAddresses(app, addresses), []);
+    // `rig acp run --help` and `rig acp serve --help` name their guide by address too.
+    const acpHelp = readFileSync(join(REPO, "packages/cli/src/commands/acp.ts"), "utf8");
+    const acpAddresses = [...acpHelp.matchAll(/rig context get (reference\/[^`\s]+)/g)].map((m) => m[1]);
+    assert.deepEqual(acpAddresses, ["reference/acp-agents.md", "reference/acp-agents.md#openrig-as-an-agent-in-acp-apps"]);
+    assert.deepEqual(await unresolvedAddresses(app, acpAddresses), []);
+    // Role guidance names its authority lookup by this address (#3193).
+    assert.deepEqual(await unresolvedAddresses(app, ["reference/product-journey-sdlc.md#resolve-the-selected-path"]), []);
+    // The daemon's tmux control mode log line and `rig doctor`'s tmux_control_mode fix name their guide the same way.
+    const tmuxAddresses = ["packages/daemon/src/adapters/tmux-control.ts", "packages/cli/src/commands/doctor.ts"]
+      .flatMap((file) => [...readFileSync(join(REPO, file), "utf8").matchAll(/rig context get (reference\/[\w.#/-]+)/g)].map((m) => m[1]));
+    const tmuxGuide = "reference/tmux-servers.md#moving-an-existing-team-onto-tmux-control-mode";
+    assert.deepEqual(tmuxAddresses, [tmuxGuide, tmuxGuide]);
+    assert.deepEqual(await unresolvedAddresses(app, tmuxAddresses), []);
     const section = await (await app.request(
       `/api/context-packs/library/resolve-address?address=${encodeURIComponent("reference/getting-started.md#incomplete-setup-and-restart")}`,
     )).json();

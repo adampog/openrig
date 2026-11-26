@@ -1,7 +1,14 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { Hono } from "hono";
 import { providerRoutes } from "../src/routes/provider.js";
-import type { ProviderService } from "../src/domain/provider/provider-service.js";
+import type { ClaudeSeatRelaunch, ProviderService } from "../src/domain/provider/provider-service.js";
+import { RigRepository } from "../src/domain/rig-repository.js";
+import { SessionRegistry } from "../src/domain/session-registry.js";
+import { SnapshotRepository } from "../src/domain/snapshot-repository.js";
+import { createFullTestDb } from "./helpers/test-app.js";
 import type { FourBlockReadModel } from "../src/domain/provider/provider-types.js";
 
 // Slice-04 (OPR.0.5.0.4) seam B — the daemon provider routes (packet 3ffa3c22 §3). Thin handlers
@@ -43,6 +50,27 @@ function appWith(svc: ProviderService | null): Hono {
 }
 
 describe("provider routes", () => {
+  it("forwards API-key file references on both endpoints and refuses conflicting selectors", async () => {
+    const precheck = vi.fn<ProviderService["precheck"]>(async () => ({ safe: true as const }));
+    const switchAccount = vi.fn<ProviderService["switchAccount"]>(async () => ({ outcome: "succeeded" as const }));
+    const app = appWith({ ...stubService, precheck, switchAccount });
+    await app.request("/api/provider/precheck?seat=dev-a@rig&toAccount=api&apiKeyFile=%2Fsynthetic%2Fkey");
+    expect(precheck.mock.calls[0]?.[0]).toMatchObject({ apiKeyFile: "/synthetic/key" });
+    const request = (body: object) => app.request("/api/provider/switch", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    expect((await request({ seat: "dev-a@rig", toAccount: "api", apiKeyFile: "/synthetic/key" })).status).toBe(200);
+    expect(switchAccount.mock.calls[0]?.[0]).toMatchObject({ apiKeyFile: "/synthetic/key" });
+    expect((await request({ seat: "dev-a@rig", toAccount: "api", apiKeyFile: "/synthetic/key", tokenFile: null })).status).toBe(400);
+    expect(switchAccount).toHaveBeenCalledTimes(1);
+  });
+
+  it("move reports are queue items now, not the removed event-log record: no setting gates them, and there's no /moves/:id", async () => {
+    const app = appWith(stubService);
+    // This app wires no queue, so the report routes say so rather than answering a disabled-feature 409.
+    expect((await app.request("/api/provider/moves")).status).toBe(503);
+    expect((await app.request("/api/provider/moves", { method: "POST", body: "{}" })).status).toBe(503);
+    expect((await app.request("/api/provider/moves/m-1")).status).toBe(404);
+  });
+
   it("GET /status returns the whole four-block model", async () => {
     const res = await appWith(stubService).request("/api/provider/status");
     expect(res.status).toBe(200);
@@ -58,6 +86,26 @@ describe("provider routes", () => {
     const bnd = await (await app.request("/api/provider/bindings?account=cdx-a")).json();
     expect(bnd.bindings).toHaveLength(1);
     expect(bnd.bindings[0].seatSession).toBe("seat-1");
+  });
+
+  it("bindings?provider= goes by the seat's runtime, so Claude seats are found; a row without one goes by its account", async () => {
+    const unknown = { state: "unknown" as const, reason: "r" };
+    const model: FourBlockReadModel = {
+      ...MODEL,
+      bindings: [
+        { accountId: "cdx-a", seatSession: "cx@r", rigName: "r", boundAt: "t", bindingSource: "codex_auth_seat_registry", anomalies: [], runtime: "codex", launched: unknown, verified: unknown },
+        { accountId: null, seatSession: "cl@r", rigName: "r", boundAt: null, bindingSource: null,
+          anomalies: [], runtime: "claude-code",
+          configured: { source: "claude_token", label: "team-a", note: "n" }, launched: unknown, verified: unknown },
+        { accountId: null, seatSession: "cx2@r", rigName: "r", boundAt: null, bindingSource: null,
+          anomalies: [], runtime: "codex", launched: unknown, verified: unknown },
+        { accountId: "cdx-a", seatSession: "older@r", rigName: "r", boundAt: "t", bindingSource: "adopt", anomalies: [] },
+      ],
+    };
+    const app = appWith({ ...stubService, getReadModel: async () => model });
+    const seats = async (q: string) => ((await (await app.request(`/api/provider/bindings?${q}`)).json()).bindings as Array<{ seatSession: string }>).map((b) => b.seatSession);
+    expect(await seats("provider=claude")).toEqual(["cl@r"]);
+    expect(await seats("provider=codex")).toEqual(["cx@r", "cx2@r", "older@r"]);
   });
 
   it("rejects a malformed provider enum at the edge (400)", async () => {
@@ -90,6 +138,152 @@ describe("provider routes", () => {
   it("precheck requires seat and toAccount (400 when missing)", async () => {
     const res = await appWith(stubService).request("/api/provider/precheck?seat=s1");
     expect(res.status).toBe(400);
+  });
+
+  it("precheck and switch lend the service the seat's in-place restart, so both act on the home the seat runs on", async () => {
+    const lent: unknown[] = [];
+    const app = appWith({
+      ...stubService,
+      precheck: async (_input, seatRestart) => { lent.push(seatRestart); return { safe: true }; },
+      switchAccount: async (_input, seatRestart) => { lent.push(seatRestart); return { outcome: "rebind_in_progress" }; },
+    });
+    expect((await app.request("/api/provider/precheck?seat=s1&toAccount=work")).status).toBe(200);
+    expect((await app.request("/api/provider/switch", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ seat: "s1", toAccount: "work" }),
+    })).status).toBe(200);
+    expect(lent).toHaveLength(2);
+    for (const seatRestart of lent) expect(seatRestart).toMatchObject({ plan: expect.any(Function), run: expect.any(Function) });
+  });
+
+  it("precheck and switch also lend a Claude seat's relaunch, and pass its token file or the stored login through", async () => {
+    const seen: Array<{ input: unknown; claudeSeat: unknown }> = [];
+    const app = appWith({
+      ...stubService,
+      precheck: async (input, _seatRestart, claudeSeat) => { seen.push({ input, claudeSeat }); return { safe: true }; },
+      switchAccount: async (input, _seatRestart, claudeSeat) => { seen.push({ input, claudeSeat }); return { outcome: "rebind_in_progress" }; },
+    });
+    expect((await app.request("/api/provider/precheck?seat=s1&toAccount=work&tokenFile=%2Ftokens%2Fwork")).status).toBe(200);
+    expect((await app.request("/api/provider/precheck?seat=s1&toAccount=stored-login&storedLogin=1")).status).toBe(200);
+    expect((await app.request("/api/provider/switch", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ seat: "s1", toAccount: "work", tokenFile: "/tokens/work" }),
+    })).status).toBe(200);
+    expect(seen.map((s) => s.input)).toEqual([
+      { seat: "s1", toAccount: "work", tokenFile: "/tokens/work" },
+      { seat: "s1", toAccount: "stored-login", tokenFile: null },
+      { seat: "s1", toAccount: "work", forceUnsafe: false, tokenFile: "/tokens/work" },
+    ]);
+    for (const { claudeSeat } of seen) {
+      expect(claudeSeat).toMatchObject({ seat: expect.any(Function), snapshot: expect.any(Function), exclusive: expect.any(Function), relaunchInPane: expect.any(Function) });
+      expect(claudeSeat).not.toHaveProperty("stop");
+    }
+    const bad = await app.request("/api/provider/switch", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ seat: "s1", toAccount: "work", tokenFile: 7 }),
+    });
+    expect(bad.status).toBe(400);
+  });
+
+  it("a Claude seat's relaunch keeps its pane: restore launches only that seat from the snapshot in it, under the seat's lease, and its warnings come back", async () => {
+    const db = createFullTestDb();
+    try {
+      const repo = new RigRepository(db), registry = new SessionRegistry(db);
+      const rig = repo.createRig("fixture-rig");
+      const node = repo.addNode(rig.id, "dev.a", { runtime: "claude-code" });
+      const session = registry.registerSession(node.id, "dev-a@fixture-rig");
+      registry.updateStatus(session.id, "running");
+      registry.updateBinding(node.id, { attachmentType: "tmux", tmuxSession: "dev-a@fixture-rig", tmuxPane: "%101" });
+      let launched: { ok: boolean; launched?: Array<{ logicalId: string; status: string; error?: string }>; warnings?: string[]; code?: string; message?: string }
+        = { ok: true, launched: [{ logicalId: "dev.a", status: "resumed" }], warnings: ["dev-a@fixture-rig: a launch warning"] };
+      const launchSingleNode = vi.fn(async () => launched);
+      const leased: string[][] = [];
+      const tmux = { killSession: vi.fn(), deliveryGuard: { lifecycle: async (ids: string[], fn: () => Promise<unknown>) => { leased.push(ids); return fn(); } } };
+      let lent!: ClaudeSeatRelaunch;
+      const app = new Hono();
+      app.use("*", async (c, next) => {
+        for (const [key, value] of Object.entries({ rigRepo: repo, tmuxAdapter: tmux, restoreOrchestrator: { launchSingleNode }, runtimeAdapters: {},
+          providerService: { ...stubService, precheck: async (_i: unknown, _r: unknown, claudeSeat: ClaudeSeatRelaunch) => { lent = claudeSeat; return { safe: true }; } } })) {
+          c.set(key as never, value as never);
+        }
+        await next();
+      });
+      app.route("/api/provider", providerRoutes());
+      await app.request("/api/provider/precheck?seat=dev-a@fixture-rig&toAccount=work&tokenFile=%2Ftokens%2Fwork");
+      expect(lent.seat("dev-a@fixture-rig")).toMatchObject({ nodeId: node.id, logicalId: "dev.a", running: true, pane: "%101" });
+      // Restores can mix ISO and SQLite timestamp spellings; ULIDs retain creation order.
+      registry.updateStatus(session.id, "superseded");
+      const current = registry.registerSession(node.id, "dev-a@fixture-rig");
+      registry.updateStatus(current.id, "running");
+      db.prepare("UPDATE sessions SET created_at = ? WHERE id = ?").run("2026-10-28T00:00:01Z", session.id);
+      db.prepare("UPDATE sessions SET created_at = ? WHERE id = ?").run("2026-10-28 00:00:02", current.id);
+      expect(lent.seat("dev-a@fixture-rig")).toMatchObject({ running: true });
+      expect(await lent.exclusive(node.id, async () => "held")).toBe("held");
+      expect(leased).toEqual([[node.id]]);
+      expect(await lent.relaunchInPane(rig.id, "dev.a", "snap-1")).toEqual({ ok: true, status: "resumed", warnings: ["dev-a@fixture-rig: a launch warning"] });
+      expect(launchSingleNode).toHaveBeenCalledWith(rig.id, "dev.a", expect.objectContaining({ snapshotId: "snap-1", keepPane: true, keepClaudeLaunch: true }));
+      expect(launchSingleNode).not.toHaveBeenCalledWith(rig.id, "dev.a", expect.objectContaining({ keepEffort: expect.anything() }));
+      // The launch's selection is heard on every relaunch, with or without a kept effort.
+      expect(launchSingleNode).toHaveBeenLastCalledWith(rig.id, "dev.a", expect.objectContaining({ onLaunchEffort: expect.any(Function) }));
+      launchSingleNode.mockImplementationOnce((async (_rigId: string, _logicalId: string, o: { onLaunchEffort?: (e: { effort: string | null; source: string }) => void }) => {
+        o.onLaunchEffort?.({ effort: "medium", source: "seat_choice" });
+        return launched;
+      }) as never);
+      expect(await lent.relaunchInPane(rig.id, "dev.a", "snap-1", { effort: "high" }))
+        .toMatchObject({ ok: true, status: "resumed", effort: { effort: "medium", source: "seat_choice" } });
+      expect(launchSingleNode).toHaveBeenLastCalledWith(rig.id, "dev.a", expect.objectContaining({ snapshotId: "snap-1", keepPane: true, keepEffort: "high",
+        onLaunchEffort: expect.any(Function) }));
+      expect(tmux.killSession).not.toHaveBeenCalled();
+      // Restore's stops before it touches the seat leave it unchanged; anything else after the launch began is unknown.
+      launched = { ok: true, launched: [{ logicalId: "dev.a", status: "awaiting-decision", error: "decide first" }] };
+      expect(await lent.relaunchInPane(rig.id, "dev.a", "snap-1")).toMatchObject({ ok: false, effect: "none", code: "awaiting-decision" });
+      launched = { ok: true, launched: [{ logicalId: "dev.a", status: "awaiting-decision", launchStarted: true, error: "resume failed after cutover" }] };
+      expect(await lent.relaunchInPane(rig.id, "dev.a", "snap-1")).toMatchObject({ ok: false, effect: "unknown", code: "awaiting-decision" });
+      launched = { ok: true, launched: [{ logicalId: "dev.a", status: "failed", error: "the pane couldn't be respawned" }] };
+      expect(await lent.relaunchInPane(rig.id, "dev.a", "snap-1")).toMatchObject({ ok: false, effect: "unknown", code: "failed" });
+      // A launch that failed before its takeover stopped anything left the seat as this attempt found it, so the switch
+      // puts its token reference back.
+      launched = { ok: true, launched: [{ logicalId: "dev.a", status: "failed", nothingStopped: true, error: "Pane %7 isn't in tmux session, so nothing was stopped." }] };
+      expect(await lent.relaunchInPane(rig.id, "dev.a", "snap-1")).toMatchObject({ ok: false, effect: "none", code: "failed" });
+      launched = { ok: false, code: "snapshot_not_found", message: "no such snapshot" };
+      expect(await lent.relaunchInPane(rig.id, "dev.a", "snap-1")).toMatchObject({ ok: false, effect: "none", code: "snapshot_not_found" });
+    } finally { db.close(); }
+  });
+
+  it("a stopped Claude seat's next launch is read from the snapshot `rig launch` selects, and no snapshot is taken", async () => {
+    const db = createFullTestDb();
+    try {
+      const repo = new RigRepository(db), registry = new SessionRegistry(db);
+      const rig = repo.createRig("fixture-rig");
+      const node = repo.addNode(rig.id, "dev.a", { runtime: "claude-code" });
+      registry.updateStatus(registry.registerSession(node.id, "dev-a@fixture-rig").id, "exited");
+      const capture = { captureSnapshot: vi.fn() };
+      let lent!: ClaudeSeatRelaunch;
+      const app = new Hono();
+      app.use("*", async (c, next) => {
+        for (const [key, value] of Object.entries({ rigRepo: repo, snapshotRepo: new SnapshotRepository(db), snapshotCapture: capture,
+          providerService: { ...stubService, precheck: async (_i: unknown, _r: unknown, claudeSeat: ClaudeSeatRelaunch) => { lent = claudeSeat; return { safe: true }; } } })) {
+          c.set(key as never, value as never);
+        }
+        await next();
+      });
+      app.route("/api/provider", providerRoutes());
+      await app.request("/api/provider/precheck?seat=dev-a@fixture-rig&toAccount=work&tokenFile=%2Ftokens%2Fwork");
+      expect(lent.seat("dev-a@fixture-rig")).toMatchObject({ running: false });
+      expect(lent.nextLaunch(rig.id, node.id)).toMatchObject({ snapshotId: null, resumes: false, why: expect.stringContaining("has no usable snapshot") });
+      const saved = (resumeToken: string | null) => JSON.stringify({
+        rig: { id: rig.id, name: "fixture-rig", createdAt: "2026-10-29", updatedAt: "2026-10-29" },
+        nodes: [{ id: node.id, logicalId: "dev.a", runtime: "claude-code" }], edges: [], checkpoints: {},
+        sessions: [{ id: "saved", nodeId: node.id, sessionName: "dev-a@fixture-rig", status: "running", createdAt: "2026-10-29T10:00:00.000Z",
+          lastSeenAt: null, resumeType: resumeToken ? "claude_id" : "none", resumeToken, restorePolicy: "resume_if_possible", origin: "launched",
+          startupStatus: "ready", startupCompletedAt: "2026-10-29T10:00:00.000Z" }],
+        activeSessionIdByNode: { [node.id]: "saved" }, activeOccupantsByNode: { [node.id]: { kind: "resolved", sessionId: "saved" } },
+      });
+      const insert = db.prepare("INSERT INTO snapshots(id, rig_id, kind, data, created_at) VALUES (?, ?, 'auto-pre-down', ?, ?)");
+      insert.run("snap-a", rig.id, saved("conv-9"), "2026-10-29 10:00:00");
+      expect(lent.nextLaunch(rig.id, node.id)).toEqual({ snapshotId: "snap-a", resumes: true, automatic: false, conversation: "conv-9" });
+      // A later snapshot that saved the seat without its conversation is what the launch would use, so it doesn't resume.
+      insert.run("snap-b", rig.id, saved(null), "2026-10-29 10:05:00");
+      expect(lent.nextLaunch(rig.id, node.id)).toMatchObject({ snapshotId: "snap-b", resumes: false, why: "has no resume token for this seat" });
+      expect(capture.captureSnapshot).not.toHaveBeenCalled();
+    } finally { db.close(); }
   });
 
   it("switch business outcomes are 200 payloads, not transport errors (failed_safely = 200)", async () => {
@@ -131,5 +325,89 @@ describe("provider routes", () => {
     const res = await appWith(null).request("/api/provider/status");
     expect(res.status).toBe(503);
     expect((await res.json()).error).toBe("provider_service_unavailable");
+  });
+});
+
+describe("provider account reference routes (#3625)", () => {
+  // Synthetic file contents, not a credential; no answer may carry them.
+  const CONTENT = "synthetic-content-never-echoed";
+
+  function refsApp(): { app: Hono; dir: string; done: () => void } {
+    const db = createFullTestDb();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "account-ref-routes-"));
+    const app = new Hono();
+    app.use("*", async (c, next) => {
+      c.set("rigRepo" as never, new RigRepository(db));
+      await next();
+    });
+    app.route("/api/provider", providerRoutes());
+    return { app, dir, done: () => { db.close(); fs.rmSync(dir, { recursive: true, force: true }); } };
+  }
+  const post = (app: Hono, body: unknown) => app.request("/api/provider/account-refs", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+  it("adds, lists and removes; a label with '@' and '.' goes through the path", async () => {
+    const { app, dir, done } = refsApp();
+    try {
+      const token = path.join(dir, "token");
+      fs.writeFileSync(token, CONTENT, { mode: 0o600 });
+      const home = path.join(dir, "codex");
+      fs.mkdirSync(path.join(home, "auth-profiles"), { recursive: true });
+      fs.writeFileSync(path.join(home, "auth-profiles", "work.json"), CONTENT, { mode: 0o600 });
+
+      const added = await post(app, { provider: "claude", label: "ops@team.1", tokenFile: token });
+      expect(added.status).toBe(201);
+      expect(await added.json()).toMatchObject({ ok: true, account: { provider: "claude", label: "ops@team.1", kind: "claude_token_file", file: token } });
+      expect((await post(app, { provider: "codex", label: "work", codexHome: home, login: "work" })).status).toBe(201);
+
+      const all = await (await app.request("/api/provider/account-refs")).json();
+      expect(all.accounts.map((a: { provider: string; label: string }) => `${a.provider}/${a.label}`)).toEqual(["claude/ops@team.1", "codex/work"]);
+      const codex = await (await app.request("/api/provider/account-refs?provider=codex")).json();
+      expect(codex.accounts).toHaveLength(1);
+      expect(JSON.stringify(all)).not.toContain(CONTENT);
+
+      const removed = await app.request(`/api/provider/account-refs/claude/${encodeURIComponent("ops@team.1")}`, { method: "DELETE" });
+      expect(removed.status).toBe(200);
+      expect(await removed.json()).toMatchObject({ ok: true, account: { label: "ops@team.1" } });
+      expect((await app.request(`/api/provider/account-refs/claude/${encodeURIComponent("ops@team.1")}`, { method: "DELETE" })).status).toBe(404);
+    } finally { done(); }
+  });
+
+  it("refuses a malformed request (400), an unusable reference (400) and a duplicate label (409), storing nothing", async () => {
+    const { app, dir, done } = refsApp();
+    try {
+      const open = path.join(dir, "open");
+      fs.writeFileSync(open, CONTENT, { mode: 0o644 });
+      fs.chmodSync(open, 0o644);
+      const ok = path.join(dir, "ok");
+      fs.writeFileSync(ok, CONTENT, { mode: 0o600 });
+
+      const malformed = await post(app, { provider: "claude", label: "a", tokenFile: ok, apiKeyFile: ok });
+      expect(malformed.status).toBe(400);
+      expect(await malformed.json()).toMatchObject({ ok: false, code: "invalid_reference" });
+      expect((await app.request("/api/provider/account-refs", { method: "POST", body: "[]", headers: { "content-type": "application/json" } })).status).toBe(400);
+      expect((await app.request("/api/provider/account-refs", { method: "POST", body: "{", headers: { "content-type": "application/json" } })).status).toBe(400);
+
+      const unusable = await post(app, { provider: "claude", label: "open", apiKeyFile: open });
+      expect(unusable.status).toBe(400);
+      const refusal = await unusable.json();
+      expect(refusal).toMatchObject({ ok: false, code: "reference_unusable" });
+      expect(refusal.message).toContain("must be private (0600 or 0400)");
+      expect(JSON.stringify(refusal)).not.toContain(CONTENT);
+
+      expect((await post(app, { provider: "claude", label: "a", tokenFile: ok })).status).toBe(201);
+      const duplicate = await post(app, { provider: "claude", label: "a", tokenFile: ok });
+      expect(duplicate.status).toBe(409);
+      expect(await duplicate.json()).toMatchObject({ ok: false, code: "duplicate_label" });
+
+      expect((await (await app.request("/api/provider/account-refs")).json()).accounts).toHaveLength(1);
+      expect((await app.request("/api/provider/account-refs?provider=pi")).status).toBe(400);
+      expect((await app.request("/api/provider/account-refs/pi/a", { method: "DELETE" })).status).toBe(400);
+    } finally { done(); }
+  });
+
+  it("is 503 when the daemon wires no database", async () => {
+    const res = await appWith(stubService).request("/api/provider/account-refs");
+    expect(res.status).toBe(503);
   });
 });

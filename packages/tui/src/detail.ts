@@ -10,6 +10,12 @@
 import type { Action } from "./types.js";
 import type { Token } from "./theme.js";
 
+/** First `end` UTF-16 units of `text`, one shorter when that would split a surrogate pair. */
+export function sliceWhole(text: string, end: number): string {
+  const last = text.charCodeAt(end - 1);
+  return text.slice(0, last >= 0xd800 && last <= 0xdbff ? end - 1 : end);
+}
+
 export interface ContentLine {
   text: string;
   action?: Action;
@@ -20,12 +26,18 @@ export interface ContentLine {
 
 /** Wrap prose and full references without losing a link's target. Graph/table rows
  * retain their own layout; callers opt in only for detail pages. */
+/** Text from outside shown in the terminal: tabs as spaces, and every other control character as a visible \xNN, so it
+ *  can't move the cursor, clear the screen or start an escape sequence. */
+export function escapeControlChars(text: string): string {
+  return text.replace(/\t/g, "    ").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, (ch) => `\\x${ch.charCodeAt(0).toString(16).padStart(2, "0")}`);
+}
+
 export function wrapDetailLines(lines: ContentLine[], width: number): ContentLine[] {
   const room = Math.max(8, width);
   // A ContentLine is one logical terminal row. YAML block scalars and current
   // source files may contain CR/LF; never emit those inside a physical row.
   const logical = lines.flatMap((line) => line.text.split(/\r\n|\r|\n/).map((text, i) => ({
-    ...line, text: text.replace(/\t/g, "    ").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, (ch) => `\\x${ch.charCodeAt(0).toString(16).padStart(2, "0")}`),
+    ...line, text: escapeControlChars(text),
     ...(i ? { action: undefined, zones: undefined, segs: undefined } : {}),
   })));
   return logical.flatMap((line) => {
@@ -40,7 +52,11 @@ export function wrapDetailLines(lines: ContentLine[], width: number): ContentLin
     while (line.text.length - offset + indent.length > room) {
       const chunk = indent + line.text.slice(offset, offset + room - indent.length + 1);
       const space = chunk.lastIndexOf(" ", room);
-      const cut = space >= room / 2 ? space : room;
+      let cut = space >= room / 2 ? space : room;
+      // A hard wrap must keep a UTF-16 surrogate pair on the same row.
+      const before = chunk.charCodeAt(cut - 1);
+      const after = chunk.charCodeAt(cut);
+      if (before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff) cut--;
       result.push({ text: chunk.slice(0, cut), ...(result.length === 0 && line.action ? { action: line.action } : {}) });
       offset += cut - indent.length;
       while (offset < line.text.length && /\s/.test(line.text[offset]!)) offset++;

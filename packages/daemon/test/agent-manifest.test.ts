@@ -76,6 +76,58 @@ profiles:
 `;
 
 describe("AgentSpec manifest parser + validator", () => {
+  it("advises on malformed selections and normalizes scalar IDs", () => {
+    const base = { name: "example", version: "1.0" };
+    expect(validateAgentSpec({ ...base, profiles: { default: { uses: "skills" } } }).advisories)
+      .toContain("profiles.default.uses: expected an object; ignored");
+    for (const category of ["skills", "guidance", "subagents", "plugins", "runtime_resources"]) {
+      const result = validateAgentSpec({ ...base, profiles: { default: { uses: { [category]: "review" } } } });
+      expect(result.valid).toBe(true);
+      expect(result.advisories).toContain(`profiles.default.uses.${category}: scalar ID accepted; use a list instead`);
+    }
+    const invalidEntry = validateAgentSpec({ ...base, profiles: { default: { uses: { skills: [null, ""] } } } });
+    expect(invalidEntry.advisories).toEqual([
+      "profiles.default.uses.skills[0]: expected a non-empty resource ID; a member using this profile fails to launch",
+      "profiles.default.uses.skills[1]: expected a non-empty resource ID; a member using this profile fails to launch",
+    ]);
+    expect(invalidEntry.valid).toBe(true);
+    for (const malformed of ["", 42, false, { id: "review" }]) {
+      const result = validateAgentSpec({ ...base, profiles: { default: { uses: { skills: malformed } } } });
+      expect(result.valid).toBe(true);
+      expect(result.advisories).toContain("profiles.default.uses.skills: expected an array of resource IDs; ignored");
+    }
+    expect(normalizeAgentSpec({ ...base, profiles: { default: { uses: { skills: [null, ""] } } } }).profiles["default"]!.uses.skills).toEqual([null, ""]);
+    expect(validateAgentSpec({ ...base, profiles: { default: { uses: { skills: ["review"] } } } }).valid).toBe(true);
+    expect(validateAgentSpec({ ...base, profiles: { default: { uses: null }, other: { uses: { skills: null } } } }).valid).toBe(true);
+    expect(validateAgentSpec({ ...base, profiles: { default: { uses: [] } } }).valid).toBe(true);
+    expect(validateAgentSpec({ ...base, profiles: { default: { uses: ["review"] } } }).valid).toBe(true);
+    const raw = { ...base, profiles: { default: { uses: { skills: "review", guidance: "guide", subagents: "agent", plugins: "plugin", runtime_resources: "runtime" } } } };
+    expect(normalizeAgentSpec(raw).profiles["default"]!.uses).toEqual({ skills: ["review"], guidance: ["guide"], subagents: ["agent"], plugins: ["plugin"], runtimeResources: ["runtime"] });
+  });
+
+  it("advises on an unknown uses key, keeps the spec valid, and selects nothing from it", () => {
+    const base = { name: "example", version: "1.0" };
+    const raw = { ...base, profiles: { default: { uses: { skils: ["review"] } } } };
+    const result = validateAgentSpec(raw);
+    expect(result.valid).toBe(true);
+    expect(result.advisories).toEqual(["profiles.default.uses.skils: unknown key ignored; known keys are skills, guidance, subagents, plugins, runtime_resources"]);
+    expect(normalizeAgentSpec(raw).profiles["default"]!.uses.skills).toEqual([]);
+  });
+
+  it("gives no unknown-key advisory for the five known uses keys", () => {
+    const result = validateAgentSpec({ name: "example", version: "1.0",
+      profiles: { default: { uses: { skills: [], guidance: [], subagents: [], plugins: [], runtime_resources: [] } } } });
+    expect(result.valid).toBe(true);
+    expect(result.advisories).toBeUndefined();
+  });
+
+  it("keeps the legacy uses.hooks key an error, without a second unknown-key advisory", () => {
+    const result = validateAgentSpec({ name: "example", version: "1.0", profiles: { default: { uses: { hooks: ["h"] } } } });
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.startsWith("profiles.default.uses.hooks: removed"))).toBe(true);
+    expect(result.advisories ?? []).not.toContainEqual(expect.stringContaining("uses.hooks: unknown key"));
+  });
+
   // T1: valid agent.yaml parses and normalizes with correct defaults
   it("valid spec parses, validates, and normalizes", () => {
     const raw = parseAgentSpec(VALID_SPEC);
@@ -99,6 +151,9 @@ describe("AgentSpec manifest parser + validator", () => {
     expect(spec.profiles["tdd"]).toBeDefined();
     expect(spec.profiles["tdd"]!.uses.skills).toContain("deep-pr-review");
     expect(spec.profiles["tdd"]!.uses.skills).toContain("acme-standards:repo-rules");
+    expect(spec.profiles["tdd"]!.uses.guidance).toEqual(["tdd-rules"]);
+    expect(spec.profiles["tdd"]!.uses.subagents).toEqual(["diff-auditor"]);
+    expect(spec.profiles["tdd"]!.uses.plugins).toEqual(["openrig-core"]);
     expect(spec.defaults?.lifecycle?.executionMode).toBe("interactive_resident");
   });
 
@@ -733,4 +788,43 @@ profiles:
     expect(result.valid).toBe(true);
     expect((result.advisories ?? []).some((a) => a.includes("preferences.effort"))).toBe(false);
   });
+});
+
+describe("keep_alive — AgentSpec lifecycle ingress (#2940)", () => {
+  const spec = (defaultsLifecycle: string, profileLifecycle: string) => `
+version: "0.2"
+name: keep-alive-fixture
+defaults:
+  runtime: claude-code
+  lifecycle:
+    execution_mode: interactive_resident
+${defaultsLifecycle}
+profiles:
+  default:
+    lifecycle:
+      execution_mode: interactive_resident
+${profileLifecycle}
+`;
+
+  it("accepts keep_alive in defaults and profiles and keeps each value as written", () => {
+    const raw = parseAgentSpec(spec("    keep_alive: true", "      keep_alive: false"));
+    expect(validateAgentSpec(raw).errors).toEqual([]);
+    const normalized = normalizeAgentSpec(raw);
+    expect(normalized.defaults?.lifecycle?.keepAlive).toBe(true);
+    expect(normalized.profiles["default"]!.lifecycle?.keepAlive).toBe(false);
+  });
+
+  it("preserves absence at both levels: nothing is materialized, so a spec without it reads exactly as before", () => {
+    const normalized = normalizeAgentSpec(parseAgentSpec(spec("", "")));
+    expect("keepAlive" in normalized.defaults!.lifecycle!).toBe(false);
+    expect("keepAlive" in normalized.profiles["default"]!.lifecycle!).toBe(false);
+  });
+
+  it.each([["defaults", spec("    keep_alive: yes-please", ""), "defaults.lifecycle.keep_alive"],
+    ["profiles", spec("", "      keep_alive: 1"), "profiles.default.lifecycle.keep_alive"]])(
+    "refuses a non-boolean keep_alive in %s by name", (_level, text, field) => {
+      const result = validateAgentSpec(parseAgentSpec(text));
+      expect(result.valid).toBe(false);
+      expect(result.errors.join(" ")).toContain(`${field}: must be true or false`);
+    });
 });

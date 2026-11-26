@@ -11,7 +11,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
 import { runFrontDoor, resolveTuiPath, probeFrontDoor, type FrontDoorIo } from "../src/front-door.js";
+import { diagnoseRuntimePosture, observeClaudePermission } from "../../daemon/src/domain/permission-drift.js";
 import { DaemonClient, DaemonConnectionError, DaemonResponseError, DaemonTimeoutError } from "../src/client.js";
+
+// The compiled front door's spawns guard against a hang (the piped TUI never exiting). A hang never ends, so a budget well
+// past a slow start still catches one: loaded CI runners took just over 5 s to start the CLI, and 30 s leaves room.
+const HANG_LIMIT_MS = 30_000;
+/** Those tests outlive their spawn's budget, so the spawn's own result is what reports a hang. */
+const HANG_TEST_TIMEOUT_MS = HANG_LIMIT_MS + 10_000;
 
 // A GUARANTEED-refused local port (bind an ephemeral port, capture it, close → connecting refuses).
 // A REAL socket refusal, not a hand-built error — buys the actual Node/undici rejection shape.
@@ -187,6 +194,35 @@ describe("bare-rig front door — first-impression degrade (never a stack trace)
       expect(deps.errLines).toEqual([]);
     },
   );
+
+  it.each([{}, { permissions: {} }, { permissions: { defaultMode: "auto" } }, { permissions: { defaultMode: "denyAll" } }])(
+    "opens the TUI from a managed Claude seat with manual defaults %j", async settings => {
+      const diagnostic = diagnoseRuntimePosture({ runtime: "claude-code", cwd: "/work",
+        applied: observeClaudePermission("--permission-mode acceptEdits"),
+        fs: { readFile: () => JSON.stringify(settings), cwdReadable: () => true,
+          commandAvailable: () => true, claudePermissionModes: () => ["acceptEdits", "auto"] } });
+      const deps = io({ probeDaemon: async () => ({ state: "diagnostic", diagnostic }) });
+      await runFrontDoor(["node", "rig"], deps);
+      expect(deps.launches).toBe(1);
+      expect(deps.exits).toEqual([0]);
+      expect(deps.errLines).toEqual([]);
+    });
+
+  it.each(["unreadable", "invalid rules", "conflicting rules"])(
+    "keeps %s settings diagnostic with a managed launch flag", async problem => {
+      const diagnostic = diagnoseRuntimePosture({ runtime: "claude-code", cwd: "/work",
+        applied: observeClaudePermission("--permission-mode acceptEdits"),
+        fs: { readFile: () => {
+          if (problem === "unreadable") throw Object.assign(new Error("denied"), { code: "EACCES" });
+          return JSON.stringify({ permissions: problem === "invalid rules" ? { ask: 3 }
+            : { allow: ["Read(/**)"], deny: ["Read(/**)"] } });
+        }, cwdReadable: () => true, commandAvailable: () => true,
+        claudePermissionModes: () => ["acceptEdits"] } });
+      const deps = io({ probeDaemon: async () => ({ state: "diagnostic", diagnostic }) });
+      await runFrontDoor(["node", "rig"], deps);
+      expect(deps.launches).toBe(0);
+      expect(deps.exits).toEqual([1]);
+    });
 
   it("front-door unreadable settings stays UNKNOWN_EFFECTIVE and never becomes daemon-down", async () => {
     const deps = io({
@@ -454,44 +490,60 @@ describe("PUBLIC bin ownership (guard finding 1 — the wrapper is the real fron
   //  "PRODUCTION PATH … REAL probeFrontDoor" test earlier, with no real TUI spawned.)
 
   it.skipIf(!existsSync(binWrapper))("piped PUBLIC bin keeps the commander usage baseline (no TUI, fast exit)", () => {
+    const started = Date.now();
     const result = spawnSync(process.execPath, [binWrapper], {
       input: "x\n",
-      timeout: 5000,
+      timeout: HANG_LIMIT_MS,
       encoding: "utf-8",
     });
-    expect(result.status).toBe(0);
+    expect(result.status, JSON.stringify({
+      elapsedMs: Date.now() - started, status: result.status, signal: result.signal,
+      error: result.error && { name: result.error.name, message: result.error.message, code: (result.error as NodeJS.ErrnoException).code },
+      stdout: result.stdout?.slice(-4096), stderr: result.stderr?.slice(-4096),
+    })).toBe(0);
     expect(`${result.stderr}${result.stdout}`).toMatch(/Usage: rig/);
-  });
+  }, HANG_TEST_TIMEOUT_MS);
 
   it.skipIf(!existsSync(binWrapper))("PUBLIC bin subcommands are untouched (rig --version via wrapper)", () => {
-    const result = spawnSync(process.execPath, [binWrapper, "--version"], { timeout: 5000, encoding: "utf-8" });
+    const result = spawnSync(process.execPath, [binWrapper, "--version"], { timeout: HANG_LIMIT_MS, encoding: "utf-8" });
     expect(result.status).toBe(0);
     expect(result.stdout.trim()).toMatch(/^\d+\.\d+\.\d+/);
-  });
+  }, HANG_TEST_TIMEOUT_MS);
 });
 
 describe("script-safety integration (the compiled front door)", () => {
   const cliEntry = join(__dirname, "..", "dist", "index.js");
+  it.skipIf(!existsSync(cliEntry))("an unresolved queue actor stays nonzero through a pipe with pipefail", () => {
+    const result = spawnSync("/bin/bash", ["--noprofile", "--norc", "-o", "pipefail", "-c",
+      'env -u OPENRIG_SESSION_NAME -u RIGGED_SESSION_NAME -u TMUX_PANE "$NODE" "$CLI" queue update qitem-pipe-proof --state in-progress --json 2>&1 | cat'], {
+      timeout: 5000,
+      encoding: "utf-8",
+      env: { ...process.env, NODE: process.execPath, CLI: cliEntry },
+    });
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("OPENRIG_SESSION_NAME is not set");
+  });
+
   it.skipIf(!existsSync(cliEntry))("`echo x | rig` returns usage fast — no hang (exit code preserves today's clean-help baseline)", () => {
     const started = Date.now();
     const result = spawnSync(process.execPath, [cliEntry], {
       input: "x\n",
-      timeout: 5000,
+      timeout: HANG_LIMIT_MS,
       encoding: "utf-8",
       env: { ...process.env, OPENRIG_URL: "", OPENRIG_PORT: "" },
     });
-    expect(Date.now() - started).toBeLessThan(5000);
+    expect(Date.now() - started).toBeLessThan(HANG_LIMIT_MS);
     // pre-slice-17 baseline: commander's clean-help path prints usage and
     // exits 0 — the front door PRESERVES the piped path byte-for-byte
     expect(result.status).toBe(0);
     expect(`${result.stderr}${result.stdout}`).toMatch(/Usage: rig/);
     expect(`${result.stderr}${result.stdout}`).not.toMatch(/\n\s+at /);
-  });
+  }, HANG_TEST_TIMEOUT_MS);
 
   it.skipIf(!existsSync(cliEntry))("`rig --help` still exits 0 with the full usage (front-door regression)", () => {
-    const result = spawnSync(process.execPath, [cliEntry, "--help"], { timeout: 5000, encoding: "utf-8" });
+    const result = spawnSync(process.execPath, [cliEntry, "--help"], { timeout: HANG_LIMIT_MS, encoding: "utf-8" });
     expect(result.status).toBe(0);
     expect(result.stdout).toMatch(/Usage: rig/);
     expect(result.stdout).toMatch(/daemon/);
-  });
+  }, HANG_TEST_TIMEOUT_MS);
 });

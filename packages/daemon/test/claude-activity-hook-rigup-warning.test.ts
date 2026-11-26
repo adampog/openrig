@@ -44,7 +44,9 @@ function mockTmux(): TmuxAdapter {
   return {
     createSession: vi.fn(async () => ({ ok: true as const })), killSession: vi.fn(async () => ({ ok: true as const })),
     sendText: vi.fn(async () => ({ ok: true as const })), hasSession: vi.fn(async () => true),
-    listSessions: vi.fn(async () => []), listWindows: vi.fn(async () => []), listPanes: vi.fn(async () => []),
+    listSessions: vi.fn(async () => []), listWindows: vi.fn(async () => []),
+    listPanes: vi.fn(async () => [{ id: "%1", index: 0, cwd: "/project", width: 80, height: 24, active: true }]),
+    getPanePid: vi.fn(async () => 4242), getPaneCommand: vi.fn(async () => "claude"),
     sendKeys: vi.fn(async () => ({ ok: true as const })),
   } as unknown as TmuxAdapter;
 }
@@ -77,7 +79,7 @@ function setup(activityAssets: { relayPath?: string; manifestPath?: string }, ex
   const eventBus = new EventBus(db);
   const tmux = mockTmux();
   const nodeLauncher = new NodeLauncher({ db, rigRepo, sessionRegistry, eventBus, tmuxAdapter: tmux });
-  const startupOrch = new StartupOrchestrator({ db, sessionRegistry, eventBus, tmuxAdapter: tmux });
+  const startupOrch = new StartupOrchestrator({ db, sessionRegistry, eventBus, tmuxAdapter: tmux, sleep: async () => {} });
   const files: Record<string, string> = { [`${RIG_ROOT}/agents/impl/agent.yaml`]: AGENT_YAML, ...extraFiles };
   const inst = new PodRigInstantiator({
     db, rigRepo, podRepo, sessionRegistry, eventBus, nodeLauncher, startupOrchestrator: startupOrch,

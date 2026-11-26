@@ -13,6 +13,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import Database from "better-sqlite3";
 import { mkdtempSync, rmSync } from "node:fs";
+import http from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sendCommand, type SendDeps } from "../src/commands/send.js";
@@ -20,7 +21,7 @@ import { captureCommand, type CaptureDeps } from "../src/commands/capture.js";
 import { transcriptCommand, type TranscriptDeps } from "../src/commands/transcript.js";
 import { broadcastCommand, type BroadcastDeps } from "../src/commands/broadcast.js";
 import { resolveCrossHostTarget } from "../src/cross-host-target.js";
-import { DaemonClient, SENDER_IDENTITY_HEADER } from "../src/client.js";
+import { DaemonClient, DaemonConnectionError, DaemonResponseError, DaemonTimeoutError, SENDER_IDENTITY_HEADER } from "../src/client.js";
 import type { CrossHostResult } from "../src/cross-host-executor.js";
 import type { HostRegistryLoadResult } from "../src/host-registry.js";
 
@@ -190,6 +191,37 @@ describe("resolveCrossHostTarget (§4 sugar + precedence)", () => {
 // ---------------------------------------------------------------------------
 
 describe("send --host (http branch)", () => {
+  it.each([false, true])("HTTP native receipts retain request IDs, uncertainty and verification limits (json=%s)", async json => {
+    for (const state of ["pending", "submitted", "rejected", "unknown", "reconciled", "erased"]) {
+      process.exitCode = undefined; captured.stdoutLines = []; captured.stderrLines = [];
+      const unknown = ["unknown", "reconciled", "erased"].includes(state);
+      const receipt = { requestId: "native-remote", stage: unknown ? "completed" : state,
+        ...(state === "unknown" ? { result: { submissionUnknown: true } } : {}),
+        ...(state === "reconciled" ? { reconciliation: "receiver_state_lost" } : {}), ...(state === "erased" ? { erasedAt: "2026-11-16" } : {}) };
+      const h = mockClient(() => ({ status: state === "rejected" ? 409 : 200, data: { ok: state !== "rejected", runnerReceipt: receipt } }));
+      await sendCommand(httpDeps(h)).parseAsync(["--host", "vps-b", "native@r", "make test", "--verify", ...(json ? ["--json"] : [])], { from: "user" });
+      expect(h.calls).toHaveLength(1);
+      if (json) expect(JSON.parse(captured.stdoutLines[0]!).result.data).toMatchObject({ runnerReceipt: receipt, verified: false });
+      else {
+        expect(captured.stdoutLines.join("\n")).not.toContain("Sent to");
+        expect(captured.stdoutLines.join("\n")).toContain("request native-remote");
+        expect(captured.stdoutLines.join("\n")).toContain("Verified: no (native receipt)");
+      }
+      expect(process.exitCode).toBe(unknown || state === "rejected" ? 1 : undefined);
+    }
+  });
+  it.each(["\r", "\x1b", "\t", " "])("preserves explicit byte payload and interaction options over HTTP (%#)", async text => {
+    const h = mockClient(() => ({ status: 200, data: { ok: true, promptInteraction: "unverified" } }));
+    await sendCommand(httpDeps(h)).parseAsync(["--host", "vps-b", "dev-impl@my-rig", text,
+      "--dangerously-interact", "--type-without-checking", "--reason", "explicit key", "--verify"], { from: "user" });
+    expect(process.exitCode).toBeUndefined();
+    expect(h.calls).toHaveLength(1);
+    expect(h.calls[0]).toMatchObject({ method: "POST", path: "/api/transport/send", body: {
+      session: "dev-impl@my-rig", text, dangerouslyInteract: true, typeWithoutChecking: true, reason: "explicit key", verify: true,
+    } });
+    expect(sshRunnerNeverCalled).not.toHaveBeenCalled();
+  });
+
   it("http host: POSTs the LOCAL body shape (wrapped envelope) to /api/transport/send; ssh runner never invoked; BR-1: session stays 2-part", async () => {
     const h = mockClient(() => ({ status: 200, data: { ok: true } }));
     const cmd = sendCommand(httpDeps(h));
@@ -205,6 +237,7 @@ describe("send --host (http branch)", () => {
     expect(body.session).toBe("dev-impl@my-rig"); // BR-1: never member@rig@host
     expect(String(body.text)).toContain("To: dev-impl@my-rig");
     expect(String(body.text)).toContain("hello");
+    expect(body.exactText).toBe("hello"); // the remote daemon types this if the seat is a terminal
     expect(call.options?.headers?.Authorization).toBe("Bearer test-token");
     expect(captured.stdoutLines).toContain("[via host=vps-b (http://vps-b:7433)]");
     expect(captured.stdoutLines).toContain("Sent to dev-impl@my-rig");
@@ -323,21 +356,123 @@ describe("send --host (http branch)", () => {
   });
 
   it("network failure surfaces as remote-daemon-unreachable, host named, never a hang", async () => {
-    const h = mockClient(() => new Error("connect ECONNREFUSED"));
+    const h = mockClient(() => new DaemonConnectionError("Cannot connect to the OpenRig daemon at http://vps-b:7433: fetch failed (ECONNREFUSED)", "ECONNREFUSED"));
     const cmd = sendCommand(httpDeps(h));
     await cmd.parseAsync(["--host", "vps-b", "dev-impl@my-rig", "hello"], { from: "user" });
     const err = captured.stderrLines.join("\n");
     expect(err).toContain("remote-daemon-unreachable");
     expect(err).toContain("host=vps-b");
+    expect(err).not.toContain("UNCONFIRMED");
     expect(process.exitCode).toBe(1);
   });
 
-  it("--wait-for-idle sizes the http deadline: waitForIdleMs + overhead", async () => {
+  it("--wait-for-idle sizes the http deadline: waitForIdleMs + the cross-host send budget", async () => {
     const h = mockClient(() => ({ status: 200, data: {} }));
     const cmd = sendCommand(httpDeps(h));
     await cmd.parseAsync(["--host", "vps-b", "dev-impl@my-rig", "hello", "--wait-for-idle", "30"], { from: "user" });
-    expect(h.calls[0]!.options?.timeoutMs).toBe(30_000 + 5_000);
+    expect(h.calls[0]!.options?.timeoutMs).toBe(30_000 + 60_000);
     expect((h.calls[0]!.body as Record<string, unknown>).waitForIdleMs).toBe(30_000);
+  });
+
+  it("--wait-for-idle longer than 300 s is one request to the remote carrying the whole wait", async () => {
+    const h = mockClient(() => ({ status: 200, data: { ok: true } }));
+    const cmd = sendCommand(httpDeps(h));
+    await cmd.parseAsync(["--host", "vps-b", "dev-impl@my-rig", "hello", "--wait-for-idle", "400"], { from: "user" });
+    expect(h.calls.map((c) => [(c.body as Record<string, unknown>).waitForIdleMs, c.options?.timeoutMs])).toEqual([[400_000, 400_000 + 60_000]]);
+  });
+
+  it("a cross-host send waits 60 s for the remote to deliver, not the 5 s read default", async () => {
+    const h = mockClient(() => ({ status: 200, data: {} }));
+    const cmd = sendCommand(httpDeps(h));
+    await cmd.parseAsync(["--host", "vps-b", "dev-impl@my-rig", "hello"], { from: "user" });
+    expect(h.calls[0]!.options?.timeoutMs).toBe(60_000);
+  });
+
+  it("a remote that delivers after more than 5 s reports the send, not a failure", { timeout: 20_000 }, async () => {
+    // Reproduces the desktop finding: the remote answered /api/transport/send after the old 5 s client deadline.
+    vi.stubEnv("OPENRIG_SESSION_NAME", "");
+    let sends = 0;
+    const server = http.createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        if (req.url !== "/api/transport/send") { res.writeHead(404).end("{}"); return; }
+        sends++;
+        setTimeout(() => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, sessionName: "dev-impl@my-rig" }));
+        }, 6_000);
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+      const deps = httpDeps(mockClient(() => ({ status: 200, data: {} })), {
+        clientFactory: (u: string) => new DaemonClient(u) as never,
+        hostRegistryLoader: () => ({ ok: true, registry: { hosts: [{ id: "slow-b", transport: "http", url }] } }),
+      });
+      await sendCommand(deps).parseAsync(["--host", "slow-b", "dev-impl@my-rig", "hello"], { from: "user" });
+      expect(sends).toBe(1);
+      expect(captured.stdoutLines).toContain("Sent to dev-impl@my-rig");
+      expect(captured.stderrLines.join("\n")).not.toContain("unreachable");
+      expect(process.exitCode).toBeUndefined();
+    } finally {
+      server.close();
+    }
+  });
+
+  it.each([
+    ["timed out", new DaemonTimeoutError("The OpenRig daemon at http://vps-b:7433 did not respond in time: Request to http://vps-b:7433/api/transport/send timed out after 30000ms")],
+    ["had its connection dropped", new DaemonConnectionError("Cannot connect to the OpenRig daemon at http://vps-b:7433: fetch failed (UND_ERR_SOCKET)", "UND_ERR_SOCKET")],
+    ["had its connection reset", new DaemonConnectionError("Cannot connect to the OpenRig daemon at http://vps-b:7433: fetch failed (ECONNRESET)", "ECONNRESET")],
+    ["failed with no cause code", new DaemonConnectionError("Cannot connect to the OpenRig daemon at http://vps-b:7433: fetch failed")],
+    ["got an unreadable response", new DaemonResponseError(200, "")],
+  ])("a send that %s reads as unconfirmed with check-first guidance, never as unreachable", async (_label, failure) => {
+    const h = mockClient(() => failure);
+    const cmd = sendCommand(httpDeps(h));
+    await cmd.parseAsync(["--host", "vps-b", "dev-impl@my-rig", "hello"], { from: "user" });
+    const err = captured.stderrLines.join("\n");
+    expect(err).toContain("cross-host (host=vps-b, http://vps-b:7433): http remote-outcome-unknown:");
+    expect(err).toContain("Delivery UNCONFIRMED — the remote daemon may have received and delivered the message.");
+    expect(err).toContain("rig capture dev-impl@my-rig --host vps-b");
+    expect(err).toContain("off-screen");
+    expect(err).toContain("does not prove non-delivery");
+    expect(err).toContain("duplicate");
+    expect(err).not.toContain("remote-daemon-unreachable");
+    expect(captured.stdoutLines).not.toContain("Sent to dev-impl@my-rig");
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("json: an unconfirmed send carries the outcome-unknown step and the check-first action", async () => {
+    const h = mockClient(() => new DaemonTimeoutError("The OpenRig daemon at http://vps-b:7433 did not respond in time"));
+    const cmd = sendCommand(httpDeps(h));
+    await cmd.parseAsync(["--host", "vps-b", "dev-impl@my-rig", "hello", "--json"], { from: "user" });
+    const parsed = JSON.parse(captured.stdoutLines[0]!) as Record<string, any>;
+    expect(parsed.result).toMatchObject({ ok: false, failedStep: "remote-outcome-unknown", outcomeUnknown: true });
+    expect(parsed.error.fact).toContain("did not respond in time");
+    expect(parsed.error.consequence).toContain("Delivery UNCONFIRMED");
+    expect(parsed.error.action).toContain("rig capture dev-impl@my-rig --host vps-b");
+    expect(process.exitCode).toBe(1);
+  });
+
+  it.each(["EHOSTDOWN", "ENETDOWN", "EHOSTUNREACH", "EPERM"])("a code the kernel can also report on a live socket (%s) reads as unconfirmed, not unreachable", async (code) => {
+    const h = mockClient(() => new DaemonConnectionError(`Cannot connect to the OpenRig daemon at http://vps-b:7433: fetch failed (${code})`, code));
+    const cmd = sendCommand(httpDeps(h));
+    await cmd.parseAsync(["--host", "vps-b", "dev-impl@my-rig", "hello", "--json"], { from: "user" });
+    const parsed = JSON.parse(captured.stdoutLines[0]!) as Record<string, any>;
+    expect(parsed.result).toMatchObject({ ok: false, failedStep: "remote-outcome-unknown", outcomeUnknown: true });
+    expect(parsed.error.action).toContain("does not prove non-delivery");
+    expect(process.exitCode).toBe(1);
+  });
+
+  it.each(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "UND_ERR_CONNECT_TIMEOUT"])("a connection that never reached the remote (%s) still reads as unreachable", async (code) => {
+    const h = mockClient(() => new DaemonConnectionError(`Cannot connect to the OpenRig daemon at http://vps-b:7433: fetch failed (${code})`, code));
+    const cmd = sendCommand(httpDeps(h));
+    await cmd.parseAsync(["--host", "vps-b", "dev-impl@my-rig", "hello", "--json"], { from: "user" });
+    const parsed = JSON.parse(captured.stdoutLines[0]!) as Record<string, any>;
+    expect(parsed.result.failedStep).toBe("remote-daemon-unreachable");
+    expect(parsed.result.outcomeUnknown).toBeUndefined();
+    expect(parsed.error).toBeUndefined();
+    expect(process.exitCode).toBe(1);
   });
 
   it("fan-out×host guard kept verbatim: --host + --rig rejected before any call", async () => {
@@ -383,9 +518,16 @@ describe("capture --host (http branch)", () => {
     expect(sshRunnerNeverCalled).not.toHaveBeenCalled();
     const call = h.calls[0]!;
     expect(call.path).toBe("/api/transport/capture");
-    expect(call.body).toEqual({ lines: 50, session: "dev-impl@my-rig" });
+    expect(call.body).toEqual({ lines: 50, session: "dev-impl@my-rig", inputBox: true });
     expect(captured.stdoutLines).toContain("[via host=vps-b (http://vps-b:7433)]");
     expect(captured.stdoutLines).toContain("pane content here");
+  });
+
+  it("http host: a non-positive --lines posts the documented default of 20, not 0", async () => {
+    const h = mockClient(() => ({ status: 200, data: { content: "pane content here" } }));
+    const cmd = captureCommand(httpDeps(h));
+    await cmd.parseAsync(["--host", "vps-b", "dev-impl@my-rig", "--lines=0"], { from: "user" });
+    expect(h.calls[0]!.body).toEqual({ lines: 20, session: "dev-impl@my-rig", inputBox: true });
   });
 
   it("anonymous (URL-only) http host: capture POSTs with NO Authorization header; still succeeds", async () => {
@@ -432,7 +574,21 @@ describe("capture --host (http branch)", () => {
     }));
     await cmd.parseAsync(["--host", "vm-ssh", "dev-impl@my-rig"], { from: "user" });
     expect(h.calls.length).toBe(0); // http client never touched for an ssh host
-    expect(sshCalls.argv).toEqual(["rig", "capture", "dev-impl@my-rig", "--lines", "20"]);
+    expect(sshCalls.argv).toEqual(["rig", "capture", "dev-impl@my-rig"]); // no --lines: the remote's default stays the default
+  });
+
+  it("http host: an explicit --lines N cuts the remote capture to its last N lines, in text and JSON", async () => {
+    const pane = Array.from({ length: 26 }, (_, i) => `row${i + 1}`).join("\n") + "\n";
+    const h = mockClient(() => ({ status: 200, data: { ok: true, sessionName: "dev-impl@my-rig", content: pane, lines: 5 } }));
+    await captureCommand(httpDeps(h)).parseAsync(["--host", "vps-b", "dev-impl@my-rig", "--lines", "5"], { from: "user" });
+    expect(h.calls[0]!.body).toEqual({ lines: 5, session: "dev-impl@my-rig", inputBox: true });
+    expect(captured.stdoutLines).toContain("row22\nrow23\nrow24\nrow25\nrow26\n");
+    expect(captured.stderrLines).toContain("[rig capture: dev-impl@my-rig: 21 earlier lines not shown; last 5 shown; activity unknown: rig ps --nodes]");
+
+    captured.stdoutLines.length = 0;
+    await captureCommand(httpDeps(h)).parseAsync(["--host", "vps-b", "dev-impl@my-rig", "--lines", "5", "--json"], { from: "user" });
+    const parsed = JSON.parse(captured.stdoutLines[0]!) as Record<string, any>;
+    expect(parsed.result.data).toMatchObject({ lines: 5, requestedLines: 5, omittedLines: 21 });
   });
 });
 
@@ -544,6 +700,14 @@ describe("transcript --host (net-new, CLI-direct GET)", () => {
 // ---------------------------------------------------------------------------
 
 describe("broadcast --host (net-new, CLI-direct POST)", () => {
+  it.each([false, true])("HTTP broadcast unknown native custody has the same failing exit in either encoding (json=%s)", async json => {
+    const h = mockClient(() => ({ status: 200, data: { total: 1, sent: 0, failed: 0, indeterminateNative: 1,
+      results: [{ ok: true, sessionName: "native@r", runnerReceipt: { requestId: "unknown", stage: "completed", reconciliation: "receiver_state_lost" } }] } }));
+    await broadcastCommand(httpDeps(h)).parseAsync(["--host", "vps-b", "message", ...(json ? ["--json"] : [])], { from: "user" });
+    expect(process.exitCode).toBe(1);
+    if (json) expect(JSON.parse(captured.stdoutLines[0]!).result.data.indeterminateNative).toBe(1);
+    else expect(captured.stdoutLines.join("\n")).toContain("native effect unknown");
+  });
   it("http host: POSTs the LOCAL body verbatim; per-target results print verbatim; clean fan-out exits 0", async () => {
     const h = mockClient(() => ({
       status: 200,
@@ -588,6 +752,65 @@ describe("broadcast --host (net-new, CLI-direct POST)", () => {
     const cmd = broadcastCommand(httpDeps(h));
     await cmd.parseAsync(["--host", "vps-b", "msg"], { from: "user" });
     expect(h.calls[0]!.options?.timeoutMs).toBe(30_000);
+  });
+
+  it("a --host broadcast that timed out says it may still be running there and not to retry it whole", async () => {
+    const h = mockClient(() => new DaemonTimeoutError("The OpenRig daemon at http://vps-b:7433 did not respond in time: Request to http://vps-b:7433/api/transport/broadcast timed out after 30000ms"));
+    await broadcastCommand(httpDeps(h)).parseAsync(["--host", "vps-b", "--rig", "r", "msg"], { from: "user" });
+    const err = captured.stderrLines.join("\n");
+    expect(err).toContain("may still be running on vps-b");
+    expect(err).toContain("Don't retry the whole broadcast");
+    expect(err).toContain("A missing receipt is not proof of non-delivery");
+    expect(err).toContain("relay@my-rig's outbox on vps-b (on that host: rig queue outbox-list relay@my-rig --limit 1000)");
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("a --host broadcast whose outcome is unknown names the outbox under the origin triple the request carried", async () => {
+    vi.stubEnv("OPENRIG_SESSION_NAME", "dev50@v-rig");
+    const home = mkdtempSync(join(tmpdir(), "origin-broadcast-hint-"));
+    vi.stubEnv("OPENRIG_DB", join(home, "origin.sqlite"));
+    const db = new Database(process.env.OPENRIG_DB!);
+    db.exec("CREATE TABLE self_host_identity (singleton INTEGER PRIMARY KEY, host_id TEXT); INSERT INTO self_host_identity VALUES (1, 'origin-host')");
+    db.close();
+    try {
+      // the connection drops after the request went out: the remote may have recorded rows under the carried sender
+      const realClientFactory = (url: string) => new DaemonClient(url, {
+        fetchImpl: (async () => { throw new Error("other side closed"); }) as unknown as typeof fetch,
+      });
+      const lifecycleDeps = { exists: () => false, fetch: async () => ({ ok: false }) } as never;
+      await broadcastCommand(httpDeps(mockClient(() => ({ status: 200, data: {} })), { clientFactory: realClientFactory, lifecycleDeps }))
+        .parseAsync(["--host", "vps-b", "--rig", "r", "msg"], { from: "user" });
+      expect(captured.stderrLines.join("\n")).toContain(
+        "dev50@v-rig@origin-host's outbox on vps-b (on that host: rig queue outbox-list dev50@v-rig@origin-host --limit 1000)");
+      expect(process.exitCode).toBe(1);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it("a --host --json broadcast that timed out carries the same recovery hint", async () => {
+    const h = mockClient(() => new DaemonTimeoutError("The OpenRig daemon at http://vps-b:7433 did not respond in time: Request to http://vps-b:7433/api/transport/broadcast timed out after 30000ms"));
+    await broadcastCommand(httpDeps(h)).parseAsync(["--host", "vps-b", "--rig", "r", "msg", "--json"], { from: "user" });
+    const out = JSON.parse(captured.stdoutLines[0]!);
+    expect(out.result.outcomeUnknown).toBe(true);
+    expect(out.hint).toContain("may still be running on vps-b");
+    expect(out.hint).toContain("Don't retry the whole broadcast");
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("a senderless --host broadcast that timed out points to rig capture, not to an outbox it never got", async () => {
+    vi.stubEnv("OPENRIG_SESSION_NAME", "");
+    const h = mockClient(() => new DaemonTimeoutError("The OpenRig daemon at http://vps-b:7433 did not respond in time: Request to http://vps-b:7433/api/transport/broadcast timed out after 30000ms"));
+    await broadcastCommand(httpDeps(h)).parseAsync(["--host", "vps-b", "--rig", "r", "msg"], { from: "user" });
+    const err = captured.stderrLines.join("\n");
+    expect(err).toContain("may still be running on vps-b");
+    expect(err).toContain("rig capture <seat> --host vps-b");
+    expect(err).not.toContain("outbox");
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("--timeout <seconds> replaces the 30 s cross-host wait", async () => {
+    const h = mockClient(() => ({ status: 200, data: { results: [], sent: 0, total: 0, failed: 0 } }));
+    await broadcastCommand(httpDeps(h)).parseAsync(["--host", "vps-b", "--timeout", "120", "msg"], { from: "user" });
+    expect(h.calls[0]!.options?.timeoutMs).toBe(120_000);
   });
 
   it("the text positional is NEVER sugar-parsed: a message containing a@b@vps-b broadcasts locally intact when no host is set", async () => {

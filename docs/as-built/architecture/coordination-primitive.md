@@ -10,8 +10,8 @@ applies-when: |
   transactional handoff guarantee, or where queue closure is enforced.
 siblings: [workflow-runtime.md, mission-control.md, daemon-core.md]
 prerequisite-reads: [../README.md, daemon-core.md]
-last-verified-against-source: 2caac7dd1bb16585138a6f7c1dd8b1f0752c49f7
-last-updated: 2026-10-05
+last-verified-against-source: e8f0ab340db773392ec8be75b072d1c0f3068a50
+last-updated: 2026-10-08
 ---
 
 # Coordination Primitive — Stream/Queue/Inbox/Outbox
@@ -24,7 +24,7 @@ filesystem path remains untouched, and the daemon-backed `rig queue` /
 only to SQLite (`packages/cli/src/commands/queue.ts:19`,
 `packages/cli/src/commands/stream.ts:11`).
 
-> Verified against source at main `2caac7dd1bb16585138a6f7c1dd8b1f0752c49f7`. Each count below sits beside the
+> Verified against source at main `e8f0ab340db773392ec8be75b072d1c0f3068a50`. Each count below sits beside the
 > command that produces it; run the command from the repository root to refresh
 > it.
 
@@ -44,7 +44,7 @@ Five host-scoped tables back the primitive, one per migration `023`–`027` in
   `archived_at` may be set, `stream-store.ts:217`).
 - **`queue_items`** (`024_queue_items.ts`) — L3 owned-work queue.
   Unless `--id` is supplied, the CLI generates the create request's `qitem_id` (TEXT PK) before sending as `qitem-<UTC YYYYMMDDHHMMSS>-<16 hex>` (64 random bits) and prints it to stderr as a request identity, not proof of persistence; reuse that ID with `--id` and the unchanged payload after an unknown outcome, while daemon callers without an ID still use `newQitemId()` and its `qitem-<UTC YYYYMMDDHHMMSS>-<8 hex>` form.
-  State enum (**8** values, `QUEUE_STATES` at `queue-repository.ts:32`;
+  State enum (**8** values, `QUEUE_STATES` at `queue-repository.ts:33`;
   `sed -n '/^export const QUEUE_STATES/,/] as const/p' packages/daemon/src/domain/queue-repository.ts | grep -c '^  "'`):
   `pending | in-progress | done | blocked | failed | denied | canceled |
   handed-off`. Carries `closure_reason`, `closure_target`,
@@ -97,15 +97,15 @@ Routes import these; services are Hono-free:
   (`findOverdue`, `:3378`), nudge-result tracking (`recordNudgeAttempt`,
   `:3663`). Nothing in the daemon writes the `last_heartbeat` column
   (`queue-pickup.ts:16`). Cross-rig validation hook exposed as `validateRig`
-  constructor option (`queue-repository.ts:711`).
+  constructor option (`queue-repository.ts:717`).
 - **`queue-transition-log.ts`** — append-only state-transition log; used by
   `queue-repository.ts`, exposed as the read-only property
-  `QueueRepository.transitionLog` (`queue-repository.ts:660`).
+  `QueueRepository.transitionLog` (`queue-repository.ts:666`).
 - **`hot-potato-enforcer.ts`** — pure validator for the load-bearing API
   contract (see §3).
 - **`inbox-handler.ts`** — mailbox handler: drop (idempotent on `inbox_id`,
-  `:99`), absorb (promotes a pending entry to a `queue_item`, idempotent,
-  `:154`), deny (records reason, `:214`). The handler has no auth hook
+  `:100`), absorb (promotes a pending entry to a `queue_item`, idempotent,
+  `:155`), deny (records reason, `:215`). The handler has no auth hook
   (`inbox-handler.ts:71`); identity comes from the route. `POST /inbox/drop`
   takes the sender only from the `X-OpenRig-Session` header through
   `requireSenderIdentity` (`routes/queue.ts:1094`) and answers 400
@@ -122,26 +122,165 @@ Routes import these; services are Hono-free:
 Create, handoff and handoff-and-complete return the committed row without
 waiting for terminal delivery. Each stages a deterministic
 `wake-intent-<qitem>` outbox row in its transaction and delivers it after
-commit (`queue-repository.ts:1404`–`1416`, `:1467`–`1475`). The returned
+commit (`queue-repository.ts:1412`–`1424`, `:1475`–`1483`). The returned
 `lastNudgeResult` is therefore normally null; `rig queue show <id>` reads the
 wake result later. If create cannot retain the intent, the task is still saved
 and the row records `failed:wake not retained: <reason>`. Startup reconciles
 and drains intents left pending by a crash once (`startup.ts:2361`–`2362`).
 `maybeNudge` remains only as the path for a repository with no outbox.
 
+**Which field answers "did it reach them".** `deliveryOutcome` is the gateway
+(human-delivery) ledger, derived at read time
+(`QueueRepository.deliveryOutcomeFor`): `posted` or `transport-failed` from the
+row's Slack receipt notes, or `never-posted` when a gateway-routed row still
+has no receipt once the post window has passed. A task delivered only to an
+agent's pane has no such receipt, so it reads `null`. A task that also has a
+gateway or human-notification side can carry a value, and the CLI then reports
+that gateway side too. For the pane side, read:
+
+- `lastNudgeWireResult`: the wake send's result as stored (for example
+  `verified`, `delivered-ack-pending`, `indeterminate:…`, `retained:…`,
+  `failed:…`). A claim never rewrites it; a later wake replaces it. Each stored
+  form reads as one delivery fact (`readWakeOutcome`, `connection-contract.ts`).
+  A result no reader recognises reads `unknown`, never delivered: the wake ladder
+  treats it as an unconfirmed wake, which escalates past the window without a
+  re-send.
+- `lastNudgeResult`: the result as presented. It is the stored result, except
+  that a claimed row whose stored result is `delivered-ack-pending` or
+  `indeterminate:…` reads `claimed` (`presentedNudgeResult`). Unclaiming shows
+  the stored result again.
+- `claimedAt`: when the destination claimed the row. Closing doesn't clear it.
+- `pickup`: the derived pickup receipt (`unclaimed`, `working`, `needs-input`,
+  `stalled-after-claim`, `parked`, `terminal`), computed at read time.
+
+A claimed item whose owner's activity reports outstanding input reads
+`needs-input`, with the reason in `pickup.evidence`. That covers an item in
+progress and a `pending` item that kept its claim, after an update back to
+`pending` or a reopen. A Codex permission request the daemon couldn't confirm on
+screen reads `owner may need input (not verified: permission_request_unverified)`.
+The input signal can outlast the prompt it reported, so it never pauses
+recovery. When the claim would otherwise read `stalled-after-claim`, the receipt
+keeps that evidence in `pickup.stall`, and the stuck sweep's finding, its
+backstop and manual dispositions behave exactly as for `stalled-after-claim`.
+Queue reads, the pickup view and the execution view share this receipt
+(`queue-pickup.ts`). Unclaimed, blocked and terminal items keep their receipts.
+
+A claim isn't proof that the body was read or that the terminal render was
+verified, and closing a task isn't a new delivery receipt: a claimed task that
+is later closed still reads `claimed` when its stored result was unconfirmed
+(`delivered-ack-pending` or `indeterminate:…`); a `verified` or `failed:…`
+result reads as stored. For such an unconfirmed, claimed item,
+`rig queue create --verify` says "Terminal receipt unconfirmed, but the seat
+has claimed the item (claimed)."; for any claimed item it adds "A claim shows
+the seat took the item; it does not prove the body was read."
+(`terminalDeliveryResult`, `packages/cli/src/commands/queue.ts`).
+
 The standing detector in `queue-stuck-sweep.ts` creates findings through the
-queue repository, with `evidenceRef: rig queue show <source-qitem-id>`
-(`queue-stuck-sweep.ts:605`) pointing to the underlying durable work row. This
-satisfies the existing human-route evidence contract without changing
-destination resolution: a finding goes to the destination's orchestrator when
-one is derivable, otherwise to the destination itself, and that seat may be
-dead. Repeated detections refresh the existing finding; when the source
-condition resolves, the sweep closes its own finding (`:612`–`637`). The sweep
-reports six finding kinds (`:50`). Its custody check covers closures that name
-a successor qitem or a seat (`closure_reason = handed_off_to`) in the last 24
-hours; a seat target is satisfied by a local successor carrying this row's
-lineage, and any target by a `custody-verified: <target> …` note on the closed
-row (`:168`–`244`, `:519`–`554`).
+queue repository, with `evidenceRef: rig queue show <source-qitem-id>` pointing
+to the underlying durable work row. Unclaimed and undelivered findings go to
+the destination's orchestrator when one is derivable, otherwise to the
+destination itself, and that seat may be dead. A wake that failed (`failed:…`)
+at a recorded agent seat with no `delegates_to` parent or `escalates_to` route is
+the exception: its finding tries the row's creator, then the operator agent
+(`agents.operator_session`), skipping an unset, confirmed-missing, self or
+unaccepted address, a bound terminal seat, and OpenRig's own machinery
+(`daemon@kernel` or a `@system` actor), so the finding's own wake isn't sent to the seat that just failed to
+take one. If neither can be used, it stays with the original seat and says why.
+When this failed-wake route sends the finding back to a creator who is a person (their answer or ask waits on a live
+agent seat that couldn't take a wake), it reaches them as a notice from OpenRig: an update (`humanIntent: update`) from
+`stuck-sweep@system` at the person's own address, titled with the seat it waits for, saying nothing in it is theirs to
+do. The other routes back to a creator (no wake route, a terminal seat, a missing seat) tell the person to act and stay
+asks. When the person's address can't be read, the finding is written as before.
+Overdue claims go to their destination. Repeated detections reuse the existing finding without changing
+its route; when the source condition resolves, the sweep closes its own finding.
+Previously, falling out of a reporting query could itself close a delivery or
+unclaimed finding. An unconfirmed retry, a fresh human-notification post window,
+an unreadable human registry or a larger reporting-age setting could therefore
+look like successful recovery. These findings now require source evidence:
+closure, pickup or parking of the work, a verified/accepted wake, or a posted
+notification for the current human recipient and episode, as appropriate to the
+finding. `delivered-ack-pending`, `indeterminate:…`, missing results and unrelated
+legacy human receipts do not prove resolution. Uncertainty keeps an existing
+finding open without itself sending another wake or creating another finding.
+A verified wake resolves a wake failure, not an unclaimed obligation: delivery
+does not prove pickup.
+
+A legacy human notice with no owner-notification history can still resolve from
+the existing item-scoped posted ledger when its recipient is confirmed human.
+This covers older pending asks and parks without inventing an episode that was
+never recorded. A registered alias needs a readable registry to establish its
+human recipient; reserved human references remain known during an outage.
+Legacy receipts carry no recipient key, so a destination reroute requires a new
+matching notification episode. A legacy park is accepted only when no earlier
+notice or reroute predates it, and later history contains only receipts or
+asking-agent reroutes within that park. A re-park, an exit from the park or an
+ambiguous append cannot establish the same recipient without owner history;
+the finding waits for a new matching episode or other source resolution.
+Rerouting only the asking agent within an otherwise unchanged park preserves
+its human recipient (`blockedOn`).
+Modern notifications still require their current episode, and an unrelated
+legacy human receipt cannot resolve an agent wake.
+
+A known hold still leaves recovery with the existing mechanism: an ask on
+Steering without an alert, a wake held by the seat typing guard, or a live
+quiet-release job. Its closure note names that disposition rather than claiming
+delivery or pickup. An unreadable quiet hold is not positive closure evidence.
+Claimed work in either `pending` or `in-progress` uses the same pickup derivation;
+returning a row to `pending` while retaining its claim no longer hides a later
+stall or closes its existing stalled-claim finding. A retained failed wake cannot
+override that pickup evidence. The agent's claim still does not establish delivery
+of a separate notification to a person.
+
+That automatic closure records `stuck-sweep@system` as the actor in both the
+transition and the `queue.updated` audit event, with the source evidence in the
+delivery and unclaimed-obligation closure notes. Previously it credited the finding's source agent
+with the detector's action. The finding's source,
+destination and claim remain its existing ownership records; the underlying work
+is not reassigned, and existing transition history is not rewritten.
+
+`queue-stuck-sweep-resolution.test.ts` checks unconfirmed retries, retained
+claims, current human-notification episodes and registry outages with migrated
+SQLite, including positive recovery controls and no repeated send on an
+unresolved retry. `quiet-hold-custody.test.ts` checks existing findings with
+readable and unreadable quiet custody. `queue-stuck-sweep.test.ts` checks that
+pending and claimed findings close once, name the sweep in their transition and
+event, and keep their ownership. The posted-human-notice case also checks the actor while leaving
+the person's original ask open. These checks exercise the detector and queue
+repository, not a live agent or connector.
+
+The sweep reports six finding kinds. Its custody check covers closures that
+name a successor qitem or a seat (`closure_reason = handed_off_to`) in the last
+24 hours, plus older closures with open findings. A seat target is satisfied by
+a local successor carrying this row's lineage, and any target by a
+`custody-verified:` note on the closed row: per note, its first word that names one
+of the row's targets exactly (or a comma list of them) is what it verifies, and later
+mentions don't count; the finding prints each target's note. A new custody finding for
+a human destination goes to the agent that closed the item, using the closing
+transition from active or archived history. Later notes and notification
+receipts do not change that owner. If the closing actor is missing, human, system
+machinery or not admitted by this host's queue, the asking agent receives the
+finding if its address is admitted. Human identity includes reserved references
+and registered aliases, independent of terminal bindings. Admission uses the
+queue's existing address check and does not require a live seat. An agent
+destination keeps its existing route; if neither closer nor source is an admitted
+agent, the human destination remains the durable fallback. This routing does not
+change custody verification or suppress unresolved findings.
+
+If the human registry is unavailable when a custody candidate's owner needs
+classification, that candidate keeps its original destination, and one log line
+per candidate names it and the registry error. This doesn't infer an agent
+identity from an unreadable registry, which may not exist before the first human
+is registered. In a pass with no finding to save for a `<name>@external` person,
+which includes an install with no registry yet, work bound for agents keeps
+routing and repaired findings still close. Such a finding still needs the
+registry to admit it when it's saved, so during an outage a pass that must save
+one fails at that finding, as it did before this routing. Findings not yet
+created in that pass, and the closing of repaired findings, wait for the next
+pass that completes. Once the registry can be read again, the next pass creates
+the finding and routes it to the closer. Registry recovery restores owner refinement
+for new findings; existing findings keep their established route. Reserved human
+references and legacy agent names keep their known classifications without a
+registry read.
 
 ## 3. The hot-potato closure contract (where queue closure is enforced)
 
@@ -150,15 +289,23 @@ contract. `validateClosure` (`hot-potato-enforcer.ts:59`) checks a transition
 against `CLOSURE_REASONS` (`:18`; **7** values:
 `sed -n '/^export const CLOSURE_REASONS/,/] as const/p' packages/daemon/src/domain/hot-potato-enforcer.ts | grep -c '^  "'`):
 
-`state=done` requires `closure_reason ∈ {handed_off_to, blocked_on, denied,
+`state=done` requires `closure_reason ∈ {handed_off_to, denied,
 canceled, no-follow-on, escalation, superseded}`. The reasons
-`handed_off_to | blocked_on | escalation` additionally require
+`handed_off_to | escalation` additionally require
 `closure_target` (`:86`):
 
 - `handed_off_to` — work continues with a different seat (`closure_target` =
-  new owner).
-- `blocked_on` — work is parked pending another qitem (`closure_target` =
-  blocker `qitem_id`).
+  new owner). `rig queue show` on such a row names the row the handoff made in
+  `successors` (rows whose `handedOffFrom` is this row, and a local row its
+  closure target names), or says in `successorNote` why none is named. A
+  cross-host successor is named as recorded (`<id>@<host>`); nothing stored
+  changes. Past 20 such rows the newest 20 are named, with
+  `successorsTruncated: true`. A scoped MCP caller doesn't get these fields;
+  `rig_queue_show`'s scope-checked `successor` answers it instead.
+- `blocked_on` — an active `state=blocked` park record, rejected with `state=done`.
+  To wait for a qitem, use `rig queue block <id> --on <child>` or
+  `rig queue update <id> --state blocked --blocked-on <child>`; the item returns
+  to pending when its blocker completes.
 - `denied` — receiver rejected the work (`closure_target` = reason text).
 - `canceled` — sender or receiver withdrew (`closure_target` = note).
 - `no-follow-on` — terminal completion, nothing else needed.
@@ -167,19 +314,19 @@ canceled, no-follow-on, escalation, superseded}`. The reasons
 - `superseded` — the row was replaced by cancel-and-replace
   (`closure_target` = the successor qitem). The update path records it on
   `state=canceled` and refuses it there without a `closure_target`
-  (`queue-repository.ts:2619`).
+  (`queue-repository.ts:2629`).
 
 Tier→SLA mapping for `closure_required_at` also lives in
-`hot-potato-enforcer.ts` (`TIER_SLA_SECONDS`, `:114`). This validator is
+`hot-potato-enforcer.ts` (`TIER_SLA_SECONDS`, `:115`). This validator is
 invoked by `QueueRepository.update()` (and `updateWithinTransaction()`), both
-through the call at `queue-repository.ts:2521`, so closure is enforced at the
+through the call at `queue-repository.ts:2531`, so closure is enforced at the
 daemon transaction boundary — the workflow runtime *projects* on closure but
 does not otherwise gate it (see `workflow-runtime.md`). The one
 workflow-aware check is in the queue: `update()` refuses a terminal close of a
 live workflow frontier packet from a non-workflow verb
-(`workflow_frontier_packet`, `queue-repository.ts:2547`), through a predicate
+(`workflow_frontier_packet`, `queue-repository.ts:2557`), through a predicate
 startup injects. "Terminal" there is the queue's terminal set, `done` and
-`handed-off` (`queue-repository.ts:51`).
+`handed-off` (`queue-repository.ts:52`).
 
 Closure fields are stored only on `state=done`, the park record (`blocked`
 with `blocked_on`), the handoff close (`handed-off` with `handed_off_to`) and
@@ -190,11 +337,11 @@ note without a state change as an append-only transition; moving it to
 another state requires an explicit reopen with a note. A `qitem-` blocker must
 exist and be live on this daemon; when a blocker leaves the active states,
 each row parked on it follows the blocker's handoff successor or returns to
-`pending` with a durable wake (`queue-repository.ts:2397`–`2519`,
-`:2602`–`2646`, `:2921`–`2998`). Claiming a parked row clears its
+`pending` with a durable wake (`queue-repository.ts:2407`–`2529`,
+`:2612`–`2656`, `:2931`–`3008`). Claiming a parked row clears its
 `blocked_on`; the claim transition keeps the former gate as a `closure_target`
 audit pointer with no closure reason, which a re-park without `--blocked-on`
-reuses (`queue-repository.ts:2223`–`2244`, `:2561`–`2567`).
+reuses (`queue-repository.ts:2233`–`2254`, `:2571`–`2577`).
 `human-route-enforcer.ts` is a second pure validator at the same boundary: a
 `human-gate` row, a row addressed to a human seat, or a park on one must carry
 `summary` and `evidence_ref`.
@@ -232,7 +379,7 @@ message-passing closure (never 2PC).**
   commit (§2; the forwarded body carries the `nudge` flag) — the sending
   daemon never reaches across a host boundary. Before forwarding, the
   forwarding daemon stamps its own host id, when it has one, onto the source
-  session (`stampSelfHostSuffix`, `queue-repository.ts:542`; called at
+  session (`stampSelfHostSuffix`, `queue-repository.ts:548`; called at
   `routes/queue.ts:378` and `:509`), so the target row records the sender as
   `member@rig@<forwarding host>`.
 - **Idempotency.** On create, the forwarding daemon mints the `qitemId` before
@@ -243,21 +390,21 @@ message-passing closure (never 2PC).**
   conflict the origin returns the stored row when destination and source
   match (idempotent absorb) and a structured `qitem_id_reuse` error (409) when
   they differ (`QueueRepository.create()` catch path,
-  `queue-repository.ts:1423`–`1464`, with `isQitemPrimaryKeyConflict`,
-  `:455`). When destination and source match but the body differs, the stored
+  `queue-repository.ts:1431`–`1472`, with `isQitemPrimaryKeyConflict`,
+  `:461`). When destination and source match but the body differs, the stored
   row is returned unchanged with `createWarning: qitem_body_not_saved`; the
-  supplied body is not saved (`:1442`–`1446`).
+  supplied body is not saved (`:1450`–`1454`).
 - **Cross-host handoff choreography.** The local atomic close+create cannot
   span two DBs, so the route-layer choreography (`crossHostHandoff`,
   `routes/queue.ts:316`) runs: successor-create on the target host FIRST (via
   the one forward helper, `:397`), local source-close SECOND
-  (`QueueRepository.closeCrossHostHandoffSource`, `queue-repository.ts:2021`)
+  (`QueueRepository.closeCrossHostHandoffSource`, `queue-repository.ts:2031`)
   — never the reverse. A crash between the two leaves a live duplicate that
   the idempotent re-drive converges; the reverse order would leave a closed
   source pointing at a successor that does not exist (a dropped potato — the
   one forbidden outcome). The successor id is DERIVED, not minted:
   `deriveCrossHostSuccessorId(source, destination, host)`
-  (`queue-repository.ts:483`) → `qitem-xh-<sha256[:16]>` — a pure stateless
+  (`queue-repository.ts:489`) → `qitem-xh-<sha256[:16]>` — a pure stateless
   function, so a re-drive re-derives the same id across daemon restarts and
   absorbs on the target PK. *(Residual, inherent to at-least-once delivery
   without 2PC: a re-drive naming a DIFFERENT destination derives a different
@@ -274,7 +421,7 @@ message-passing closure (never 2PC).**
   host-qualified key appears only in the `closure_target` column on
   `queue_items` and its verbatim mirror on `queue_transitions`: the minted
   cross-host close note names the 2-part `toSession` only
-  (`queue-repository.ts:2077`), and `handed_off_to` and the
+  (`queue-repository.ts:2087`), and `handed_off_to` and the
   `queue.handed_off` event stay 2-part.
   Re-drive semantics: already-terminal + MATCHING `closure_target` = absorb;
   MISMATCH = structured `cross_host_close_conflict` (409), checked in the route
@@ -327,6 +474,33 @@ a daemon route or reconnect policy.
 
 ## 5. Route surface
 
+The TUI FEED reads `/api/attention` for human requests and current explicit
+human-addressed updates. Its independent update query filters open states and
+strict human destinations before the 1001-row sentinel, serves at most 1000
+updates with critical then urgent rows first, and requires no transport receipt. These local
+FYIs create no approval obligation. `/api/queue/human-updates` remains confirmed
+delivery history; the TUI suppresses a history card when the same queue item is
+in the current update window. Current-update coverage is independent of the
+receipt window, so an unavailable current reader cannot retain closed delivery
+history beyond a successful history read. Both reads leave queue state intact.
+
+Clients that need only current FYIs can use `GET /api/queue/open-human-updates`.
+It returns `{items, limit, truncated}` with open human-addressed updates, ordered
+critical then urgent then routine, without requiring a delivery receipt. `limit`
+defaults to 20 and accepts integers from 1 to 100. Optional `view` follows the
+same person perspective as `/api/attention`; a perspective read scans at most
+1000 rows and signals `truncated` when the window may omit matching items.
+
+A finished item's result file is its `evidenceRef`, read through the daemon's
+shared roots with `rig_artifact_read` (MCP) or `rig queue artifact <qitemId>
+--json` (CLI). For a code result, the assignee writes a JSON file of kind
+`openrig.code-result/v1`, with `repo` (an absolute path or a URL), `base` and
+`revision` (full commit ids, SHA-1 or SHA-256), and optionally `paths`, `branch`
+and `fetch: {remote, ref}`. Both reads then add `codeResult`, the exact pair a
+client can diff. A manifest whose base or revision isn't a full commit id gets
+`codeResultIssue` instead. `branch` and `fetch` are hints for finding the commits,
+never the revision. Other files read as before.
+
 - `/api/stream` (`server.ts:783`) — `POST /emit` (`routes/stream.ts:56`),
   `GET /list` (`:91`, including `sourceSession`, `hintDestination`, `hintTag`,
   `since`, `until` and `direction` filters), `GET /watch` + `/sse` SSE
@@ -349,7 +523,9 @@ over a body actor. On a direct request from a known origin it is recorded as
 `transport:v1`; `resolveRecordedProvenance` (`:199`) instead records
 `origin-unknown:v1` when the origin-unknown marker is set or a relayed request
 carried `origin-unknown:v1` (`:207`), `relay:v1` for a relayed request that
-carried `transport:v1`, and `claimed:v1` for other relayed requests. Without the
+carried `transport:v1`, and `claimed:v1` for other relayed requests. `transport:v1`
+says the name came from that header, which the CLI sets from the seat's
+`OPENRIG_SESSION_NAME`; it isn't an authentication. Without the
 header, the
 body actor is recorded as `claimed:v1`; with neither (or, for inbox drop,
 without the header) the route answers 400 `actor_required`. The stamp lands in

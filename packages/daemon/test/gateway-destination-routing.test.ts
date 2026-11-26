@@ -28,12 +28,16 @@ import { outboxEntriesSchema } from "../src/db/migrations/027_outbox_entries.js"
 import { queueTransitionsArchiveSchema } from "../src/db/migrations/054_queue_transitions_archive.js";
 import { ownerNotificationLevelsSchema } from "../src/db/migrations/076_owner_notification_levels.js";
 import { externalCliAttachmentSchema } from "../src/db/migrations/019_external_cli_attachment.js";
+import { rigArchiveSchema } from "../src/db/migrations/042_rig_archive.js";
+import { occupantTenuresSchema } from "../src/db/migrations/060_occupant_tenures.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { OutboxHandler } from "../src/domain/outbox-handler.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
 import { subsystemSlackDeliver } from "../src/domain/gateway/slack/slack-delivery.js";
 import type { HumanFragment } from "../src/domain/gateway/human-registry.js";
 import { makeQueuePorts } from "../src/domain/gateway/slack/queue-access.js";
+import { Hono } from "hono";
+import { queueRoutes } from "../src/routes/queue.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -56,7 +60,7 @@ function makeHarness(opts?: { registryReadable?: () => boolean; entities?: () =>
   migrate(db, [
     coreSchema, bindingsSessionsSchema, externalCliAttachmentSchema, eventsSchema, queueItemsSchema,
     queueTransitionsSchema, outboxEntriesSchema, queueTransitionsArchiveSchema,
-    ownerNotificationLevelsSchema,
+    ownerNotificationLevelsSchema, rigArchiveSchema, occupantTenuresSchema,
   ]);
   const bus = new EventBus(db);
   const sends: Array<{ session: string; text: string }> = [];
@@ -102,7 +106,7 @@ describe("OPR.0.5.6.14 — one destination resolver, no fall-through", () => {
     // Registration does not replay an older unclassified obligation. Its explicit
     // failed-routing record remains for an operator to reconcile deliberately.
     expect(await ports.listHumanAlerts({})).toHaveLength(0);
-    const registered = await fixture.repo.create({ sourceSession: "dev-a@rig1", destinationSession: alias,
+    const registered = await fixture.repo.create({ sourceSession: "dev-a@rig1", destinationSession: alias, humanAlert: true,
       summary: "Registered legacy spelling", evidenceRef: EVIDENCE, body: "new explicit request" });
     await vi.waitFor(() => expect(fixture.repo.getById(registered.qitemId)!.lastNudgeResult).not.toBeNull());
     const alerts = await ports.listHumanAlerts({});
@@ -182,8 +186,9 @@ describe("OPR.0.5.6.14 — one destination resolver, no fall-through", () => {
       body: "pane-backed founder seat",
     });
     await vi.waitFor(() => expect(h.repo.getById(item.qitemId)!.lastNudgeResult).not.toBeNull());
-    expect(h.sends.map((send) => send.session)).toEqual(["human-founder@rig1"]);
-    expect(h.repo.getById(item.qitemId)!.lastNudgeResult).toMatch(/^failed:/);
+    // Pane-bound, not gateway-owned. The pane is a terminal seat, so the wake is not typed into it.
+    expect(h.sends).toHaveLength(0);
+    expect(h.repo.getById(item.qitemId)!.lastNudgeResult).toMatch(/^failed:terminal-seat: /);
   });
 
   it("PANELLESS TOPOLOGY IS NOT A TERMINAL: an external_cli-bound registered human stays gateway-routable", async () => {
@@ -412,14 +417,14 @@ describe("OPR.0.5.6.14 — the delivery ledger is universal and consulted", () =
 
   it("UNDELIVERED TELLS THE TRUTH from the ledger, not the nudge literal (the 34a6ad0b contradiction dies)", async () => {
     // Row A: gateway-routed, POSTED (receipt transition present) but nudge literal failed.
-    const a = await h.repo.create({ sourceSession: "s@r", destinationSession: "human-founder@external", body: "a", summary: "a", evidenceRef: EVIDENCE, nudge: false });
+    const a = await h.repo.create({ sourceSession: "s@r", destinationSession: "human-founder@external", humanAlert: true, body: "a", summary: "a", evidenceRef: EVIDENCE, nudge: false });
     h.db.prepare("UPDATE queue_items SET last_nudge_result = 'failed: stale poison literal', last_nudge_attempt = datetime('now') WHERE qitem_id = ?").run(a.qitemId);
     receipt(a.qitemId, "posted", "level=ALERT kind=unclassified message_ts=111.22 thread_ts=111.22");
     // Row B: gateway-routed, TRANSPORT-FAILED transition.
-    const b = await h.repo.create({ sourceSession: "s@r", destinationSession: "human-founder@external", body: "b", summary: "b", evidenceRef: EVIDENCE, nudge: false });
+    const b = await h.repo.create({ sourceSession: "s@r", destinationSession: "human-founder@external", humanAlert: true, body: "b", summary: "b", evidenceRef: EVIDENCE, nudge: false });
     receipt(b.qitemId, "transport-failed", "class=http-500 error=internal-server-error");
     // Row C: gateway-routed, NO receipt, older than the post window.
-    const c = await h.repo.create({ sourceSession: "s@r", destinationSession: "human-founder@external", body: "c", summary: "c", evidenceRef: EVIDENCE, nudge: false });
+    const c = await h.repo.create({ sourceSession: "s@r", destinationSession: "human-founder@external", humanAlert: true, body: "c", summary: "c", evidenceRef: EVIDENCE, nudge: false });
     ageCurrentEpisode(c.qitemId);
 
     const und = h.repo.findUndelivered({});
@@ -493,6 +498,7 @@ describe("OPR.0.5.6.14 — the delivery ledger is universal and consulted", () =
     const direct = await h.repo.create({
       sourceSession: "s@r",
       destinationSession: "human-founder@external",
+      humanAlert: true,
       body: "direct no-nudge human",
       summary: "direct",
       evidenceRef: EVIDENCE,
@@ -507,7 +513,7 @@ describe("OPR.0.5.6.14 — the delivery ledger is universal and consulted", () =
   });
 
   it("THE ROW FACE READS DELIVERY: gateway-routed rows surface posted/transport-failed/never-posted; pane-bound rows keep their exact keys", async () => {
-    const posted = await h.repo.create({ sourceSession: "s@r", destinationSession: "human-founder@external", body: "p", summary: "p", evidenceRef: EVIDENCE, nudge: false });
+    const posted = await h.repo.create({ sourceSession: "s@r", destinationSession: "human-founder@external", humanAlert: true, body: "p", summary: "p", evidenceRef: EVIDENCE, nudge: false });
     receipt(posted.qitemId, "posted", "level=ALERT kind=unclassified message_ts=222.33 thread_ts=222.33");
     const face = h.repo.getById(posted.qitemId) as unknown as { deliveryOutcome?: string | null };
     expect(face.deliveryOutcome, "a posted gateway row answers 'did it reach them' in one read").toMatch(/posted/);
@@ -522,18 +528,170 @@ describe("OPR.0.5.6.14 — the delivery ledger is universal and consulted", () =
   });
 
   it("UNDELIVERED LIMIT IS HONEST: posted rows cannot consume the window and hide a later gateway failure", async () => {
-    const posted = await h.repo.create({ sourceSession: "s@r", destinationSession: "human-founder@external", body: "p", summary: "p", evidenceRef: EVIDENCE, nudge: false });
+    const posted = await h.repo.create({ sourceSession: "s@r", destinationSession: "human-founder@external", humanAlert: true, body: "p", summary: "p", evidenceRef: EVIDENCE, nudge: false });
     receipt(posted.qitemId, "posted", "level=ALERT kind=unclassified message_ts=444.55 thread_ts=444.55");
-    const failed = await h.repo.create({ sourceSession: "s@r", destinationSession: "human-founder@external", body: "f", summary: "f", evidenceRef: EVIDENCE, nudge: false });
+    const failed = await h.repo.create({ sourceSession: "s@r", destinationSession: "human-founder@external", humanAlert: true, body: "f", summary: "f", evidenceRef: EVIDENCE, nudge: false });
     receipt(failed.qitemId, "transport-failed", "class=http-500 error=failed");
     expect(h.repo.findUndelivered({ limit: 1 }).map((item) => item.qitemId)).toEqual([failed.qitemId]);
   });
 
   it("FLOOR: the receipt-bound episode dedupe stands — a second identical receipt write is a no-op", async () => {
-    const row = await h.repo.create({ sourceSession: "s@r", destinationSession: "human-founder@external", body: "d", summary: "d", evidenceRef: EVIDENCE, nudge: false });
+    const row = await h.repo.create({ sourceSession: "s@r", destinationSession: "human-founder@external", humanAlert: true, body: "d", summary: "d", evidenceRef: EVIDENCE, nudge: false });
     const key = currentEpisodeKey(row.qitemId);
     const note = "slack-owner-notification-posted notification_key=" + key + " level=ALERT kind=unclassified message_ts=333.44 thread_ts=333.44";
     h.repo.update({ qitemId: row.qitemId, actorSession: "daemon@kernel", transitionNote: note });
     expect(h.repo.transitionLog.hasOwnerNotificationReceipt(row.qitemId, key), "the receipt suppresses the repeat").toBe(true);
+  });
+});
+
+// #1029 — the single-row read carries the resolver's own routing decision, so a reader such as
+// `rig queue create --verify` never has to guess a registered person's alias from its
+// spelling, even when no wake result exists yet (--no-nudge). getById itself stays unchanged.
+describe("GET /api/queue/:qitemId carries the destination class", () => {
+  const MIKE = { ...FOUNDER_FRAGMENT, entityId: "mike", displayName: "Mike", address: "mike@external" } as unknown as HumanFragment;
+
+  it.each([
+    ["dev-a@rig1", "pane-bound"],
+    ["mike@kernel", "gateway-routable"],
+    ["human-founder@kernel", "gateway-routable"],
+    ["founder@external", "gateway-routable"],
+    ["revieweer@rig1", "unroutable"],
+  ] as const)("%s reads as %s on a --no-nudge row", async (destinationSession, destinationClass) => {
+    const h = makeHarness({ entities: () => [FOUNDER_FRAGMENT, MIKE] });
+    const app = new Hono();
+    app.use("*", async (c, next) => { c.set("queueRepo" as never, h.repo); await next(); });
+    app.route("/api/queue", queueRoutes());
+    const item = await h.repo.create({
+      sourceSession: "dev-a@rig1", destinationSession, nudge: false,
+      summary: "Routing", evidenceRef: EVIDENCE, body: "b",
+    });
+    const res = await app.request(`/api/queue/${item.qitemId}`);
+    expect(res.status).toBe(200);
+    const row = await res.json() as Record<string, unknown>;
+    expect(row.lastNudgeResult).toBeNull();
+    expect(row.destinationClass).toBe(destinationClass);
+    expect(h.repo.getById(item.qitemId)).not.toHaveProperty("destinationClass");
+    expect(h.sends).toHaveLength(0);
+    h.db.close();
+  });
+});
+
+// #1029 follow-up — the single-row read also carries the owner-notification level the Slack
+// selector keys on, so `--verify` keeps the Slack wait for a registered person who also has a pane.
+describe("GET /api/queue/:qitemId carries the owner notification level", () => {
+  const PANE_PERSON = { ...FOUNDER_FRAGMENT, entityId: "dev-a", displayName: "Dev A", address: "dev-a@external" } as unknown as HumanFragment;
+
+  it.each([
+    ["a registered person with a pane", "dev-a@rig1", [FOUNDER_FRAGMENT, PANE_PERSON], "pane-bound", "ALERT"],
+    ["a seat with a pane and no registration", "dev-a@rig1", [FOUNDER_FRAGMENT], "pane-bound", null],
+    ["a registered person's alias", "human-founder@kernel", [FOUNDER_FRAGMENT], "gateway-routable", "ALERT"],
+  ] as const)("%s reads level %s", async (_label, destinationSession, entities, destinationClass, level) => {
+    const h = makeHarness({ entities: () => [...entities] });
+    const app = new Hono();
+    app.use("*", async (c, next) => { c.set("queueRepo" as never, h.repo); await next(); });
+    app.route("/api/queue", queueRoutes());
+    const item = await h.repo.create({
+      sourceSession: "dev-a@rig1", destinationSession, nudge: false,
+      summary: "Routing", evidenceRef: EVIDENCE, body: "b",
+    });
+    const row = await (await app.request(`/api/queue/${item.qitemId}`)).json() as Record<string, unknown>;
+    expect(row.destinationClass).toBe(destinationClass);
+    expect(row.ownerNotificationLevel).toBe(level);
+    expect(h.repo.getById(item.qitemId)).not.toHaveProperty("ownerNotificationLevel");
+    h.db.close();
+  });
+  it("a pane-bound registered person's row reaches the Slack selector, and its receipt shows on the row read", async () => {
+    const h = makeHarness({ entities: () => [FOUNDER_FRAGMENT, PANE_PERSON] });
+    const app = new Hono();
+    app.use("*", async (c, next) => { c.set("queueRepo" as never, h.repo); await next(); });
+    app.route("/api/queue", queueRoutes());
+    const item = await h.repo.create({
+      sourceSession: "s@r", destinationSession: "dev-a@rig1", nudge: false, humanAlert: true,
+      summary: "Decide", evidenceRef: EVIDENCE, body: "b",
+    });
+    const alerts = await makeQueuePorts(h.repo, { loadHumanRegistry: () => ({ ok: true, entities: [FOUNDER_FRAGMENT, PANE_PERSON] }) }).listHumanAlerts({});
+    expect(alerts.map((a) => a.qitemId)).toContain(item.qitemId);
+    const owner = h.repo.transitionLog.latestOwnerNotificationForQitem(item.qitemId)!;
+    h.repo.update({
+      qitemId: item.qitemId, actorSession: "daemon@kernel",
+      transitionNote: `slack-owner-notification-posted notification_key=${item.qitemId}:${owner.transitionId} level=ALERT kind=unclassified message_ts=1.1 thread_ts=1.1`,
+    });
+    const row = await (await app.request(`/api/queue/${item.qitemId}`)).json() as Record<string, unknown>;
+    expect(row).toMatchObject({ destinationClass: "pane-bound", ownerNotificationLevel: "ALERT", deliveryOutcome: "posted" });
+    h.db.close();
+  });
+});
+
+// A terminal seat runs a shell or a TUI, not an agent: a typed wake would run as a command line.
+describe("a terminal seat never gets a typed queue wake", () => {
+  let h: ReturnType<typeof makeHarness>;
+  beforeEach(() => { h = makeHarness(); });
+
+  function seedTerminalSeat(rig: string, logicalId: string, session: string) {
+    h.db.prepare("INSERT OR IGNORE INTO rigs (id, name) VALUES (?, ?)").run(`rig-${rig}`, rig);
+    const { id: rigId } = h.db.prepare("SELECT id FROM rigs WHERE name = ?").get(rig) as { id: string };
+    h.db.prepare("INSERT INTO nodes (id, rig_id, logical_id, runtime) VALUES (?, ?, ?, 'terminal')").run(`node-${logicalId}`, rigId, logicalId);
+    h.db.prepare("INSERT INTO sessions (id, node_id, session_name) VALUES (?, ?, ?)").run(`sess-${logicalId}`, `node-${logicalId}`, session);
+    h.db.prepare("INSERT INTO bindings (id, node_id, attachment_type, tmux_session) VALUES (?, ?, 'tmux', ?)").run(`binding-${logicalId}`, `node-${logicalId}`, session);
+  }
+
+  it.each([
+    ["a shell seat", "rig1", "infra.shell", "infra-shell@rig1"],
+    ["the kernel's operator.human (rig tui)", "kernel", "operator.human", "operator-human@kernel"],
+  ])("%s: nothing is typed, the result is an honest failed:, the row stays queued, and a retry types nothing", async (_label, rig, logicalId, session) => {
+    seedTerminalSeat(rig, logicalId, session);
+    const item = await h.repo.create({
+      sourceSession: "dev-a@rig1", destinationSession: session,
+      summary: "x; touch /tmp/should-not-run", evidenceRef: EVIDENCE, body: "preserve these bytes",
+    });
+    await vi.waitFor(() => expect(h.repo.getById(item.qitemId)!.lastNudgeResult).not.toBeNull());
+    expect(h.sends).toHaveLength(0);
+    expect(h.repo.getById(item.qitemId)).toMatchObject({
+      state: "pending", body: "preserve these bytes", lastNudgeResult: expect.stringMatching(/^failed:terminal-seat: /),
+    });
+    // The wake ladder retries through maybeNudge.
+    await h.repo.maybeNudge(item.qitemId, session, true, "dev-a@rig1");
+    expect(h.sends).toHaveLength(0);
+    expect(h.repo.getById(item.qitemId)!.lastNudgeResult).toMatch(/^failed:terminal-seat: /);
+  });
+
+  it("a terminal seat known only by its composed name (binding, no session row) gets no typed wake", async () => {
+    h.db.prepare("INSERT INTO nodes (id, rig_id, logical_id, runtime) VALUES ('node-logs', 'rig-1', 'infra.logs', 'terminal')").run();
+    h.db.prepare("INSERT INTO bindings (id, node_id, attachment_type, tmux_session) VALUES ('binding-logs', 'node-logs', 'tmux', 'infra-logs@rig1')").run();
+    const item = await h.repo.create({
+      sourceSession: "dev-a@rig1", destinationSession: "infra-logs@rig1",
+      summary: "x; touch /tmp/should-not-run", evidenceRef: EVIDENCE, body: "composed seat",
+    });
+    await vi.waitFor(() => expect(h.repo.getById(item.qitemId)!.lastNudgeResult).not.toBeNull());
+    expect(h.sends).toHaveLength(0);
+    expect(h.repo.getById(item.qitemId)!.lastNudgeResult).toMatch(/^failed:terminal-seat: /);
+  });
+
+  it("an agent seat still gets its typed wake", async () => {
+    seedTerminalSeat("rig1", "infra.shell", "infra-shell@rig1");
+    const item = await h.repo.create({
+      sourceSession: "infra-shell@rig1", destinationSession: "dev-a@rig1",
+      summary: "agent work", evidenceRef: EVIDENCE, body: "for the agent",
+    });
+    await vi.waitFor(() => expect(h.repo.getById(item.qitemId)!.lastNudgeResult).toBe("verified"));
+    expect(h.sends).toHaveLength(1);
+    expect(h.sends[0]!.session).toBe("dev-a@rig1");
+    expect(h.sends[0]!.text).toContain("From: infra-shell@rig1");
+    expect(h.sends[0]!.text).toContain(item.qitemId);
+  });
+
+  it("a currently bound agent with older terminal history gets its wake and retry", async () => {
+    seedTerminalSeat("rig1", "old.shell", "dev-a@rig1");
+    // Retain the old terminal session row, but its binding has moved elsewhere.
+    h.db.prepare("UPDATE bindings SET tmux_session='old-shell@rig1' WHERE node_id='node-old.shell'").run();
+    const item = await h.repo.create({ sourceSession: "dev-b@rig1", destinationSession: "dev-a@rig1",
+      summary: "current agent work", evidenceRef: EVIDENCE, body: "for the current occupant" });
+    await vi.waitFor(() => expect(h.repo.getById(item.qitemId)!.lastNudgeResult).not.toBeNull());
+    expect(h.repo.getById(item.qitemId)!.lastNudgeResult).toBe("verified");
+    expect(h.sends).toHaveLength(1);
+    await h.repo.maybeNudge(item.qitemId, "dev-a@rig1", true, "dev-b@rig1");
+    expect(h.repo.getById(item.qitemId)!.lastNudgeResult).toBe("verified");
+    expect(h.sends).toHaveLength(2);
+    expect(h.sends.every(send => send.session === "dev-a@rig1")).toBe(true);
   });
 });

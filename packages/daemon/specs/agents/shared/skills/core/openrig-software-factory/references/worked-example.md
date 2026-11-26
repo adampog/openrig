@@ -22,7 +22,8 @@ boundary, acceptance and evidence pointers; create it before sending:
 ```sh
 rig whoami --json
 rig queue create --destination dev-build@starter \
-  --body-file ./TASK.md --summary 'Implement the agreed CSV inspection' --json
+  --body-file ./TASK.md --summary 'Implement the agreed CSV inspection' \
+  --tags 'project:<id>,mission:<id>,slice:<id>' --json
 rig queue claim <returned-qitem-id> --json
 ```
 
@@ -30,7 +31,8 @@ After implementing and checking the cumulative candidate, the current owner uses
 
 ```sh
 rig queue handoff <owned-qitem-id> --to dev-review@starter \
-  --body-file ./REVIEW-REQUEST.md --json
+  --body-file ./REVIEW-REQUEST.md --summary 'Review the CSV inspection candidate' \
+  --tags 'project:<id>,mission:<id>,slice:<id>' --json
 ```
 
 The request binds exact candidate, acceptance, commands and evidence. Read the
@@ -177,10 +179,11 @@ task instead of duplicating it):
 ```sh
 rig queue create --destination dev-parser@starter \
   --body-file "$PROJECT_ROOT/.openrig/factory/TASK-A.md" \
-  --summary 'Implement the agreed independent change A' --json
+  --summary 'Implement the agreed independent change A' \
+  --tags 'project:<id>,mission:<id>,slice:<id>' --json
 ```
 
-Use actual project/mission/slice tags where applicable. Read back the returned ID
+Use the project, mission and slice the work belongs to. Read back the returned ID
 with `rig queue show <id> --full --json`; A claims it as itself. Use the earlier
 queue loop for results, review and blockers. Existing Workflow-bound work keeps
 its packet/projection contract: adding a seat does not revise a running graph or
@@ -501,7 +504,7 @@ At each completed step, the **current packet owner** projects its own result. Ex
 
 ```sh
 rig workflow project --instance <instance-id> --current-packet <inspect-packet> \
-  --exit handoff --actor-session dev-build@starter \
+  --exit handoff \
   --result-note 'Inspection contract implemented; exact candidate and checks recorded' \
   --evidence-ref <absolute-slice-01-proof-path> --json
 ```
@@ -512,7 +515,7 @@ For a **real unresolved blank-cell product choice**, ask the user the concrete q
 
 ```sh
 rig workflow project --instance <instance-id> --current-packet <cli-packet> \
-  --exit waiting --actor-session dev-build@starter \
+  --exit waiting \
   --blocked-on external:user/blank-required-cells \
   --result-note 'Need the user decision recorded in mission NOTES before selecting CLI behavior' \
   --evidence-ref <absolute-mission-notes-path> --json
@@ -539,6 +542,6 @@ resume as failed; do not silently replace the original sessions.
 
 ## Optional growth, with the same two seats
 
-When the same coordination obligations recur, move the reusable workflow to `project.yaml` under `lifecycle.profiles.small-change-v1`, with `required_steps: [check, finish]` and a `workflow` mapping; keep `lifecycle.profile: small-change-v1`. Remove mission-specific paths/objectives from the reusable base and supply them through each mission's context/arrangement. Missions can inherit it unchanged, explicitly `mode: extend` to add uniquely named steps, or `mode: override` with a complete arrangement that preserves required obligations. `required_steps` names real stable step IDs, not prose headings. This optional design is not a second validated manifest in this example.
+When the same coordination obligations recur, move the reusable workflow to `project.yaml` under `lifecycle.profiles.small-change-v1`, with `required_steps: [check, finish]` and a `workflow` mapping; keep `lifecycle.profile: small-change-v1`. Remove mission-specific paths/objectives from the reusable base and supply them through each mission's context/arrangement. Missions can inherit it unchanged, explicitly `mode: extend` to add uniquely named steps, or `mode: override` with a complete arrangement that preserves required obligations. A mission that leaves out one of the profile's pods still keeps that pod's required step IDs, and their required order, in its `mode: override` arrangement. Give each such step to the workflow's `orchestrator_role` and keep its `depends_on`. Its objective says the step doesn't apply to this mission, and asks the orchestrator to record who decided that, and why, when it closes the step. That's a recorded judgment, never a pass for the missing pod's work, and the steps that depend on it wait for it to close. Leaving the step out instead fails compilation with `lifecycle_required_step_missing`. A running instance can't drop one either: reconciliation asks to preserve the obligation and record an attributed disposition. `required_steps` names real stable step IDs, not prose headings. This optional design is not a second validated manifest in this example.
 
 Slices remain the work/spec/progress/proof home. If a project instead chooses per-slice execution, the native compiler supports `execution.actor_role`, `preferred_targets`, `depends_on` and `allowed_exits`, but do not imply those independently add steps beneath an already selected mission/profile graph. Compile the chosen single graph, inspect the result, and instantiate or explicitly revise the existing instance. Retained running inputs do not silently follow disk edits. Add more roles, SDLC advice, typed gates or release obligations only when the user's work requires them. No mandatory wave, release graph, private lifecycle helper or seven-seat factory is part of this first example.

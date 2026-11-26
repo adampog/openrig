@@ -91,7 +91,12 @@ and `severity=info`. CLI/TUI call this **needs diagnosis**, not a confirmed
 warning. Enabled diagnosis policy admits one bounded packet even though the
 product denominator is unknown. Ordinary unavailable/stale detector records
 remain ineligible. Diagnosis and human-notification traffic are excluded from
-the numerator and cannot recursively generate another investigation.
+the numerator and cannot recursively generate another investigation. So is the
+daemon's own bookkeeping: transitions by system actors (`*@system`, the
+bare `system` of claim handover, `daemon@kernel` and every `system:*` actor;
+other kernel seats such as `human@kernel` still count) and daemon notes recorded under any actor
+(`auto-unparked:`, `blocker custody moved `, `park wake `, `parked-owner `).
+The reported `transitionIds` are the counted transitions.
 
 The agent reads the actual evidence, including beyond the supplied references,
 and resolves the semantic outcome granularity and consequence boundary. Use the
@@ -139,7 +144,8 @@ explicitly linked project or mission work resolves a scope. Its bounds: at most 
 qitems, 1,000 members / 10,000 transitions per family, 200 workflow
 receipts, 200 declared slices, and 100 proof files per selected slice. Overflow
 refuses visibly. When more than 200 families (roots) were touched, it evaluates the
-200 with the most transitions in the window, then by lineage ID, and reports the
+200 with the most transitions in the window (every transition, daemon bookkeeping
+included, which bounds the counted ones), then by lineage ID, and reports the
 result as partial coverage with the total and omitted counts. Omitted families
 were not evaluated, so having no finding for them is not a healthy verdict.
 Context files are bounded to 64 KiB. A lineage beginning before
@@ -389,6 +395,19 @@ The default list excludes cleared records; explicit cleared queries and exact
 ID reads retain them while the source can still project them. A recurrence after
 clear receives a new episode ID. This is an on-demand projection, not a history
 store; a detail 404 does not prove resolution.
+
+In the TUI, the instance Table and the rig/pod Table and Overview load canonical
+findings for their health summaries. These summaries previously could show `Not assessed`
+even when the daemon served findings because they did not request the projection.
+Once the topology drill is resolved, these pages use the existing bounded
+`GET /api/health?limit=200` read; pod summaries continue to cover their rig.
+Other topology views using focused reads keep this projection lazy; the Health
+tab requests it explicitly.
+This findings read is separate from the control-plane `GET /healthz` read.
+
+If `GET /api/health?limit=200` fails, including HTTP 503, the summary shows
+`Unknown · Unavailable`. A projection that was not requested remains
+`Unknown · Not assessed`, and a loaded empty result is not a healthy verdict.
 
 Lists default to 100 and cap at 200, with `total` and `truncated` explicit.
 Ceremony findings take precedence before the cap so context pressure cannot

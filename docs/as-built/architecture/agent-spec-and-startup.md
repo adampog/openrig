@@ -11,8 +11,8 @@ applies-when: |
   resolve and preserve identity.
 siblings: [daemon-core.md, adapters-and-runtimes.md, lifecycle-snapshot-restore.md, packaging-bootstrap-bundles.md]
 prerequisite-reads: [../README.md, daemon-core.md]
-last-verified-against-source: 2caac7dd1bb16585138a6f7c1dd8b1f0752c49f7
-last-updated: 2026-10-05
+last-verified-against-source: e8f0ab340db773392ec8be75b072d1c0f3068a50
+last-updated: 2026-10-08
 ---
 
 # Agent/Rig Spec, Resolution, Startup, Identity
@@ -22,7 +22,7 @@ and identity-addressable topology. The spec-and-startup contract: parse →
 resolve → project → deliver pre-launch files → persist replay context → launch
 → wait → deliver post-launch files.
 
-> Verified against source at main `2caac7dd1bb16585138a6f7c1dd8b1f0752c49f7`. `domain/…` and `routes/…` paths
+> Verified against source at main `e8f0ab340db773392ec8be75b072d1c0f3068a50`. `domain/…` and `routes/…` paths
 > are under `packages/daemon/src/`; a bare file name such as
 > `rigspec-schema.ts:119` is in `packages/daemon/src/domain/`. Each count sits
 > beside the command that produces it; run the command from the repository
@@ -64,6 +64,35 @@ resolve → project → deliver pre-launch files → persist replay context → 
   `packages/daemon/src/db/migrations/014_agentspec_reboot.ts:24`).
 
 ## 2. Execution and projection types
+
+The member's optional `claude_mcp: none` is normalized as `claudeMcp` and
+persisted independently in `nodes.claude_mcp` (migration 142). The
+expansion HTTP route preserves both `claude_mcp` and `claudeMcp`, including
+invalid values for the canonical validator to reject. An authored relaunch
+updates the seat choice after launch eligibility and startup-source resolution;
+an already-bound seat or a failed tmux launch keeps its prior value. Export
+describes the current runtime; a dormant choice on another runtime is omitted
+and must be restored in the Claude declaration when rebuilding from that export.
+The YAML export route names those agents in the existing `# Not carried:` report;
+the JSON export is unchanged. `rigspec-routes.test.ts` covers both pod-aware and
+legacy exports, omission controls and successful JSON export.
+
+The shared `StartupOrchestrator` reads the current seat record, so both an authored start
+and saved-context restore pass the choice to Claude. Legacy resume and handover
+successors read it separately; a runtime-switch successor reads it only when
+the target is Claude. `claude-mcp.ts` builds the strict empty-server arguments
+for the adapters, shutdown resume probes and displayed recovery commands,
+including the conversation picker. Shutdown skips a probe with an unreadable
+saved choice and keeps the resume token without adding a shutdown refusal.
+The native lineage selectors recognize these exact
+arguments without treating JSON contents as session options. Invalid stored
+values refuse launch. With no choice, the adapters add no MCP arguments.
+
+`claude-mcp-lifecycle.test.ts` exercises real schema/storage, export, snapshot
+and restore with simulated tmux/provider processes. `claude-mcp-launch.test.ts`
+executes managed and unmanaged shell commands against a private argv-printing
+fake, including fresh/resume/fork and legacy resume. These tests verify command
+plumbing and identity handling; they do not claim live provider enforcement.
 
 Restore/snapshot types are detailed in `lifecycle-snapshot-restore.md`; the
 spec/projection types live here.
@@ -118,6 +147,37 @@ them imports Hono: **0**
   startup layering, restore-policy narrowing.
 - `startup-resolver.ts` — additive startup layering.
 - `projection-planner.ts` — runtime resource projection planning.
+
+### Profile resolution during launch
+
+Preflight already resolves profiles in `profile-resolution-worker.ts`. Previously,
+the pod-aware apply path, materialized-member launch and first-start retry called
+the synchronous resolver again on the daemon's request thread. A fallback skill
+scan or managed-catalog inspection could therefore delay every other request even
+after preflight had finished ([#1653](https://github.com/mvschwarz/openrig/issues/1653)).
+Those three launch paths now await the same resolver in a worker before projecting
+resources or starting the member. Configuration precedence and launch order still
+come from the existing resolver and instantiator.
+
+An apply operation reuses one lazy worker across its members and terminates it on
+success or failure. Unlike preflight, launch supplies no `scanScope`: each member
+reads current files, including changes made by an earlier member's startup.
+Standalone member launches and first-start retries use a short-lived worker for
+their resolution. This adds worker startup and context-copy costs; it does not
+reuse the preflight result or cache configuration between requests. The helper's
+existing synchronous fallback for a deleted process working directory remains.
+
+Worker errors become configuration-failure results. Apply can then follow the
+existing all-members-failed cleanup, including service rollback and restoration
+of replaced generations. Materialized launches report a failed member, and
+first-start retries refuse before writing retained state.
+
+`profile-resolution-worker.test.ts` holds a real fallback scan open with a FIFO,
+requires an HTTP health response while that FIFO is still blocked, then checks
+that the selected skill reaches projection. It covers all three launch paths and
+a skill edit between members. These fixtures use SQLite and the real instantiator
+with a simulated runtime; they do not establish native provider behavior or
+responsiveness during other synchronous parts of startup.
 
 ## 4. Startup orchestration (the spec-startup contract)
 
@@ -192,16 +252,22 @@ proof selected, or a terminal runtime) record `node.startup_proof_skipped`
 (`startup-orchestrator.ts:374`); resume, fork and rebuild keep the existing proof
 history.
 
-**Fresh context pending and `rig seat continue`.** When a fresh launch stops at
-a native prompt before its context is delivered, `fail()` (`:592`) marks the
-failure `freshContextPending` and adds "run: rig seat continue <session>".
-`canContinueFresh` (`:554`, using `hasPendingFreshStartup`, `:35`) allows
+**Pending startup context and `rig seat continue`.** When a fresh launch stops at
+a native prompt before its context is delivered, `fail()` (`:806`) marks the
+failure `freshContextPending` and adds "run: rig seat continue <session>". A
+Codex fork whose own id isn't verified at launch, or whose readiness times out,
+ends `attention_required` with `forkContextPending` (its parent token) instead:
+the role waits, and nothing is saved for an unverified child.
+`canContinueStartup` (`:764`, using `readPendingStartupContext`, `:46`) allows
 continuation only while that failure is the occupant's latest startup event.
-`continueFreshStartup` (`seat-lifecycle-service.ts:395`) re-checks the binding,
+`continueStartup` (`seat-lifecycle-service.ts:723`) re-checks the binding,
 pane and runtime, then runs startup again on the same conversation without
-relaunching the harness. It is reached by `rig seat continue`,
+relaunching the harness. A fork continuation first re-verifies the child with
+`captureForkIdentity` (`codex-runtime-adapter.ts:668`; `startup-orchestrator.ts:559`)
+and needs the exact pending event it started from; a fresh continuation keeps
+the plain "still pending" check. It is reached by `rig seat continue`,
 `POST /api/seat/continue/:seatRef` and the per-seat startup route's `continue`
-action (`routes/startup.ts:148`).
+action (`routes/startup.ts:159`).
 
 **Startup layering is additive and ordered** (`resolveStartup`,
 `startup-resolver.ts:15`–`22`): (1) agent base, (2) profile, (3) rig culture

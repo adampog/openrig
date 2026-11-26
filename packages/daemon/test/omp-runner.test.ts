@@ -6,6 +6,49 @@ import { collectAllowlistedProviderAuthEnv } from "../src/startup.js";
 const sessionName = "omp-worker@rig";
 const sessionFile = "/openrig/state/omp/omp-worker@rig/sessions/2026_0197.jsonl";
 
+describe("input-only managed RPC consumers", () => {
+  it.each(["omp", "arbitrary-rpc"])("%s accepts correlated input without inheriting Pi wake or epoch ownership", async runtime => {
+    const rpc: Record<string, unknown>[] = [], posts: Record<string, unknown>[] = [];
+    const core = new RunnerCore({ sendRpc: command => { rpc.push(command); }, mirrorLine: () => {}, writeSidecar: () => {},
+      postActivity: () => {}, sessionFileExists: () => true, now: () => "2026-09-24T12:00:00Z",
+      postRunner: async body => { posts.push(body); return true; } }, { sessionName, runId: "actual-run" }, { runtime });
+    expect(core.nativeChannelCapabilities()).toEqual({ input: false, wake: false, cancel: false });
+    core.start();
+    core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-get-state", success: true,
+      data: { sessionFile, isStreaming: false, pendingMessageCount: 0 } }));
+    expect(core.nativeChannelCapabilities()).toEqual({ input: true, wake: false, cancel: false });
+    const frame = (id: string, sequence: number) => ({ version: 1 as const, runId: "actual-run", requestId: id, sequence, kind: "input" as const, payload: { text: id } });
+    const beforeStale = rpc.length;
+    await core.acceptRunnerRequest({ ...frame("stale", 1), runId: "old-run" });
+    expect(rpc).toHaveLength(beforeStale);
+    for (const [id, sequence, data] of [["local", 1, { agentInvoked: false }], ["start", 2, { disposition: "started" }], ["busy", 3, {}]] as const) {
+      if (id === "busy") core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+      await core.acceptRunnerRequest(frame(id, sequence));
+      expect(rpc.at(-1)).toMatchObject({ id: `openrig-native-${id}`, type: "prompt", message: id, streamingBehavior: "steer" });
+      core.handlePiLine(JSON.stringify({ type: "response", id: `openrig-native-${id}`, command: "prompt", success: true, data }));
+      await new Promise(resolve => setImmediate(resolve));
+      expect(posts).toContainEqual(expect.objectContaining({ type: "result", requestId: id, result: { kind: "input", accepted: true } }));
+    }
+    await core.acceptRunnerRequest(frame("busy", 3));
+    expect(rpc.filter(command => command.message === "busy")).toHaveLength(1);
+    await expect(core.acceptRunnerRequest(frame("other", 3))).rejects.toThrow(/sequence/);
+    await core.acceptRunnerRequest(frame("refused", 4));
+    core.handlePiLine(JSON.stringify({ type: "response", id: "openrig-native-refused", success: false, error: "native refused" }));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(posts).toContainEqual(expect.objectContaining({ type: "rejected", requestId: "refused" }));
+    expect(posts.some(post => post.type === "turn" || post.nativeTurnId !== undefined || post.acceptedTurnId !== undefined)).toBe(false);
+    const before = rpc.length;
+    await core.acceptRunnerRequest({ version: 1, runId: "actual-run", requestId: "wake", sequence: 5, kind: "wake", payload: { question: "no native mapping" } });
+    await core.acceptRunnerRequest({ version: 1, runId: "actual-run", requestId: "cancel", sequence: 6, kind: "cancel", payload: { target: { runId: "actual-run", nativeTurnId: "invented" } } });
+    expect(rpc).toHaveLength(before);
+    core.handlePiExit(1);
+    expect(core.nativeChannelCapabilities()).toEqual({ input: false, wake: false, cancel: false });
+    const afterExit = rpc.length;
+    await core.acceptRunnerRequest(frame("after-exit", 7));
+    expect(rpc).toHaveLength(afterExit);
+  });
+});
+
 function runner() {
   const rpc: Record<string, unknown>[] = [];
   const activity: Record<string, unknown>[] = [];
@@ -28,15 +71,16 @@ function runner() {
 }
 
 describe("OMP runner command and child isolation", () => {
-  it.each(["pi", "omp"] as const)("retains only supplied user names in the %s child baseline", runtime => {
+  it.each(["pi", "omp"] as const)("retains only supplied user names and agent socket in the %s child baseline", runtime => {
     const opts = { runtime, agentDir: "/fixture/agent", sessionsDir: "/fixture/sessions" };
     const source = { HOME: "/fixture/home", PATH: "/fixture/bin", UNRELATED_VALUE: "not-forwarded" };
     const absent = buildPiChildEnv(source, opts);
     expect(absent).not.toHaveProperty("USER");
     expect(absent).not.toHaveProperty("LOGNAME");
+    expect(absent).not.toHaveProperty("SSH_AUTH_SOCK");
     expect(absent).not.toHaveProperty("UNRELATED_VALUE");
-    expect(buildPiChildEnv({ ...source, USER: "fixture-user", LOGNAME: "fixture-login" }, opts))
-      .toEqual({ ...absent, USER: "fixture-user", LOGNAME: "fixture-login" });
+    expect(buildPiChildEnv({ ...source, USER: "fixture-user", LOGNAME: "fixture-login", SSH_AUTH_SOCK: "/fixture/agent.sock" }, opts))
+      .toEqual({ ...absent, USER: "fixture-user", LOGNAME: "fixture-login", SSH_AUTH_SOCK: "/fixture/agent.sock" });
   });
   it("launches exact session/fork with OMP approval flags, never Pi-only flags", () => {
     const common = { runnerEntryPath: "/daemon/pi-runner.js", sessionName, stateRoot: "/openrig/state/omp", cwd: "/work", model: "anthropic/claude-sonnet", runtime: "omp" as const, launchId: "attempt-1" };
@@ -54,13 +98,15 @@ describe("OMP runner command and child isolation", () => {
   });
 
   it("passes only declared provider key and managed identity, not daemon activity credentials", () => {
-    const env = buildPiChildEnv({ PATH: "/usr/bin", HOME: "/operator", ANTHROPIC_API_KEY: "seat-key", OPENAI_API_KEY: "other-key", OPENRIG_ACTIVITY_HOOK_TOKEN: "private-token", OPENRIG_OCCUPANT_GENERATION: "occupant-42", AWS_SECRET_ACCESS_KEY: "other-secret" }, { runtime: "omp", agentDir: "/openrig/state/omp/seat/agent", sessionsDir: "/openrig/state/omp/seat/sessions", model: "anthropic/claude-sonnet", sessionName, nodeId: "node-1", openrigHome: "/openrig", openrigUrl: "http://127.0.0.1:3000" });
+    const env = buildPiChildEnv({ PATH: "/usr/bin", HOME: "/operator", ANTHROPIC_API_KEY: "seat-key", OPENAI_API_KEY: "other-key", OPENRIG_ACTIVITY_HOOK_TOKEN: "private-token", OPENRIG_RUN_ID: "omp-actual-run", OPENRIG_RUN_GRANT_PRIVATE: "private-token", OPENRIG_OCCUPANT_GENERATION: "occupant-42", AWS_SECRET_ACCESS_KEY: "other-secret" }, { runtime: "omp", agentDir: "/openrig/state/omp/seat/agent", sessionsDir: "/openrig/state/omp/seat/sessions", model: "anthropic/claude-sonnet", sessionName, nodeId: "node-1", openrigHome: "/openrig", openrigUrl: "http://127.0.0.1:3000" });
     // OMP children get the same accepted identity allowlist as Pi (including
     // the occupant generation), plus the seat HOME and pinned identity.
     expect(env).toMatchObject({ HOME: "/openrig/state/omp/seat", PI_CODING_AGENT_DIR: "/openrig/state/omp/seat/agent", PI_CODING_AGENT_SESSION_DIR: "/openrig/state/omp/seat/sessions", ANTHROPIC_API_KEY: "seat-key", OPENRIG_SESSION_NAME: sessionName, OPENRIG_NODE_ID: "node-1", OPENRIG_RUNTIME: "omp", OPENRIG_HOME: "/openrig", OPENRIG_URL: "http://127.0.0.1:3000", OPENRIG_OCCUPANT_GENERATION: "occupant-42" });
     expect(env).not.toHaveProperty("OPENAI_API_KEY");
     expect(env).not.toHaveProperty("AWS_SECRET_ACCESS_KEY");
     expect(env).not.toHaveProperty("OPENRIG_ACTIVITY_HOOK_TOKEN");
+    expect(env).not.toHaveProperty("OPENRIG_RUN_ID");
+    expect(env).not.toHaveProperty("OPENRIG_RUN_GRANT_PRIVATE");
   });
 
   it("forwards the accepted OPENRIG_* identity to Pi children without OMP's seat HOME", () => {
@@ -208,6 +254,24 @@ describe("OMP executable resolution before the seat HOME applies", () => {
     };
     expect(resolveRuntimeExecutable("omp", { PATH: "/home/op/.local/share/mise/shims" }, fake)).toMatchObject({ ok: false, error: expect.stringContaining("ENOENT") });
   });
+
+  it("resolves an absolute executable path directly", () => {
+    const fake = ops({ "/usr/local/bin/omo": "/usr/local/bin/omo" });
+    expect(resolveRuntimeExecutable("/usr/local/bin/omo", {}, fake)).toEqual({ ok: true, path: "/usr/local/bin/omo" });
+  });
+
+  it("parses --command flag in runner arguments", () => {
+    const parsed = parseRunnerArgs([
+      "--session-name", "omo-seat@rig",
+      "--state-root", "/state/pi",
+      "--cwd", "/work",
+      "--launch-id", "launch-1",
+      "--command", "omo",
+      "--no-approve",
+    ]);
+    expect(parsed.command).toBe("omo");
+    expect(parsed.sessionName).toBe("omo-seat@rig");
+  });
 });
 
 describe("OMP RPC lifecycle", () => {
@@ -224,11 +288,42 @@ describe("OMP RPC lifecycle", () => {
     core.handlePiLine(JSON.stringify({ type: "agent_end", isTerminal: false }));
     expect(activity.filter((event) => event.hookEvent === "Stop")).toHaveLength(0);
     core.handleUserBlock("steer ongoing work");
-    expect(rpc.at(-1)).toEqual({ type: "steer", message: "steer ongoing work" });
+    expect(rpc.at(-1)).toEqual({ type: "prompt", message: "steer ongoing work", streamingBehavior: "steer" });
     core.handlePiLine(JSON.stringify({ type: "auto_compaction_start" }));
     expect(activity.at(-1)).toMatchObject({ hookEvent: "active", subtype: "compaction", generation: "occupant-42" });
     core.handlePiLine(JSON.stringify({ type: "agent_end", isTerminal: true }));
     expect(activity.at(-1)).toMatchObject({ hookEvent: "Stop", runtime: "omp" });
+  });
+
+  it("mirrors OMP text deltas once when non-text updates include cumulative assistant text", () => {
+    const { core, appends } = runner();
+    core.handlePiLine(JSON.stringify({ type: "message_start", message: { role: "assistant", content: [] } }));
+    core.handlePiLine(JSON.stringify({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_start", contentIndex: 0 },
+      message: { role: "assistant", content: [{ type: "text", text: "" }] },
+    }));
+    core.handlePiLine(JSON.stringify({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "Hello" },
+      message: { role: "assistant", content: [{ type: "text", text: "Hello" }] },
+    }));
+    core.handlePiLine(JSON.stringify({
+      type: "message_update",
+      assistantMessageEvent: { type: "usage_update" },
+      message: { role: "assistant", content: [{ type: "text", text: "Hello" }] },
+    }));
+    core.handlePiLine(JSON.stringify({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: " there" },
+      message: { role: "assistant", content: [{ type: "text", text: "Hello there" }] },
+    }));
+    core.handlePiLine(JSON.stringify({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_end", contentIndex: 0 },
+      message: { role: "assistant", content: [{ type: "text", text: "Hello there" }] },
+    }));
+    expect(appends.join("")).toBe("Hello there");
   });
 
   it("re-posts identity until the daemon confirms the token, then stops", async () => {
@@ -279,6 +374,35 @@ describe("OMP RPC lifecycle", () => {
     expect(pending).toHaveLength(3);
   });
 
+  it("a second startup block before agent_start goes as a prompt OMP queues as a steer, with no runtime_error (#1932)", () => {
+    const { core, rpc, activity } = runner();
+    core.handleUserBlock("first startup block");
+    core.handlePiLine(JSON.stringify({ id: "p1", type: "response", command: "prompt", success: true }));
+    core.handleUserBlock("second startup block");
+    expect(rpc.filter((x) => ["prompt", "steer"].includes(String(x.type)))).toEqual([
+      { type: "prompt", message: "first startup block", streamingBehavior: "steer" },
+      { type: "prompt", message: "second startup block", streamingBehavior: "steer" },
+    ]);
+    core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    core.handlePiLine(JSON.stringify({ type: "agent_end", isTerminal: true }));
+    expect(activity.filter((event) => event.subtype === "runtime_error")).toHaveLength(0);
+  });
+
+  it("after a local-only command (agentInvoked false), real work still goes as a prompt and runs", () => {
+    // OMP answers a consumed builtin with agentInvoked:false, in its response or a later prompt_result, and starts no turn.
+    for (const noTurn of [
+      { id: "p1", type: "response", command: "prompt", success: true, data: { agentInvoked: false } },
+      { type: "prompt_result", id: "p1", agentInvoked: false },
+    ]) {
+      const { core, rpc } = runner();
+      core.handleUserBlock("/local-command");
+      core.handlePiLine(JSON.stringify(noTurn));
+      core.handleUserBlock("real work");
+      expect(rpc.filter((x) => x.type === "steer")).toEqual([]);
+      expect(rpc.at(-1)).toMatchObject({ type: "prompt", message: "real work" });
+    }
+  });
+
   it("keeps prompt rejections visible as attention after the turn ends", () => {
     const { core, activity } = runner();
     core.handlePiLine(JSON.stringify({ type: "response", id: "prompt-1", command: "prompt", success: false, error: "No API key" }));
@@ -308,6 +432,57 @@ describe("OMP RPC lifecycle", () => {
     // One alert for one failure: the Stop is dropped, not replaced.
     expect(activity.filter((event) => event.subtype === "runtime_error")).toHaveLength(1);
     expect(activity.filter((event) => event.hookEvent === "Stop")).toHaveLength(0);
+  });
+
+  it.each([408, 429, 500, 502, 503, 504, 529])("releases typed transient status %s only at agent_end", errorStatus => {
+    const { core, activity, mirror } = runner();
+    const failed = { role: "assistant", stopReason: "error", errorStatus, errorMessage: "529 overloaded" };
+    core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    core.handlePiLine(JSON.stringify({ type: "message_end", message: failed }));
+    core.handlePiLine(JSON.stringify({ type: "turn_end", message: failed }));
+    expect(activity.at(-1)).toMatchObject({ hookEvent: "Notification", subtype: "runtime_error" });
+    core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    expect(activity.at(-1)).toMatchObject({ hookEvent: "Stop", subtype: "agent_end" });
+    expect(mirror.filter(line => line.startsWith("[omp-runner] ERROR"))).toEqual(["[omp-runner] ERROR 529 overloaded"]);
+    core.handleUserBlock("try again");
+    core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    expect(activity.at(-1)).toMatchObject({ hookEvent: "Stop" });
+  });
+
+  it.each(["invalid-attempt", "new-turn", "new-agent", "success-summary", "terminal", "unmatched-then-matched"])(
+    "invalidates retry-summary correlation at %s", boundary => {
+      const { core, activity } = runner();
+      const emit = (event: Record<string, unknown>) => core.handlePiLine(JSON.stringify(event));
+      emit({ type: "agent_start" });
+      emit({ type: "auto_retry_start", attempt: boundary === "invalid-attempt" ? "3" : 3 });
+      emit({ type: "message_end", message: { role: "assistant", stopReason: "error", errorStatus: 529, errorMessage: "busy" } });
+      if (boundary === "new-turn") emit({ type: "turn_start" });
+      if (boundary === "new-agent") emit({ type: "agent_start" });
+      if (boundary === "success-summary") emit({ type: "auto_retry_end", success: true, attempt: 3 });
+      if (boundary === "terminal") emit({ type: "agent_end", isTerminal: true });
+      if (boundary === "unmatched-then-matched") emit({ type: "auto_retry_end", success: false, attempt: 2, finalError: "busy" });
+      emit({ type: "auto_retry_end", success: false, attempt: 3, finalError: "busy" });
+      emit({ type: "agent_end", isTerminal: true });
+      expect(activity.at(-1)).toMatchObject({ hookEvent: "Notification", subtype: "runtime_error" });
+    },
+  );
+
+  it("keeps approval attention when it follows a typed transient failure", () => {
+    const { core, activity } = runner();
+    core.handlePiLine(JSON.stringify({ type: "turn_end", message: { role: "assistant", stopReason: "error", errorStatus: 529 } }));
+    core.handlePiLine(JSON.stringify({ type: "extension_ui_request", id: "approve-1", method: "confirm" }));
+    core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    expect(activity.at(-1)).toMatchObject({ hookEvent: "Notification", subtype: "permission_prompt" });
+  });
+
+  it("does not clear an earlier untyped or auth failure on a later transient error", () => {
+    const { core, activity } = runner();
+    for (const errorStatus of [401, 529]) core.handlePiLine(JSON.stringify({
+      type: "turn_end", message: { role: "assistant", stopReason: "error", errorStatus },
+    }));
+    core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    expect(activity.at(-1)).toMatchObject({ hookEvent: "Notification", subtype: "runtime_error" });
   });
 
   it("reports a model error carried only on turn_end, once per turn", () => {

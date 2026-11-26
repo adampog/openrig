@@ -68,13 +68,28 @@ describe("MissionControlNotificationDispatcher (PL-005 Phase B)", () => {
     expect(adapter.calls[0]!.tags).toContain("human-gate");
   });
 
+  it("keeps an emoji whole when shortening a long human-gate body", async () => {
+    await queueRepo.create({
+      sourceSession: "src@rig",
+      destinationSession: "human-operator@kernel",
+      body: `${"a".repeat(278)}🚀 ship it`,
+      tier: "human-gate",
+      summary: "test summary (FR-4 human-routed fixture)",
+      evidenceRef: "proof/test-evidence.md",
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    const body = adapter.calls[0]!.body;
+    expect(body.endsWith("…")).toBe(true);
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(body)).toBe(false);
+  });
+
   it("includes a Mission Control deep link for human-gate qitem notifications", async () => {
     dispatcher.stop();
     dispatcher = new MissionControlNotificationDispatcher({
       db,
       eventBus: bus,
       adapter,
-      missionControlBaseUrl: "http://100.95.124.51:18437",
+      missionControlBaseUrl: "http://192.0.2.10:18437",
     });
     dispatcher.start();
 
@@ -89,7 +104,7 @@ describe("MissionControlNotificationDispatcher (PL-005 Phase B)", () => {
     await new Promise((r) => setTimeout(r, 10));
 
     expect(adapter.calls[0]!.qitemRef).toBe(
-      `http://100.95.124.51:18437/mission-control?view=human-gate&qitem=${encodeURIComponent(created.qitemId)}`,
+      `http://192.0.2.10:18437/mission-control?view=human-gate&qitem=${encodeURIComponent(created.qitemId)}`,
     );
   });
 

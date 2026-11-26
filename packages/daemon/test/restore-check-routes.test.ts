@@ -127,6 +127,44 @@ describe("Restore check routes", () => {
     });
   }
 
+  it.each(["hooks", "hookless", "missing", "relative"])("reads current %s selection without writes at explicit full/compact detail routes", async kind => {
+    const rig = rigRepo.createRig("selection-check");
+    const source = path.join(openRigHome, "agent"); fs.mkdirSync(source);
+    const agent = `name: diagnostic-fixture
+version: "1.0.0"
+resources:
+  runtime_resources:
+    - id: activity
+      path: hooks.json
+      runtime: claude-code
+      type: claude_activity_hooks
+profiles:
+  hooks:
+    uses:
+      runtime_resources: [activity]
+  hookless:
+    uses:
+      runtime_resources: []
+`;
+    fs.writeFileSync(path.join(source, "agent.yaml"), agent);
+    const node = rigRepo.addNode(rig.id, "seat", { runtime: "claude-code", cwd: openRigHome,
+      agentRef: kind === "relative" ? "local:agent" : `path:${source}`, profile: kind === "hookless" ? "hookless" : "hooks" });
+    insertStartupContextRow(db, node.id);
+    if (kind === "missing") fs.unlinkSync(path.join(source, "agent.yaml"));
+    const before = db.serialize();
+    for (const query of ["", "&compact=1&ready=1"]) {
+      const response = await app.request(`/api/restore-check?rig=selection-check&noQueue=true${query}`);
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      const hook = body.checks.find((c: { check: string }) => c.check.endsWith(".hooks"));
+      expect(hook.status).toBe(kind === "hookless" ? "green" : "yellow");
+      expect(hook.evidence).toContain(kind === "hookless" ? "not selected" : kind === "hooks" ? "stale selection" : "unknown");
+      expect(hook.remediation).toBe("");
+    }
+    expect(db.serialize()).toEqual(before);
+    if (kind !== "missing") expect(fs.readFileSync(path.join(source, "agent.yaml"), "utf8")).toBe(agent);
+  });
+
   it("uses restore's ranked snapshot and reports missing service inputs in compact output", async () => {
     const rig = rigRepo.createRig("service-rig");
     const selected = snapshotRepo.createSnapshot(rig.id, "auto-pre-down", minimalSnapshotData(rig.id, rig.name) as never);
@@ -162,6 +200,30 @@ describe("Restore check routes", () => {
     expect(input.evidence).toContain("older occupant");
     expect(body.recovery.actions[0].command).toBe("rig up --existing changed-occupant");
     expect(db.prepare("SELECT COUNT(*) AS n FROM snapshots").get()).toEqual(before);
+  });
+
+  // A malformed recorded roster isn't "no roster": snapshot capture refuses it, so restore-check reports the rig's restore
+  // inputs as unknown and never says restore brings a seat back. With no roster recorded, every current seat is in it.
+  it.each([
+    ["malformed JSON", "{not json", "unknown"],
+    ["a malformed id array", JSON.stringify({ type: "topology.roster_recorded", intendedNodeIds: [1] }), "unknown"],
+    ["no recorded roster", null, "actionable"],
+  ] as const)("reads a current-state restore's roster with %s", async (_label, payload, recovery) => {
+    const rig = rigRepo.createRig("roster-read");
+    const node = rigRepo.addNode(rig.id, "seat", { runtime: "terminal" });
+    sessionRegistry.registerSession(node.id, "seat@roster-read");
+    insertStartupContextRow(db, node.id, { runtime: "terminal" });
+    snapshotRepo.createSnapshot(rig.id, "auto-pre-down", minimalSnapshotData(rig.id, rig.name) as never);
+    if (payload !== null) {
+      db.prepare("INSERT INTO events (rig_id, type, payload) VALUES (?, 'topology.roster_recorded', ?)").run(rig.id, payload);
+    }
+    const body = await (await app.request("/api/restore-check?rig=roster-read&noQueue=true&noHooks=true")).json();
+    expect(body.recovery.status).toBe(recovery);
+    expect(body.rigs[0].status === "unknown").toBe(recovery === "unknown");
+    if (recovery === "unknown") {
+      expect(body.checks.find((c: { check: string }) => c.check.endsWith(".restore-preconditions")).evidence).toContain("malformed authoritative topology roster");
+      expect(body.checks.some((c: { evidence: string }) => c.evidence.includes("brings it back"))).toBe(false);
+    }
   });
 
   it("isolates a real factory snapshot read error to its rig", () => {
@@ -200,6 +262,32 @@ describe("Restore check routes", () => {
     } finally {
       selection.mockRestore();
     }
+  });
+
+  // The route keeps a snapshot whose occupants still match, and a seat added since with no session yet doesn't change that
+  // (one with a session moves the check to a current-state restore). From a snapshot with no recorded roster, restore
+  // restores the snapshot's own nodes and skips the later seat, so restore-check uses the same membership: the later
+  // seat's startup inputs don't block, and nothing says it's brought back. Its readiness keeps the existing red for a
+  // seat with no canonical session identity.
+  it.each([["saved", true], ["missing", false]] as const)("reads a seat added after a kept pre-roster snapshot as left, with its startup context %s", async (_label, saved) => {
+    const rig = rigRepo.createRig("pre-roster");
+    const node = rigRepo.addNode(rig.id, "seat", { runtime: "terminal" });
+    const session = sessionRegistry.registerSession(node.id, "seat@pre-roster");
+    sessionRegistry.updateStatus(session.id, "running");
+    sessionRegistry.updateStartupStatus(session.id, "ready");
+    insertStartupContextRow(db, node.id, { runtime: "terminal" });
+    const snapshot = seedCurrentSnapshot(rig.id);
+    const late = rigRepo.addNode(rig.id, "late", { runtime: "terminal" });
+    if (saved) insertStartupContextRow(db, late.id, { runtime: "terminal" });
+
+    const body = await (await app.request("/api/restore-check?rig=pre-roster&noQueue=true&noHooks=true")).json();
+
+    expect(body.checks.find((c: { check: string }) => c.check.endsWith(".restore-preconditions")).evidence).toContain(`Snapshot ${snapshot.id}`);
+    expect(body.checks.find((c: { check: string }) => c.check === "seat.late.readiness")).toMatchObject({ status: "red", evidence: "Missing canonical session identity" });
+    expect(body.checks.find((c: { check: string }) => c.check === "seat.late.startup-context")).toMatchObject(saved
+      ? { status: "green" }
+      : { status: "yellow", evidence: expect.stringContaining("Restore doesn't launch this seat (it isn't in the roster this restore uses") });
+    expect(body.checks.some((c: { evidence: string }) => c.evidence.includes("brings it back"))).toBe(false);
   });
 
   it.each(["configured", "legacy"])("resolves the spec root and probes the SQLite queue store for %s shared-docs", async (layout) => {
@@ -331,7 +419,7 @@ describe("Restore check routes", () => {
     expect(hookChecks).toHaveLength(0);
   });
 
-  it("GET /api/restore-check recognizes the selected Claude activity-hook delivery", async () => {
+  it.each([false, true])("GET /api/restore-check recognizes activity delivery with optional diagnostic present=%s", async includeOptional => {
     const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "restore-check-route-hook-cwd-"));
     const settingsDir = path.join(projectDir, ".claude");
     const settingsPath = path.join(settingsDir, "settings.local.json");
@@ -346,7 +434,8 @@ describe("Restore check routes", () => {
     const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf-8")) as { hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>> };
     const relayEvents = Object.entries(manifest.hooks)
       .filter(([, groups]) => groups.some((group) => group.hooks.some((hook) => hook.command.includes("activity-relay.cjs"))))
-      .map(([event]) => event);
+      .map(([event]) => event)
+      .filter(event => includeOptional || event !== "PermissionRequest");
     fs.writeFileSync(settingsPath, JSON.stringify({ hooks: Object.fromEntries(relayEvents.map((event) => [
       event, [{ hooks: [{ type: "command", command: `node '${relayPath}'` }] }],
     ])) }));

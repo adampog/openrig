@@ -54,7 +54,8 @@ Use for any substantive work that must not fall through chat — slice handoffs,
 guard verdicts, QA results, full-tip reviews, multi-item batches. Survives agent
 restarts. Tracked in the daemon SQLite schema. Surfaces in Project / queue views
 + in the destination seat's inbox. Tag with mission / slice / gate / checkpoint
-so future-you (and any peer) can find it.
+so future-you (and any peer) can find it. Give the row a `--summary` (its subject, wherever the row is listed)
+and the `project:`, `mission:` and `slice:` tags when it is project work.
 
 Body discipline: substantive bodies go through **`--body-file <path>`** (or `-` for stdin) — the
 purpose-built, corruption-safe surface (it kills the backtick-shell-corruption class for multi-line
@@ -66,7 +67,8 @@ Example:
 ```bash
 rig queue create \
   --destination dev-reviewer@example-project \
-  --tags "mission:data-import,slice:import-report" \
+  --summary "Review the import report: it changes how rows are deduplicated" \
+  --tags "project:example-project,mission:data-import,slice:import-report" \
   --body-file /tmp/import-report-handoff.md
 ```
 
@@ -83,9 +85,55 @@ Example:
 ```bash
 rig queue handoff <qitem-id> \
   --to dev-reviewer@example-project \
-  --tags "mission:data-import,slice:import-report" \
+  --summary "Review the import report: it changes how rows are deduplicated" \
+  --tags "project:example-project,mission:data-import,slice:import-report" \
   --body-file /tmp/import-report-handoff.md
 ```
+
+### After a queue write — use the response; read back only when it doesn't show what you need
+
+A queue write (`create`, `claim`, `update`, `handoff`, `handoff-and-complete`) answers with the row it wrote; a
+handoff answers with the closed row and its successor. When that answer shows what you need to establish, use it.
+
+`queue update` is stricter: before it reports success, the CLI reads the row back from the canonical queue and checks
+every requested row field using daemon semantics (including normalized deadlines and appended closing resolutions).
+When `--note` is present, it first records the transition cursor and then requires a newer canonical transition,
+recorded under the actor the write was sent as, that carries those note bytes as written or with only what the daemon
+adds for that request (the reopen prefix, the summary suffix, a revised deadline's receipt). Another writer's note, or
+a note that only starts the same way, doesn't count. If that cursor can't be read, the write is still sent, and the
+note can't be shown to be new: the command says so and exits non-zero. A failed post-write check exits non-zero and
+says the write may have committed. Reconcile with `rig queue show <id> --full --json` before retrying. Preserve that
+exit status in wrappers, and use `set -o pipefail` when piping its output so a downstream formatter cannot turn
+failure into success.
+
+`create` also prints `Queue create request ID: <id> (not proof of persistence)` on stderr *before* it sends the write,
+so an interrupted create can be reconciled. That ID names a request, not a row. The row is the `qitemId` on stdout
+when the command exits 0. A non-zero exit means no row was confirmed, even when stdout carries a `qitemId`: an
+indeterminate answer repeats the request ID so you can reconcile by it. Don't merge stderr into stdout and keep the
+first `qitem-…` you find there; a refused create prints its request ID first, too.
+
+A timed-out write can still land late. To retry a `create` or `rig stream emit` safely, repeat it unchanged with the
+same `--id` (create's request ID, or the emit's own), since the daemon keeps one row or item per ID; an emit sent
+without `--id` has no ID to reuse, so look for it with `rig stream list --source <seat>` before emitting again.
+
+Read back (`rig queue show <id> --full --json`, or `rig queue transitions <id>`) when the answer doesn't show what you
+need, for example:
+
+- the outcome was INDETERMINATE (a transport failure, or a 502 `remote_queue_write_failed` that may have reached the
+  other host), or the write warned `qitem_body_not_saved` (an existing row came back). Reconcile by the original ID
+  before any retry. A 502 whose `failureClass` is `unknown-host`, `unsupported-transport` or `registry` isn't
+  indeterminate: the daemon refused before contacting any host and wrote nothing (`create` says "No row was
+  created"). `unsupported-transport` means that host entry is SSH-declared. Use the http entry for the same machine
+  from `rig host list`; if there isn't one, add it with that machine's daemon URL (`rig host add --id <id>
+  --transport http --url <daemon-url>`), asking whoever runs that host for the URL;
+- the output was compact or truncated and the field you need isn't in it (the compact receipt shows `bodyBytes`, not
+  the body, and its footer names what it left out);
+- you need a transition note, a closure or blocker detail, or a successor that the output you saw omits;
+- you need evidence from downstream of the write: the recipient's wake (`create --verify` waits for it), or its
+  pickup or claim (a later read);
+- your team's custody rule asks for a separate read-back.
+
+Don't read back only to see again a field the response already showed you.
 
 ### §1b doctrine — turn ends by passing the ball
 
@@ -355,11 +403,15 @@ restore) into one call.
 
 ```bash
 rig start                    # interactive: daemon + kernel + pick-and-restore
-rig start --last             # headless: restore all rigs that were last running
+rig start --last             # headless: restore rigs that were last running; a rig stopped on purpose stays down
 rig start --all              # headless: restore all rigs with restore-usable snapshots
 rig start --rigs <name> [<name>...]   # headless: restore only the named rigs
 rig start --json             # JSON output for agents
 ```
+
+`rig start --last` keeps down a rig that was stopped on purpose (`rig down` or `rig seat stop`).
+Bring it back with `rig start --rigs <rig>`. A rig whose seat statuses can't be read is still
+attempted, with a warning (`seat_status_unreadable`).
 
 Framing: `rig start` is the RECOVERY entry point, not the getting-started
 hero. The fresh-user boot hero remains `rig up <team>` (typically
@@ -377,11 +429,19 @@ rig reconcile-session <session>
 rig reconcile-session <session> --rig <rigId> --node <logicalId>
 rig reconcile-session <session> --no-launch
 rig reconcile-session <session> --json
+rig reconcile-session <session> --repair-missing-pane --no-launch
 ```
 
-This is a no-launch, no-input adopt. `--rig`/`--node` disambiguate when the
-canonical session name does not uniquely resolve. `--no-launch` is accepted
-for explicitness (it is the only mode this command has).
+This is a no-launch, no-input adopt: it records a new claimed session row for
+the seat (any running row is superseded); it re-captures the resume token if
+it can, and conversation continuity stays unverified. `--rig`/`--node`
+disambiguate when the canonical session name does not uniquely resolve.
+`--no-launch` is accepted for explicitness.
+
+`--repair-missing-pane --no-launch` is different: for a running launched seat
+whose tmux pane was never recorded, it fills in the pane and keeps the
+session, resume token and generation. It never adopts. Both forms refuse
+while the seat's typing protection is on.
 
 ### Five-term restore status vocabulary
 
@@ -424,6 +484,16 @@ Startup and restore clears write their corresponding audit events; an identity-o
 clear updates the current binding and identity verdict without a clear event.
 Acknowledgment or responsiveness alone does not prove that the original
 conversation resumed.
+
+Two startup cases also end in `attention_required`, and the result says what to do:
+- **Assisted startup** (a community harness preset with `startup_assisted: true`): the startup text and Enter were
+  sent but submission isn't confirmed. Check the pane and submit any staged text, don't resend it, then run the
+  reported `rig seat clear-attention <session> --reason "..."` once the seat has responded.
+- **A refused startup turn** (Claude answered a startup turn with a refusal such as an expired login): nothing more is
+  typed into the seat, and the result names how many later startup inputs weren't sent. A fresh start that ran no
+  one-shot action stays continuable: `rig seat continue <seat>` delivers the whole startup again, the refused turn
+  included. A resumed or forked seat keeps its conversation and isn't offered continue; a fresh start that can't
+  continue names `rig seat launch <seat> --fresh --stop --reason "<why>"`.
 
 A 422 response names the uncleared class and its failed check. If the recorded
 native token needs correction and you know the actual token, use
@@ -500,11 +570,12 @@ rig ps --active             # opt-in active-state filter (does NOT change the al
 ```bash
 rig whoami                  # compact: identity + peers names + edges + transcript path
 rig whoami --json           # compact JSON
+rig whoami --json --all-peers  # compact JSON with every peer, when output.compact bounds the list
 rig whoami --full           # complete payload (v0.3.4 default shape)
 rig whoami --verbose        # alias of --full
 ```
 
-The first command every agent runs on boot AND every compaction-restore. The compact default keeps identity-recovery essentials (`identity`, `peers` names + sessionNames, `edges` directional `kind` + `to.sessionName`, `transcriptPath`). `--full` adds `contextUsage`, `commands`, `peersNote`, `runtimeContext`. The compact-default is an ALLOWLIST projection — future payload fields default to `--full` and cannot silently re-bloat the every-boot path.
+The first command every agent runs on boot AND every compaction-restore. The compact default keeps identity-recovery essentials (`identity`, `peers` names + sessionNames, `peersNote`, `edges` directional `kind` + `to.sessionName`, the transcript path). `--full` adds `contextUsage`, `commands`, `runtimeContext` and `workspace`. With `output.compact` on, compact JSON lists at most `output.whoami_peers` peers (default 8): edge peers first, then your pod, then roster order. `peersNote` and `peersOmitted` then say how many were left out, and `--all-peers` lists every one; `edges` stays complete. The compact-default is an ALLOWLIST projection — future payload fields default to `--full` and cannot silently re-bloat the every-boot path.
 
 ### `rig queue list` — active-frontier + docker/kubectl grammar
 
@@ -519,7 +590,7 @@ rig queue list --mine                # just the caller's items
 rig queue list --destination <s>     # destined to <s>
 rig queue list --source <s>          # sourced by <s>
 rig queue show <qitemId>             # bounded single-item body preview
-rig queue show <qitemId> --full      # complete body and chain fields
+rig queue show <qitemId> --full      # complete body and chain fields; a closed row adds closingTransition (the close's state, reason, target, actor, time and note)
 ```
 
 Four orthogonal axes (scope × history × field-breadth × encoding), all composable. **STOP using bare `rig queue list` as the cross-rig firehose.** Default is now active + compact + current-rig. Cross-rig history with full bodies is opt-in via `-A -a --full`; request only the breadth and fields needed for the question.
@@ -785,12 +856,15 @@ rig send <session> "message" --host <id>
 rig send <session> "message" --json
 ```
 
-**The send-guard (v0.4.0) — the default is SAFE.** A default `rig send` is guarded: it will NOT submit into an interactive prompt / permission block on the target pane. Flags:
+**The send-guard (v0.4.0) — the default is SAFE.** A default `rig send` is guarded: it will NOT submit into an interactive prompt / permission block on the target pane. That includes Claude's MCP server approval menu (`N new MCP servers found in .mcp.json`, ending `Space to select · Enter to confirm · Esc to reject all`) while it is the current screen: the send is refused with reason `target_needs_input` and `Refused: '<session>' is at an interactive prompt (selection_prompt). A message must not select or approve it. … No text was sent.` Approving or rejecting those servers is the person's call; `--dangerously-interact` drives it only deliberately. Flags:
 - `--verify` — delivery evidence.
 - `--force` — **a back-compat no-op on the send DECISION**: it never bypasses the interactive-prompt/permission guard and never changes whether a message is delivered (a mid-task/busy pane already sends-with-advisory by default). *(It does NOT "bypass activity-risk checks" — that earlier teaching is retired.)* It is **not fully inert**, though — it is still parsed solely to be **rejected in combination with `--wait-for-idle`**: `rig send … --force --wait-for-idle <n>` prints `--wait-for-idle cannot be combined with --force`, exits 1, and sends nothing. So do not read "no-op" as "`--force --wait-for-idle` is harmless"; that pairing errors. *(Verified against current product main `d37a08ad`: the guard-bypass no-op is declared at `send.ts` and confirmed by runtime capture — a plain `--force` send delivers through the ordinary path; the `--wait-for-idle` rejection is enforced at `send.ts`, `routes/transport.ts`, and `session-transport.ts`, and confirmed by runtime capture — exit 1, nothing sent.)*
 - `--wait-for-idle <seconds>` — wait until the target is explicitly idle before sending. **Cannot be combined with `--force`** (that pairing is rejected: exit 1, nothing sent).
 - `--raw` — send exact text/keystrokes without the From/To messaging envelope (still guarded against interactive prompts).
 - `--dangerously-interact --reason "<why>"` — the ONLY override of the prompt/permission guard: deliberately drive an interactive prompt/permission block (implies `--raw`, requires `--reason`, audit-logged).
+  On a guard-attached managed seat, a non-menu override stops and shows existing typed/pasted input (author unknown) with `override_input_present`. Input it can't read doesn't stop the override: the answer is typed, nothing is cleared, and the result reports the input as unreadable (never empty) with a warning that the answer may join or submit existing text. Recognized dim suggestions are shown separately and count as empty; a collapsed paste shows only its label, not hidden contents.
+  Inspect the input, deliberately clear the native prompt with native/tmux controls, then retry. Manual clearing is outside OpenRig's lease and observation checks and is not recorded; human typing can still race a read and paste.
+  When you deliberately need to type without that composer check (for example an unsupported input you inspected yourself), add `--type-without-checking` with `--dangerously-interact --reason "<why>"`. It does not clear input and may join or submit existing text. Ordinary sends and wakes keep their current rules.
 - `--host <id>` — send on a remote host declared in `~/.openrig/hosts.yaml` (ssh hosts shell out; http hosts go CLI-direct to the remote daemon).
 - `--from <session>` — deprecated and ignored; it does not select the sender. Sender identity comes from the current seat and transport provenance; cross-host envelopes use the durable local origin, not the supplied flag or a relay identity.
 - `--context <ref>` **(0.5.0)** — attach a composed context pack/piece by ref (see "Context packs and paced delivery"). Small piece → `send --context`; a real pack → `rig walk`. The noun `rig context` composes the ref; the verb delivers it.
@@ -938,6 +1012,223 @@ rig auth seats … --runtime codex         # seat -> profile registry (metadata 
 
 **Hard secret boundary:** no token value is ever printed, logged, queued, streamed, or committed; status/validate report presence/mode/login-state only; seat labels are metadata, not live-account proof. MVP is `--runtime codex`; other runtimes use the same surface with a different `--runtime`, never a parallel command.
 
+### Give a seat its own Claude or Codex account
+
+A runtime's login lives in its home: Claude Code's in its config dir (`CLAUDE_CONFIG_DIR`, default `~/.claude`), Codex's
+in `CODEX_HOME` (default `~/.codex`). A seat that names its own home in `env:` runs on that home's login.
+
+1. **Prepare the home once, natively,** in a terminal: `CLAUDE_CONFIG_DIR=/abs/path claude`, then `/login`; or
+   `CODEX_HOME=/abs/path codex login`. The person signs in; never copy credential files between homes.
+2. **Name it in the member's `env:`** in `rig.yaml`, not with `rig up --env`, which leaves these two out
+   (`CLAUDE_CONFIG_DIR: /abs/path` or `CODEX_HOME: /abs/path`), or in
+   the rig's `env:` for every seat of that runtime. The member's value wins. It must be an absolute path: any other
+   value is reported and ignored, and the seat keeps the daemon's home.
+3. **It takes effect at the seat's next launch** (a fresh launch, restore or handover); a running seat keeps the home
+   it started with. A conversation saved under the old home doesn't resume from the new one.
+4. **Check it:** `rig seat status <seat>` shows the home and where it came from, and `rig provider status` lists it as
+   the seat's configured account. Both say what's configured, not which login a running session holds.
+
+Seats may share a home. OpenRig writes its own settings (Codex hooks, managed `config.toml` and plugin; Claude's
+first-run trust settings) into the seat's home.
+
+### Move one Codex seat to another login
+
+For a Codex seat on Linux. The login must already be saved in the Codex home the seat runs on (`rig seat status <seat>`
+shows it). Other operating systems, and moving a seat to another home, aren't supported by this command yet: say so instead
+of improvising. A Claude seat moves differently; see the next section.
+
+1. **Save each login once, in that home:** `CODEX_HOME=<home> codex login` (the person signs in), then
+   `CODEX_HOME=<home> rig auth save <name>`. `rig auth list --codex-home <home>` lists them.
+2. **Check:** `rig provider precheck --seat <seat> --to-account <name>` shows the home, what the seat is doing, and every
+   peer on that home. A refusal says what's missing, and nothing changes.
+3. **Move:** `rig provider switch --seat <seat> --to-account <name>`. It saves the home's current login as
+   `before-switch-<time>`, activates the chosen one, and restarts the seat in place on the same conversation. If the
+   current login can't be saved first, nothing changes. Peers on the home aren't restarted. Each keeps its current login
+   only until its next token refresh, when Codex stops it with "signed in to another account". Run the printed
+   `rig seat restart <peer> --keep-conversation --reason "..."` for each to move it too. Don't sign in again in that home: that replaces
+   the login you just switched to.
+4. **Confirm:** after the seat completes a real tool-using turn, run the printed
+   `rig seat restart <seat> --keep-conversation --verify --expect-account <its Account line>`. Until then the move is
+   unconfirmed. An uncertain restart is reported; never restart it a second time.
+
+### Move one Claude seat to its own subscription token
+
+The seat keeps its config dir and gets its own `CLAUDE_CODE_OAUTH_TOKEN`, read from a file as Claude starts. OpenRig keeps only
+the file's path and your label, never the token.
+
+1. **Prepare the token once:** the person runs `claude setup-token`, which prints a one-year subscription token, and saves it to a
+   file only their user can read (`chmod 600`). Never paste the token into a message, a row or a command line.
+2. **Check:** `rig provider precheck --seat <seat> --to-account <label> --token-file <absolute path>`. It refuses, changing
+   nothing, if the file wouldn't apply, the seat isn't running, or something Claude Code ranks above the token is set (a cloud
+   provider, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, an `apiKeyHelper`). It names each one and how to remove it for that
+   seat. When the token applies, the launch unsets those names for Claude's process, so the pane shell's own exports can't
+   outrank it. Managed settings can't be read; the seat's `/status` shows what it actually uses.
+3. **Move:** `rig provider switch --seat <seat> --to-account <label> --token-file <absolute path>`. It takes a snapshot that
+   resumes the seat's conversation, sets the reference, and relaunches the seat from that snapshot in its own pane: the pane
+   and its scrollback stay, but work in flight when Claude ended doesn't carry over. Seats sharing the config dir keep their
+   own login. `--stored-login` moves the seat back; if the seat still receives a `CLAUDE_CODE_OAUTH_TOKEN`, Claude uses that
+   instead of the stored login, and the report names it.
+4. **Confirm:** after the seat completes a real tool-using turn, its `/status` shows token auth, with no account email. The
+   label is yours, not an account Claude observed: say so. A token session can't use claude.ai connectors or Remote Control.
+   The token is in Claude's environment, so the tools, hooks and MCP servers it starts inherit it; don't have it print its
+   environment. A relaunch that didn't resume reads unknown, with its recovery command; never run the switch again for it.
+   `rig seat status <seat>` shows the reference, and says when its file won't apply at the next launch.
+
+### Manage subscriptions across a fleet (when the person asks you to)
+
+**This applies only when the person has asked you to manage their subscriptions.** Otherwise, don't take this job on. Installing or upgrading OpenRig appoints no agent, launches no bundle and starts no
+rotation.
+
+When a person runs several Claude and Codex subscriptions across machines, the fleet studio bundle's one agent is meant
+to keep work running, through the Fleet app. Until that bundle is available, the agent the person asks to manage their
+subscriptions can use this section. If that's you, you decide which subscription or home moves, and when. You decide
+from:
+- the usage and assignment readings, and their freshness;
+- your earlier move reports (`rig provider moves`);
+- the person's account policy, or their standing preferences when there's no policy.
+
+You say why, and you see the outcome through. OpenRig gives you the facts and the tools; it never decides for you,
+and there's no threshold to obey.
+
+**Who decides:**
+- **The person's operator agent** can ask you for a move, or ask what you've moved. It doesn't make competing moves of
+  its own.
+- **One agent manages subscriptions:** the one the person asked, or the fleet studio's agent once that bundle is
+  available. There's no other fleet-manager role and no automatic manager. Use the commands below directly; no extra
+  hand-off is needed.
+- **The Observatory is optional:** it can show readings, but you don't need it to rotate.
+
+**The unit is a Codex home, with every seat on it.** Moving only some of the seats on a shared home to a different
+account isn't a supported move: say so instead of improvising. A Codex seat with a home of its own, or a Claude seat,
+moves alone with `rig provider switch --seat` (above).
+
+**A whole rig moves with `rig provider assign`.**
+- Add the account by label first, with `rig provider account add`.
+- `rig provider assign <rig> --provider <p> --account <label>` shows a plan and changes nothing. Seats with their own
+  choice of account are kept unless you add `--include-overrides`.
+- Apply exactly that plan with `--apply --plan <digest>`. Each seat's result is reported on its own, and nothing is
+  retried.
+- `rig provider status` then shows each seat against the rig's assignment.
+- `rig provider account remove` on a label a rig is assigned to warns, names those rigs and goes ahead. The seats keep
+  their credentials, and status shows the reference as missing until the label is added again or another account is
+  assigned.
+- The reference is rig-spec's "Assigning an account to a whole rig".
+
+0. **Load the person's account policy.**
+   - It's the context pack named `account-policy`: check `rig context list` for it, then read it with
+     `rig context get account-policy`. Its manifest's `version` is the version you follow and report.
+   - Follow it, and record the version in each report. A line the person approved ("move the build box's seats without
+     asking", "never move the reviewers") is standing authorization: act on it, don't ask again.
+   - A line grants only what the person actually gave. "Agents may do sign-ins" is usable only where a sign-in route
+     and access already exist; otherwise ask, and record that the preference couldn't be used.
+   - Something the policy doesn't cover: use your judgment or ask the way the policy says, record why, and propose a
+     one-line addition.
+   - **No policy** is never a reason to stop: work from this section, report the policy as `{ "none": true }`, and
+     offer once to write one with them (below).
+1. **Know the subscriptions.**
+   - Each subscription is reached through a saved profile on a home (`rig auth list` and `rig auth save`) on each
+     machine. Which seats use which profile is `rig auth seats`, and that's metadata: not proof of a live account.
+   - Check you can read each subscription's usage, and name any you can't.
+2. **Read before deciding.**
+   - Use `rig provider status --all-hosts --json` (add `--refresh` for fresh native readings). Each allowance has
+     its windows, reset times and when it was observed, and when it was last observed exhausted.
+   - **One allowance seen on two machines is one allowance:** never add its headroom twice.
+   - **A stale reading** is usable only with its age recorded, or after a refresh.
+   - **An unknown or unavailable reading is never observed room.**
+   - **After a known reset,** a window carries an `expectation` (expected full since that reset). You may plan on it,
+     but it isn't measured: report it as expected, and take a fresh reading when you can.
+   - **Equal reset times don't mean the same account.**
+   - **A seat's link to a subscription is observed, configured or unknown.** Only an observed link shows the seat
+     actually uses it; a configured one (a profile, a registry row) is a claim.
+   - **A sign-in state of `unknown` isn't `needs_sign_in`.** An otherwise authorized move can go ahead, and its uptake
+     evidence settles it. A known `needs_sign_in` is step 6.
+3. **Decide, and leave seats alone for a reason.**
+   - **Balance, don't chase:** spread machines across the subscriptions with room rather than moving every machine onto
+     the one that just reset. `rig usage top` on each machine shows which work hardest: a high-use machine is worth a
+     subscription of its own, and lower-use machines can share one. Keep a backup where the policy says so.
+   - `rig seat restart <seat> --keep-conversation --plan` shows what a restart keeps, and every peer on the same
+     home. Moving the home moves them all.
+   - Skip a seat that's mid-turn, running a service, or about to finish, and record why.
+4. **Move the home.**
+   - `rig auth switch <profile> --runtime codex --codex-home <that home>`, on that machine, or from here with
+     `--host <that machine's SSH entry>`. Without `--codex-home`, `rig auth` acts on `CODEX_HOME`, or on the default
+     home; `rig auth status --codex-home <home>` (with `--host` for another machine) prints which home it means:
+     check it before switching. A remote switch always names its home, and copies a profile already saved there.
+   - **Another machine** is reached through its SSH entry in `rig host list`. An entry registered only over HTTP
+     can't run these commands; use the machine's SSH entry, or run them on that machine.
+   - Then restart each chosen seat: `rig seat restart <seat> --keep-conversation --reason "<why>"`, with `--host <id>`
+     for a seat on another machine (the restart runs there, and its audit names you). If the connection drops, the
+     answer is `remote-outcome-unknown`: the switch or restart may have run there, so read what it names (for a
+     restart, `--plan`'s `lastRestart`) before anything else.
+   - After it completes a real tool-using turn, check it: `rig seat restart <seat> --keep-conversation --verify
+     --expect-account <the target's Account line>`. `--verify` only checks; it never restarts. Only that check
+     reports `moved`, and anything less is unconfirmed.
+   - **A slow reply isn't a failure:** never restart a seat a second time. Follow up at your next look.
+5. **Report every move, partial or unconfirmed included,** with
+   `rig provider moves report --file <move.json> --to <whoever asked>` (`--help` shows the shape). It becomes a queue
+   item to them; the Fleet app reads these reports once its page is connected to them. It holds:
+   - the home and machine, and from and to, as labels;
+   - your reason, and the policy version you followed (or `{ "none": true }`);
+   - each reading you acted on, `observed` with its observation time, `expected` with the reset it rests on, or
+     `unavailable`;
+   - each seat's result: `moved` only with the verify check's matched account and observed tool turn, kept as separate
+     facts; otherwise `unconfirmed` or `unknown`, with what's missing;
+   - the peers, for example "not restarted; account unverified".
+
+   A home switched with every seat left as a peer is still a move to report. A follow-up that confirms an earlier
+   unconfirmed seat is a new report with `--follows <the earlier report's qitemId>`. A report to a person's seat names
+   its evidence with `--evidence-ref` (for example, the saved `--verify --json` output). Never put credentials in a
+   report: a value in a recognized credential format is refused. **A refused report changes nothing about the move:**
+   correct it and file it again; never repeat the switch or a restart because a report was refused. Asked "why did
+   these seats move?", even after your own restart, answer from `rig provider moves --seat <seat>`. It reads the newest
+   reports (50 by default, `--limit` up to 200) and then filters them, so it's a recent window, not a seat's whole
+   history: raise `--limit` when you need older ones.
+6. **When a sign-in is needed:**
+   - Ask the person once, durably: a queue item to their seat, naming the machine and the subscription.
+   - Move nothing onto that subscription until it's done.
+   - On later wakes, check that item instead of asking again. Carry on with everything else.
+7. **When nothing has room:** say so, with the reset times. Never fall back to an API key, buy anything, or create an
+   account.
+
+**What wakes you:** a watchdog, a usage-limit park on the queue, or the person asking. How often you look is your
+judgment within those.
+
+**If there's no policy yet.** Start from what you can see, and ask only what you can't; keep it to a few minutes, and
+never run it as a form. "Whatever you think" or "skip" is an answer: write down the default you'll use.
+1. **Look first:** `rig auth list` and `rig auth seats` on each machine you can reach, `rig provider status
+   --all-hosts --json`, and `rig usage top` on each machine. Draft what you can.
+2. **Confirm what you saw,** in one message ("three Codex subscriptions and one Claude one, on two machines; the build
+   box uses about four times the tokens of the laptop; any I can't see?").
+3. **Ask how they want them used,** offering the common shape: the busiest machine gets its own subscription, the
+   rest share, and one stays spare.
+4. **Ask what you may do on your own:** move a machine's seats without asking; machines or seats to ask about first
+   or never move; sign-ins (may agents, and through which browser or profile, or always ask). Say what's supported
+   today: a Claude or Codex seat moves with `rig provider switch`, and a whole rig with `rig provider assign`; a Codex
+   seat moves in place only on Linux and macOS, with every seat on its Codex home; and a sign-in preference is used only where a
+   sign-in route and access exist.
+5. **Ask how to reach them** (their seat's queue, a chat channel, the Fleet app), for what, and what to do when they
+   don't answer. A channel they name is a preference: check the route with `messaging-the-human`, and use a queue
+   item to their seat if it isn't ready.
+6. **Ask what to do when things go wrong:** nothing has room, a sign-in is needed while they're away, a move didn't
+   confirm.
+7. **Show the draft in plain words,** let them correct it, and save it as a context pack named `account-policy` in
+   the context library where you run (`rig config get context.root`): a folder with `manifest.yaml` (`version: "1"`,
+   `name: account-policy`, `taxonomy: world`, a `purpose`, and `files: [{ path: POLICY.md, role: policy }]`) and
+   `POLICY.md`, installed with `rig context add <folder>` and read back with `rig context get account-policy`. To share
+   one policy across machines, use a Git repository: `rig context add <repo> --git`. Labels and references only:
+   never tokens, passwords, cookies or recovery codes.
+
+   `POLICY.md` has these parts, in their words: subscriptions (label, provider, plan, how each is reached); how they
+   want them used; what agents may do on their own; how to reach them; when things go wrong; and a dated **Changes**
+   list. Fill it from what you saw and what they said, never from another person's setup.
+
+**Changing the policy.** When they say what changed, copy `POLICY.md` aside as the before copy, edit it, add a dated
+line under **Changes**, and raise `version` in `manifest.yaml`. Keep one place where it's edited: edited where it's
+installed, run `rig context sync`; kept in a separate folder, replace it with `rig context rm account-policy` and
+`rig context add <folder>`; Git-backed, edit and commit in the checkout `rig context source inspect account-policy`
+reports, then `rig context source update account-policy` (it never pushes). Read it back with
+`rig context get account-policy`; your next decision follows the new version.
+
 ## Context packs and paced delivery (0.5.0)
 
 **Compose context once, hand it to a seat cleanly.** A library primitive plus a set of delivery flags. The rule that keeps the grammar coherent — internalize this one: **the noun stores and composes; the verbs deliver.** `rig context` never sends anything; delivery is only ever `rig send` / `rig broadcast` / `rig walk` / `rig queue`.
@@ -984,7 +1275,8 @@ Walk a seat *through* a pack: each piece is sent into the pane, spaced by `--pac
 - **The orchestrator habit — assign work *with* its context attached:**
   ```bash
   rig context compose --out packs/qitem-brief --from <brief-file> <proof-file>
-  rig queue create --destination dev-driver@build --body-context packs/qitem-brief --summary "…"
+  rig queue create --destination dev-driver@build --body-context packs/qitem-brief \
+    --summary "…" --tags "project:<id>,mission:<id>,slice:<id>"
   ```
   Replace `<brief-file>` and `<proof-file>` with your existing local files. The curated context rides the durable handoff, survives compaction, and is auditable.
 
@@ -1181,6 +1473,8 @@ Notes:
 - for tmux-backed self-attach, `rig whoami --json` is the right verification
 - for raw/external self-attach, `rig ps --nodes --json` is currently the more reliable verification surface
 - if the current shell is outside tmux, pass `--display-name <name>` when you want a stable human session label recorded
+- to read a seat's identity or state later, use `rig whoami` or `rig seat status`, not `rig attach --json` output or a file holding a
+  seat's environment. Don't print `OPENRIG_ACTIVITY_*` values: the activity token is a credential, and it doesn't identify the seat
 
 ### Adopt a topology and bind live sessions
 
@@ -1280,8 +1574,8 @@ This lets ordinary agents ask the manager for OpenRig help instead of every agen
 ```bash
 rig grow <rig-id> <member...> [--pod <pod> | --new-pod <pod>] [--runtime <runtime>] [--cwd <path>] [--json]
 rig expand <rig-id> <pod-fragment-path> [--rig-root <path>] [--json]
-rig launch <rigId> <nodeRef> [--json]
-rig launch <rigId> --seats <a,b,c> [--hold-reason <text>] [--json]
+rig launch <rig> <nodeRef> [--json]
+rig launch <rig> --seats <a,b,c> [--hold-reason <text>] [--json]
 rig remove <rigId> <nodeRef> [--json]
 rig shrink <rigId> <podRef> [--json]
 rig unclaim <sessionRef> [--json]
@@ -1294,21 +1588,29 @@ or `rig add` (one member) when a seat needs an explicit model, a permission poli
 different agent spec or role profile, per-seat runtime or cwd, or startup files.
 
 Node-granular managed partial restore (v0.3.4+):
-- `rig launch <rigId> <nodeRef>` relaunches a single seat by logical id or node id through orchestration.
-- `rig launch <rigId> --seats <a,b,c>` relaunches a comma-separated subset of seats.
+- `rig launch <rig> <nodeRef>` launches a single seat that isn't running, by logical id or node id, through orchestration.
+  `<rig>` is the rig's name or ID; a name shared by more than one active rig stops with the candidate IDs. A seat that's
+  already running is left as it is; for a fresh occupant there, use `rig seat launch <seat> --fresh --stop --reason <why>`.
+- `rig launch <rig> --seats <a,b,c>` launches a comma-separated subset of seats.
 - `--hold-reason <text>` records a reason for holding non-target seats during the partial launch.
 - This is a SUPPORTED managed path. The prior `pod_aware_launch_unsupported` dead-end is retired; pod-aware narrow launch now goes through this surface rather than ad-hoc rebuilds.
 
 ### Add a member to an existing pod — v0.3.3+
 
 ```bash
-rig add <rig-id> <pod-namespace> <member-fragment-path> [--json]
+rig add <rig> <pod-namespace> <member-fragment-path> [--json]
 ```
 
 `rig add` is the top-level verb for the `add_member` converge op. It adds a
 single member to an existing pod from a YAML/JSON member fragment file. The
 daemon resolves the named pod, validates the member, runs preflight, and
 launches the member in place.
+
+`<rig>` is the rig id or its exact name (the `rigName` that `rig whoami --json`
+reports). A name shared by more than one rig is refused before anything is
+added, with the matching ids listed (`rig_ambiguous` under `--json`). `rig add`
+always targets the local daemon: while a remote host is selected it refuses to
+resolve a name (`remote_host_selected`); an exact local id still works.
 
 HTTP outcomes:
 - `201` — member added; per-node launch state included in the response.
@@ -1343,27 +1645,204 @@ rig specs rename <name-or-id> <new-name> [--json]
 ## MCP
 
 ```bash
-rig mcp serve [--port <port>]
+rig mcp serve [--port <daemon-port>]        # stdio: a local app starts the server itself
+rig mcp serve --http [--bind <host:port>]   # Streamable HTTP at /mcp (default 127.0.0.1:7437)
+rig mcp token add <name> --seat <session> [--rig <name>...] [--root <name>...] [--workspace] [--owner] [--person <entity_id>]
+rig mcp token list [--json]
+rig mcp token revoke <name>
 ```
 
-Current shipped MCP tools:
-- `rig_up`
-- `rig_down`
-- `rig_ps`
-- `rig_status`
-- `rig_snapshot_create`
-- `rig_snapshot_list`
-- `rig_restore`
-- `rig_discover`
-- `rig_bind`
-- `rig_bundle_inspect`
-- `rig_agent_validate`
-- `rig_rig_validate`
-- `rig_rig_nodes`
-- `rig_send`
-- `rig_capture`
-- `rig_chatroom_send`
-- `rig_chatroom_watch`
+The 40 shipped tools fall into four groups. Over stdio, and over HTTP with no grants, every tool but the person tools is
+offered. An HTTP grant offers the work tools; the workspace tools with `--workspace` or `--owner`; and the owner tools only
+with `--owner`, which offers every tool but the person tools. Only a grant bound to a person offers the person tools: a
+grant service's grant that names its person, or a token-file grant added with `--person`. A local caller and an unbound
+grant never get them.
+- **Work (21):** orientation, communication and the durable work loop.
+  - `rig_whoami`: the seat the server acts as (rig, pod, peers, edges) and the `caller`: authenticated (an HTTP
+    credential, with its principal) or declared (`OPENRIG_SESSION_NAME` where the server was configured, which nothing
+    verifies).
+  - `rig_status`, `rig_ps`, `rig_rig_nodes`, and `rig_team`: a rig's lead (its one `delegates_to` root, the seat to
+    delegate to) and each seat's role, delegation and activity.
+  - `rig_send`, `rig_capture`, `rig_chatroom_send`, `rig_chatroom_watch`.
+  - `rig_queue_create`, `rig_queue_show`, `rig_queue_list`, `rig_queue_claim`, `rig_queue_update`,
+    `rig_queue_handoff`, `rig_queue_unclaim`:
+    - `revises` on create asks for a linked revision of an earlier item;
+    - show names a handed-off item's successor;
+    - `handedOffFrom` on list follows a handoff;
+    - handoff passes an item this seat holds on to the next seat in one step, as `rig queue handoff` does: the new item
+      carries the work's lineage;
+    - unclaim puts back a claimed item this seat won't finish.
+  - `rig_artifact_read`: a finished item's artifact (its `evidenceRef`) or a named file, through the daemon's shared
+    roots (`OPENRIG_FILES_ALLOWLIST`), in windows (`offset`, `nextOffset`). Outside those roots it answers unavailable
+    rather than reading a local path.
+  - `rig_environment_export`: copies a bound worker's JSON artifact to the host, checks its bytes, schema and context, and
+    adds a receipt to its existing work. It doesn't close the work, stop compute or restore native history, and it needs
+    an authenticated HTTP work connection.
+  - `rig_human_decision_room`, then `rig_queue_decide`: on your own pending ask to a person, read the decision room of
+    the mode they have on, and record a decision you made for them inside it. Only the person tools record a person's own
+    answer, and only for the person a grant names.
+  - `rig_seat_decide_permission`: answers a seat's permission ask (`qitem-runner-permission-…`) with one of its options,
+    as `rig seat decide-permission` does, with `relay`, `personSaid` and `reason`. It needs no seat.
+- **Workspace (4):** `rig_slices`, `rig_mission`, `rig_context_pack`, and `rig_context_get` (one context file or
+  section, as `rig context get` reads it).
+- **Owner (13):** `rig_up`, `rig_down`, `rig_snapshot_create`, `rig_snapshot_list`, `rig_discover`, `rig_bind`,
+  `rig_add`, `rig_bundle_inspect`, `rig_agent_validate`, `rig_rig_validate`, `rig_telemetry_events` (one bounded page
+  of event metadata), and:
+  - `rig_restore`, which starts a restore and returns its attempt;
+  - `rig_restore_status`, that attempt's receipt.
+- **Person (2):** `rig_question_list` and `rig_question_answer`, offered only on a grant bound to the person who owns
+  the connection: a grant service's grant that names them (`person.entity_id`, with the `question` pair), or a token-file
+  grant added with `--person <entity_id>`. They list the team's questions waiting on
+  that person, as Steering shows them, and record that person's own answer, given through the connection: `answer` for an
+  ask, which returns their words to the asker, and `resolve` for a park. `docs/reference/hosted-members.md` has the
+  contract.
+
+**Results:**
+- A structured result comes beside the text from the queue tools, `rig_whoami`, `rig_team`, the four workspace tools,
+  `rig_artifact_read`, `rig_human_decision_room`, `rig_restore_status` and the person tools. The other tools answer in
+  text.
+- Every failure carries the same structured shape: `ok: false`, a `code` and a `message`.
+
+**Identity:**
+- **Over stdio, and over HTTP with no grants:** the server acts as one seat, the `OPENRIG_SESSION_NAME` in its
+  environment. Every request carries that identity, so no tool call names a sender. Without it, messages, new tasks and
+  chat go through as an unknown sender (`unknown-mcp-` and eight hex digits, one per `rig mcp serve` process) with a
+  note at the top, and claim, update, hand off, unclaim and decide are refused with `actor_required`.
+- **Over HTTP with grants:** each caller acts as its own grant's seat.
+
+### Over HTTP: an assistant that can't start a local process
+
+- **No grants (no token file):**
+  - the listener stays on loopback and acts as `OPENRIG_SESSION_NAME`, declared, like stdio;
+  - a request whose `Host` isn't loopback is refused.
+- **With grants:** every request needs `Authorization: Bearer <token>`, loopback included, because a tunnel or proxy
+  delivers remote traffic to loopback.
+  - **Identity:** each caller acts as its grant's seat.
+  - **What it reaches:** only its rigs' seats and work, and its roots' artifacts. Anything else answers `out_of_scope`.
+  - **Bad credentials:** a missing, invalid or revoked token gets a 401, never the environment's seat.
+  - **A broken token file:** the server reads the file on every request. While it is missing or can't be read, every
+    request is refused (`auth_config_unreadable`); restore a valid, readable file and requests are served again, with
+    no restart. The other way back is a restart with no token file, which returns the server to the no-grants mode
+    above (loopback only). A restart never skips a token file that is present: its grants still apply.
+- **Beyond loopback** (`--bind`), the server starts only with a grant. TLS comes from the tunnel or proxy, not from
+  this server.
+- **`rig mcp token add`** prints the token once and stores only its hash.
+- **`revoke`:** the caller's next request is refused, and work it already handed over stays with its owners.
+- **Grants, binds and tunnels are the person's decisions.** Give them the commands, and don't run them on their behalf.
+
+### Join a team from an agent with no terminal of its own (desktop apps)
+
+An agent in a desktop app can work with a team as a seat through this MCP server. If the app gives it a shell, it can
+use the `rig` CLI instead, the same way.
+
+1. **Attach once.** With its shell, or by asking the person to run it:
+   `rig attach --self --rig <rigId> --pod <namespace> --member <name> --runtime <runtime> --print-env`.
+   Note the `OPENRIG_SESSION_NAME` it prints.
+2. **Give the person the MCP entry to add.** Don't edit their app's settings yourself. The entry runs
+   `rig mcp serve`, with `OPENRIG_SESSION_NAME=<that seat>` in its environment. Most MCP clients take it as a
+   command, arguments and an `env` map. An app that can't start a local process connects to `rig mcp serve --http`
+   instead, with a grant for that seat (see "Over HTTP" above).
+3. **Hand off work** with `rig_queue_create`, and keep the `qitemId` it returns.
+4. **Read the answer** with `rig_queue_show <qitemId>`. The item's state, closure and transition notes are where the
+   assignee records it, and `rig_artifact_read` reads an artifact it names. A call that times out has an unknown
+   outcome: check `rig_queue_show` with the same id before you retry, and retry only with that id.
+5. **Take work** with `rig_queue_list` (`owned: true`), `rig_queue_claim` and `rig_queue_update`. Close with the
+   answer in `resolution`. To pass it to the next seat, use `rig_queue_handoff`; to put back one you won't finish, use
+   `rig_queue_unclaim`.
+
+Limits today:
+- **OpenRig can't wake this agent itself.** `rig send` to an attached external node is refused, and a task's nudge to
+  it is unroutable. It sees new work when it checks `rig_queue_list`. In Claude Desktop, a scheduled task can check
+  for it (below). An app that can run background shell commands can also wait for it in an open session.
+- **Proven surfaces:** treat each app, and each mode inside one, as unproven until it has been run there.
+
+#### Pick up work in Claude Desktop with a scheduled task (opt-in)
+
+A local scheduled task in Claude Desktop starts a fresh Code-tab session on a schedule, so the seat picks up its work
+with no session left open. This is the default way to pick up work in Claude Desktop. The wait in the next section is
+for a session the person keeps open.
+
+- **Only if the person asks for it.** They create the task, or ask you to, and they choose its permission mode.
+- **Create it by asking Claude in a Code-tab session,** for example: "Create a local scheduled task for this folder,
+  named openrig-pickup, that runs every 2 minutes, with this prompt: …". Desktop's forms take nothing more often
+  than hourly, while Claude can set a schedule as often as every minute (Anthropic's docs). In OpenRig's test, the
+  task Claude created had no folder setting, so name the folder in the prompt. The task's Edit form can also set it.
+- **The prompt**, with this seat's identity from the one-time attach:
+
+```text
+Work in <folder>. Run every rig command with OPENRIG_SESSION_NAME=<seat> set.
+Run rig queue list --owned --state pending,in-progress --json. For each item, read
+it with rig queue show <id> --full. A pending item: claim it with rig queue claim
+<id>. An in-progress item is one an earlier run claimed and didn't finish: don't
+claim it again, and check what that run already did before you redo any step.
+Do the item, then close it with the answer (rig queue update <id> --state done
+--closure-reason no-follow-on --resolution "<answer>"), or hand it off or block
+it. If there are none, end the run.
+```
+
+- **Then click Run now once** on the task's page, and answer its permission prompts with "always allow". A later run
+  that stops at a prompt waits in its own session until someone answers it (Anthropic's docs).
+- **What OpenRig's test measured,** with an earlier version of this prompt that listed only pending items and put
+  the answer in `--note` (one test: Claude Desktop 5.11492.5 with Claude Code 2.1.325, OpenRig 0.7.13,
+  macOS, Auto permission mode): a task every 2 minutes closed two items 51 s and 116 s after they were created, each
+  in a fresh session.
+- **Its limits:**
+  - Each run costs a model turn, even with nothing pending.
+  - Runs happen only while the app is open and the computer is awake. A run is skipped while the previous one is
+    still going (Anthropic's docs).
+  - The prompt takes an in-progress item as one an earlier run left, which holds only while no other session uses
+    this seat (runs of one task don't overlap). While the task is active, don't use the seat elsewhere, including
+    the open-session wait below.
+  - Not tested with the app quit or the Mac asleep.
+
+#### Wake on new work (opt-in; off unless the person turns it on)
+
+An agent whose app can run a shell command in the background, and starts a new turn when that command finishes, can
+wait for its own work. Claude Code, including Claude Desktop's Code tab, does this.
+
+**In Claude Desktop, use it only in a session the person keeps open.** The scheduled task above is the default there.
+- **If the app runs this wait with its Monitor tool,** the watch ends after 5 minutes unless it's given a longer
+  timeout, and after 30 minutes at most, even when asked for longer. Either is before this loop's own 55-minute
+  deadline, so start it again when the app says the watch ended.
+  OpenRig's test saw Desktop end a one-hour Monitor watch at 30:00, and Anthropic's docs give the same cap.
+- **As a plain background command,** Anthropic's docs give it no time limit in the desktop app. In OpenRig's test,
+  one outlasted Monitor's cap: it was still running at 40 minutes when an item arrived, and the session closed that
+  item 11 s after it was created. The full 55 minutes, a quit app and a sleeping Mac weren't tested.
+
+- **Only if the person has said they want teammates to be able to wake this session.** Never turn it on yourself, and
+  never change their settings for it.
+- The shell needs this seat's identity: export the `OPENRIG_SESSION_NAME` that the one-time attach printed.
+- Start this as a background command, then end your turn. Don't poll it yourself.
+
+```sh
+# Waits until a task is assigned to this seat, prints it and exits; ends after MAX seconds.
+max=${MAX:-3300}; every=${EVERY:-5}; end=$(( $(date +%s) + max )); checked=0; failing_since=""
+while [ "$(date +%s)" -lt "$end" ]; do
+  if out=$(rig queue list --owned --state pending --json 2>/dev/null); then
+    checked=1; failing_since=""
+    case "$out" in *'"qitemId"'*) printf 'NEW WORK: %s\n' "$out"; exit 0 ;; esac
+  elif [ -z "$failing_since" ]; then
+    failing_since=$(date -u +%H:%M:%SZ)
+  fi
+  sleep "$every"
+done
+why="Run rig queue list --owned to see why (this seat's identity, the daemon) before starting the wait again."
+if [ "$checked" = 0 ]; then
+  echo "Couldn't check for work: every poll failed. $why"; exit 1
+elif [ -n "$failing_since" ]; then
+  echo "Checking stopped working at $failing_since: every poll since then failed. $why"; exit 1
+fi
+echo "No new work before the deadline. Start the wait again."
+```
+
+- **When it wakes you with `NEW WORK`:** `rig queue claim` each item, do it, and close it with the answer. Then start
+  the wait again and end your turn.
+- **Don't leave an item you've seen pending:** it wakes you again at once. Claim it, block it or hand it off.
+- **A failed poll doesn't end the wait;** only new work or the deadline does.
+- **If every poll failed, or every poll since some point did** (the daemon stopped mid-wait), it says so, with when,
+  and exits non-zero instead of reporting no work. A failure followed by a successful poll stays quiet. Find out why
+  with `rig queue list --owned` (usually this seat's identity, or the daemon) before starting the wait again.
+- **If your app stops the background command, or you start a new session,** start the wait again.
 
 ## Troubleshooting and Weird States
 

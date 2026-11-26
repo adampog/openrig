@@ -31,7 +31,10 @@ export type FindingKind =
   // SPEC.md compatibility — a node carrying BOTH authored files. Advisory by
   // construction (low severity never flips the exit code): SPEC.md wins, and the
   // shadowed README.md is a state to notice, never a failure to gate on.
-  | "shadowed_node_file";
+  | "shadowed_node_file"
+  // Another mission has a slice folder of the same name, which the slice list and the name-only routes
+  // hide. Advisory (low severity): renaming is the person's call.
+  | "slice_name_shared";
 
 export interface AuditFinding {
   kind: FindingKind;
@@ -166,6 +169,11 @@ export function deriveMissionDependencyGraph(input: MissionDependencyGraphInput)
 // without this file changing too).
 export const MISSION_BRIEF_HEADERS = ["What & why", "Building", "Progress", "Proven", "Needs you", "Pointers"];
 
+// A slice directory's name: two or more digits, a dash, then the slug. `rig scope slice create` numbers past 99
+// (100-…), so a two-digit-only check flags names OpenRig made. The CLI audit and the daemon's audit route both read
+// this one pattern.
+export const SLICE_DIRECTORY_NAME = /^\d{2,}-/;
+
 function childPath(parent: string, child: string): string {
   return parent.endsWith("/") ? `${parent}${child}` : `${parent}/${child}`;
 }
@@ -184,9 +192,17 @@ function parseStatusFromFrontmatter(raw: string | null): string | null {
   return null;
 }
 
+const NON_DELIVERY_CLOSURE_WORDS = new Set([
+  "closed-wontfix",
+  "closed-deferred",
+  "closed-superseded",
+  "closed-stale",
+]);
+
 function statusRequiresProof(status: string | null | undefined): boolean {
   if (!status) return false;
   const normalized = status.toLowerCase().trim();
+  if (NON_DELIVERY_CLOSURE_WORDS.has(normalized)) return false;
   return normalized.includes("done")
     || normalized.includes("ship")
     || normalized.includes("close")
@@ -243,6 +259,38 @@ function h2Body(content: string, heading: string): string | null {
   const rest = content.slice(match.index + match[0].length);
   const next = rest.search(/^##\s+/m);
   return next === -1 ? rest : rest.slice(0, next);
+}
+
+// A pilot slice's single `## Requirements` R list (a planning pilot's draft format, 2026-11-15): bullets that start
+// `R<n>.`, plain or bold, each with its proof after `Observable:`, plain or italic, in the same item. It's known only
+// by its R ids, so a `## Requirements` of unnumbered lines (the format's "not numbered yet", and older slices' own
+// lists) reads as before.
+const R_ITEM_START = /^\s*[-*+]\s+(?:\*{1,2}|_{1,2})?(R\d+)[.:]/;
+const R_ITEM_OBSERVABLE = /\bObservable\b(?:\*{1,2}|_{1,2})?\s*:\s*(?:\*{1,2}|_{1,2})?\s*[^\s*_]/i;
+
+const LIST_ITEM_START = /^\s*(?:[-*+]|\d+[.)])\s+/;
+
+/** The R items in a `## Requirements` body that carry no observable proof, or null when it names no R item. An item
+ *  runs as a Markdown list item does: its deeper-indented lines and its lazy continuation lines, until a sibling or
+ *  outer list item, or text back at its margin after a blank line. */
+function requirementsRList(body: string | null): { withoutProof: string[] } | null {
+  if (body === null) return null;
+  const items: Array<{ id: string; text: string }> = [];
+  let open: { indent: number; afterBlank: boolean } | null = null;
+  for (const line of body.split("\n")) {
+    const start = R_ITEM_START.exec(line);
+    const indent = line.length - line.trimStart().length;
+    if (start) {
+      items.push({ id: start[1]!, text: line });
+      open = { indent, afterBlank: false };
+    } else if (open) {
+      if (line.trim() === "") open.afterBlank = true;
+      else if (indent <= open.indent && (LIST_ITEM_START.test(line) || open.afterBlank)) open = null;
+      else items[items.length - 1]!.text += `\n${line}`;
+    }
+  }
+  if (items.length === 0) return null;
+  return { withoutProof: items.filter((item) => !R_ITEM_OBSERVABLE.test(item.text)).map((item) => item.id) };
 }
 
 // A mission is ACTIVE unless its status names a terminal / archived state.
@@ -422,7 +470,7 @@ export function classifyScopeItem(input: ScopeAuditInput): ScopeAuditResult {
       });
     }
 
-    // PM dogfood #1 (qitem-20260720015700-630eef64) — per-SECTION source
+    // PM dogfood #1 — per-SECTION source
     // selection, decided independently for `## Mini-requirements` and
     // `## Proof contract`: an authored PRD section is canonical, but a
     // PRESENT-and-PRISTINE scaffold-only PRD section yields to an authored
@@ -453,6 +501,10 @@ export function classifyScopeItem(input: ScopeAuditInput): ScopeAuditResult {
     };
     const miniSource = pickSectionSource("Mini-requirements");
     const contractSource = pickSectionSource("Proof contract");
+    // The pilot's R list stands in for both lists. An R item without its observable proof gets the proof finding below,
+    // naming it, instead of a request to add the two lists back.
+    const requirementsSource = pickSectionSource("Requirements");
+    const rList = requirementsSource ? requirementsRList(requirementsSource.body) : null;
     if (miniSource) {
       // OPR.0.4.4.23 rev1-r2 B1 (PRD L34 guard F-3): well-formed
       // `## Mini-requirements` — the PLAN leg of the Living Notes
@@ -466,7 +518,7 @@ export function classifyScopeItem(input: ScopeAuditInput): ScopeAuditResult {
       // blindness in one predicate; the finding message below already reads
       // honestly for both and stays unchanged).
       const hasNumberedItem = hasAuthoredNumberedItem(miniBody);
-      if (!hasNumberedItem) {
+      if (!hasNumberedItem && !rList) {
         findings.push({
           kind: "mini_requirements_missing_or_malformed",
           severity: "low",
@@ -492,7 +544,16 @@ export function classifyScopeItem(input: ScopeAuditInput): ScopeAuditResult {
         [...contractBody.matchAll(/^\s*-\s*\[[ xX]\]\s*(.*)$/gm)].some(
           (m) => !isScaffoldPlaceholderText((m[1] ?? "").trim()),
         );
-      if (!hasAuthoredCheckboxItem) {
+      if (rList && rList.withoutProof.length > 0) {
+        findings.push({
+          kind: "proof_contract_missing_or_malformed",
+          severity: "low",
+          path: requirementsSource?.path ?? contractSource.path,
+          message: `\`## Requirements\` has R items with no observable proof (${rList.withoutProof.join(", ")}), so proof has nothing to pair against for them.`,
+          remediation: `Add each one's observable proof to the same item, after \`Observable:\`. The R list stands in for \`## Mini-requirements\` and \`## Proof contract\`.`,
+        });
+      }
+      if (!hasAuthoredCheckboxItem && !rList) {
         findings.push({
           kind: "proof_contract_missing_or_malformed",
           severity: "low",
@@ -512,9 +573,13 @@ export function classifyScopeItem(input: ScopeAuditInput): ScopeAuditResult {
         // token in the proof contract. Generic prose containing the word
         // "mockup" (the scaffold placeholder says "name their planned
         // mockup") is NOT a reference and must not suppress the advisory.
+        // An accepted R list stands in for the proof contract here too.
+        const rListBody = rList ? requirementsSource?.body ?? "" : "";
         const hasMockupRef = /!\[/.test(visualBody ?? "")
           || /plannedRef/i.test(contractBody ?? "")
-          || /!\[/.test(contractBody ?? "");
+          || /!\[/.test(contractBody ?? "")
+          || /plannedRef/i.test(rListBody)
+          || /!\[/.test(rListBody);
         if (isUiSlice && !hasMockupRef) {
           findings.push({
             kind: "ui_slice_missing_mockup",

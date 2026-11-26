@@ -13,24 +13,29 @@ import { parseCommand } from "./grammar.js";
 import { filterPalette, paletteExecuteLine } from "./commands/palette.js";
 import { COMMAND_REGISTRY, currentCommandContext } from "./commands/registry.js";
 import { createInputDecoder, resolveEscapeAction, resolveKeyAction, resolveMouseAction, MOUSE_ENABLE, MOUSE_DISABLE, ALT_SCREEN_ON, ALT_SCREEN_OFF, PASTE_ENABLE, PASTE_DISABLE } from "./input.js";
-import { renderScreen } from "./render.js";
+import { drawableSize, renderScreen } from "./render.js";
 import { createStyle, detectColorMode } from "./theme.js";
 import { stylizeLines } from "./stylize.js";
-import { createControlSocket, defaultSocketPath } from "./socket-server.js";
+import { createControlSocket, defaultSocketPath, type ControlSocket } from "./socket-server.js";
 import { demoSnapshot } from "./demo-data.js";
 import { DaemonClient, launchNodeNotice } from "./daemon-client.js";
 import { hydrateSnapshot } from "./hydrate.js";
 import { createLiveRefresh } from "./live.js";
 import { resolvePendingAddress } from "./pending-address.js";
 import { subscribeActivityEvents } from "./live-events.js";
+import { checkVersionSkew, parseCliIdentity } from "./version-skew.js";
 import { execFile } from "node:child_process";
+import { helperCwd } from "./helper-cwd.js";
 import { probeCrashCart, type CrashCartRenderOpts } from "./crash-cart/from-emit.js";
 import { resolveCrashCartKey, type CrashCartKeyAction } from "./crash-cart/keys.js";
 import { driveRestoreLifecycle, buildRestoreLifecycleVM } from "./crash-cart/restore-lifecycle.js";
 import { restoreKeyAction, type RestoreInputEvent } from "./crash-cart/restore-input.js";
 import { evaluateOneClickGate, restoreConfirmMessage } from "./crash-cart/one-click-gate.js";
-import { daemonStartArgs } from "./crash-cart/start-daemon.js";
+import { daemonStartArgs, daemonStartTimeoutMs, runDaemonStart } from "./crash-cart/start-daemon.js";
 import { readLocal } from "./local-reading.js";
+import { replyAct, opensOnDefaultFeed, actingAs, answerRequest } from "./attention/attention-model.js";
+import { decidePairRequest } from "./config/pairing.js";
+import type { AttentionRead } from "@openrig/daemon/attention";
 import { StartupController } from "./startup.js";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -39,6 +44,7 @@ import type { SpecReviewCache } from "./hydrate.js";
 import { MOTION_FRAME_MS } from "./visual-layout.js";
 import { launchProcess, runSpecLaunch } from "./specs/launch.js";
 import { runCopySession, processCopyTerminal } from "./print-for-copy.js";
+import { isBoundSocketCopy } from "./socket-copy.js";
 import { openTerminalInWindow, terminalWindowNotice } from "./terminals/open-window.js";
 
 function argOf(args: string[], flag: string): string | undefined {
@@ -61,26 +67,43 @@ async function run(): Promise<void> {
   let snapshot: FleetSnapshot = demo ? demoSnapshot() : emptySnapshot();
   let timeReadWarning = false;
   const timeSetting = new Promise<unknown>((resolve) => {
-    execFile(cliExecutable, cliArgs(["config", "get", "ui.timezone", "--json"]), { timeout: 5000, maxBuffer: 8192 }, (err, stdout, stderr) => {
+    execFile(cliExecutable, cliArgs(["config", "get", "ui.timezone", "--json"]), { cwd: helperCwd(), timeout: 5000, maxBuffer: 8192 }, (err, stdout, stderr) => {
       timeReadWarning = !!err || stderr.includes("ui.timezone");
       if (err) return resolve(null);
       try { resolve(JSON.parse(stdout).value); } catch { resolve(null); }
     });
   });
+  // #3637: each start reads the wait the `rig daemon start` it runs will use, from that same CLI (`viaPathRig` for
+  // the start that runs the bare `rig`), so the TUI never ends it first.
+  const startTimeoutMs = (viaPathRig = false): Promise<number> => new Promise<number>((resolve) => {
+    const configArgs = ["config", "get", "daemon.start_readiness_wait_seconds", "--json"];
+    execFile(viaPathRig ? "rig" : cliExecutable, viaPathRig ? configArgs : cliArgs(configArgs), { cwd: helperCwd(), timeout: 5000, maxBuffer: 8192 }, (err, stdout) => {
+      let value: unknown = null;
+      if (!err) { try { value = JSON.parse(stdout).value; } catch { value = null; } }
+      resolve(daemonStartTimeoutMs(value));
+    });
+  });
   const view = createViewState({ instanceId, getSnapshot: () => snapshot, timeZoneWarning: "Reading configured timezone…" });
   let startupHeaders: () => Record<string, string> = () => ({});
+  let actionHeaders: () => Record<string, string> = () => ({});
   if (cliEntry) {
     try {
       const cli = await import(pathToFileURL(join(dirname(cliEntry), "client.js")).href);
       startupHeaders = cli.terminalAuthHeaders;
+      // Answering an ask is operator-gated: the daemon's operator bearer when one is configured, else the terminal
+      // credential as before (a CLI without the helper keeps that).
+      actionHeaders = typeof cli.operatorAuthHeaders === "function" ? () => cli.operatorAuthHeaders() : cli.terminalAuthHeaders;
     } catch { /* the startup read will expose an unavailable/unauthorized prerequisite */ }
   }
-  const client = demo ? null : new DaemonClient({ baseUrl: argOf(args, "--url"), headers: startupHeaders });
+  const client = demo ? null : new DaemonClient({ baseUrl: argOf(args, "--url"), headers: startupHeaders, actionHeaders });
   let startup: StartupController | null = null;
   let nativeAttached = false;
   let launching = false;
   let openingTerminal = false;
   let controlSocketPath: string | undefined;
+  /** Why no control socket could be bound, when that happened. Shown in the status bar for as long as
+   *  the TUI runs: the notice above it can be replaced by choosing work, and this cannot. */
+  let controlSocketFailure: string | null = null;
   let shuttingDown = false;
 
   let inputLine = "";
@@ -124,7 +147,7 @@ async function run(): Promise<void> {
   const selectedRigName = (): string | null =>
     view.get().drill.find((part) => part.kind === "rig")?.name ?? null;
   const live = client
-    ? createLiveRefresh({ scopeKey: () => pageReadKey(view.get()), hydrate: (page, signal) => hydrateSnapshot(client.forPage(page, signal), reviewCache, view.get().scopesMission, selectedSliceDirectory(), selectedRigName(), view.get()), onFrame: () => draw(), now: () => Date.now() })
+    ? createLiveRefresh({ scopeKey: () => pageReadKey(view.get()), hydrate: (page, signal, firstPaint) => hydrateSnapshot(client.forPage(page, signal), reviewCache, view.get().scopesMission, selectedSliceDirectory(), selectedRigName(), view.get(), { firstPaint }), onFrame: () => draw(), now: () => Date.now() })
     : null;
   let motionTimer: NodeJS.Timeout | null = null;
   // S19 AM-R18 — the open view updates ITSELF: oracle pushes drive the refresh owner.
@@ -138,11 +161,50 @@ async function run(): Promise<void> {
   let drawnSettled = false;
   let previousPage: { state: ReturnType<typeof view.get>; snapshot: FleetSnapshot } | undefined;
   let activityEvents: ReturnType<typeof subscribeActivityEvents> | null = null;
+  // A daemon upgraded or restarted under this TUI: on the first connect and every reconnect, compare
+  // builds; on a mismatch stop the background reads (event-driven and quiet) until the TUI restarts.
+  const tuiBuild = parseCliIdentity(process.env["OPENRIG_TUI_CLI_IDENTITY"]);
+  let buildMismatch = false;
+  let eventsDropped = false;
+  function checkDaemonBuild(attempt = 0): void {
+    if (!live || !client || buildMismatch) return;
+    void checkVersionSkew(tuiBuild, () => client.health()).then((skew) => {
+      // A loaded daemon can time out a /healthz read; retry twice before waiting for the next reconnect.
+      if (skew.state === "unreadable" && attempt < 2) { setTimeout(() => checkDaemonBuild(attempt + 1), 15_000).unref(); return; }
+      if (skew.state !== "mismatch" || buildMismatch) return;
+      buildMismatch = true;
+      activityEvents?.close();
+      live.stopBackground(skew.message);
+    });
+  }
   function enableLive(): boolean {
     if (!live || !client || startup?.state.connection !== "up") return false;
+    if (!liveEnabled) checkDaemonBuild();
+    if (!liveEnabled) openChosenDefaultFeed();
     liveEnabled = true;
-    activityEvents ??= subscribeActivityEvents({ open: () => client.openActivityEvents(), onEvent: (event) => { if (event.type.startsWith("proof.")) reviewCache.clear(); void live.invalidate(); }, onStatus: (status) => live.connectionStatus(status) });
+    if (!buildMismatch) activityEvents ??= subscribeActivityEvents({ open: () => client.openActivityEvents(), onEvent: (event) => { if (event.type.startsWith("proof.")) reviewCache.clear(); live.pushed(); }, onStatus: (status) => {
+      if (status === "dropped") eventsDropped = true;
+      else if (status === "connected" && eventsDropped) { eventsDropped = false; checkDaemonBuild(); }
+      live.connectionStatus(status);
+    } });
     return true;
+  }
+  // Once, when the TUI first reaches the daemon, whichever startup path gets there: the chosen default person's Feed opens
+  // first, only for someone who hasn't touched anything since the TUI started (see opensOnDefaultFeed).
+  let defaultFeedChecked = false;
+  function openChosenDefaultFeed(): void {
+    if (defaultFeedChecked || !client) return;
+    defaultFeedChecked = true;
+    if (inputRevision !== 0) return;
+    // After the page's first answer: on a busy daemon this read takes seconds, and Topology's reads would wait behind it.
+    void (live ? live.answered() : Promise.resolve())
+      .then(() => inputRevision === 0 ? client.humanAttention(null, "default") : null)
+      .then((read) => {
+        if (!opensOnDefaultFeed(read as AttentionRead | null, view.get(), inputRevision === 0)) return;
+        view.dispatch({ type: "jump", section: "needs" });
+        draw();
+        void live?.refresh();
+      }, () => {});
   }
   function commandContext() {
     return currentCommandContext(startup && startup.state.connection !== "up" ? "unverified" : crashCartOpts.daemonState ?? null);
@@ -150,8 +212,11 @@ async function run(): Promise<void> {
 
   function draw(): void {
     if (nativeAttached) return;
-    const cols = process.stdout.columns ?? 120;
-    const rows = process.stdout.rows ?? 32;
+    // A terminal reporting 0 rows or columns has nothing to draw into: skip the frame (the view keeps its state) and
+    // let the next resize draw.
+    const size = drawableSize(process.stdout.columns, process.stdout.rows);
+    if (!size) return;
+    const { cols, rows } = size;
     const nowMs = Date.now();
     if (live) {
       const next = live.snapshot();
@@ -171,7 +236,7 @@ async function run(): Promise<void> {
       ...(!liveEnabled ? { readErrors: [`Live data not loaded · connection ${startup?.state.connection ?? "probing"} · L Local reading · S Startup`] } : {}),
       launchingCli: process.env["OPENRIG_TUI_CLI_IDENTITY"]?.replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 180) };
     if (resolvePendingAddress(view, liveEnabled && live ? live.load() : null)) refreshFromActivity();
-    const opts = { cols, rows, nowMs, completion, controlSocketPath, colorMode: style.mode, commandContext: commandContext(), ...crashCartOpts, ...(startup?.state.open && !view.get().palette ? { startup: startup.state } : {}), restoreScroll: restoreScrollOffset, ...(liveEnabled && live ? { load: live.load(), rowFlashes: live.flashes() } : {}) };
+    const opts = { cols, rows, nowMs, completion, controlSocketPath, ...(controlSocketFailure !== null ? { controlSocketUnavailable: true } : {}), colorMode: style.mode, commandContext: commandContext(), ...crashCartOpts, ...(startup?.state.open && !view.get().palette ? { startup: startup.state } : {}), restoreScroll: restoreScrollOffset, ...(liveEnabled && live ? { load: live.load(), rowFlashes: live.flashes() } : {}) };
     if (liveEnabled && live?.load().settled) previousPage = { state: { ...view.get() }, snapshot };
     const pageOptions = { ...opts, ...(liveEnabled && !live?.load().settled ? { previousPage } : {}) };
     lastScreen = renderScreen(view.get(), snapshot, pageOptions, inputLine);
@@ -194,19 +259,19 @@ async function run(): Promise<void> {
   // JSON is the truth even on a hint non-zero exit). Any failure → normal TUI (never a fabricated cockpit).
   const runCrashCartVerb = (): Promise<string> =>
     new Promise((resolve, reject) => {
-      execFile(cliExecutable, cliArgs(["crash-cart", "--json"]), { timeout: 5000, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
+      execFile(cliExecutable, cliArgs(["crash-cart", "--json"]), { cwd: helperCwd(), timeout: 5000, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
         if (stdout && stdout.trim()) resolve(stdout);
         else reject(new Error(stderr.trim() || err?.message || "crash-cart: no output"));
       });
     });
   if (client) startup = new StartupController({
     client, home: process.env["OPENRIG_HOME"] ?? "default local instance", probe: runCrashCartVerb,
-    startDaemon: () => new Promise<void>((resolve, reject) => {
-      execFile(cliExecutable, cliArgs(daemonStartArgs(client.baseUrl)), { timeout: 30_000 }, (error, stdout, stderr) => {
+    startDaemon: () => startTimeoutMs().then((timeout) => new Promise<void>((resolve, reject) => {
+      runDaemonStart(cliExecutable, cliArgs(daemonStartArgs(client.baseUrl)), { cwd: helperCwd(), timeout }, (error, stdout, stderr) => {
         if (error) reject(new Error(`Daemon start did not confirm completion: ${stderr.trim() || stdout.trim() || error.message}`));
         else resolve();
       });
-    }),
+    })),
     onChange: () => {
       draw();
       // Skip during the probe must remain skipped, but can start reads when
@@ -294,9 +359,9 @@ async function run(): Promise<void> {
     const daemonClient = client;
     restoreCancelRequested = false;
     restoreScrollOffset = 0;
-    new Promise<void>((resolve, reject) =>
-      execFile("rig", ["daemon", "start"], { timeout: 30_000 }, (err) => (err ? reject(err) : resolve())),
-    )
+    startTimeoutMs(true).then((timeout) => new Promise<void>((resolve, reject) =>
+      runDaemonStart("rig", ["daemon", "start"], { cwd: helperCwd(), timeout }, (err) => (err ? reject(err) : resolve())),
+    ))
       .then(() => pollRestore(daemonClient))
       .catch((e: unknown) => {
         crashCartOpts = { ...crashCartOpts, restore: undefined };
@@ -332,7 +397,7 @@ async function run(): Promise<void> {
       startingDaemon = true;
       crashCartOpts = { ...crashCartOpts, starting: client!.baseUrl };
       draw();
-      execFile(cliExecutable, cliArgs(startArgs), { timeout: 30_000 }, (error, stdout, stderr) => {
+      void startTimeoutMs().then((timeout) => runDaemonStart(cliExecutable, cliArgs(startArgs), { cwd: helperCwd(), timeout }, (error, stdout, stderr) => {
         startingDaemon = false;
         if (error) {
           crashCartOpts = { unavailable: `Daemon start did not confirm completion. Retry reads actual state before another attempt. ${stderr.trim() || stdout.trim() || error.message}` };
@@ -340,8 +405,10 @@ async function run(): Promise<void> {
         } else {
           void refreshCrashCart();
           void live?.refresh();
+          // Daemon only: no seat was started. Start and return lists the rigs, with a kernel first if there is one, to bring one back.
+          if (startup) view.dispatch({ type: "notice", message: "Daemon started; this start didn't start any seats. Press S to choose seats to bring back; a kernel, if you have one, is listed first." });
         }
-      });
+      }));
       return;
     }
     if (action === "restore") {
@@ -379,20 +446,32 @@ async function run(): Promise<void> {
   }
 
   const socketPath = argOf(args, "--socket") ?? defaultSocketPath(instanceId);
-  const socket = await createControlSocket({
-    socketPath,
-    fallbackOnCollision: true,
-    view,
-    onMutation: () => {
-      inputRevision += 1; startup?.interacted();
-      if (startup) startup.state.open = false;
-      draw();
-      refreshFromActivity();
-    },
-    currentContext: () => commandContext(),
-  });
+  // The control socket is how an agent reads and drives this TUI. Losing it costs that, not the
+  // session: a socket home that cannot be written, or a second endpoint that also fails, leaves the
+  // operator with a TUI that draws and works and cannot be reached from outside. Losing the whole
+  // launcher over it would be the worse trade, so the failure is caught and said out loud instead.
+  let socket: ControlSocket | null = null;
+  try {
+    socket = await createControlSocket({
+      socketPath,
+      fallbackOnCollision: true,
+      view,
+      onMutation: () => {
+        inputRevision += 1; startup?.interacted();
+        if (startup) startup.state.open = false;
+        draw();
+        refreshFromActivity();
+      },
+      currentContext: () => commandContext(),
+    });
+  } catch (error) {
+    controlSocketFailure = error instanceof Error ? error.message : String(error);
+  }
 
-  if (socket.path !== socketPath) controlSocketPath = socket.path;
+  if (socket && socket.path !== socketPath) controlSocketPath = socket.path;
+  if (controlSocketFailure !== null) {
+    view.dispatch({ type: "notice", message: `Control socket unavailable, so an agent cannot read or drive this TUI: ${controlSocketFailure}` });
+  }
 
   // Reuse the CLI's desktop opener and the daemon's node-launch contract.
   // The view-state is only told the outcome.
@@ -416,6 +495,17 @@ async function run(): Promise<void> {
       } else if (action.act === "run") {
         const result = await client.launchNode(action.rigId, action.agent);
         view.dispatch({ type: "notice", message: launchNodeNotice(action.agent, result) });
+      } else if (action.act === "pair-decision") {
+        view.dispatch({ type: "notice", message: await decidePairRequest(client, action) });
+      } else if (action.act === "answer") {
+        const result = await client.missionControlAction(answerRequest(action));
+        const actor = actingAs(snapshot.attentionRead, action.actorSession);
+        view.dispatch({ type: "notice", message: action.verb === "resolve" ? `Resolved ${action.qitemId} as ${actor}: it's unparked for its owner, with your decision.`
+          : action.verb === "approve"
+          // A runner's permission request says what became of the answer: handed to its receiving agent, or kept.
+          ? result.answer?.message ?? `Approved ${action.qitemId} as ${actor}: the request is closed on its own row.`
+          : result.answer?.message ?? (result.answer?.outcome === "recorded" ? `Recorded on ${action.qitemId}. Still to answer: ${result.answer.unanswered.join("; ")}`
+          : `Answered ${action.qitemId} as ${actor}: the answer went back to the asker, and the request is closed.`) });
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -455,6 +545,10 @@ async function run(): Promise<void> {
       } catch (err) { view.dispatch({ type: "notice", message: (err as Error).message }); }
       return;
     }
+    if (action.type === "attention-reply") {
+      perform(replyAct(snapshot.attentionRead, view.get().attentionOpen, action.text));
+      return;
+    }
     if (action.type === "act") {
       view.dispatch({ type: "notice", message: `${action.act}…` });
       void executeAct(action);
@@ -474,7 +568,7 @@ async function run(): Promise<void> {
     live?.close();
     unsubscribeCopyMode();
     process.stdout.write(PASTE_DISABLE + MOUSE_DISABLE + ALT_SCREEN_OFF);
-    await socket.close();
+    if (socket) await socket.close();
     activityEvents?.close();
     process.exit(0);
   }
@@ -493,7 +587,7 @@ async function run(): Promise<void> {
       // contexts, whose input handlers otherwise consume the status-row click.
       if (ev.type === "mouse" && ev.button === 0 && lastScreen) {
         const hit = lastScreen.hitMap.find((h) => h.y === ev.y && ev.x >= h.x1 && ev.x <= h.x2);
-        if (hit?.action.type === "print-for-copy" && hit.action.value === socket.path) {
+        if (socket && hit && isBoundSocketCopy(hit.action as { type: string; value?: string }, socket.path)) {
           perform(hit.action);
           return;
         }
@@ -738,8 +832,9 @@ async function run(): Promise<void> {
   draw();
   // Probe the daemon-down verdict once on launch: bare `rig` with the daemon down renders the cockpit.
   // (Key-triggered re-probe after `s start daemon` / `r retry` is the follow-on increment.)
+  // --demo renders its labeled fixture without a daemon, so it never probes for one.
   if (startup) void startup.refresh();
-  else void refreshCrashCart();
+  else if (!demo) void refreshCrashCart();
   // A merely-open TUI must impose no steady-state fleet load. The initial
   // hydrate establishes honest state; navigation, commands, and socket-driven
   // mutations request later truth through the same single-flight owner.

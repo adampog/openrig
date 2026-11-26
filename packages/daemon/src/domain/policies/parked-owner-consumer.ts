@@ -7,29 +7,30 @@
 // wake to the first eligible parked owner per evaluation. The S01 ladder owns
 // retries/escalation; the watchdog engine owns scheduling.
 //
-// RECEIPTS ARE ROW-SIDE (R2 repair, advisor-approved): the episode receipt is a
-// queue TRANSITION on the episode's primary obligation row, written BEFORE the
-// engine delivers (reserve-before-deliver — the at-most-once contract: a crash
-// between reserve and delivery loses that wake recoverably, never duplicates;
-// exactly-once is not claimed without an idempotent transport). Durability comes
-// from queue-retention's binding active-frontier invariant — transitions of any
-// non-terminal qitem are never touched, at any age — so an open park's receipt
-// outlives watchdog telemetry pruning by construction, and once the row is
-// terminal the obligation is gone and the episode is moot.
+// Row notes describe attempts and preserve positive prompt-refusal recovery. They
+// do not veto an undelivered reminder. Recorded success and actual prompt holds
+// still apply. A typed quota refusal waits for admission or obligation changes while existing recovery keeps custody.
+// The engine owns cadence; attempts rotate eligible owners.
 //
 // One-oracle law (mini-req 2): the parked verdict, held-health classification,
 // indeterminate arm, and obligation join all come from diagnoseRigParked — this
 // module re-derives nothing and never reads raw per-runtime evidence.
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Policy, PolicyJob, PolicyEvaluation } from "./types.js";
-import type { WatchdogHistoryEntry } from "../watchdog-history-log.js";
+import { BACKGROUND_SHELL_GRACE_MINUTES } from "../queue-pickup.js";
+import { deliveryReachedSeat, type WatchdogHistoryEntry } from "../watchdog-history-log.js";
 
 /** Structural view of the shipped SeatParkedDiagnosis (parked-query.ts). */
 export interface ParkedSeatDiagnosisView {
   sessionName: string;
   parked: boolean | "indeterminate";
-  activity: { value: string; needsInput: { count: number; reason: string | null } };
+  /** `since`: when the seat's arbitrated state last changed, so for a stopped seat, when it began waiting. */
+  activity: {
+    value: string; needsInput: { count: number; reason: string | null }; since?: string | null;
+    /** #2661 (b): a live background shell, first seen at observedAt. */
+    backgroundWork?: { observedAt: string } | null;
+  };
   obligations: {
     items: Array<{ qitemId: string; state: string; summary: string | null }>;
     held: Array<{ qitemId: string; healthy: boolean }>;
@@ -39,13 +40,18 @@ export interface ParkedSeatDiagnosisView {
 export interface RowTransitionView {
   ts: string;
   transitionNote: string | null;
+  /** Who wrote the transition and the row state it records. A view without them can't show that a
+   *  row is unchanged, so a repeat wake is never withheld on its account. */
+  actorSession?: string;
+  state?: string;
+  /** The persisted transition order (global across rows); orders changes that share a millisecond. */
+  transitionId?: number;
 }
 
 export interface ParkedOwnerConsumerDeps {
   /** The shipped rig-scoped diagnosis (diagnoseRigParked), adapter-constructed. */
   diagnoseRig: (rigName: string) => { seats: ParkedSeatDiagnosisView[] } | null;
-  /** Telemetry — used ONLY to reconcile recent delivery outcomes onto rows
-   *  (immediate horizon); NEVER as episode state. */
+  /** Bounded outcomes for rotation and best-effort reporting; missing history cannot veto input. */
   history: {
     listForJob: (jobId: string, limit: number) => WatchdogHistoryEntry[];
     countForJob: (jobId: string) => number;
@@ -53,8 +59,7 @@ export interface ParkedOwnerConsumerDeps {
   /** The durable row-side surfaces (queue repository, adapter-wired). */
   rows: {
     listTransitions: (qitemId: string) => RowTransitionView[];
-    /** State-preserving note append; ok:false when the row is terminal or missing
-     *  (the last guard of the delivery boundary). */
+    /** Best-effort state-preserving attempt note. Failure is not a transport refusal. */
     appendNote: (qitemId: string, note: string) => { ok: boolean };
     /** Lands a failed wake in the ladder's native vocabulary (last_nudge_result). */
     recordNudgeResult: (qitemId: string, result: string) => void;
@@ -63,9 +68,36 @@ export interface ParkedOwnerConsumerDeps {
     /** Existing delivery/recovery ownership; does not change the parked diagnosis. */
     recoveryOwnsWake?: (qitemId: string) => boolean;
   };
+  /** Optional attempt provenance; the transport still binds the actual recipient. */
+  occupantGeneration?: (sessionName: string) => string | null;
+  /** The same enforcer's owed turn-boundary/restore/audit state, not an idle-time inference. */
+  hasPendingPostCompactStage?: (sessionName: string) => boolean;
+  /** Existing bound-terminal authority; only a positive result excludes automated reminders. */
+  isTerminalSeat?: (sessionName: string) => boolean;
+  /** The seat's typing guard is at queue-only (#3076): a person types there, so nothing is typed; its open rows already
+   *  are the reminder in its queue. */
+  isQueueOnlySeat?: (sessionName: string) => boolean;
+  /** #3315: the seat's tmux server does not answer (the queue's delivery hold). Nothing is reserved or attempted until
+   *  it answers again; the reminder stays owed. */
+  terminalServerUnreachable?: (sessionName: string) => boolean;
+  /** Opaque current node/guard revision/retained quota inputs, not a parked-state oracle. */
+  retentionState?: (sessionName: string) => string | null;
+  /** The clock the waiting grace is measured on; the wall clock when absent. */
+  now?: () => number;
+  /** #2661 (b): how long a live background shell defers the reminder; BACKGROUND_SHELL_GRACE_MINUTES when absent. */
+  backgroundShellGraceMs?: number;
+  /** A delivered reminder whose rows are still pending and unclaimed past PARKED_OWNER_ESCALATE_AFTER_MS: tell someone who can
+   *  act, once per episode. Returns who was told; nothing is held, refused or re-sent to the seat. */
+  escalateUnclaimed?: (input: { seat: string; qitemIds: string[]; deliveredAt: string; episodeKey: string }) => Promise<string[]>;
 }
 
 export const PARKED_OWNER_POLICY_NAME = "parked-owner-consumer";
+/** A seat that just handed work off or asked a person has only started waiting (#1933): its first reminder waits
+ *  until its arbitrated waiting state has been unchanged this long. A seat at a prompt gets no grace. */
+export const PARKED_OWNER_IDLE_GRACE_MS = 5 * 60_000;
+/** How long a delivered reminder's rows may stay pending and unclaimed, with the seat idle and nothing changed, before
+ *  someone who can act is told. */
+export const PARKED_OWNER_ESCALATE_AFTER_MS = 15 * 60_000;
 
 /** Stable per-rig registration anchor: member@rig shape, policy name as slug. */
 export function makeRigAnchor(rigName: string): string {
@@ -84,12 +116,22 @@ export const RESERVE_PREFIX = "parked-owner wake reserved:";
 export const CLOSE_PREFIX = "parked-owner episode closed:";
 export const REFUSED_PREFIX = "parked-owner wake delivery refused:";
 export const FAILED_PREFIX = "parked-owner wake delivery failed:";
+/** A recorded ok wake to the same known occupant waits for a change to its obligations. */
+export const DELIVERED_PREFIX = "parked-owner wake delivered:";
 export const NUDGE_FAIL_PREFIX = "failed: parked-owner wake delivery";
+/** A queue-only seat's reminder, held on purpose (#3076): neither a delivery nor a failure. */
+export const HELD_PREFIX = "parked-owner wake held:";
+/** The once-per-episode notice that a delivered reminder's rows are still unclaimed. */
+export const ESCALATED_PREFIX = "parked-owner escalated:";
+const QUEUE_ONLY_NO_INPUT = "; code queue_only_seat; input not_reached;";
+const QUOTA_NO_INPUT = "; code retained_quota_full; input not_reached;";
+const TERMINAL_NO_INPUT = "; code terminal_seat; input not_reached;";
+export const PARKED_OWNER_COMPACTION_PENDING = "[managed-compaction-pending] Parked-owner reminder deferred until the existing post-compact stages clear.";
 
 /** Only the transport's interactive-prompt refusal counts — a generic failed
  *  delivery is never mislabeled refused. Literal source:
  *  session-transport.ts:1045 `Refused: '<name>' is at an interactive prompt`. */
-function isRefusedInteractive(deliveryReason: unknown): boolean {
+export function isRefusedInteractive(deliveryReason: unknown): boolean {
   return (
     typeof deliveryReason === "string" &&
     deliveryReason.startsWith("Refused:") &&
@@ -104,7 +146,7 @@ function idsHashOf(sortedIds: string[]): string {
 /** The key sits immediately after the prefix, delimited by ';', ' (' or EOL —
  *  anchored on the prefix so body words can never masquerade as the key. */
 function keyOfNote(note: string): string | null {
-  for (const prefix of [RESERVE_PREFIX, CLOSE_PREFIX, REFUSED_PREFIX, FAILED_PREFIX]) {
+  for (const prefix of [RESERVE_PREFIX, CLOSE_PREFIX, REFUSED_PREFIX, FAILED_PREFIX, DELIVERED_PREFIX]) {
     if (!note.startsWith(prefix)) continue;
     const rest = note.slice(prefix.length).trim();
     const m = rest.match(/^([^;()]+?)(?:;|\s*\(|$)/);
@@ -113,34 +155,38 @@ function keyOfNote(note: string): string | null {
   return null;
 }
 
-interface RowEpisodeState {
-  openKey: string | null;
-  refused: boolean;
-  nextOrdinal: number;
+/** The current machine-authored failure only: free-text suffixes never establish no-input. */
+export function currentParkedOwnerNoInputFailure(transitions: RowTransitionView[]):
+  { code: "retained_quota_full" | "terminal_seat"; ts: string; transitionId?: number } | null {
+  const reserve = [...transitions].reverse().find(t => t.transitionNote?.startsWith(RESERVE_PREFIX));
+  const key = reserve?.transitionNote && keyOfNote(reserve.transitionNote);
+  if (!key || !openKeysOnRow(transitions).includes(key)) return null;
+  for (const t of [...transitions].reverse()) {
+    // A later held note (the seat turned queue-only, #3076) supersedes an earlier refusal: input there stops by the level.
+    if (t.transitionNote?.startsWith(HELD_PREFIX)) return null;
+    if (t.transitionNote?.startsWith(`${FAILED_PREFIX} ${key}${QUOTA_NO_INPUT}`)) return { code: "retained_quota_full", ts: t.ts, transitionId: t.transitionId };
+    if (t.transitionNote?.startsWith(`${FAILED_PREFIX} ${key}${TERMINAL_NO_INPUT}`)) return { code: "terminal_seat", ts: t.ts, transitionId: t.transitionId };
+  }
+  return null;
 }
 
-/** Derive the episode state for one idsHash from the primary row's transitions.
- *  Open = a reserve note whose key has no later close note. FAILED annotates but
- *  does not close (the ladder owns the failure; the consumer never re-attempts).
- *  REFUSED marks the refusal cell for as long as the episode stays open. */
-function rowEpisode(transitions: RowTransitionView[], idsHash: string): RowEpisodeState {
-  const closed = new Set<string>();
-  const refusedKeys = new Set<string>();
-  let openKey: string | null = null;
-  let reserves = 0;
-  // listTransitions returns oldest-first; walk newest-first.
-  for (let i = transitions.length - 1; i >= 0; i--) {
-    const note = transitions[i]!.transitionNote ?? "";
-    const key = keyOfNote(note);
-    if (!key) continue;
-    if (note.startsWith(CLOSE_PREFIX)) closed.add(key);
-    else if (note.startsWith(REFUSED_PREFIX)) refusedKeys.add(key);
-    else if (note.startsWith(RESERVE_PREFIX) && key.includes(`|${idsHash}#`)) {
-      reserves += 1;
-      if (openKey === null && !closed.has(key)) openKey = key;
+/** Whether what the seat holds changed after `since`: on any of the rows, a transition by the seat
+ *  itself or a state change. Notes by other seats and system bookkeeping (this consumer's own
+ *  reserve and close notes) aren't changes. A transition the view can't attribute counts as one, and
+ *  so does a state with no baseline state to compare it with. */
+function changedSince(listTransitions: (qitemId: string) => RowTransitionView[], ids: string[], seat: string, since: { ts: string; transitionId?: number }): boolean {
+  for (const id of ids) {
+    let prior: string | undefined;
+    for (const t of listTransitions(id)) {
+      // The reserve and everything before it set the baseline state. Transition order decides when the
+      // view carries it, since two transitions can share a millisecond.
+      const atOrBefore = since.transitionId !== undefined && t.transitionId !== undefined ? t.transitionId <= since.transitionId : t.ts <= since.ts;
+      if (atOrBefore) { prior = t.state; continue; }
+      if (t.actorSession === undefined || t.state === undefined || t.actorSession === seat) return true;
+      if (prior !== t.state) return true;
     }
   }
-  return { openKey, refused: openKey !== null && refusedKeys.has(openKey), nextOrdinal: reserves + 1 };
+  return false;
 }
 
 /** Every open reserve key on a row, across all obligation-set hashes — the set a
@@ -159,13 +205,13 @@ function openKeysOnRow(transitions: RowTransitionView[]): string[] {
 }
 
 /** Open positive refusals and the exact obligation set reserved before delivery. */
-export function openPromptRefusals(transitions: RowTransitionView[]): Array<{ key: string; ids: string[]; refusedAt: string }> {
+export function openPromptRefusals(transitions: RowTransitionView[]): Array<{ key: string; ids: string[]; refusedAt: string; note: string }> {
   return openKeysOnRow(transitions).flatMap(key => {
     const refusal = transitions.find(t => t.transitionNote?.startsWith(REFUSED_PREFIX) && keyOfNote(t.transitionNote) === key);
     if (!refusal) return [];
     const reserve = transitions.find(t => t.transitionNote?.startsWith(RESERVE_PREFIX) && keyOfNote(t.transitionNote) === key);
     const ids = reserve?.transitionNote?.split("; obligations ")[1]?.split(",") ?? [];
-    return [{ key, ids, refusedAt: refusal.ts }];
+    return [{ key, ids, refusedAt: refusal.ts, note: refusal.transitionNote ?? "" }];
   });
 }
 
@@ -179,37 +225,62 @@ export function makeParkedOwnerConsumerPolicy(deps: ParkedOwnerConsumerDeps): Po
         return { action: "skip", reason: "indeterminate-not-parked", notes: { rig: rigName } };
       }
 
-      // B2 reconciliation (bounded, immediate horizon): land recent delivery
-      // outcomes onto the reserved rows. Refusals mark the refusal cell; generic
-      // failures enter the ladder's native vocabulary via last_nudge_result.
-      // The episode stays OPEN either way — the consumer never re-attempts.
-      const recent = deps.history.listForJob(job.jobId, Math.min(deps.history.countForJob(job.jobId), 25));
+      // Missing telemetry or note writes cannot prevent a current input attempt.
+      let recent: WatchdogHistoryEntry[] = [];
+      try { recent = deps.history.listForJob(job.jobId, 25); } catch { /* telemetry is not admission */ }
+      const latestRows = new Set<string>();
       for (const e of recent) {
-        if (e.outcome !== "sent" || !e.deliveryStatus || e.deliveryStatus === "ok") continue;
+        if (e.outcome === "skipped" || e.outcome === "terminal" || !e.deliveryStatus) continue;
         const n = e.evaluationNotes ?? {};
-        const key = typeof n["episodeKey"] === "string" ? (n["episodeKey"] as string) : null;
-        const primary = typeof n["primaryRow"] === "string" ? (n["primaryRow"] as string) : null;
-        if (!key || !primary) continue;
-        const trans = deps.rows.listTransitions(primary);
-        const alreadyRecorded = trans.some((t) => {
-          const note = t.transitionNote ?? "";
-          return (note.startsWith(REFUSED_PREFIX) || note.startsWith(FAILED_PREFIX)) && keyOfNote(note) === key;
-        });
-        if (alreadyRecorded) continue;
-        const reason = String(n["deliveryReason"] ?? e.deliveryStatus);
-        if (isRefusedInteractive(reason)) {
-          deps.rows.appendNote(primary, `${REFUSED_PREFIX} ${key}; ${reason}`);
-        } else {
-          deps.rows.appendNote(primary, `${FAILED_PREFIX} ${key}; ${reason}`);
-          deps.rows.recordNudgeResult(primary, `${NUDGE_FAIL_PREFIX} — ${reason}`);
+        const key = typeof n["episodeKey"] === "string" ? n["episodeKey"] : null;
+        const primary = typeof n["primaryRow"] === "string" ? n["primaryRow"] : null;
+        if (!key || !primary || latestRows.has(primary)) continue;
+        latestRows.add(primary);
+        if (deliveryReachedSeat(e.deliveryStatus)) {
+          try {
+            if (!deps.rows.listTransitions(primary).some(t => t.transitionNote === `${DELIVERED_PREFIX} ${key}`))
+              deps.rows.appendNote(primary, `${DELIVERED_PREFIX} ${key}`);
+          } catch { /* absent bookkeeping cannot prove a delivered reminder */ }
+          continue;
         }
+        const reason = String(n["deliveryReason"] ?? e.deliveryStatus);
+        // The parked policy retries after its own stage clears; the generic wake ladder must not interrupt restore.
+        if (reason.includes(PARKED_OWNER_COMPACTION_PENDING)) continue;
+        try {
+          const recorded = deps.rows.listTransitions(primary).some(t =>
+            (t.transitionNote?.startsWith(REFUSED_PREFIX) || t.transitionNote?.startsWith(FAILED_PREFIX)) && keyOfNote(t.transitionNote!) === key);
+          if (recorded) continue;
+          if (isRefusedInteractive(reason)) {
+            deps.rows.appendNote(primary, `${REFUSED_PREFIX} ${key}; ${reason}`);
+          } else {
+            const typedNoInput = n["deliveryInputPhase"] === "not_reached" && n["deliveryCode"] === "retained_quota_full";
+            const terminal = n["deliveryInputPhase"] === "not_reached" && n["deliveryCode"] === "terminal_seat";
+            const admission = typedNoInput ? QUOTA_NO_INPUT : terminal ? TERMINAL_NO_INPUT : "; detail:";
+            deps.rows.appendNote(primary, `${FAILED_PREFIX} ${key}${admission} ${reason}`);
+            const uncertain = n["deliveryInputPhase"] === "attempted" || n["deliveryInputPhase"] === "written";
+            deps.rows.recordNudgeResult(primary, `${uncertain ? "indeterminate: parked-owner wake delivery" : NUDGE_FAIL_PREFIX}${typedNoInput ? QUOTA_NO_INPUT : terminal ? TERMINAL_NO_INPUT : ""} — ${reason}`);
+          }
+        } catch { /* reporting failure is not permission to lose the next message */ }
       }
 
       const closures: string[] = [];
-      const skipped: Array<{ seat: string; why: string }> = [];
-      const seats = [...d.seats].sort((a, b) => a.sessionName.localeCompare(b.sessionName));
+      const skipped: Array<{ seat: string; why: string; primaryRow?: string; obligations?: string[]; episodeKey?: string; refusalReason?: string;
+        escalationFailure?: { episodeKey: string; failure: string } }> = [];
+      // Rotate after the latest physical delivery selection, including retained input. A single
+      // cursor from history cannot lose an owner's turn just because a bounded window filled.
+      const lastTarget = recent.find(e => e.deliveryStatus && e.deliveryTargetSession)?.deliveryTargetSession;
+      const ordered = [...d.seats].sort((a, b) => a.sessionName.localeCompare(b.sessionName));
+      const next = ordered.findIndex(seat => seat.sessionName === lastTarget) + 1;
+      const seats = [...ordered.slice(next), ...ordered.slice(0, next)];
 
       for (const seat of seats) {
+        // #3315: first, so it holds whatever else the seat reads as (a seat on a lost server often reads indeterminate):
+        // no reservation and no transition per scan for a seat whose terminal server does not answer; the first scan
+        // after it answers again sends the reminder.
+        if (deps.terminalServerUnreachable?.(seat.sessionName)) {
+          skipped.push({ seat: seat.sessionName, why: "terminal-server-unreachable" });
+          continue;
+        }
         if (seat.parked === "indeterminate") {
           skipped.push({ seat: seat.sessionName, why: "indeterminate-not-parked" });
           continue;
@@ -224,10 +295,11 @@ export function makeParkedOwnerConsumerPolicy(deps: ParkedOwnerConsumerDeps): Po
           // reserve key on the seat's rows, durably, on this pass (bounded —
           // one close note per open key, never a write per clean scan).
           for (const qitemId of knownRows) {
-            for (const key of openKeysOnRow(deps.rows.listTransitions(qitemId))) {
-              deps.rows.appendNote(qitemId, `${CLOSE_PREFIX} ${key} (seat resumed)`);
-              if (!closures.includes(key)) closures.push(key);
-            }
+            try {
+              for (const key of openKeysOnRow(deps.rows.listTransitions(qitemId))) {
+                if (deps.rows.appendNote(qitemId, `${CLOSE_PREFIX} ${key} (no longer observed parked)`).ok && !closures.includes(key)) closures.push(key);
+              }
+            } catch { /* best-effort closure of old prompt-refusal records */ }
           }
           continue;
         }
@@ -251,6 +323,31 @@ export function makeParkedOwnerConsumerPolicy(deps: ParkedOwnerConsumerDeps): Po
           continue;
         }
 
+        // Leave this wake unreserved: the existing next pass can remind the owner after restore/audit.
+        if (deps.hasPendingPostCompactStage?.(seat.sessionName)) {
+          skipped.push({ seat: seat.sessionName, why: "managed-compaction-pending" });
+          continue;
+        }
+
+        // #2661 (b): the turn is over but a shell the owner started still runs (a CI watch, a test suite). It is working
+        // in the background, up to a ceiling, so a forgotten shell still gets its reminder. Unreserved, as above.
+        const shell = seat.activity.backgroundWork?.observedAt ? Date.parse(seat.activity.backgroundWork.observedAt) : Number.NaN;
+        const shellGraceMs = deps.backgroundShellGraceMs ?? BACKGROUND_SHELL_GRACE_MINUTES * 60_000;
+        if (seat.activity.needsInput.count === 0 && Number.isFinite(shell) && (deps.now?.() ?? Date.now()) - shell < shellGraceMs) {
+          skipped.push({ seat: seat.sessionName, why: "background-shell" });
+          continue;
+        }
+
+        // A seat idle for moments has just handed off or asked someone, not got stuck holding work. The diagnosis says
+        // how long its waiting state has been unchanged; with no start known, the reminder goes as before. A seat at a
+        // prompt gets no grace: this attempt's refusal is what alerts whoever can clear the prompt.
+        const waitingSince = seat.activity.since ? Date.parse(seat.activity.since) : Number.NaN;
+        if (seat.activity.needsInput.count === 0 && Number.isFinite(waitingSince)
+          && (deps.now?.() ?? Date.now()) - waitingSince < PARKED_OWNER_IDLE_GRACE_MS) {
+          skipped.push({ seat: seat.sessionName, why: "waiting-grace" });
+          continue;
+        }
+
         // B1 — the delivery-boundary recheck: re-read the seat's open rows NOW;
         // an obligation closed after diagnosis must not be named or woken.
         const fresh = new Set(deps.rows.listOpenIds(seat.sessionName));
@@ -262,24 +359,96 @@ export function makeParkedOwnerConsumerPolicy(deps: ParkedOwnerConsumerDeps): Po
 
         const idsHash = idsHashOf(namedIds);
         const primaryRow = namedIds[0]!;
-        const ep = rowEpisode(deps.rows.listTransitions(primaryRow), idsHash);
-        if (ep.openKey !== null) {
-          skipped.push({
-            seat: seat.sessionName,
-            why: ep.refused ? "destination-refused-interactive-prompt" : "already-woken-this-episode",
-          });
+        const generation = deps.occupantGeneration?.(seat.sessionName) ?? null;
+        let transitions: RowTransitionView[] = [];
+        try { transitions = deps.rows.listTransitions(primaryRow); } catch { /* missing history cannot prove success or refusal */ }
+        const matches = (key: string) => key.startsWith(`${seat.sessionName}|${idsHash}#`);
+        const generationOf = (t: RowTransitionView | undefined) => t?.transitionNote?.match(/; generation ([^;\s]+);/)?.[1] ?? null;
+        // A queue-only seat: nothing is typed, its open rows are the reminder. Held once per obligation set and occupant,
+        // with no nudge result (each row keeps its own) and no failure code the no-input recovery would read. Once held,
+        // the unchanged hold is quiet (below), not a history row every scan.
+        if (deps.isQueueOnlySeat?.(seat.sessionName) === true && deps.isTerminalSeat?.(seat.sessionName) !== true) {
+          const held = `${HELD_PREFIX} ${seat.sessionName}|${idsHash}${generation === null ? "" : `; generation ${generation}`}${QUEUE_ONLY_NO_INPUT}`;
+          if (transitions.some(t => t.transitionNote?.startsWith(held))) {
+            skipped.push({ seat: seat.sessionName, why: "queue-only-seat-unchanged" });
+            continue;
+          }
+          try {
+            deps.rows.appendNote(primaryRow, `${held} The seat takes OpenRig's reminders only in its queue (typing guard queue-only); its open rows are the reminder. No input was written.`);
+          } catch { /* the rows stay open and listed */ }
+          skipped.push({ seat: seat.sessionName, why: "queue-only-seat" });
+          continue;
+        }
+        const reserve = [...transitions].reverse().find(t => t.transitionNote?.startsWith(RESERVE_PREFIX) && matches(keyOfNote(t.transitionNote) ?? ""));
+        const refused = openPromptRefusals(transitions).find(({ key }) => {
+          const prior = generationOf(transitions.find(t => t.transitionNote?.startsWith(RESERVE_PREFIX) && keyOfNote(t.transitionNote) === key));
+          return matches(key) && (generation === null || prior === null || prior === generation);
+        });
+        if (refused) {
+          skipped.push({ seat: seat.sessionName, why: "destination-refused-interactive-prompt", primaryRow,
+            obligations: namedIds, episodeKey: refused.key, refusalReason: refused.note });
+          continue;
+        }
+        const lastKey = reserve && keyOfNote(reserve.transitionNote!);
+        const delivered = reserve && generation !== null && generationOf(reserve) === generation
+          && transitions.some(t => t.transitionNote === `${DELIVERED_PREFIX} ${lastKey}`)
+          && !transitions.some(t => (t.transitionNote?.startsWith(FAILED_PREFIX) || t.transitionNote?.startsWith(REFUSED_PREFIX)) && keyOfNote(t.transitionNote!) === lastKey);
+        if (delivered && !changedSince(deps.rows.listTransitions, namedIds, seat.sessionName, reserve)) {
+          // Delivered, the seat idle and nothing changed: the reminder doesn't repeat. Rows still unclaimed past the bound
+          // go to someone who can act, once for this episode.
+          const deliveredAt = transitions.find(t => t.transitionNote === `${DELIVERED_PREFIX} ${lastKey}`)?.ts;
+          let escalationFailure: { episodeKey: string; failure: string } | undefined;
+          const unclaimed = seat.obligations.items.filter(r => r.state === "pending" && namedIds.includes(r.qitemId)).map(r => r.qitemId);
+          if (deps.escalateUnclaimed && deliveredAt && unclaimed.length > 0
+            && (deps.now?.() ?? Date.now()) - Date.parse(deliveredAt) >= PARKED_OWNER_ESCALATE_AFTER_MS
+            && !transitions.some(t => t.transitionNote?.startsWith(`${ESCALATED_PREFIX} ${lastKey} `))) {
+            try {
+              const told = await deps.escalateUnclaimed({ seat: seat.sessionName, qitemIds: unclaimed, deliveredAt, episodeKey: lastKey! });
+              if (told.length > 0) deps.rows.appendNote(primaryRow, `${ESCALATED_PREFIX} ${lastKey} to ${told.join(", ")}`);
+            } catch (error) {
+              // Nothing is marked escalated, so a later pass tries again; this pass's notes say why it didn't land.
+              escalationFailure = { episodeKey: lastKey!, failure: (error as { code?: string }).code ?? (error instanceof Error ? error.name : typeof error) };
+            }
+          }
+          skipped.push({ seat: seat.sessionName, why: "unchanged-since-last-wake", ...(escalationFailure ? { escalationFailure } : {}) });
+          continue;
+        }
+        let retentionState: string | null = null;
+        try { retentionState = deps.retentionState?.(seat.sessionName) ?? null; } catch { /* unknown is not evidence that admission recovered */ }
+        const encodedRetentionState = Buffer.from(retentionState ?? "unknown").toString("base64url");
+        const open = lastKey != null && openKeysOnRow(transitions).includes(lastKey);
+        const sameGeneration = generation === null || generationOf(reserve) === null || generationOf(reserve) === generation;
+        const quotaFailed = open && sameGeneration && transitions.some(t => t.transitionNote?.startsWith(FAILED_PREFIX)
+          && keyOfNote(t.transitionNote) === lastKey && t.transitionNote.startsWith(`${FAILED_PREFIX} ${lastKey}${QUOTA_NO_INPUT}`));
+        const priorRetentionState = reserve?.transitionNote?.match(/; retention-state ([^;\s]+);/)?.[1];
+        if (quotaFailed && reserve && (retentionState === null || priorRetentionState === encodedRetentionState)
+          && !changedSince(deps.rows.listTransitions, namedIds, seat.sessionName, reserve)) {
+          // The existing row failure/recovery keeps custody. Do not recreate attempts or row notes every tick.
+          skipped.push({ seat: seat.sessionName, why: "retention-quota-unchanged" });
+          continue;
+        }
+        const terminal = deps.isTerminalSeat?.(seat.sessionName) === true;
+        if (terminal && open && sameGeneration && transitions.some(t => t.transitionNote?.startsWith(FAILED_PREFIX)
+          && keyOfNote(t.transitionNote) === lastKey && t.transitionNote.startsWith(`${FAILED_PREFIX} ${lastKey}${TERMINAL_NO_INPUT}`))) {
+          skipped.push({ seat: seat.sessionName, why: "terminal-seat" });
+          continue;
+        }
+        const episodeKey = `${seat.sessionName}|${idsHash}#${randomUUID()}`;
+        let noted = false;
+        try {
+          noted = deps.rows.appendNote(primaryRow,
+            `${RESERVE_PREFIX} ${episodeKey}; ${generation === null ? "" : `generation ${generation}; `}retention-state ${encodedRetentionState}; obligations ${namedIds.join(",")}`).ok;
+        } catch { /* the current row, not the receipt write, governs the wake */ }
+        if (!noted && !deps.rows.listOpenIds(seat.sessionName).includes(primaryRow)) {
+          skipped.push({ seat: seat.sessionName, why: "obligation-closed-between-derive-and-wake" });
           continue;
         }
 
-        // B4 — reserve BEFORE the engine delivers: the durable receipt is this
-        // transition; a terminal race at the row is the final honest guard.
-        const episodeKey = `${seat.sessionName}|${idsHash}#${ep.nextOrdinal}`;
-        const reserved = deps.rows.appendNote(
-          primaryRow,
-          `${RESERVE_PREFIX} ${episodeKey}; obligations ${namedIds.join(",")}`,
-        );
-        if (!reserved.ok) {
-          skipped.push({ seat: seat.sessionName, why: "obligation-closed-between-derive-and-wake" });
+        if (terminal) {
+          const reason = "Automated reminders cannot be consumed by a terminal seat; route it to an agent seat. No input was written.";
+          try { deps.rows.appendNote(primaryRow, `${FAILED_PREFIX} ${episodeKey}${TERMINAL_NO_INPUT} ${reason}`); } catch { /* keep the obligation visible if reporting is unavailable */ }
+          try { deps.rows.recordNudgeResult(primaryRow, `failed:terminal-seat: ${reason}`); } catch { /* no reporting failure permits terminal input */ }
+          skipped.push({ seat: seat.sessionName, why: "terminal-seat" });
           continue;
         }
 
@@ -287,7 +456,10 @@ export function makeParkedOwnerConsumerPolicy(deps: ParkedOwnerConsumerDeps): Po
           `You are parked (arbitrated: idle at prompt) while holding ${namedIds.length} open ` +
           `obligation${namedIds.length === 1 ? "" : "s"}: ${namedIds.join(", ")}. ` +
           `Resume the work or update each row honestly (close, park-with-wake, or hand off). ` +
-          `This is the one wake for this park episode; the wake-or-escalate ladder owns anything further.`;
+          `If you're waiting on a person's answer, don't ask again; hold the row with rig queue block <id> --on <who> --wake-after <duration> ` +
+          `(a hold on a person also needs --summary and --evidence-ref unless the row has them). ` +
+          `After a recorded delivery to this occupant, this check waits for your rows to change. An interrupted or unconfirmed attempt may repeat; interactive-prompt recovery stays with the wake-or-escalate ladder. ` +
+          `Held rows stay listed in rig view show held; for a claimed in-progress row, the wake-or-escalate ladder also retries a failed wake.`;
         return {
           action: "send",
           target: { session: seat.sessionName },
@@ -298,7 +470,7 @@ export function makeParkedOwnerConsumerPolicy(deps: ParkedOwnerConsumerDeps): Po
             idsHash,
             primaryRow,
             obligations: namedIds,
-            evidence: "arbitrated-idle-at-prompt",
+            evidence: Number.isFinite(shell) && seat.activity.needsInput.count === 0 ? "arbitrated-idle-at-prompt; background-shell-past-ceiling" : "arbitrated-idle-at-prompt",
             episodeClosures: closures,
             skippedSeats: skipped,
           },
@@ -307,6 +479,15 @@ export function makeParkedOwnerConsumerPolicy(deps: ParkedOwnerConsumerDeps): Po
 
       if (closures.length > 0) {
         return { action: "skip", reason: "episode-ended", notes: { episodeClosures: closures, skippedSeats: skipped } };
+      }
+      // Only queue-only seats already held, and nothing else: nothing new to record (#3076).
+      if (skipped.length > 0 && skipped.every(({ why }) => why === "queue-only-seat-unchanged")) {
+        return { action: "skip", reason: "queue_only_seat_unchanged", notes: { skippedSeats: skipped } };
+      }
+      // #3315: deferred only because the terminal server is gone: quiet, like the clean scan, so a long loss writes no
+      // history per scan; the loss itself is recorded once (tmux.server_gone).
+      if (skipped.length > 0 && skipped.every(entry => entry.why === "terminal-server-unreachable")) {
+        return { action: "skip", reason: "terminal-server-unreachable", notes: { skippedSeats: skipped } };
       }
       if (skipped.length > 0) {
         return { action: "skip", reason: "all-parked-owners-deferred", notes: { skippedSeats: skipped } };

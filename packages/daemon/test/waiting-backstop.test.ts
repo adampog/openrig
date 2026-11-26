@@ -125,47 +125,34 @@ describe("waiting face names the next action the existing ladder can actually ta
 
   // ── #344: a guard-refused wake must keep the unclaimed baton's retry path ──
 
-  it("counts a typing-guard refusal after a closed recovery as fresh evidence, reopening the retry path (#344)", async () => {
-    // Every wake this episode is refused by the typing guard: no pane input is
-    // written, and the nudge records the retained vocabulary.
+  it("a baton whose wake was held only by a draft keeps its retry path (#344): the draft can clear", async () => {
     queue = new QueueRepository(db, new EventBus(db), {
       validateRig: () => true,
-      transport: { send: async () => ({ outcome: "retained" }) },
+      transport: { send: async () => ({ outcome: "retained", reason: "draft_input_busy" }) },
     });
-    const source = await queue.create({ sourceSession: "owner@rig", destinationSession: "owner@rig", body: "Prepare result", nudge: false });
-    const id = (await queue.handoff({ qitemId: source.qitemId, fromSession: "owner@rig", toSession: "worker@rig", body: "Continue exact work", nudge: false })).created.qitemId;
-    // A terminal recovery disposition closes BEFORE the next wake attempt.
-    const recovery = await queue.create({ sourceSession: "owner@rig", destinationSession: "orch@rig", body: "Inspect failed delivery", tags: [recoveryTag(id)], nudge: false });
-    await queue.update({ qitemId: recovery.qitemId, actorSession: "orch@rig", state: "done", closureReason: "no-follow-on", resolution: "Do not retry this episode" });
-    // The ladder's later retry is refused again — the refusal is NEWER than the
-    // recovery and must count as evidence about the original obligation.
-    advance(60);
-    queue.recordNudgeAttempt(id, "retained:typing_guard");
-    expect(view(id).nextBackstop).toMatchObject({
-      mechanism: "queue-wake-ladder:retry",
-      dueAt: "2026-09-08T00:06:00.000Z",
-    });
+    queue.attachOutbox(new OutboxHandler(db));
+    const id = await handoff();
+    expect(queue.getByIdOrThrow(id).lastNudgeResult).toBe("retained:draft_aware");
+    expect(view(id).nextBackstop).toMatchObject({ mechanism: "queue-wake-ladder:retry", dueAt: "2026-09-08T00:05:00.000Z" });
     advance(301);
     expect((await tick()).actions).toContainEqual({ qitemId: id, action: "retry", target: "worker@rig" });
   });
 
-  it("keeps an unclaimed baton whose wake was guard-refused inside the retry ladder (#344)", async () => {
+  it("a baton the seat's typing guard holds on purpose reads as held and is never re-nudged; one notice goes out after the window", async () => {
     queue = new QueueRepository(db, new EventBus(db), {
       validateRig: () => true,
-      transport: { send: async () => ({ outcome: "retained" }) },
+      transport: { send: async () => ({ outcome: "retained", reason: "typing_guard_enabled" }) },
     });
     queue.attachOutbox(new OutboxHandler(db));
     const id = await handoff();
-    // The handoff nudge was refused by the typing guard: retained:typing_guard.
     expect(queue.getByIdOrThrow(id).lastNudgeResult).toBe("retained:typing_guard");
-    // A safe refusal still protects the prompt, but the baton keeps a retry path
-    // (each retry is another guard probe; when the prompt clears it verifies).
-    expect(view(id).nextBackstop).toMatchObject({
-      mechanism: "queue-wake-ladder:retry",
-      dueAt: "2026-09-08T00:05:00.000Z",
-    });
+    expect(view(id).nextBackstop).toMatchObject({ held: true, note: expect.stringContaining("Held by worker@rig's typing guard: nothing was typed") });
     advance(301);
-    expect((await tick()).actions).toContainEqual({ qitemId: id, action: "retry", target: "worker@rig" });
+    expect((await tick()).actions.filter((a) => a.qitemId === id)).toEqual([]); // no re-nudge, and not yet escalated
+    advance(30 * 60);
+    const later = (await tick()).actions.filter((a) => a.qitemId === id);
+    expect(later.some((a) => a.action === "retry")).toBe(false);
+    expect(later.some((a) => a.action.startsWith("escalate-"))).toBe(true); // the one held notice
   });
 
   it("does not let a retained nudge claim ownership of a claimed parked-owner row (#344 follow-up)", async () => {
@@ -208,5 +195,58 @@ describe("waiting face names the next action the existing ladder can actually ta
     // A blocker change writes the epoch as a wake-now marker: due now.
     jobs.updateSchedule(job.jobId, job.specYaml, 600, new Date(0).toISOString());
     expect(view(row.qitemId).nextBackstop.dueAt).toBe("2026-09-08T00:00:00.000Z");
+  });
+
+  it("shows the owner, progress and backstop of a blocker with a custom queue ID", async () => {
+    const blocker = await queue.create({ qitemId: "custom-blocker", sourceSession: "owner@rig", destinationSession: "healthy@rig", body: "Resolve dependency", nudge: false });
+    const row = await queue.create({ sourceSession: "owner@rig", destinationSession: "worker@rig", body: "Wait for dependency", nudge: false });
+    await queue.claim({ qitemId: blocker.qitemId, destinationSession: "healthy@rig" });
+    await queue.update({ qitemId: row.qitemId, actorSession: "worker@rig", state: "blocked", blockedOn: blocker.qitemId });
+    advance(1);
+    await queue.update({ qitemId: blocker.qitemId, actorSession: "healthy@rig", transitionNote: "Dependency progress" });
+    const waiting = view(row.qitemId);
+    expect(waiting.blocker).toEqual({ ref: "custom-blocker", owner: "healthy@rig", state: "in-progress" });
+    expect(waiting.liveness.subject).toBe("healthy@rig");
+    expect(waiting.lastMeaningfulChange).toEqual(lastMeaningfulTransition(db, blocker.qitemId));
+    expect(waiting.nextBackstop).toMatchObject({ owner: "healthy@rig", mechanism: "blocker-transition / queue-stuck-sweep" });
+    await queue.update({ qitemId: blocker.qitemId, actorSession: "healthy@rig", state: "done", closureReason: "no-follow-on" });
+    expect(queue.getByIdOrThrow(row.qitemId)).toMatchObject({ state: "pending", blockedOn: null });
+  });
+
+  it.each(["external:vendor", "auth:vendor", "fold:vendor"])("keeps %s as a typed gate when an item has the same ID", async (gate) => {
+    await queue.create({ qitemId: gate, sourceSession: "owner@rig", destinationSession: "healthy@rig", body: "Unrelated item", nudge: false });
+    const row = await queue.create({ sourceSession: "owner@rig", destinationSession: "worker@rig", body: "Wait for gate", nudge: false });
+    await queue.update({ qitemId: row.qitemId, actorSession: "worker@rig", state: "blocked", blockedOn: gate });
+    expect(view(row.qitemId).blocker).toEqual({ ref: gate, owner: null, state: null });
+    expect(view(row.qitemId).liveness.subject).toBe(gate);
+    expect(view(row.qitemId).nextBackstop).toMatchObject({ mechanism: "UNVERIFIED: no timed backstop", dueAt: null });
+  });
+
+  it("does not promise a transition wake for a custom blocker that already finished", async () => {
+    const blocker = await queue.create({ qitemId: "finished-blocker", sourceSession: "owner@rig", destinationSession: "healthy@rig", body: "Finished dependency", nudge: false });
+    await queue.update({ qitemId: blocker.qitemId, actorSession: "healthy@rig", state: "done", closureReason: "no-follow-on" });
+    const row = await queue.create({ sourceSession: "owner@rig", destinationSession: "worker@rig", body: "Wait for dependency", nudge: false });
+    await queue.update({ qitemId: row.qitemId, actorSession: "worker@rig", state: "blocked", blockedOn: blocker.qitemId });
+    expect(view(row.qitemId).blocker).toEqual({ ref: blocker.qitemId, owner: "healthy@rig", state: "done" });
+    expect(view(row.qitemId).nextBackstop).toMatchObject({ mechanism: "UNVERIFIED: no timed backstop", dueAt: null });
+    await queue.update({ qitemId: row.qitemId, actorSession: "worker@rig", state: "blocked", blockedOn: blocker.qitemId, wakeAfterSeconds: 600 });
+    expect(view(row.qitemId).nextBackstop.mechanism).toMatch(/^watchdog:/);
+  });
+
+  it("#2739: a claimed row parked with no wake reads as having no timed backstop, and a later wake on the same blocker arms one it shows", async () => {
+    const row = await queue.create({ sourceSession: "owner@rig", destinationSession: "worker@rig", body: "park-without-wake repro", nudge: false });
+    await queue.claim({ qitemId: row.qitemId, destinationSession: "worker@rig" });
+    await queue.update({ qitemId: row.qitemId, actorSession: "worker@rig", state: "blocked", blockedOn: "external:some-gate",
+      transitionNote: "parked without a wake" } as never);
+    expect(view(row.qitemId).nextBackstop).toMatchObject({ mechanism: "UNVERIFIED: no timed backstop", dueAt: null });
+    expect(queue.getParkWakeStatus(row.qitemId)).toBeNull();
+
+    // The reporter's second call: the same blocker, now with a wake.
+    await queue.update({ qitemId: row.qitemId, actorSession: "worker@rig", state: "blocked", blockedOn: "external:some-gate",
+      wakeAfterSeconds: 600, transitionNote: "adding a wake later" } as never);
+    const wake = queue.getParkWakeStatus(row.qitemId);
+    expect(wake).toMatchObject({ kind: "timer" });
+    expect(new WatchdogJobsRepository(db).getById(wake!.ref)).toMatchObject({ state: "active", intervalSeconds: 600 });
+    expect(view(row.qitemId).nextBackstop).toMatchObject({ mechanism: `watchdog:${wake!.ref}`, intervalSeconds: 600, dueAt: "2026-09-08T00:10:00.000Z" });
   });
 });

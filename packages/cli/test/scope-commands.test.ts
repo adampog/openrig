@@ -14,6 +14,8 @@ import YAML from "yaml";
 
 import { scopeCommand } from "../src/commands/scope.js";
 import { readFrontmatter } from "../src/lib/scope/scope-fs.js";
+import { readMissionReadiness, readProjectReadiness, readSliceReadiness, recordJudgment } from "../../daemon/src/domain/proof/judgments.js";
+import { compileProjectLifecycle } from "../../daemon/src/domain/project-lifecycle-compiler.js";
 
 function mktemp(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "rig-scope-cmd-"));
@@ -90,7 +92,8 @@ interface CaptureResult {
   stderr: string;
 }
 
-async function run(args: string[], workspace: string): Promise<CaptureResult> {
+/** Run `rig scope <args> --workspace <dirname(workspace)>`, or with no --workspace when `workspace` is null. */
+async function run(args: string[], workspace: string | null): Promise<CaptureResult> {
   const stdoutBuf: string[] = [];
   const stderrBuf: string[] = [];
   const origWrite = process.stdout.write.bind(process.stdout);
@@ -107,7 +110,7 @@ async function run(args: string[], workspace: string): Promise<CaptureResult> {
   program.addCommand(scopeCommand());
   program.exitOverride();
   try {
-    await program.parseAsync(["node", "rig", "scope", ...args, "--workspace", path.dirname(workspace)]);
+    await program.parseAsync(["node", "rig", "scope", ...args, ...(workspace === null ? [] : ["--workspace", path.dirname(workspace)])]);
   } catch (err) {
     const msg = (err as Error).message ?? "";
     if (!msg.startsWith("__EXIT__")) {
@@ -124,6 +127,31 @@ async function run(args: string[], workspace: string): Promise<CaptureResult> {
     stderr: stderrBuf.join(""),
   };
 }
+
+it("creates a mission in the associated project and reports the default basis", async () => {
+  const root = mktemp();
+  const project = path.join(root, "alpha");
+  const shared = path.join(root, "shared", "missions");
+  fs.mkdirSync(project, { recursive: true });
+  fs.mkdirSync(shared, { recursive: true });
+  writeFile(path.join(root, "workspace.yaml"), "projects:\n  - id: alpha\n    root: alpha\n    rigs: [rig-a]\n");
+  vi.stubEnv("OPENRIG_WORKSPACE_CATALOG_PATH", path.join(root, "workspace.yaml"));
+  vi.stubEnv("OPENRIG_WORKSPACE_SLICES_ROOT", shared);
+  vi.stubEnv("OPENRIG_SESSION_NAME", "builder@rig-a");
+  vi.stubEnv("OPENRIG_WORK_ROOT", "");
+  const report = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const result = await run(["mission", "create", "new-work", "--id", "OPR.99.0.1", "--json"], null);
+    expect(result.exitCode, result.stdout + result.stderr).toBe(0);
+    expect(report).toHaveBeenCalledWith(expect.stringContaining("selected by rig rig-a"));
+    expect(fs.existsSync(path.join(project, "missions", "new-work"))).toBe(true);
+    expect(fs.existsSync(path.join(shared, "new-work"))).toBe(false);
+  } finally {
+    report.mockRestore();
+    vi.unstubAllEnvs();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 describe("rig scope resolve-notes", () => {
   let root: string;
@@ -675,6 +703,17 @@ describe("rig scope mission ls (HG-8)", () => {
     const names = parsed.missions.map((m: { name: string }) => m.name).sort();
     expect(names).toEqual(["backlog", "release-0.3.2"]);
   });
+
+  it("counts a mission's shipped slices apart from its active ones (#2427)", async () => {
+    for (const nn of ["02-shipped-a", "03-shipped-b"]) {
+      writeFile(path.join(env.missionsRoot, "release-0.3.2", "slices", nn, "README.md"), `---\nid: OPR.0.3.2.${nn[1]}\nstatus: shipped\n---\n# ${nn}\n`);
+    }
+    const text = await run(["mission", "ls"], env.missionsRoot);
+    expect(text.stdout).toContain("release-0.3.2    OPR.0.3.2    active=1  shipped=2  closed=0");
+    const json = JSON.parse((await run(["mission", "ls", "--json"], env.missionsRoot)).stdout);
+    expect(json.missions.find((m: { name: string }) => m.name === "release-0.3.2"))
+      .toMatchObject({ activeSliceCount: 1, shippedSliceCount: 2, closedSliceCount: 0 });
+  });
 });
 
 describe("rig scope mission show", () => {
@@ -711,6 +750,198 @@ describe("rig scope mission create (HG-14 + HG-15)", () => {
     expect(parsed.mission.name).toBe("release-0.4.0");
     expect(parsed.mission.path).toBeTruthy();
     expect(parsed.mission.template).toBe("release");
+  });
+
+  // The lab's self-scout: a new mission refused to compile (lifecycle_field_missing) until metadata.name was added by hand.
+  it("scaffolds a mission whose project lifecycle compiles, with its name recorded exactly", async () => {
+    fs.copyFileSync(new URL("../../../docs/reference/project-release-profile.yaml", import.meta.url),
+      path.join(path.dirname(env.missionsRoot), "project.yaml"));
+    // Unquoted, YAML would read "#2" as a comment and "1.10" as the number 1.1.
+    for (const name of ["lab-mission", "#2", "1.10"]) {
+      const r = await run(["mission", "create", name, "--json"], env.missionsRoot);
+      expect(r.exitCode).toBe(0);
+      const missionPath = JSON.parse(r.stdout).mission.path as string;
+      expect(YAML.parse(fs.readFileSync(path.join(missionPath, "mission.yaml"), "utf8")).metadata).toEqual({ name, status: "planned" });
+      expect(compileProjectLifecycle({ missionPath, operationKey: "first-compile" }).identity.mission).toBe(name);
+    }
+  });
+
+  it("creates the first mission under an explicit workspace before its missions folder exists", async () => {
+    const workspace = path.join(env.root, "project-workspace");
+    const globalHome = path.join(env.root, "global-home");
+    const globalMissions = path.join(env.root, "global-workspace", "missions");
+    fs.mkdirSync(workspace, { recursive: true });
+    fs.mkdirSync(globalMissions, { recursive: true });
+    writeFile(path.join(globalHome, "config.json"), JSON.stringify({
+      workspace: { root: path.dirname(globalMissions), slicesRoot: globalMissions },
+    }));
+
+    const priorHome = process.env.OPENRIG_HOME;
+    const priorSlicesRoot = process.env.OPENRIG_WORKSPACE_SLICES_ROOT;
+    process.env.OPENRIG_HOME = globalHome;
+    delete process.env.OPENRIG_WORKSPACE_SLICES_ROOT;
+    try {
+      const r = await run(["mission", "create", "first-project-mission", "--json"], path.join(workspace, "missions"));
+      expect(r.exitCode).toBe(0);
+      const parsed = JSON.parse(r.stdout);
+      expect(parsed.mission.path).toBe(path.join(workspace, "missions", "first-project-mission"));
+      expect(fs.existsSync(path.join(globalMissions, "first-project-mission"))).toBe(false);
+    } finally {
+      if (priorHome === undefined) delete process.env.OPENRIG_HOME;
+      else process.env.OPENRIG_HOME = priorHome;
+      if (priorSlicesRoot === undefined) delete process.env.OPENRIG_WORKSPACE_SLICES_ROOT;
+      else process.env.OPENRIG_WORKSPACE_SLICES_ROOT = priorSlicesRoot;
+    }
+  });
+
+  it("prefers an existing missions child for a workspace named missions", async () => {
+    const workspace = path.join(env.root, "missions");
+    const childMissionsRoot = path.join(workspace, "missions");
+    fs.mkdirSync(childMissionsRoot, { recursive: true });
+
+    const r = await run(
+      ["mission", "create", "nested-workspace-mission", "--json"],
+      childMissionsRoot,
+    );
+
+    expect(r.exitCode).toBe(0);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.mission.path).toBe(path.join(childMissionsRoot, "nested-workspace-mission"));
+    expect(fs.existsSync(path.join(workspace, "nested-workspace-mission"))).toBe(false);
+
+    const shown = await run(
+      ["mission", "show", "nested-workspace-mission", "--json"],
+      childMissionsRoot,
+    );
+    expect(shown.exitCode).toBe(0);
+    expect(JSON.parse(shown.stdout).mission.path).toBe(
+      path.join(childMissionsRoot, "nested-workspace-mission"),
+    );
+  });
+
+  it("creates the first mission under the workspace's nested project.yaml missions.root", async () => {
+    const workspace = path.join(env.root, "declared-workspace");
+    writeFile(path.join(workspace, "project.yaml"), "missions:\n  root: work/plans/missions\n");
+
+    const r = await run(["mission", "create", "first-declared-mission", "--json"], path.join(workspace, "missions"));
+
+    expect(r.exitCode).toBe(0);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.mission.path).toBe(path.join(workspace, "work", "plans", "missions", "first-declared-mission"));
+    expect(parsed.mission.advisories).toEqual([]);
+    expect(fs.existsSync(path.join(workspace, "missions"))).toBe(false);
+  });
+
+  it("uses the declared missions.root even when a conventional missions folder exists", async () => {
+    const workspace = path.join(env.root, "declared-over-conventional");
+    fs.mkdirSync(path.join(workspace, "missions"), { recursive: true });
+    writeFile(path.join(workspace, "project.yaml"), "missions:\n  root: planning\n");
+
+    const r = await run(["mission", "create", "declared-wins", "--json"], path.join(workspace, "missions"));
+
+    expect(r.exitCode).toBe(0);
+    expect(JSON.parse(r.stdout).mission.path).toBe(path.join(workspace, "planning", "declared-wins"));
+    expect(fs.existsSync(path.join(workspace, "missions", "declared-wins"))).toBe(false);
+  });
+
+  it("reads a mission back from the declared missions.root of the same workspace", async () => {
+    const workspace = path.join(env.root, "declared-read-back");
+    writeFile(path.join(workspace, "project.yaml"), "missions:\n  root: work/missions\n");
+    const named = path.join(workspace, "missions");
+
+    expect((await run(["mission", "create", "read-back", "--json"], named)).exitCode).toBe(0);
+
+    const shown = await run(["mission", "show", "read-back", "--json"], named);
+    expect(shown.exitCode).toBe(0);
+    expect(JSON.parse(shown.stdout).mission.path).toBe(path.join(workspace, "work", "missions", "read-back"));
+    const listed = await run(["mission", "ls", "--json"], named);
+    expect(listed.exitCode).toBe(0);
+    expect(listed.stdout).toContain("read-back");
+  });
+
+  for (const [via, named] of [
+    ["--workspace", "project"],
+    ["OPENRIG_WORK_ROOT", "project"],
+    ["--workspace naming its missions folder", "missions"],
+  ] as const) {
+    it(`refuses a missing workspace named by ${via}, creating nothing there or in the configured root`, async () => {
+      const absent = path.join(env.root, "not-yet", via.replace(/\W+/g, "-"));
+      const workspace = path.join(absent, named);
+      const configuredRoot = path.join(env.root, "configured", via.replace(/\W+/g, "-"), "missions");
+      fs.mkdirSync(configuredRoot, { recursive: true });
+      const priorSlicesRoot = process.env.OPENRIG_WORKSPACE_SLICES_ROOT;
+      const priorWorkRoot = process.env.OPENRIG_WORK_ROOT;
+      process.env.OPENRIG_WORKSPACE_SLICES_ROOT = configuredRoot;
+      const byEnv = via === "OPENRIG_WORK_ROOT";
+      if (byEnv) process.env.OPENRIG_WORK_ROOT = workspace;
+      else delete process.env.OPENRIG_WORK_ROOT;
+      const naming = byEnv ? null : path.join(workspace, "child");
+      try {
+        expect(fs.existsSync(absent)).toBe(false);
+
+        const created = await run(["mission", "create", "first-anywhere", "--json"], naming);
+        expect(created.exitCode).not.toBe(0);
+        expect(created.stdout + created.stderr).toContain(`named by ${byEnv ? "OPENRIG_WORK_ROOT" : "--workspace"} is not an existing directory`);
+        expect(fs.existsSync(absent)).toBe(false);
+        expect(fs.readdirSync(configuredRoot)).toEqual([]);
+      } finally {
+        if (priorSlicesRoot === undefined) delete process.env.OPENRIG_WORKSPACE_SLICES_ROOT;
+        else process.env.OPENRIG_WORKSPACE_SLICES_ROOT = priorSlicesRoot;
+        if (priorWorkRoot === undefined) delete process.env.OPENRIG_WORK_ROOT;
+        else process.env.OPENRIG_WORK_ROOT = priorWorkRoot;
+      }
+    });
+  }
+
+  it("refuses a workspace path that is a file, writing nowhere else", async () => {
+    const workspace = path.join(env.root, "a-file-not-a-folder");
+    writeFile(workspace, "not a workspace\n");
+    const configuredRoot = path.join(env.root, "configured-for-file", "missions");
+    fs.mkdirSync(configuredRoot, { recursive: true });
+    const priorSlicesRoot = process.env.OPENRIG_WORKSPACE_SLICES_ROOT;
+    process.env.OPENRIG_WORKSPACE_SLICES_ROOT = configuredRoot;
+    try {
+      const r = await run(["mission", "create", "nowhere", "--json"], path.join(workspace, "child"));
+      expect(r.exitCode).not.toBe(0);
+      expect(r.stdout + r.stderr).toContain("named by --workspace is not an existing directory");
+      expect(fs.readdirSync(configuredRoot)).toEqual([]);
+    } finally {
+      if (priorSlicesRoot === undefined) delete process.env.OPENRIG_WORKSPACE_SLICES_ROOT;
+      else process.env.OPENRIG_WORKSPACE_SLICES_ROOT = priorSlicesRoot;
+    }
+  });
+
+  it("slice create refuses a named workspace with no missions tree instead of using the configured root", async () => {
+    const configuredRoot = path.join(env.root, "configured-for-slice", "missions");
+    fs.mkdirSync(path.join(configuredRoot, "kept-mission"), { recursive: true });
+    const empty = path.join(env.root, "no-missions-here");
+    fs.mkdirSync(empty, { recursive: true });
+    const priorSlicesRoot = process.env.OPENRIG_WORKSPACE_SLICES_ROOT;
+    process.env.OPENRIG_WORKSPACE_SLICES_ROOT = configuredRoot;
+    try {
+      const r = await run(["slice", "create", "kept-mission", "stray", "--json"], path.join(empty, "missions"));
+      expect(r.exitCode).not.toBe(0);
+      expect(r.stdout + r.stderr).toContain("the configured workspace was NOT used as a fallback");
+      expect(fs.readdirSync(path.join(configuredRoot, "kept-mission"))).toEqual([]);
+    } finally {
+      if (priorSlicesRoot === undefined) delete process.env.OPENRIG_WORKSPACE_SLICES_ROOT;
+      else process.env.OPENRIG_WORKSPACE_SLICES_ROOT = priorSlicesRoot;
+    }
+  });
+
+  it("keeps the conventional missions root, with an advisory, when missions.root leaves the workspace", async () => {
+    const workspace = path.join(env.root, "escaping-workspace");
+    writeFile(path.join(workspace, "project.yaml"), "missions:\n  root: ../elsewhere\n");
+
+    const r = await run(["mission", "create", "kept-inside", "--json"], path.join(workspace, "missions"));
+
+    expect(r.exitCode).toBe(0);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.mission.path).toBe(path.join(workspace, "missions", "kept-inside"));
+    expect(parsed.mission.advisories).toEqual([
+      "project.yaml: optional missions.root must be a relative path inside the project; kept the conventional missions root",
+    ]);
+    expect(fs.existsSync(path.join(env.root, "elsewhere"))).toBe(false);
   });
 
   it("HG-15: created mission frontmatter has a conformant dot-ID per §1", async () => {
@@ -779,6 +1010,105 @@ describe("rig scope mission create (HG-14 + HG-15)", () => {
     ], env.missionsRoot);
     expect(r.exitCode).toBe(1);
     expect(JSON.parse(r.stdout).ok).toBe(false);
+  });
+
+  it("seeds metadata.status: planned so a new mission stays outside the project rollup", async () => {
+    const r = await run(["mission", "create", "experiments-foo", "--json"], env.missionsRoot);
+    expect(r.exitCode).toBe(0);
+    const manifest = YAML.parse(
+      fs.readFileSync(path.join(JSON.parse(r.stdout).mission.path, "mission.yaml"), "utf8"),
+    ) as { metadata?: { status?: string }; composition: { slices: unknown[] } };
+    expect(manifest.metadata?.status).toBe("planned");
+    expect(manifest.composition.slices).toEqual([]);
+  });
+
+  it("seeds planned for the release template too", async () => {
+    const r = await run(["mission", "create", "release-0.6.0", "--json"], env.missionsRoot);
+    expect(JSON.parse(r.stdout).mission.template).toBe("release");
+    const manifest = YAML.parse(
+      fs.readFileSync(path.join(JSON.parse(r.stdout).mission.path, "mission.yaml"), "utf8"),
+    ) as { metadata?: { status?: string } };
+    expect(manifest.metadata?.status).toBe("planned");
+  });
+
+  it("keeps metadata.status when a slice is later added to the mission", async () => {
+    await run(["mission", "create", "experiments-foo", "--json"], env.missionsRoot);
+    const slice = await run(["slice", "create", "experiments-foo", "first", "--json"], env.missionsRoot);
+    expect(slice.exitCode).toBe(0);
+    const manifest = YAML.parse(
+      fs.readFileSync(path.join(env.missionsRoot, "experiments-foo", "mission.yaml"), "utf8"),
+    ) as { metadata?: { status?: string }; composition: { slices: unknown[] } };
+    expect(manifest.composition.slices).toHaveLength(1);
+    expect(manifest.metadata?.status).toBe("planned");
+  });
+
+  describe("project readiness", () => {
+    let project: string;
+    let missions: string;
+    beforeEach(() => {
+      project = mktemp();
+      missions = path.join(project, "missions");
+      writeFile(path.join(project, "project.yaml"), YAML.stringify({
+        kind: "project",
+        metadata: { id: "trial" },
+        proofPolicy: { judges: ["judge@trial"] },
+        missions: { root: "missions" },
+      }));
+      fs.mkdirSync(missions, { recursive: true });
+    });
+    afterEach(() => { fs.rmSync(project, { recursive: true, force: true }); });
+
+    /** Create a mission with one slice whose only item is accepted; returns the mission dir. */
+    async function missionWithAcceptedSlice(name: string): Promise<string> {
+      expect((await run(["mission", "create", name, "--json"], missions)).exitCode).toBe(0);
+      const sliceRun = await run(["slice", "create", name, "only", "--json"], missions);
+      expect(sliceRun.exitCode).toBe(0);
+      const sliceDir = JSON.parse(sliceRun.stdout).slice.path as string;
+      writeFile(
+        path.join(sliceDir, "SPEC.md"),
+        `---\nid: only\nstatus: done\n---\n# only\n\n## Proof contract\n- [x] Prove it.\n`,
+      );
+      writeFile(path.join(sliceDir, "proof", "evidence.md"), "Observed outcome.\n");
+      const item = readSliceReadiness(sliceDir).items[0]!;
+      recordJudgment(missions, {
+        scope: `${name}/slices/${path.basename(sliceDir)}`,
+        item: item.id,
+        verdict: "accept",
+        reason: "Independent accept judgment",
+        evidence: ["proof/evidence.md"],
+        expectedRevision: item.revision,
+        expectedPrevious: null,
+      }, "judge@trial", "transport:v1");
+      return path.join(missions, name);
+    }
+
+    function setStatus(missionDir: string, status: string): void {
+      const manifestPath = path.join(missionDir, "mission.yaml");
+      const doc = YAML.parseDocument(fs.readFileSync(manifestPath, "utf8"));
+      doc.setIn(["metadata", "status"], status);
+      fs.writeFileSync(manifestPath, String(doc), "utf8");
+    }
+
+    it("a ready project stays ready after creating an empty ordinary mission and an empty release mission", async () => {
+      const existing = await missionWithAcceptedSlice("existing");
+      setStatus(existing, "active");
+      expect(readProjectReadiness(missions).state).toBe("ready");
+
+      expect((await run(["mission", "create", "experiments-foo", "--json"], missions)).exitCode).toBe(0);
+      expect(readProjectReadiness(missions).state).toBe("ready");
+      expect((await run(["mission", "create", "release-0.6.0", "--json"], missions)).exitCode).toBe(0);
+      expect(readProjectReadiness(missions).state).toBe("ready");
+    });
+
+    it("a planned mission is not counted after its slices are accepted, and is once set to active", async () => {
+      const created = await missionWithAcceptedSlice("trial");
+      expect(readMissionReadiness(created).state).toBe("ready");
+      expect(readMissionReadiness(created).historicalStatus).toBe("planned");
+      // Not counted: no active mission, so the project is not ready.
+      expect(readProjectReadiness(missions).state).toBe("not-ready");
+      setStatus(created, "active");
+      expect(readProjectReadiness(missions).state).toBe("ready");
+    });
   });
 
   it("mission create auto-scaffolds NOTES.md with placeholders substituted", async () => {
@@ -1057,6 +1387,29 @@ describe("--help is present on every command (HG-12)", () => {
       expect(tier.description()).toBeTruthy();
       for (const verb of tier.commands) {
         expect(verb.description()).toBeTruthy();
+      }
+    }
+  });
+});
+
+describe("slice and mission verb help names the parent --workspace option", () => {
+  const helpOf = (cmd: Command): string => {
+    let out = "";
+    cmd.configureOutput({ writeOut: (text) => { out += text; } });
+    cmd.outputHelp();
+    return out;
+  };
+
+  it("every slice and mission verb, and each tier, shows the rig scope --workspace route", () => {
+    const cmd = scopeCommand();
+    for (const tierName of ["slice", "mission"] as const) {
+      const tier = cmd.commands.find((c) => c.name() === tierName)!;
+      expect(helpOf(tier)).toContain(`rig scope --workspace <project root> ${tierName} <verb> ...`);
+      for (const verb of tier.commands) {
+        const help = helpOf(verb);
+        expect(help, `${tierName} ${verb.name()}`).toContain(`rig scope --workspace <project root> ${tierName} ${verb.name()} ...`);
+        expect(help, `${tierName} ${verb.name()}`).toContain("$(rig config get workspace.projects_root)/<project>");
+        expect(help, `${tierName} ${verb.name()}`).not.toContain("~/.openrig");
       }
     }
   });
@@ -1801,5 +2154,119 @@ describe("scope create dependency identity", () => {
     expect(result.exitCode).toBe(0);
     const fm = readFrontmatter(path.join(missionsRoot, "release-0.3.2", "slices", "02-next", "SPEC.md"));
     expect(fm.depends_on).toEqual(["OPR.0.3.2.1"]);
+  });
+
+  // #3615: two paths. --depends-on stays advisory SPEC.md frontmatter; --execution-depends-on is the explicit
+  // slice.yaml execution.depends_on edge that proof readiness reads.
+  describe("advisory frontmatter versus an explicit execution edge", () => {
+    const missionPath = () => path.join(missionsRoot, "release-0.3.2");
+    const manifestOf = (folder: string) =>
+      YAML.parse(fs.readFileSync(path.join(missionPath(), "slices", folder, "slice.yaml"), "utf8"));
+    const readinessOf = (folder: string) =>
+      readMissionReadiness(missionPath()).slices.find((slice) => slice.scope === folder);
+    beforeEach(() => {
+      writeFile(path.join(missionPath(), "mission.yaml"),
+        "schema: openrig.mission/v0alpha1\nkind: mission\ncomposition:\n  slices: []\n");
+    });
+
+    it("--depends-on writes only SPEC.md frontmatter, which readiness reports as advisory", async () => {
+      const result = await run(["slice", "create", "release-0.3.2", "next", "--depends-on", "OPR.0.3.2.1"], missionsRoot);
+      expect(result.exitCode).toBe(0);
+      expect(readFrontmatter(path.join(missionPath(), "slices", "02-next", "SPEC.md")).depends_on).toEqual(["OPR.0.3.2.1"]);
+      expect(manifestOf("02-next")).not.toHaveProperty("execution");
+      expect(readinessOf("02-next")).toMatchObject({ dependsOnBasis: "frontmatter-advisory" });
+    });
+
+    it("--execution-depends-on writes only slice.yaml execution.depends_on, which readiness reads", async () => {
+      const result = await run(["slice", "create", "release-0.3.2", "next", "--execution-depends-on", "OPR.0.3.2.1"], missionsRoot);
+      expect(result.exitCode).toBe(0);
+      const manifest = manifestOf("02-next");
+      expect(manifest.execution).toEqual({ depends_on: ["OPR.0.3.2.1"] });
+      expect(manifest.composition.mission).toBe("../../mission.yaml");
+      expect(readFrontmatter(path.join(missionPath(), "slices", "02-next", "SPEC.md")).depends_on).toEqual([]);
+      expect(readinessOf("02-next")).toMatchObject({ dependsOn: ["OPR.0.3.2.1"], dependsOnBasis: "slice.yaml" });
+    });
+
+    it("keeps today's scaffold with neither option: no execution block, an advisory empty frontmatter list", async () => {
+      const result = await run(["slice", "create", "release-0.3.2", "free"], missionsRoot);
+      expect(result.exitCode).toBe(0);
+      expect(manifestOf("02-free")).not.toHaveProperty("execution");
+      expect(readFrontmatter(path.join(missionPath(), "slices", "02-free", "SPEC.md")).depends_on).toEqual([]);
+      expect(readinessOf("02-free")).toMatchObject({ dependsOnBasis: "frontmatter-advisory" });
+    });
+
+    it("rejects an --execution-depends-on edge outside the mission before creating the folder", async () => {
+      const result = await run(["slice", "create", "release-0.3.2", "next", "--execution-depends-on", "OPR.9.9.9.1"], missionsRoot);
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("--execution-depends-on");
+      expect(fs.existsSync(path.join(missionPath(), "slices", "02-next"))).toBe(false);
+    });
+  });
+});
+
+// A project nested in another workspace (its own project.yaml and missions) mints ids with its project.yaml's optional
+// scope.idPrefix; without one, an id the enclosing project's missions already use is named, not refused.
+describe("a nested project's mission ids", () => {
+  let root: string;
+  const nested = () => path.join(root, "projects", "ops");
+  beforeEach(() => {
+    root = mktemp();
+    writeFile(path.join(root, "project.yaml"), "metadata:\n  id: parent\n");
+    writeFile(path.join(root, "missions", "backlog", "README.md"), "---\nid: OPR.99.0.1\n---\n# backlog\n");
+    writeFile(path.join(root, "missions", "release-0.7.21", "README.md"), "---\nid: OPR.0.7.21\n---\n# release\n");
+  });
+  afterEach(() => { fs.rmSync(root, { recursive: true, force: true }); });
+
+  it("mints the nested project's own prefix for an escape-band and a release mission", async () => {
+    writeFile(path.join(nested(), "project.yaml"), "scope:\n  idPrefix: OPS\n");
+    const work = await run(["mission", "create", "work", "--json"], path.join(nested(), "missions"));
+    expect(work.exitCode).toBe(0);
+    expect(JSON.parse(work.stdout).mission).toMatchObject({ id: "OPS.99.0.1", advisories: [] });
+    const release = await run(["mission", "create", "release-0.7.21", "--json"], path.join(nested(), "missions"));
+    expect(release.exitCode).toBe(0);
+    expect(JSON.parse(release.stdout).mission).toMatchObject({ id: "OPS.0.7.21", advisories: [] });
+  });
+
+  it("names an id the enclosing project's missions already use, and still creates the mission, when no prefix is declared", async () => {
+    writeFile(path.join(nested(), "project.yaml"), "metadata:\n  id: ops\n");
+    const r = await run(["mission", "create", "work", "--json"], path.join(nested(), "missions"));
+    expect(r.exitCode).toBe(0);
+    const mission = JSON.parse(r.stdout).mission;
+    expect(mission.id).toBe("OPR.99.0.1");
+    expect(mission.advisories).toEqual([`Mission ID OPR.99.0.1 is already used by ${path.join(root, "missions", "backlog")} in the enclosing project's missions (${path.join(root, "missions")}). Edit this mission's id: before creating its slices, since their ids inherit it. For later missions, set scope.idPrefix (2-3 uppercase letters, such as OPS) in this project's project.yaml, or pass --id.`]);
+    expect(fs.existsSync(path.join(nested(), "missions", "work"))).toBe(true);
+  });
+
+  it("still creates the mission when the enclosing project's missions can't be read, and says the check couldn't run", async () => {
+    writeFile(path.join(nested(), "project.yaml"), "metadata:\n  id: ops\n");
+    // A file where the enclosing missions folder should be: reading it fails (ENOTDIR) for any user.
+    fs.rmSync(path.join(root, "missions"), { recursive: true, force: true });
+    writeFile(path.join(root, "missions"), "not a folder\n");
+    const r = await run(["mission", "create", "work", "--json"], path.join(nested(), "missions"));
+    expect(r.exitCode).toBe(0);
+    const mission = JSON.parse(r.stdout).mission;
+    expect(mission.id).toBe("OPR.99.0.1");
+    expect(mission.advisories).toHaveLength(1);
+    expect(mission.advisories[0]).toMatch(/^The enclosing project's mission IDs couldn't be checked for OPR\.99\.0\.1: .*ENOTDIR/);
+    expect(fs.existsSync(path.join(nested(), "missions", "work"))).toBe(true);
+  });
+
+  it("keeps OPR, with a warning, for a scope.idPrefix that isn't 2-3 uppercase letters", async () => {
+    writeFile(path.join(nested(), "project.yaml"), "scope:\n  idPrefix: ops\n");
+    const r = await run(["mission", "create", "later", "--id", "OPR.99.0.7", "--json"], path.join(nested(), "missions"));
+    expect(r.exitCode).toBe(0);
+    const minted = await run(["mission", "create", "work", "--json"], path.join(nested(), "missions"));
+    expect(minted.exitCode).toBe(0);
+    const mission = JSON.parse(minted.stdout).mission;
+    expect(mission.id).toBe("OPR.99.0.8");
+    expect(mission.advisories).toEqual([`${path.join(nested(), "project.yaml")}: optional scope.idPrefix must be 2-3 uppercase letters (such as OPS); kept OPR`]);
+  });
+
+  it("gives a mission with no id the project's prefix when its first slice is created", async () => {
+    writeFile(path.join(nested(), "project.yaml"), "scope:\n  idPrefix: OPS\n");
+    writeFile(path.join(nested(), "missions", "older", "README.md"), "# older, no id yet\n");
+    const r = await run(["slice", "create", "older", "first", "--json"], path.join(nested(), "missions"));
+    expect(r.exitCode).toBe(0);
+    expect(readFrontmatter(path.join(nested(), "missions", "older", "README.md")).id).toBe("OPS.99.0.1");
   });
 });

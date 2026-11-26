@@ -1,9 +1,22 @@
+import { isEscalationTargetRef } from "./escalation-target-ref.js";
+import { validateClaudePermissionRules } from "./claude-permission-rules.js";
+import { validateClaudeAutoMode } from "./claude-auto-mode.js";
+import { validateClaudeMcp, type ClaudeMcp } from "./claude-mcp.js";
+import { isLaunchWrapperRuntime, parseStoredLaunchWrapper, validateLaunchWrapper } from "./launch-wrapper.js";
+import { parseStoredProcessLimits, serializeProcessLimits, validateProcessLimits, type ProcessLimits } from "./process-limits.js";
+import { storedStatuslineThrottle, validateStatuslineThrottle } from "./claude-statusline-throttle.js";
+import { parseStoredPoolBlock, storedPoolText, type SeatPoolNodeBlock, type StoredSeatPool } from "./seat-pool-spec.js";
+import { validateCodexMemberPermissions } from "./codex-member-permissions.js";
 import type Database from "better-sqlite3";
 import { resolveActiveOccupantRow } from "./active-occupant.js";
-import { resolve } from "node:path";
+import { decodeStoredSnapshotData } from "./snapshot-repository.js";
+import { posix, resolve } from "node:path";
 import { ulid } from "ulid";
 import { deriveComposeProjectName } from "./compose-project-name.js";
 import type { ClaudeManagedBlockFile } from "./managed-blocks.js";
+import { mergeSeatEnv, parseStoredSeatEnv, type SeatEnv } from "./seat-env.js";
+import { seatAccountHome, RUNTIME_HOME_VAR, withoutIgnoredRuntimeHomes } from "./seat-runtime-home.js";
+import { claudeSeatTokenRefProblem, parseClaudeSeatTokenRef, type ClaudeSeatTokenRef } from "./claude-seat-token.js";
 import type {
   Rig,
   Node,
@@ -16,7 +29,205 @@ import type {
   Snapshot,
   SnapshotData,
   SessionSourceSpec,
+  NodeLaunchRecipe,
+  SeatSliceMode,
+  StartupBlock,
+  StartupFile,
 } from "./types.js";
+
+function isValidStoredRecipeLaunchWrapper(value: unknown, runtime: unknown): boolean {
+  if (!isLaunchWrapperRuntime(runtime)) return false;
+  try {
+    validateLaunchWrapper(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && Object.values(value).every((entry) => typeof entry === "string");
+}
+
+function isStoredSessionSource(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const source = value as Record<string, unknown>;
+  const ref = source.ref;
+  if (ref === null || typeof ref !== "object" || Array.isArray(ref)) return false;
+  const refRecord = ref as Record<string, unknown>;
+  if (source.mode === "fork") {
+    return ["native_id", "artifact_path", "name", "last"].includes(String(refRecord.kind))
+      && (refRecord.value === undefined || typeof refRecord.value === "string");
+  }
+  if (source.mode === "rebuild") {
+    return refRecord.kind === "artifact_set"
+      && Array.isArray(refRecord.value)
+      && refRecord.value.length > 0
+      && refRecord.value.every((entry) => typeof entry === "string" && entry.trim().length > 0);
+  }
+  if (source.mode === "agent_image") {
+    return refRecord.kind === "image_name"
+      && typeof refRecord.value === "string"
+      && refRecord.value.trim().length > 0
+      && (refRecord.version === undefined || typeof refRecord.version === "string");
+  }
+  return false;
+}
+
+function isStoredStartupBlock(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const startup = value as Record<string, unknown>;
+  if (!Array.isArray(startup.files) || !Array.isArray(startup.actions)) return false;
+  const fileHints = ["auto", "guidance_merge", "skill_install", "send_text"];
+  const phases = ["fresh_start", "restore"];
+  const actionTypes = ["slash_command", "send_text", "startup_proof"];
+  const actionPhases = ["after_files", "after_ready"];
+  return startup.files.every((file) => {
+    if (file === null || typeof file !== "object" || Array.isArray(file)) return false;
+    const entry = file as Record<string, unknown>;
+    return typeof entry.path === "string"
+      && fileHints.includes(String(entry.deliveryHint))
+      && typeof entry.required === "boolean"
+      && Array.isArray(entry.appliesOn)
+      && entry.appliesOn.every((phase) => typeof phase === "string" && phases.includes(phase))
+      && (entry.orientation === undefined || entry.orientation === "role")
+      && (entry.kind === undefined || entry.kind === "file");
+  }) && startup.actions.every((action) => {
+    if (action === null || typeof action !== "object" || Array.isArray(action)) return false;
+    const entry = action as Record<string, unknown>;
+    return actionTypes.includes(String(entry.type))
+      && typeof entry.value === "string"
+      && actionPhases.includes(String(entry.phase))
+      && Array.isArray(entry.appliesOn)
+      && entry.appliesOn.every((phase) => typeof phase === "string" && phases.includes(phase))
+      && typeof entry.idempotent === "boolean"
+      && (entry.builtin === undefined || entry.builtin === "session_identity");
+  });
+}
+
+function isStoredContinuityPolicy(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const policy = value as Record<string, unknown>;
+  if (typeof policy.enabled !== "boolean") return false;
+  if (policy.syncTriggers !== undefined
+    && (!Array.isArray(policy.syncTriggers) || !policy.syncTriggers.every((entry) => typeof entry === "string"))) return false;
+  for (const field of ["artifacts", "restoreProtocol"] as const) {
+    const nested = policy[field];
+    if (nested !== undefined) {
+      if (nested === null || typeof nested !== "object" || Array.isArray(nested)) return false;
+      if (!Object.values(nested as Record<string, unknown>).every((entry) => typeof entry === "boolean")) return false;
+    }
+  }
+  return true;
+}
+
+function isStoredWorkspace(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const workspace = value as Record<string, unknown>;
+  if (typeof workspace.workspaceRoot !== "string" || !Array.isArray(workspace.repos)) return false;
+  if (workspace.defaultRepo !== undefined && typeof workspace.defaultRepo !== "string") return false;
+  if (workspace.knowledgeRoot !== undefined && typeof workspace.knowledgeRoot !== "string") return false;
+  return workspace.repos.every((repo) => {
+    if (repo === null || typeof repo !== "object" || Array.isArray(repo)) return false;
+    const entry = repo as Record<string, unknown>;
+    return typeof entry.name === "string" && typeof entry.path === "string" && typeof entry.kind === "string";
+  });
+}
+
+function isStoredServices(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const services = value as Record<string, unknown>;
+  if (services.kind !== "compose" || typeof services.composeFile !== "string") return false;
+  if (services.projectName !== undefined && typeof services.projectName !== "string") return false;
+  if (services.profiles !== undefined
+    && (!Array.isArray(services.profiles) || !services.profiles.every((entry) => typeof entry === "string"))) return false;
+  if (services.downPolicy !== undefined
+    && !["leave_running", "down", "down_and_volumes"].includes(String(services.downPolicy))) return false;
+  if (services.waitFor !== undefined && !Array.isArray(services.waitFor)) return false;
+  if (services.surfaces !== undefined
+    && (services.surfaces === null || typeof services.surfaces !== "object" || Array.isArray(services.surfaces))) return false;
+  if (services.checkpoints !== undefined && !Array.isArray(services.checkpoints)) return false;
+  return true;
+}
+
+function isStoredRigSpec(value: unknown): value is NodeLaunchRecipe["rigSpec"] {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const spec = value as Record<string, unknown>;
+  if (typeof spec.version !== "string" || typeof spec.name !== "string" || !Array.isArray(spec.pods)) return false;
+  if (spec.cultureFile !== undefined && typeof spec.cultureFile !== "string") return false;
+  if (spec.nonInterruptive !== undefined && typeof spec.nonInterruptive !== "boolean") return false;
+  if (spec.seatSlice !== undefined && spec.seatSlice !== "rig") return false;
+  if (spec.defaultOnboardingPack !== undefined && typeof spec.defaultOnboardingPack !== "boolean") return false;
+  if (spec.permissionPolicy !== undefined && typeof spec.permissionPolicy !== "string") return false;
+  if (spec.env !== undefined && !isStringRecord(spec.env)) return false;
+  if (spec.managedBlocks !== undefined) {
+    if (spec.managedBlocks === null || typeof spec.managedBlocks !== "object" || Array.isArray(spec.managedBlocks)) return false;
+    const managedBlocks = spec.managedBlocks as Record<string, unknown>;
+    if (managedBlocks["claude-code"] !== undefined
+      && !["CLAUDE.md", "CLAUDE.local.md"].includes(String(managedBlocks["claude-code"]))) return false;
+  }
+  if (spec.startup !== undefined && !isStoredStartupBlock(spec.startup)) return false;
+  if (spec.services !== undefined && !isStoredServices(spec.services)) return false;
+  if (spec.workspace !== undefined && !isStoredWorkspace(spec.workspace)) return false;
+  return spec.pods.every((pod) => {
+    if (pod === null || typeof pod !== "object" || Array.isArray(pod)) return false;
+    const candidate = pod as Record<string, unknown>;
+    if (typeof candidate.id !== "string" || typeof candidate.label !== "string"
+      || !Array.isArray(candidate.members) || candidate.members.length === 0) return false;
+    if (candidate.continuityPolicy !== undefined && !isStoredContinuityPolicy(candidate.continuityPolicy)) return false;
+    if (candidate.startup !== undefined && !isStoredStartupBlock(candidate.startup)) return false;
+    return candidate.members.every((member) => {
+      if (member === null || typeof member !== "object" || Array.isArray(member)) return false;
+      const entry = member as Record<string, unknown>;
+      return typeof entry.id === "string"
+        && typeof entry.agentRef === "string"
+        && typeof entry.profile === "string"
+        && typeof entry.runtime === "string"
+        && typeof entry.cwd === "string"
+        && (entry.label === undefined || typeof entry.label === "string")
+        && (entry.codexConfigProfile === undefined || typeof entry.codexConfigProfile === "string")
+        && (entry.model === undefined || typeof entry.model === "string")
+        && (entry.effort === undefined || typeof entry.effort === "string")
+        && (entry.role === undefined || typeof entry.role === "string")
+        && (entry.advisor === undefined || typeof entry.advisor === "string")
+        && (entry.claudeMcp === undefined || (entry.runtime === "claude-code" && entry.claudeMcp === "none"))
+        && (entry.launchWrapper === undefined || isValidStoredRecipeLaunchWrapper(entry.launchWrapper, entry.runtime))
+        && (entry.agentFile === undefined || typeof entry.agentFile === "string")
+        && (entry.appendSystemPromptFile === undefined || typeof entry.appendSystemPromptFile === "string")
+        && (entry.pluginDirs === undefined
+          || (Array.isArray(entry.pluginDirs) && entry.pluginDirs.every((dir) => typeof dir === "string")))
+        && (entry.pluginChannels === undefined
+          || (Array.isArray(entry.pluginChannels) && entry.pluginChannels.every((channel) => typeof channel === "string")))
+        && (entry.permissionPolicy === undefined || typeof entry.permissionPolicy === "string")
+        && (entry.env === undefined || isStringRecord(entry.env))
+        && (entry.restorePolicy === undefined || typeof entry.restorePolicy === "string")
+        && (entry.keepAlive === undefined || typeof entry.keepAlive === "boolean")
+        && (entry.compactionStrategy === undefined || typeof entry.compactionStrategy === "string")
+        && (entry.mechanic === undefined || typeof entry.mechanic === "string")
+        && (entry.startup === undefined || isStoredStartupBlock(entry.startup))
+        && (entry.sessionSource === undefined || isStoredSessionSource(entry.sessionSource))
+        && (entry.starterRef === undefined
+          || (entry.starterRef !== null && typeof entry.starterRef === "object" && !Array.isArray(entry.starterRef)
+            && typeof (entry.starterRef as Record<string, unknown>).name === "string"));
+    });
+  });
+}
+
+/** A rig's own startup layers: its `culture_file` and rig `startup` block as declared, and the absolute root they resolve against.
+ *  `podStartupFiles` holds each pod's declared startup files by pod id, resolved against the same root; a seat added to an
+ *  existing pod inherits them. Files only: pod startup actions are not inherited. */
+export interface RigStartupLayers {
+  root: string;
+  cultureFile?: string;
+  startup?: StartupBlock;
+  defaultOnboardingPack?: boolean;
+  podStartupFiles?: Record<string, StartupFile[]>;
+  /** Export-only authored actions, never inherited by seats added later. */
+  podStartupActions?: Record<string, StartupBlock["actions"]>;
+  /** Validated declarations for seats created without a first launch. One source per materialization. */
+  materializedSources?: Array<{ root: string; spec: import("./types.js").RigSpec; nodeIds: string[]; cwdOverride?: string }>;
+}
 
 /**
  * Free helper: returns the latest snapshot for a rig whose data carries non-null
@@ -33,7 +244,7 @@ interface SnapshotRow { id: string; rig_id: string; kind: string; status: string
 function snapshotFromRowIfUsable(row: SnapshotRow): Snapshot | null {
   let data: SnapshotData;
   try {
-    data = JSON.parse(row.data) as SnapshotData;
+    data = decodeStoredSnapshotData(row.data);
   } catch {
     return null;
   }
@@ -79,10 +290,11 @@ export function findLatestUsableSnapshot(db: Database.Database, rigId: string): 
  * arch-D1.1 sibling-audit `snapshots(rig_id, created_at)` index candidate.
  */
 export function findLatestUsableSnapshotsForAllRigs(db: Database.Database): Map<string, Snapshot> {
+  // One latest-snapshot lookup per rig with snapshots (from the index), not one per snapshot row.
   const rows = db.prepare(`
-    SELECT s.* FROM snapshots s
-    WHERE s.id = (
-      SELECT s2.id FROM snapshots s2 WHERE s2.rig_id = s.rig_id
+    SELECT s.* FROM (SELECT DISTINCT rig_id FROM snapshots) r
+    JOIN snapshots s ON s.id = (
+      SELECT s2.id FROM snapshots s2 WHERE s2.rig_id = r.rig_id
       ORDER BY s2.created_at DESC, s2.id DESC LIMIT 1
     )
   `).all() as SnapshotRow[];
@@ -122,9 +334,27 @@ interface NodeOptions {
   runtime?: string;
   model?: string;
   effort?: string;
+  advisor?: string;
   codexConfigProfile?: string;
   /** OPR.0.4.8.3 Seam B: per-seat permission_policy REF (builtin:<name> or spec-relative path). */
   permissionPolicy?: string;
+  claudePermissions?: import("./claude-permission-rules.js").ClaudePermissionRules;
+  claudeAutoMode?: import("./claude-auto-mode.js").ClaudeAutoMode;
+  /** A Claude seat's own subscription token file, by reference (spec `claude_token`). */
+  claudeTokenRef?: ClaudeSeatTokenRef;
+  claudeMcp?: ClaudeMcp;
+  launchWrapper?: readonly string[] | null;
+  /** The seat's own process limits (spec `process_limits`); null/absent = none. */
+  processLimits?: ProcessLimits | null;
+  /** #2940: the seat's resolved keep_alive; absent = off. */
+  keepAlive?: boolean;
+  /** #3416 (3): a Claude seat's status line throttle in seconds (spec `statusline_throttle`); null/absent = none. */
+  statuslineThrottle?: number | null;
+  /** #3395: the seat pool block this node is the model of (spec `pool`); null/absent = none. */
+  pool?: SeatPoolNodeBlock | null;
+  codexPermissions?: import("./codex-member-permissions.js").CodexMemberPermissions;
+  /** The member's declared launch environment (spec `env:`); not merged with the rig's. */
+  env?: SeatEnv;
   cwd?: string;
   surfaceHint?: string;
   workspace?: string;
@@ -138,6 +368,8 @@ interface NodeOptions {
   resolvedSpecName?: string;
   resolvedSpecVersion?: string;
   resolvedSpecHash?: string;
+  /** Validated pod-aware source used to rebuild a fresh launch after restart. */
+  launchRecipe?: NodeLaunchRecipe;
 }
 
 export class RigRepository {
@@ -146,6 +378,11 @@ export class RigRepository {
    *  protection arms in the same act that creates the rig. Wired at startup;
    *  optional so repo construction stays dependency-free. */
   onRigCreated?: (rig: Rig) => void;
+  /** #3634 — the same act for archive, unarchive and delete: fired after the row changed, so a daemon-owned
+   *  per-name job follows the rig on every path (routes, instantiator, teardown, lifecycle). */
+  onRigArchived?: (rig: { id: string; name: string }) => void;
+  onRigUnarchived?: (rig: { id: string; name: string }) => void;
+  onRigDeleted?: (rig: { id: string; name: string }) => void;
   constructor(db: Database.Database) {
     this.db = db;
   }
@@ -164,6 +401,23 @@ export class RigRepository {
     );
     this.onRigCreated?.(rig);
     return rig;
+  }
+
+  /** Original built-in kernel template from the rig's latest rig-spec bootstrap, including partial launches.
+   *  Match the verified specs root supplied by daemon startup, not an arbitrary matching path suffix.
+   *  A custom spec or absent history is unknown; do not infer a selection from today's runtime mix. */
+  getKernelVariantFromBootstrap(rigId: string, builtInSpecsDir: string): string | null {
+    const row = this.db.prepare(
+      "SELECT source_ref FROM bootstrap_runs WHERE rig_id = ? AND source_kind = 'rig_spec' ORDER BY created_at DESC, rowid DESC LIMIT 1"
+    ).get(rigId) as { source_ref: string } | undefined;
+    if (!row) return null;
+    const source = posix.normalize(row.source_ref.replace(/\\/g, "/"));
+    const root = posix.normalize(builtInSpecsDir.replace(/\\/g, "/"));
+    if (!posix.isAbsolute(root) && !/^[A-Za-z]:\//.test(root)) return null;
+    const directory = root.replace(/\/+$/, "") + "/rigs/launch/kernel/";
+    if (!source.startsWith(directory)) return null;
+    const variant = source.slice(directory.length);
+    return /^rig(?:-claude-only|-codex-only)?\.yaml$/.test(variant) ? variant : null;
   }
 
   /** Canonical bundle materialization folder, independent of seats' working directories. */
@@ -214,6 +468,62 @@ export class RigRepository {
     return row?.non_interruptive === 1;
   }
 
+  /** #80: persist the rig's seat grouping (spec `seat_slice`), or null for none. A grouping is never silently dropped:
+   *  without the column it needs a migration. */
+  setRigSeatSlice(rigId: string, mode: SeatSliceMode | null): void {
+    if (!this.hasRigColumn("seat_slice")) {
+      if (mode !== null) throw new Error("Cannot persist seat_slice: database migration is required");
+      return;
+    }
+    this.db.prepare("UPDATE rigs SET seat_slice = ?, updated_at = ? WHERE id = ?").run(mode, new Date().toISOString(), rigId);
+  }
+
+  getRigSeatSlice(rigId: string): SeatSliceMode | null {
+    if (!this.hasRigColumn("seat_slice")) return null;
+    const row = this.db.prepare("SELECT seat_slice FROM rigs WHERE id = ?").get(rigId) as { seat_slice: string | null } | undefined;
+    return row?.seat_slice === "rig" ? "rig" : null;
+  }
+
+  /** #80: the name of the rig whose slice a seat's new scopes go beneath, read at each launch; undefined when the seat's
+   *  rig doesn't group its seats (or the seat is unknown). */
+  getNodeSeatSliceRig(nodeId: string): string | undefined {
+    if (!this.hasRigColumn("seat_slice")) return undefined;
+    const row = this.db.prepare("SELECT r.name AS name, r.seat_slice AS seat_slice FROM nodes n JOIN rigs r ON r.id = n.rig_id WHERE n.id = ?")
+      .get(nodeId) as { name: string; seat_slice: string | null } | undefined;
+    return row?.seat_slice === "rig" ? row.name : undefined;
+  }
+
+  /** Persist the rig-level `env:` block from the spec, or null to clear. */
+  setRigEnv(rigId: string, env: SeatEnv | null): void {
+    if (!this.hasRigColumn("env_json")) return;
+    this.db.prepare("UPDATE rigs SET env_json = ?, updated_at = ? WHERE id = ?")
+      .run(env ? JSON.stringify(env) : null, new Date().toISOString(), rigId);
+  }
+
+  getRigEnv(rigId: string): SeatEnv | null {
+    if (!this.hasRigColumn("env_json")) return null;
+    const row = this.db.prepare("SELECT env_json FROM rigs WHERE id = ?")
+      .get(rigId) as { env_json: string | null } | undefined;
+    return parseStoredSeatEnv(row?.env_json);
+  }
+
+  /** What a seat's process gets: its rig's `env:` with the member's own `env:` over it. A launch,
+   *  a restore and a handover successor all read this, so they cannot disagree. A CLAUDE_CONFIG_DIR or
+   *  CODEX_HOME that isn't an absolute path is left out: OpenRig reports it as ignored (seat-runtime-home.ts),
+   *  so the runtime resolves as if the seat declared none. */
+  getEffectiveSeatEnv(nodeId: string, ignoreAccountHome = false): SeatEnv {
+    if (!this.hasNodeColumn("env_json")) return {};
+    const row = this.db.prepare("SELECT rig_id, env_json FROM nodes WHERE id = ?")
+      .get(nodeId) as { rig_id: string; env_json: string | null } | undefined;
+    if (!row) return {};
+    const env = withoutIgnoredRuntimeHomes(mergeSeatEnv(this.getRigEnv(row.rig_id), parseStoredSeatEnv(row.env_json)));
+    for (const runtime of ignoreAccountHome ? [] : ["codex", "claude-code", "pi"] as const) {
+      const accountHome = seatAccountHome(this.db, nodeId, runtime);
+      if (accountHome) env[RUNTIME_HOME_VAR[runtime]] = accountHome;
+    }
+    return env;
+  }
+
   /** OPR.0.4.8.3 Seam B — persist a rig's attached permission_policy REF (builtin:<name> or a
    *  spec-relative custom path), or null to clear. Mirrors setRigWorkspace (migration 056). */
   setRigPermissionPolicy(rigId: string, permissionPolicy: string | null): void {
@@ -236,6 +546,27 @@ export class RigRepository {
     if (!this.hasRigColumn("claude_managed_block_file")) return;
     this.db.prepare("UPDATE rigs SET claude_managed_block_file = ?, updated_at = ? WHERE id = ?")
       .run(file ?? null, new Date().toISOString(), rigId);
+  }
+
+  /** The rig's authored startup layers and the absolute root their paths resolve against (migration 121).
+   *  A seat added to the rig later reads them back. */
+  setRigStartupLayers(rigId: string, layers: RigStartupLayers | null): void {
+    if (!this.hasRigColumn("startup_layers_json")) return;
+    this.db.prepare("UPDATE rigs SET startup_layers_json = ?, updated_at = ? WHERE id = ?")
+      .run(layers ? JSON.stringify(layers) : null, new Date().toISOString(), rigId);
+  }
+
+  getRigStartupLayers(rigId: string): RigStartupLayers | null {
+    if (!this.hasRigColumn("startup_layers_json")) return null;
+    const row = this.db.prepare("SELECT startup_layers_json FROM rigs WHERE id = ?")
+      .get(rigId) as { startup_layers_json: string | null } | undefined;
+    if (!row?.startup_layers_json) return null;
+    try {
+      const parsed = JSON.parse(row.startup_layers_json) as Partial<RigStartupLayers>;
+      return typeof parsed.root === "string" ? parsed as RigStartupLayers : null;
+    } catch {
+      return null;
+    }
   }
 
   /** #25 — the rig's selected Claude managed-block file, or null when it uses the default. */
@@ -312,6 +643,16 @@ export class RigRepository {
     ).run(provenance.origin, provenance.resolvedTarget, provenance.declaringDir, provenance.launchPosture, nodeId);
   }
 
+  /** Re-point an EXISTING seat's own permission_policy REF (`rig policy apply --seat`); the caller
+   *  writes its resolved provenance through setNodePolicyProvenance in the same transaction. Restore,
+   *  resume and launches that read the stored seat use that provenance. A later launch from a spec that
+   *  declares a policy rewrites the provenance but not this ref, so the two can then differ: this ref
+   *  is what `rig export` emits, not necessarily the policy the seat launched with. */
+  setNodePermissionPolicy(nodeId: string, permissionPolicy: string): void {
+    if (!this.hasNodeColumn("permission_policy")) return;
+    this.db.prepare("UPDATE nodes SET permission_policy = ? WHERE id = ?").run(permissionPolicy, nodeId);
+  }
+
   /** Seam B (R2) — read a node's persisted policy provenance; null when none attached
    *  (or pre-057 DB). Restore consumers re-derive posture from this without the spec. */
   getNodePolicyProvenance(nodeId: string): {
@@ -354,6 +695,57 @@ export class RigRepository {
   }
 
   addNode(rigId: string, logicalId: string, opts?: NodeOptions): Node {
+    if (opts?.claudeMcp !== undefined) {
+      if (opts.runtime !== "claude-code") throw new Error("claude_mcp requires a claude-code seat");
+      validateClaudeMcp(opts.claudeMcp);
+      if (!this.db.inTransaction) return this.db.transaction(() => this.addNode(rigId, logicalId, opts))();
+    }
+    if (opts?.launchWrapper !== undefined && opts.launchWrapper !== null) {
+      if (!isLaunchWrapperRuntime(opts.runtime)) throw new Error("launch_wrapper requires a pi, codex, claude-code or supported community-harness seat");
+      validateLaunchWrapper(opts.launchWrapper);
+      if (!this.db.inTransaction) return this.db.transaction(() => this.addNode(rigId, logicalId, opts))();
+    }
+    if (opts?.processLimits) {
+      validateProcessLimits({ tasks_max: opts.processLimits.tasksMax, memory_max: opts.processLimits.memoryMax });
+      // Written atomically with creation: a seat never exists without the limit it was created with.
+      if (!this.db.inTransaction) return this.db.transaction(() => this.addNode(rigId, logicalId, opts))();
+    }
+    // #2940: likewise, a seat never exists without the keep_alive it was declared with.
+    if (opts?.keepAlive && !this.db.inTransaction) return this.db.transaction(() => this.addNode(rigId, logicalId, opts))();
+    if (opts?.statuslineThrottle) {
+      validateStatuslineThrottle(opts.statuslineThrottle, "statusline_throttle");
+      // As with process limits: a seat never exists without the throttle it was created with.
+      if (!this.db.inTransaction) return this.db.transaction(() => this.addNode(rigId, logicalId, opts))();
+    }
+    if (opts?.pool) {
+      storedPoolText(opts.pool);
+      // As with process limits: a model seat never exists without the pool block it was created with.
+      if (!this.db.inTransaction) return this.db.transaction(() => this.addNode(rigId, logicalId, opts))();
+    }
+    if (opts?.claudePermissions !== undefined) {
+      if (opts.runtime !== "claude-code") throw new Error("claude_permissions requires a claude-code seat");
+      validateClaudePermissionRules(opts.claudePermissions);
+      // Required rule persistence is atomic with creation, including direct repository callers.
+      if (!this.db.inTransaction) return this.db.transaction(() => this.addNode(rigId, logicalId, opts))();
+    }
+    if (opts?.claudeAutoMode !== undefined) {
+      if (opts.runtime !== "claude-code") throw new Error("claude_auto_mode requires a claude-code seat");
+      validateClaudeAutoMode(opts.claudeAutoMode);
+      if (!this.db.inTransaction) return this.db.transaction(() => this.addNode(rigId, logicalId, opts))();
+    }
+    if (opts?.codexPermissions !== undefined) {
+      if (opts.runtime !== "codex") throw new Error("codex_permissions requires a codex seat");
+      validateCodexMemberPermissions(opts.codexPermissions);
+      // The envelope is written atomically with creation, including direct repository callers.
+      if (!this.db.inTransaction) return this.db.transaction(() => this.addNode(rigId, logicalId, opts))();
+    }
+    if (opts?.claudeTokenRef !== undefined) {
+      if (opts.runtime !== "claude-code") throw new Error("claude_token requires a claude-code seat");
+      const problem = claudeSeatTokenRefProblem(opts.claudeTokenRef);
+      if (problem) throw new Error(`claude_token: ${problem}`);
+      // The reference is written atomically with creation, including direct repository callers.
+      if (!this.db.inTransaction) return this.db.transaction(() => this.addNode(rigId, logicalId, opts))();
+    }
     // Same-rig guard for podId
     if (opts?.podId) {
       const pod = this.db.prepare("SELECT rig_id FROM pods WHERE id = ?").get(opts.podId) as { rig_id: string } | undefined;
@@ -450,6 +842,27 @@ export class RigRepository {
         );
     }
 
+    if (opts?.claudeTokenRef !== undefined && !this.setNodeClaudeTokenRef(id, opts.claudeTokenRef)) {
+      throw new Error("claude_token needs the current database schema; the seat wasn't created");
+    }
+
+    if (opts?.claudePermissions !== undefined) {
+      if (opts.runtime !== "claude-code") throw new Error("claude_permissions requires a claude-code seat");
+      this.db.prepare("UPDATE nodes SET claude_permissions_json = ? WHERE id = ?")
+        .run(JSON.stringify(validateClaudePermissionRules(opts.claudePermissions)), id);
+    }
+    if (opts?.claudeAutoMode !== undefined) {
+      if (opts.runtime !== "claude-code") throw new Error("claude_auto_mode requires a claude-code seat");
+      this.db.prepare("UPDATE nodes SET claude_auto_mode_json = ? WHERE id = ?")
+        .run(JSON.stringify(validateClaudeAutoMode(opts.claudeAutoMode)), id);
+    }
+
+    if (opts?.codexPermissions !== undefined) {
+      if (opts.runtime !== "codex") throw new Error("codex_permissions requires a codex seat");
+      this.db.prepare("UPDATE nodes SET codex_permissions_json = ? WHERE id = ?")
+        .run(JSON.stringify(validateCodexMemberPermissions(opts.codexPermissions)), id);
+    }
+
     if (opts?.sessionSource && this.hasNodeColumn("session_source_json")) {
       this.db.prepare("UPDATE nodes SET session_source_json = ? WHERE id = ?")
         .run(JSON.stringify(opts.sessionSource), id);
@@ -459,10 +872,72 @@ export class RigRepository {
       this.db.prepare("UPDATE nodes SET effort = ? WHERE id = ?")
         .run(opts.effort, id);
     }
+    if (opts?.advisor) this.setNodeAdvisor(id, opts.advisor);
+    if (opts?.claudeMcp !== undefined) this.setNodeClaudeMcp(id, opts.claudeMcp);
+    if (opts?.launchWrapper !== undefined && opts.launchWrapper !== null && opts.launchWrapper.length > 0) {
+      this.setNodeLaunchWrapper(id, opts.launchWrapper);
+    }
+    if (opts?.processLimits) this.setNodeProcessLimits(id, opts.processLimits);
+    if (opts?.keepAlive) this.setNodeKeepAlive(id, true);
+    if (opts?.statuslineThrottle) this.setNodeStatuslineThrottle(id, opts.statuslineThrottle);
+    if (opts?.pool) this.setNodePool(id, opts.pool);
+
+    if (opts?.env && this.hasNodeColumn("env_json")) {
+      this.db.prepare("UPDATE nodes SET env_json = ? WHERE id = ?")
+        .run(JSON.stringify(opts.env), id);
+    }
+
+    if (opts?.launchRecipe && this.hasNodeColumn("launch_recipe_json")) {
+      this.db.prepare("UPDATE nodes SET launch_recipe_json = ? WHERE id = ?")
+        .run(JSON.stringify(opts.launchRecipe), id);
+    }
 
     return this.rowToNode(
       this.db.prepare("SELECT * FROM nodes WHERE id = ?").get(id) as NodeRow
     );
+  }
+
+  /** #2940: keep the seat's launch recipe current with the keep_alive its member declares in the spec applied now
+   *  (undefined: it declares none). The recipe is written when the seat is created, while each applied spec rewrites the
+   *  resolved value; an export reads the member's own declaration from the recipe, so without this a later
+   *  `keep_alive: false` would be exported as nothing and come back on from the agent spec. */
+  setNodeAuthoredKeepAlive(nodeId: string, logicalId: string, keepAlive: boolean | undefined): void {
+    const recipe = this.getNodeLaunchRecipe(nodeId);
+    if (!recipe || !Array.isArray(recipe.rigSpec.pods)) return;
+    const [podId, memberId] = logicalId.split(".");
+    const pods = recipe.rigSpec.pods.filter((pod) => pod && pod.id === podId);
+    const members = pods.length === 1 && Array.isArray(pods[0]!.members) ? pods[0]!.members.filter((member) => member && member.id === memberId) : [];
+    if (members.length !== 1 || members[0]!.keepAlive === keepAlive) return;
+    if (keepAlive === undefined) delete members[0]!.keepAlive;
+    else members[0]!.keepAlive = keepAlive;
+    this.db.prepare("UPDATE nodes SET launch_recipe_json = ? WHERE id = ?").run(JSON.stringify(recipe), nodeId);
+  }
+
+  /** Return the durable source for rebuilding a pod-aware seat, if available. */
+  getNodeLaunchRecipe(nodeId: string): NodeLaunchRecipe | null {
+    if (!this.hasNodeColumn("launch_recipe_json")) return null;
+    const row = this.db.prepare("SELECT launch_recipe_json FROM nodes WHERE id = ?").get(nodeId) as
+      { launch_recipe_json?: string | null } | undefined;
+    if (!row?.launch_recipe_json) return null;
+    try {
+      const recipe = JSON.parse(row.launch_recipe_json) as Partial<NodeLaunchRecipe>;
+      if (recipe.version !== 1 || typeof recipe.rigRoot !== "string" || !recipe.rigSpec) return null;
+      if (!isStoredRigSpec(recipe.rigSpec)) return null;
+      return recipe as NodeLaunchRecipe;
+    } catch {
+      return null;
+    }
+  }
+
+  getNodeInputRoute(nodeId: string): "typed" | "native" {
+    if (!this.hasNodeColumn("input_route")) return "typed";
+    const row = this.db.prepare("SELECT input_route FROM nodes WHERE id=?").get(nodeId) as { input_route: string | null } | undefined;
+    return row?.input_route === "native" ? "native" : "typed";
+  }
+
+  setNodeInputRoute(nodeId: string, route: "typed" | "native"): boolean {
+    if (!["typed", "native"].includes(route)) throw new Error("Invalid input route.");
+    return this.db.prepare("UPDATE nodes SET input_route=? WHERE id=?").run(route, nodeId).changes > 0;
   }
 
   /** S5 (OPR.0.5.4.7) — the first supported nodes.model write (the inventory was insert-only;
@@ -475,12 +950,42 @@ export class RigRepository {
     return result.changes > 0;
   }
 
+  /** Saves a seat's launch directory only if it's still `expectedCwd`. The lifecycle service checks the new
+   *  directory, read-only, before calling this; it writes no startup files. */
+  setNodeCwd(nodeId: string, cwd: string, expectedCwd: string | null): boolean {
+    return this.db.prepare("UPDATE nodes SET cwd = ? WHERE id = ? AND cwd IS ?")
+      .run(cwd, nodeId, expectedCwd).changes > 0;
+  }
+
   setNodeEffort(nodeId: string, effort: string): boolean {
     if (!this.hasNodeColumn("effort")) return false;
     const result = this.db
       .prepare("UPDATE nodes SET effort = ? WHERE id = ?")
       .run(effort, nodeId);
     return result.changes > 0;
+  }
+
+  /** OPR.0.7.0.7: write or clear (null) a seat's explicit effort choice. Returns false when
+   *  the column isn't available or no row matched, so a caller never reports a change from it. */
+  setNodeEffortChoice(nodeId: string, choice: string | null): boolean {
+    if (!this.hasNodeColumn("effort_choice")) return false;
+    return this.db.prepare("UPDATE nodes SET effort_choice = ? WHERE id = ?")
+      .run(choice, nodeId).changes > 0;
+  }
+
+  /** Write or clear (null) the registered person who answers this seat's runner permission requests. Returns false when
+   *  the column isn't available or no row matched, so a caller never reports a change from it. */
+  setNodePermissionsTo(nodeId: string, owner: string | null): boolean {
+    if (!this.hasNodeColumn("permissions_to")) return false;
+    return this.db.prepare("UPDATE nodes SET permissions_to = ? WHERE id = ?")
+      .run(owner, nodeId).changes > 0;
+  }
+
+  /** The seat's selected permission answer owner, or null when none is selected or the column isn't available. */
+  getNodePermissionsTo(nodeId: string): string | null {
+    if (!this.hasNodeColumn("permissions_to")) return null;
+    const row = this.db.prepare("SELECT permissions_to FROM nodes WHERE id = ?").get(nodeId) as { permissions_to: string | null } | undefined;
+    return row?.permissions_to ?? null;
   }
 
   clearNodeEffort(nodeId: string): boolean {
@@ -491,17 +996,141 @@ export class RigRepository {
     return result.changes > 0;
   }
 
+  /** A Claude seat's own subscription credential, by reference only; null clears it. */
+  setNodeClaudeTokenRef(nodeId: string, ref: ClaudeSeatTokenRef | null): boolean {
+    if (!this.hasNodeColumn("claude_token_ref")) return false;
+    return this.db.prepare("UPDATE nodes SET claude_token_ref = ? WHERE id = ?")
+      .run(ref ? JSON.stringify({ label: ref.label, tokenFile: ref.tokenFile, ...(ref.kind ? { kind: ref.kind } : {}) }) : null, nodeId).changes > 0;
+  }
+
+  /** Persist the resolved Advisor; null removes a previous spec's selection. */
+  setNodeClaudeMcp(nodeId: string, value: ClaudeMcp | null): boolean {
+    if (value !== null) validateClaudeMcp(value);
+    if (!this.hasNodeColumn("claude_mcp")) {
+      if (value !== null) throw new Error("Cannot persist claude_mcp: database migration is required");
+      return false;
+    }
+    return this.db.prepare("UPDATE nodes SET claude_mcp = ? WHERE id = ?").run(value, nodeId).changes > 0;
+  }
+
+  /** Persist or clear (null or []) a seat's launch_wrapper argv prefix. */
+  setNodeLaunchWrapper(nodeId: string, value: readonly string[] | null): boolean {
+    const validated = value === null ? null : validateLaunchWrapper(value);
+    const stored = validated && validated.length > 0 ? JSON.stringify(validated) : null;
+    if (!this.hasNodeColumn("launch_wrapper")) {
+      if (stored !== null) throw new Error("Cannot persist launch_wrapper: database migration is required");
+      return false;
+    }
+    if (value !== null) {
+      const existing = this.db.prepare("SELECT runtime FROM nodes WHERE id = ?").get(nodeId) as { runtime: string | null } | undefined;
+      if (existing && !isLaunchWrapperRuntime(existing.runtime)) {
+        throw new Error("launch_wrapper requires a pi, codex, claude-code or supported community-harness seat");
+      }
+    }
+    return this.db.prepare("UPDATE nodes SET launch_wrapper = ? WHERE id = ?").run(stored, nodeId).changes > 0;
+  }
+
+  /** Persist or clear (null) a seat's process limits (spec `process_limits`, #3253). The terminal reads them as it
+   *  creates the seat's pane, so a re-applied spec must write them before that launch. */
+  setNodeProcessLimits(nodeId: string, value: ProcessLimits | null): boolean {
+    let stored: string | null = null;
+    if (value !== null) {
+      // A value with neither key would store `{}`, which reads back as invalid: null is the only way to clear.
+      const checked = validateProcessLimits({ tasks_max: value.tasksMax, memory_max: value.memoryMax });
+      if (checked.tasksMax === undefined && checked.memoryMax === undefined) {
+        throw new Error("process_limits: tasks_max or memory_max is required (pass null to clear)");
+      }
+      stored = serializeProcessLimits(checked);
+    }
+    if (!this.hasNodeColumn("process_limits")) {
+      if (stored !== null) throw new Error("Cannot persist process_limits: database migration is required");
+      return false;
+    }
+    return this.db.prepare("UPDATE nodes SET process_limits = ? WHERE id = ?").run(stored, nodeId).changes > 0;
+  }
+
+  /** A seat's stored process limits, read at each new launch of its pane; undefined = none. A malformed stored value
+   *  throws: a limit the operator set is never silently dropped. */
+  getNodeProcessLimits(nodeId: string): ProcessLimits | undefined {
+    if (!this.hasNodeColumn("process_limits")) return undefined;
+    const row = this.db.prepare("SELECT process_limits FROM nodes WHERE id = ?").get(nodeId) as
+      { process_limits: string | null } | undefined;
+    return parseStoredProcessLimits(row?.process_limits, `Seat ${nodeId} process_limits`);
+  }
+
+  /** Persist a seat's resolved keep_alive (#2940). Off needs no column: a database without it already treats every seat
+   *  as off; turning it on there throws instead of being dropped. */
+  setNodeKeepAlive(nodeId: string, value: boolean): boolean {
+    if (!this.hasNodeColumn("keep_alive")) {
+      if (value) throw new Error("Cannot persist keep_alive: database migration is required");
+      return false;
+    }
+    return this.db.prepare("UPDATE nodes SET keep_alive = ? WHERE id = ?").run(value ? 1 : 0, nodeId).changes > 0;
+  }
+
+  /** #3416 (3): persist or clear (null) a Claude seat's status line throttle in seconds. Its launches read it. */
+  setNodeStatuslineThrottle(nodeId: string, seconds: number | null): boolean {
+    if (seconds !== null) validateStatuslineThrottle(seconds, "statusline_throttle");
+    if (!this.hasNodeColumn("statusline_throttle_seconds")) {
+      if (seconds !== null) throw new Error("Cannot persist statusline_throttle: database migration is required");
+      return false;
+    }
+    return this.db.prepare("UPDATE nodes SET statusline_throttle_seconds = ? WHERE id = ?").run(seconds, nodeId).changes > 0;
+  }
+
+  /** A seat's status line throttle in seconds, read at each launch; null = none, and a stored value outside the bounds
+   *  reads as none (the launch then collects on every status line run, as without a throttle). */
+  getNodeStatuslineThrottle(nodeId: string): number | null {
+    if (!this.hasNodeColumn("statusline_throttle_seconds")) return null;
+    const row = this.db.prepare("SELECT statusline_throttle_seconds FROM nodes WHERE id = ?").get(nodeId) as
+      { statusline_throttle_seconds: number | null } | undefined;
+    return storedStatuslineThrottle(row?.statusline_throttle_seconds);
+  }
+
+  /** #3395: persist or clear (null) the seat pool block of a model seat. A usable block is stored in its spec form;
+   *  one that can't be used is stored as authored, so it holds that pool rather than removing it. */
+  setNodePool(nodeId: string, block: SeatPoolNodeBlock | null): boolean {
+    const stored = block === null ? null : storedPoolText(block);
+    if (!this.hasNodeColumn("pool")) {
+      if (stored !== null) throw new Error("Cannot persist pool: database migration is required");
+      return false;
+    }
+    return this.db.prepare("UPDATE nodes SET pool = ? WHERE id = ?").run(stored, nodeId).changes > 0;
+  }
+
+  /** #3395: a model seat's stored pool block; undefined = none. A block that can't be read comes back as stored, with
+   *  why, and never throws. */
+  getNodePool(nodeId: string): StoredSeatPool | undefined {
+    if (!this.hasNodeColumn("pool")) return undefined;
+    const row = this.db.prepare("SELECT pool FROM nodes WHERE id = ?").get(nodeId) as { pool: string | null } | undefined;
+    return parseStoredPoolBlock(row?.pool);
+  }
+
+  setNodeAdvisor(nodeId: string, advisor: string | null): boolean {
+    if (!this.hasNodeColumn("advisor")) return false;
+    return this.db.prepare("UPDATE nodes SET advisor = ? WHERE id = ?")
+      .run(advisor, nodeId).changes > 0;
+  }
+
   addEdge(rigId: string, sourceId: string, targetId: string, kind: string): Edge {
     const id = ulid();
-    this.db
-      .prepare(
-        "INSERT INTO edges (id, rig_id, source_id, target_id, kind) VALUES (?, ?, ?, ?, ?)"
-      )
-      .run(id, rigId, sourceId, targetId, kind);
+    const targetRef = kind === "escalates_to" && isEscalationTargetRef(targetId) ? targetId : null;
+    if (targetRef) {
+      this.db.prepare("INSERT INTO edges (id, rig_id, source_id, target_ref, kind) VALUES (?, ?, ?, ?, ?)")
+        .run(id, rigId, sourceId, targetRef, kind);
+    } else {
+      this.db.prepare("INSERT INTO edges (id, rig_id, source_id, target_id, kind) VALUES (?, ?, ?, ?, ?)")
+        .run(id, rigId, sourceId, targetId, kind);
+    }
 
     return this.rowToEdge(
       this.db.prepare("SELECT * FROM edges WHERE id = ?").get(id) as EdgeRow
     );
+  }
+
+  /** Removes exactly one edge row within the target rig; true when it existed. */
+  removeEdge(rigId: string, edgeId: string): boolean {
+    return this.db.prepare("DELETE FROM edges WHERE rig_id = ? AND id = ?").run(rigId, edgeId).changes > 0;
   }
 
   getRig(rigId: string): RigWithRelations | null {
@@ -577,6 +1206,13 @@ export class RigRepository {
     return rows.map((r) => this.rowToRig(r));
   }
 
+  /** #3634: the names that still have an unarchived row (every name before migration 042). */
+  listUnarchivedRigNames(): string[] {
+    const where = this.hasRigColumn("archived_at") ? " WHERE archived_at IS NULL" : "";
+    const rows = this.db.prepare(`SELECT DISTINCT name FROM rigs${where} ORDER BY name`).all() as Array<{ name: string }>;
+    return rows.map((r) => r.name);
+  }
+
   getRigSummaries(filter?: RigArchiveFilter): Array<{ id: string; name: string; nodeCount: number; latestSnapshotAt: string | null; latestSnapshotId: string | null; hasServices: boolean; archivedAt: string | null }> {
     const cond = archiveWhereClause("r.archived_at", filter);
     const where = cond ? `WHERE ${cond}` : "";
@@ -620,6 +1256,7 @@ export class RigRepository {
     const result = this.db
       .prepare("UPDATE rigs SET archived_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND archived_at IS NULL")
       .run(rigId);
+    if (result.changes > 0) this.fireRigHook(this.onRigArchived, rigId);
     return result.changes > 0;
   }
 
@@ -628,11 +1265,22 @@ export class RigRepository {
     const result = this.db
       .prepare("UPDATE rigs SET archived_at = NULL, updated_at = datetime('now') WHERE id = ? AND archived_at IS NOT NULL")
       .run(rigId);
+    if (result.changes > 0) this.fireRigHook(this.onRigUnarchived, rigId);
     return result.changes > 0;
   }
 
   deleteRig(rigId: string): void {
-    this.db.prepare("DELETE FROM rigs WHERE id = ?").run(rigId);
+    const rig = this.onRigDeleted
+      ? this.db.prepare("SELECT id, name FROM rigs WHERE id = ?").get(rigId) as { id: string; name: string } | undefined
+      : undefined;
+    const result = this.db.prepare("DELETE FROM rigs WHERE id = ?").run(rigId);
+    if (rig && result.changes > 0) this.onRigDeleted?.(rig);
+  }
+
+  private fireRigHook(hook: ((rig: { id: string; name: string }) => void) | undefined, rigId: string): void {
+    if (!hook) return;
+    const rig = this.db.prepare("SELECT id, name FROM rigs WHERE id = ?").get(rigId) as { id: string; name: string } | undefined;
+    if (rig) hook(rig);
   }
 
   deleteNode(nodeId: string): void {
@@ -725,6 +1373,16 @@ export class RigRepository {
   }
 
   private rowToNode(row: NodeRow): Node {
+    const launchWrapper = parseStoredLaunchWrapper(row.launch_wrapper, `Seat ${row.id} launch_wrapper`);
+    // #3253: a malformed stored limit stays local to its seat: the rig read goes on, the node says why, and the stored
+    // value is kept (that seat's launch and status read it as invalid).
+    let processLimits: ProcessLimits | undefined;
+    let processLimitsError: string | undefined;
+    try { processLimits = parseStoredProcessLimits(row.process_limits, `Seat ${row.id} process_limits`); }
+    catch (error) { processLimitsError = (error as Error).message; }
+    if (launchWrapper && !isLaunchWrapperRuntime(row.runtime)) {
+      throw new Error(`Seat ${row.id} launch_wrapper: only valid when runtime is "pi", "codex", "claude-code" or a supported community harness`);
+    }
     return {
       id: row.id,
       rigId: row.rig_id,
@@ -732,9 +1390,21 @@ export class RigRepository {
       role: row.role,
       runtime: row.runtime,
       model: row.model,
+      inputRoute: row.input_route ?? "typed",
       effort: row.effort ?? null,
+      advisor: row.advisor ?? null,
+      claudeMcp: row.claude_mcp ?? null,
+      ...(launchWrapper ? { launchWrapper } : {}),
+      ...(processLimits ? { processLimits } : {}),
+      ...(processLimitsError ? { processLimitsError } : {}),
+      ...(row.keep_alive === 1 ? { keepAlive: true } : {}),
+      ...(storedStatuslineThrottle(row.statusline_throttle_seconds) !== null ? { statuslineThrottle: storedStatuslineThrottle(row.statusline_throttle_seconds) } : {}),
+      effortChoice: row.effort_choice ?? null,
       codexConfigProfile: row.codex_config_profile ?? null,
+      claudeTokenRef: parseClaudeSeatTokenRef(row.claude_token_ref),
+      ...(row.account_home ? { accountHome: row.account_home } : {}),
       permissionPolicy: row.permission_policy ?? null,
+      env: parseStoredSeatEnv(row.env_json),
       cwd: row.cwd,
       surfaceHint: row.surface_hint ?? null,
       workspace: row.workspace ?? null,
@@ -764,7 +1434,8 @@ export class RigRepository {
       id: row.id,
       rigId: row.rig_id,
       sourceId: row.source_id,
-      targetId: row.target_id,
+      targetId: row.target_ref ?? row.target_id!,
+      ...(row.target_ref ? { targetRef: row.target_ref } : {}),
       kind: row.kind,
       createdAt: row.created_at,
     };
@@ -815,6 +1486,7 @@ interface RigRow {
 }
 
 interface NodeRow {
+  input_route?: "typed" | "native";
   id: string;
   rig_id: string;
   logical_id: string;
@@ -822,8 +1494,18 @@ interface NodeRow {
   runtime: string | null;
   model: string | null;
   effort?: string | null;
+  advisor?: string | null;
+  claude_mcp?: ClaudeMcp | null;
+  launch_wrapper?: string | null;
+  process_limits?: string | null;
+  keep_alive?: number;
+  statusline_throttle_seconds?: number | null;
+  effort_choice?: string | null;
   codex_config_profile?: string | null;
+  claude_token_ref?: string | null;
   permission_policy?: string | null;
+  env_json?: string | null;
+  account_home?: string | null;
   cwd: string | null;
   surface_hint: string | null;
   workspace: string | null;
@@ -834,6 +1516,7 @@ interface NodeRow {
   profile: string | null;
   label: string | null;
   session_source_json?: string | null;
+  launch_recipe_json?: string | null;
   resolved_spec_name: string | null;
   resolved_spec_version: string | null;
   resolved_spec_hash: string | null;
@@ -849,7 +1532,8 @@ interface EdgeRow {
   id: string;
   rig_id: string;
   source_id: string;
-  target_id: string;
+  target_id: string | null;
+  target_ref?: string | null;
   kind: string;
   created_at: string;
 }

@@ -505,6 +505,36 @@ ${worlds}`);
     expect(execFileSync("git", ["-C", workingRoot, "status", "--short"], { encoding: "utf8" })).toBe("");
   });
 
+  it("projects the rest past a skill with uncommitted content, and exits 1 only when something selected it", async () => {
+    writeFileSync(join(skillsRoot, "topology-skill", "draft.md"), "uncommitted work\n");
+    const run = (...topology: string[]) => captureLogs(async () => {
+      await makeCommand().parseAsync([
+        "node", "rig", "context", "work-install",
+        "--project", "alpha", "--runtime", "codex", "--cwd", workingRoot,
+        ...topology, "--apply-skills", "--json",
+      ]);
+    });
+    type Output = {
+      skillLoadout: { entries: Array<{ id: string }>; skipped: Array<{ id: string; selectedBy: string[]; message: string }> };
+      skillProjection: { ok: boolean; applied: boolean };
+    };
+
+    const unselected = await run();
+    expect(unselected.exitCode).toBeUndefined();
+    const quiet = JSON.parse(unselected.logs.join("")) as Output;
+    expect(quiet.skillLoadout.skipped).toMatchObject([{ id: "topology-skill", selectedBy: [] }]);
+    expect(quiet.skillLoadout.skipped[0]!.message).toMatch(/^catalog_skill_skipped: 'topology-skill' /);
+
+    const selected = await run("--topology", "topology-skill");
+    expect(selected.exitCode).toBe(1);
+    const output = JSON.parse(selected.logs.join("")) as Output;
+    expect(output.skillLoadout.entries.map((entry) => entry.id)).toEqual(["project-skill", "system-skill"]);
+    expect(output.skillLoadout.skipped).toMatchObject([{ id: "topology-skill", selectedBy: ["topology"] }]);
+    expect(output.skillProjection).toMatchObject({ ok: true });
+    expect(existsSync(join(workingRoot, ".agents", "skills", "project-skill", "SKILL.md"))).toBe(true);
+    expect(existsSync(join(workingRoot, ".agents", "skills", "topology-skill"))).toBe(false);
+  });
+
   it.each(["unknown-runtime", ""])("rejects explicit runtime %j before project lookup or projection", async (runtime) => {
     const command = makeCommand();
     const workInstall = command.commands[0]!.commands.find((cmd) => cmd.name() === "work-install")!;
@@ -686,6 +716,32 @@ id: OPR.0.5.8.13
         candidates: ["01-live-work", "02-duplicate-id"],
       },
     });
+  });
+
+  it("warns and keeps the project's context when the selected mission doesn't exist, with or without --slice", async () => {
+    const missionsRoot = join(alphaRoot, "missions");
+    for (const slice of [undefined, "01-live-work"]) {
+      const result = await captureLogs(async () => {
+        await makeCommand().parseAsync([
+          "node", "rig", "context", "work-install",
+          "--project", "alpha", "--mission", "release-0.7.13", ...(slice ? ["--slice", slice] : []), "--json",
+        ]);
+      });
+      expect(result.exitCode).toBeUndefined();
+      const plan = JSON.parse(result.logs.join("")) as {
+        position: { mission: string; missionRoot: string | null; sliceRoot: string | null; frontier: string };
+        pieces: Array<{ altitude: string }>;
+        warnings: string[];
+      };
+      expect(plan.position).toMatchObject({ mission: "release-0.7.13", missionRoot: null, sliceRoot: null, frontier: "project" });
+      expect(plan.pieces.every((piece) => piece.altitude === "project")).toBe(true);
+      expect(plan.warnings).toContain(`mission 'release-0.7.13' not found under ${missionsRoot}${slice ? `, so slice '${slice}' wasn't looked up` : ""}; using the project's context`);
+    }
+    const text = await captureLogs(async () => {
+      await makeCommand().parseAsync(["node", "rig", "context", "work-install", "--project", "alpha", "--mission", "release-0.7.13"]);
+    });
+    expect(text.exitCode).toBeUndefined();
+    expect(text.errLogs).toContain(`Warning: mission 'release-0.7.13' not found under ${missionsRoot}; using the project's context`);
   });
 
   it("uses explicit mission composition as the strict slice-selection boundary", async () => {

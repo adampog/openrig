@@ -15,7 +15,8 @@ export type CodexDaemonSupport =
   | { kind: "unknown"; detail: string };
 
 /** Detects support for the Codex a seat in `cwd` would run. */
-export type CodexDaemonSupportDetector = (cwd: string) => Promise<CodexDaemonSupport>;
+/** `codexHome` is the seat's own home when it has one; it wins over the detector's own. */
+export type CodexDaemonSupportDetector = (cwd: string, codexHome?: string) => Promise<CodexDaemonSupport>;
 
 const CODEX_USAGE = /^Usage: codex(?:[ \t]|$)/m;
 const NO_DAEMON_OPTION = /^[ \t]*--no-daemon(?:[ \t]|$)/m;
@@ -34,9 +35,11 @@ export async function probeCodexDaemonSupport(runHelp: () => Promise<string>): P
 
 /** The production detector: runs `codex --help` asynchronously, so the daemon keeps serving. */
 export function codexDaemonSupportProbe(launchPath?: string, timeoutMs = 10_000, codexHome?: string): CodexDaemonSupportDetector {
-  return (cwd) => probeCodexDaemonSupport(async () => {
+  return (cwd, seatHome) => probeCodexDaemonSupport(async () => {
     const { execFile } = await import("node:child_process");
-    const env = { ...process.env, ...(launchPath ? { PATH: launchPath } : {}), ...(codexHome ? { CODEX_HOME: codexHome } : {}) };
+    const { existsSync } = await import("node:fs");
+    const home = seatHome ?? codexHome;
+    const env = { ...process.env, ...(launchPath ? { PATH: launchPath } : {}), ...(home ? { CODEX_HOME: home } : {}) };
     let deadline: ReturnType<typeof setTimeout> | undefined;
     return new Promise<string>((resolve, reject) => {
       // execFile closes its pipes on timeout, but can report success if a wrapper
@@ -44,7 +47,11 @@ export function codexDaemonSupportProbe(launchPath?: string, timeoutMs = 10_000,
       // separately; execFile still owns pipe/direct-child cleanup, not the whole tree.
       deadline = setTimeout(() => reject(new Error(`timed out after ${timeoutMs} ms`)), timeoutMs);
       execFile("codex", ["--help"], { cwd, env, timeout: timeoutMs, killSignal: "SIGKILL", encoding: "utf-8" }, (error, stdout) => {
-        if (error) reject(error.killed ? new Error(`timed out after ${timeoutMs} ms`) : error);
+        // Node reports a working directory that doesn't exist as `spawn codex ENOENT`, which reads as a missing Codex.
+        const missingCwd = ((error as NodeJS.ErrnoException | null)?.code === "ENOENT" || /\bENOENT\b/.test(String(error?.message)))
+          && !existsSync(cwd);
+        if (error) reject(error.killed ? new Error(`timed out after ${timeoutMs} ms`)
+          : missingCwd ? new Error(`the seat's working directory ${cwd} doesn't exist`) : error);
         else resolve(stdout);
       });
     }).finally(() => clearTimeout(deadline));

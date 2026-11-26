@@ -5,11 +5,29 @@ import type { ProjectSelection } from "./types.js";
 // one-file read (every route below is an EXISTING, web-consumed daemon read).
 // Daemon-direct, never via the Studio serve-shell (FR-9). Phase 1 ships the
 // wrappers; Phase 2 binds the three sections to them.
+
+/** Usage across hosts: the daemon answers by its 15 s view deadline; 15 s + 5 s for its own read and the transfer. */
+export const USAGE_HOSTS_VIEW_WAIT_MS = 20_000;
+/** The fleet Projects view: the daemon answers within its own 10 s view deadline
+ *  whatever the registry's size, plus its 5 s read and the transfer. */
+export const FLEET_SCOPES_VIEW_WAIT_MS = 20_000;
+/** Topology's own reads (rigs, seats, hosts and the daemon's identity). A daemon busy with one long request answers
+ *  every other request after it, so these wait as long as the slower views above: a late answer shows as pending,
+ *  never as a failed Topology. Other reads keep 5 s. */
+export const TOPOLOGY_READ_WAIT_MS = 20_000;
+
 export interface DaemonClientOptions {
   baseUrl?: string;
   fetchImpl?: typeof fetch;
   headers?: Record<string, string> | (() => Record<string, string>);
+  /** Headers for operator-gated writes (answering an ask), which the daemon checks against its operator bearer. Absent:
+   *  the same headers as every other call. */
+  actionHeaders?: Record<string, string> | (() => Record<string, string>);
 }
+
+/** What a person reads when the daemon refuses an answer for want of its operator bearer. Never carries a token. */
+export const ACTION_UNAUTHORIZED = "This daemon refused the answer without its operator bearer token, so nothing was recorded. "
+  + "Start the TUI with OPENRIG_AUTH_BEARER_TOKEN set to the token this daemon runs with, then answer again.";
 
 export class StartupRequestError extends Error {
   constructor(readonly status: number, readonly result: Record<string, unknown>) {
@@ -37,7 +55,7 @@ export interface TerminalOpenResult {
   ok: boolean;
   opened: string[];
   absent: Array<{ seat: string; reason: string }>;
-  degraded: Array<{ seat: string; reason: string }>;
+  degraded: Array<{ seat: string; reason: string; code?: "pane_unconfirmed" }>;
   pages: number;
   error?: string;
   code?: string;
@@ -55,7 +73,8 @@ export interface LaunchNodeResult {
 
 export function launchNodeNotice(agent: string, result: LaunchNodeResult): string {
   const notice = result.code === "already_running"
-    ? `agent already running: ${agent}`
+    // The launch kept a live session it couldn't prove is a bare shell; that isn't proof the agent is running.
+    ? `not relaunched, live session (its agent isn't proven running): ${agent}`
     : `agent run requested: ${agent}`;
   return [notice, ...(result.warnings ?? [])].join("\n");
 }
@@ -65,16 +84,18 @@ export class DaemonClient {
   private readonly fetchImpl: typeof fetch;
   private optionalFetchImpl: typeof fetch;
   private readonly headerSource: Record<string, string> | (() => Record<string, string>);
+  private readonly actionHeaderSource: Record<string, string> | (() => Record<string, string>) | undefined;
 
   constructor(options: DaemonClientOptions = {}) {
     this.baseUrl = (options.baseUrl ?? process.env["OPENRIG_URL"] ?? "http://127.0.0.1:7433").replace(/\/$/, "");
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.optionalFetchImpl = this.fetchImpl;
     this.headerSource = options.headers ?? {};
+    this.actionHeaderSource = options.actionHeaders;
   }
 
   forPage(page: PageRead, signal: AbortSignal): DaemonClient {
-    const client = new DaemonClient({ baseUrl: this.baseUrl, headers: this.headerSource,
+    const client = new DaemonClient({ baseUrl: this.baseUrl, headers: this.headerSource, actionHeaders: this.actionHeaderSource,
       fetchImpl: page.fetch(this.fetchImpl, signal) });
     client.optionalFetchImpl = page.fetch(this.fetchImpl, signal, true);
     return client;
@@ -82,6 +103,11 @@ export class DaemonClient {
 
   private get headers(): Record<string, string> {
     return typeof this.headerSource === "function" ? this.headerSource() : this.headerSource;
+  }
+
+  private get actionHeaders(): Record<string, string> {
+    const source = this.actionHeaderSource;
+    return source === undefined ? this.headers : typeof source === "function" ? source() : source;
   }
 
   /** S19 AM-R18 — open the oracle's SSE event stream (FR-8: HTTP stays in THIS module).
@@ -110,8 +136,8 @@ export class DaemonClient {
     }
   }
 
-  private async get(route: string, fetchImpl = this.fetchImpl): Promise<unknown> {
-    const res = await fetchImpl(`${this.baseUrl}${route}`, { headers: this.headers, signal: AbortSignal.timeout(5_000) });
+  private async get(route: string, fetchImpl = this.fetchImpl, waitMs = 5_000): Promise<unknown> {
+    const res = await fetchImpl(`${this.baseUrl}${route}`, { headers: this.headers, signal: AbortSignal.timeout(waitMs) });
     if (!res.ok) {
       const parsed = await res.json().catch(() => null);
       const detail = parsed && typeof parsed === "object" && "error" in parsed ? ` — ${(parsed as { error: unknown }).error}` : "";
@@ -120,15 +146,19 @@ export class DaemonClient {
     return res.json();
   }
 
-  private async post(route: string, body: unknown): Promise<unknown> {
+  private async post(route: string, body: unknown, options: { headers?: Record<string, string>; unauthorized?: string } = {}): Promise<unknown> {
     const res = await this.fetchImpl(`${this.baseUrl}${route}`, {
       method: "POST",
-      headers: { ...this.headers, "Content-Type": "application/json" },
+      headers: { ...(options.headers ?? this.headers), "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
     const parsed = await res.json().catch(() => null);
+    if (res.status === 401 && options.unauthorized) throw new Error(options.unauthorized);
     if (!res.ok) {
-      const detail = parsed && typeof parsed === "object" && "error" in parsed ? ` — ${(parsed as { error: unknown }).error}` : "";
+      const detail = parsed && typeof parsed === "object"
+        ? "error" in parsed ? ` — ${(parsed as { error: unknown }).error}`
+          : "message" in parsed ? ` — ${(parsed as { message: unknown }).message}` : ""
+        : "";
       throw new Error(`daemon write failed: POST ${route} → ${res.status}${detail}`);
     }
     return parsed;
@@ -158,7 +188,8 @@ export class DaemonClient {
     return data;
   }
 
-  humanUpdates() { return this.get("/api/queue/human-updates?limit=20"); }
+  /** Delivered updates, in the same Feed view as the asks (`view`). */
+  humanUpdates(view?: string | null) { return this.get(`/api/queue/human-updates?limit=20${view ? `&view=${encodeURIComponent(view)}` : ""}`); }
   connections() { return this.get("/api/gateway/connections"); }
   slackManifest() { return this.get("/api/gateway/slack/manifest"); }
 
@@ -179,7 +210,69 @@ export class DaemonClient {
   }
 
   health() {
-    return this.get("/healthz");
+    return this.get("/healthz", this.fetchImpl, TOPOLOGY_READ_WAIT_MS);
+  }
+
+  /** Slice 01 — the provider read model, as `rig provider status --json` prints it. GET only: the daemon answers it
+   *  from memory and never starts a native read for it; this client never calls the refresh route. A failed or
+   *  absent route resolves to its status (404: a daemon without provider routes) instead of throwing. */
+  async providerStatus(): Promise<import("./usage/usage-model.js").UsageRead["status"]> {
+    let res: Response;
+    try {
+      res = await this.fetchImpl(`${this.baseUrl}/api/provider/status`, { headers: this.headers, signal: AbortSignal.timeout(5_000) });
+    } catch (error) {
+      return { status: null, error: error instanceof Error ? error.message : "Read failed; the cause was not identified." };
+    }
+    const data = await res.json().catch(() => null) as Record<string, unknown> | null;
+    if (!res.ok) return { status: res.status, error: typeof data?.["error"] === "string" ? data["error"] : `HTTP ${res.status}` };
+    if (!data || typeof data !== "object" || Array.isArray(data)) return { status: res.status, error: "the response was not a provider read model" };
+    return { model: data };
+  }
+
+  /** Slice 01 — usage windows across registered hosts, as `rig provider status --all-hosts --json` prints them. GET
+   *  only: the daemon and every host answer from memory, and this client has no method for the refresh route. A
+   *  failed or absent route resolves to its status, with the daemon's own message (409: usage windows off here). */
+  async usageAcrossHosts(): Promise<import("./usage/usage-hosts-model.js").UsageHostsRead["status"]> {
+    let res: Response;
+    try {
+      // 20 s, not the usual 5 s: the daemon answers this view within its own 15 s deadline whatever the registry's
+      // size (hosts it hasn't heard from by then are listed as such), plus 5 s for its own read and the transfer. The
+      // page reader is per page, so a slow read here holds up neither other sections nor the live refresh of other pages.
+      res = await this.fetchImpl(`${this.baseUrl}/api/provider/usage/hosts`, { headers: this.headers, signal: AbortSignal.timeout(USAGE_HOSTS_VIEW_WAIT_MS) });
+    } catch (error) {
+      return { status: null, error: error instanceof Error ? error.message : "Read failed; the cause was not identified." };
+    }
+    const data = await res.json().catch(() => null) as Record<string, unknown> | null;
+    if (!res.ok) {
+      return {
+        status: res.status,
+        error: typeof data?.["error"] === "string" ? data["error"] : `HTTP ${res.status}`,
+        ...(typeof data?.["message"] === "string" ? { message: data["message"] } : {}),
+      };
+    }
+    if (!data || typeof data !== "object" || Array.isArray(data)) return { status: res.status, error: "the response was not a usage-across-hosts view" };
+    return { view: data };
+  }
+
+  /** Slice 02 — the cost view, as `rig usage cost --json` prints it. GET only, computed from what the daemon already
+   *  stores: no provider lookup, native read or charge lookup. A failed or absent route resolves to its status. */
+  async usageCost(): Promise<import("./cost/cost-read.js").CostRead["status"]> {
+    let res: Response;
+    try {
+      res = await this.fetchImpl(`${this.baseUrl}/api/telemetry/usage/cost`, { headers: this.headers, signal: AbortSignal.timeout(5_000) });
+    } catch (error) {
+      return { status: null, error: error instanceof Error ? error.message : "Read failed; the cause was not identified." };
+    }
+    const data = await res.json().catch(() => null) as Record<string, unknown> | null;
+    if (!res.ok) return { status: res.status, error: typeof data?.["error"] === "string" ? data["error"] : `HTTP ${res.status}` };
+    // Every seat must be an object naming its seat and status, or the whole body isn't a cost view: a malformed
+    // member reads as unavailable, never as a partial view or a render failure.
+    const isSeat = (s: unknown) => !!s && typeof s === "object" && !Array.isArray(s)
+      && typeof (s as Record<string, unknown>)["seatSession"] === "string" && typeof (s as Record<string, unknown>)["status"] === "string";
+    if (!data || typeof data !== "object" || Array.isArray(data) || !Array.isArray(data["seats"]) || !data["seats"].every(isSeat)) {
+      return { status: res.status, error: "the response was not a cost view" };
+    }
+    return { body: { seats: data["seats"] as import("./cost/cost-read.js").CostBody["seats"], note: typeof data["note"] === "string" ? data["note"] : "" } };
   }
 
   /** Bounded canonical findings; the TUI filters this one record set by scope. */
@@ -208,16 +301,45 @@ export class DaemonClient {
 
   // --- Topology (§4.A rows 1–3) ---
   rigGraph(rigId: string) {
-    return this.get(`/api/rigs/${encodeURIComponent(rigId)}/graph`);
+    return this.get(`/api/rigs/${encodeURIComponent(rigId)}/graph`, this.fetchImpl, TOPOLOGY_READ_WAIT_MS);
   }
   ps() {
-    return this.get(`/api/ps`);
+    return this.get(`/api/ps`, this.fetchImpl, TOPOLOGY_READ_WAIT_MS);
   }
-  rigsSummary() {
-    return this.get(`/api/rigs/summary`);
+  /** With `host`, the rigs of that registered host, read through this daemon (its read-only `?host=` forwarding). */
+  rigsSummary(host?: string) {
+    return this.get(host ? `/api/rigs/summary?host=${encodeURIComponent(host)}` : `/api/rigs/summary`, this.fetchImpl, TOPOLOGY_READ_WAIT_MS);
   }
-  rigNodes(rigId: string) {
-    return this.get(`/api/rigs/${encodeURIComponent(rigId)}/nodes`);
+  /** The registered hosts (`rig host list`), each with a quick reachability probe. */
+  hosts() {
+    return this.get(`/api/hosts`, this.fetchImpl, TOPOLOGY_READ_WAIT_MS);
+  }
+  /** A rig's node inventory. With `host`, the same route read through this daemon's `?host=` forwarding for a
+   *  registered http-transport host (the read-only allowlist covers /api/rigs/:rigId/nodes). */
+  rigNodes(rigId: string, host?: string) {
+    return this.get(`/api/rigs/${encodeURIComponent(rigId)}/nodes${host ? `?host=${encodeURIComponent(host)}` : ""}`, this.fetchImpl, TOPOLOGY_READ_WAIT_MS);
+  }
+  /** The existing per-seat effort report: requested, saved, emitted and observed.
+   * A refusal is an answer, so the page reader doesn't count it as a failed read. */
+  async seatEffort(seatRef: string): Promise<unknown> {
+    const route = `/api/seat/effort/${encodeURIComponent(seatRef)}`;
+    const res = await this.optionalFetchImpl(`${this.baseUrl}${route}`, {
+      headers: this.headers,
+      signal: AbortSignal.timeout(5_000),
+    });
+    const parsed = await res.json().catch(() => null);
+    if (res.ok) return parsed;
+    if (parsed && typeof parsed === "object"
+      && (parsed as { ok?: unknown }).ok === false
+      && typeof (parsed as { code?: unknown }).code === "string"
+      && typeof (parsed as { message?: unknown }).message === "string") {
+      return parsed;
+    }
+    if (res.status === 404 && parsed == null) return null;
+    const detail = parsed && typeof parsed === "object" && "error" in parsed
+      ? ` — ${(parsed as { error: unknown }).error}`
+      : "";
+    throw new Error(`daemon read failed: GET ${route} → ${res.status}${detail}`);
   }
   reviewAgents(scope: "rig" | "fleet" = "rig") {
     return this.get(`/api/review/agents?scope=${scope}`);
@@ -244,6 +366,42 @@ export class DaemonClient {
   }
   scopesDetailed(project?: ProjectSelection | null) {
     return this.get(`/api/scopes?detail=1${this.projectQuery(project)}`);
+  }
+
+  /** #3093 fleet Projects: every registered host's rows as this daemon read them,
+   *  host-attributed beside per-host status. GET only; the daemon never writes. */
+  async fleetScopes(): Promise<import("./scopes/fleet-scopes-model.js").FleetScopesRead["status"]> {
+    let res: Response;
+    try {
+      res = await this.fetchImpl(`${this.baseUrl}/api/scopes/fleet`, { headers: this.headers, signal: AbortSignal.timeout(FLEET_SCOPES_VIEW_WAIT_MS) });
+    } catch (error) {
+      return { status: null, error: error instanceof Error ? error.message : "Read failed; the cause was not identified." };
+    }
+    const data = await res.json().catch(() => null) as Record<string, unknown> | null;
+    if (!res.ok) return { status: res.status, error: typeof data?.["error"] === "string" ? data["error"] : `HTTP ${res.status}` };
+    if (!data || typeof data !== "object" || Array.isArray(data) || !Array.isArray(data["missions"]) || !Array.isArray(data["hosts"])) {
+      return { status: res.status, error: "the response was not a fleet Projects view" };
+    }
+    return { view: data as unknown as import("./scopes/fleet-scopes-model.js").FleetScopesView };
+  }
+
+  /** #3093: a fleet slice's DETAIL, read from its ORIGIN host through the daemon's
+   *  read-through (`?host=` envelope). The origin's shape is returned verbatim. */
+  async fleetSliceDetail(hostId: string, mission: string, slice: string): Promise<import("./scopes/fleet-scopes-model.js").FleetSliceDetailRead> {
+    let res: Response;
+    try {
+      res = await this.fetchImpl(`${this.baseUrl}/api/scopes/slice?host=${encodeURIComponent(hostId)}&mission=${encodeURIComponent(mission)}&slice=${encodeURIComponent(slice)}`,
+        { headers: this.headers, signal: AbortSignal.timeout(USAGE_HOSTS_VIEW_WAIT_MS) });
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : "Read failed; the cause was not identified." };
+    }
+    const data = await res.json().catch(() => null) as Record<string, unknown> | null;
+    if (!res.ok) {
+      const detail = data && typeof data["detail"] === "string" ? `: ${data["detail"]}` : typeof data?.["error"] === "string" ? `: ${data["error"]}` : "";
+      return { error: `HTTP ${res.status}${detail}` };
+    }
+    if (!data || typeof data !== "object" || Array.isArray(data) || typeof data["dirName"] !== "string") return { error: "the origin answered, but not with a slice detail" };
+    return { detail: data as unknown as import("./scopes/scopes-model.js").SliceScopeSnap };
   }
 
   /** EXECUTION view via the shipped generic view route; no new endpoint. */
@@ -292,18 +450,28 @@ export class DaemonClient {
   }
   /** Recent terminal transitions (JUST FINISHED) via the SAME shipped /list
    * route with a COMMA multi-state ?state=done,handed-off (queue.ts splits
-   * stateRaw on ","). No fleet-wide finish-time transitions endpoint exists, so
-   * this is a bounded RECENT WINDOW fetched in ts_created order; the PULSE render
-   * re-sorts by tsUpdated DESC (finish time) for newest-first. NOT a new endpoint. */
-  queueRecentlyFinished(limit = 20) {
-    return this.get(`/api/queue/list?state=done,handed-off&limit=${limit}`);
+   * stateRaw on ","). sort=updated picks this bounded RECENT WINDOW by finish time,
+   * so an old item closed just now is in it. A seat's page asks for that seat's own
+   * window, so other seats' finishes can't push its items out. NOT a new endpoint. */
+  queueRecentlyFinished(limit = 20, destinationSession?: string) {
+    const seat = destinationSession ? `&destinationSession=${encodeURIComponent(destinationSession)}` : "";
+    return this.get(`/api/queue/list?state=done,handed-off&sort=updated&limit=${limit}${seat}`);
   }
   /** A single qitem by id via the shipped GET /api/queue/:qitemId (queue.ts:864,
    * returns the QueueItem or 404). Used for the BLOCKED ON AGENTS bounded per-row
    * lookup: blockedOn is a qitem POINTER, so the blocking agent is that qitem's
    * owner (destinationSession). NOT a new endpoint. */
-  humanAttention(item?: string | null) {
-    return this.get(`/api/attention${item ? `?item=${encodeURIComponent(item)}` : ""}`);
+  humanAttention(item?: string | null, view?: string | null) {
+    const query = [item ? `item=${encodeURIComponent(item)}` : null, view ? `view=${encodeURIComponent(view)}` : null].filter(Boolean).join("&");
+    return this.get(`/api/attention${query ? `?${query}` : ""}`);
+  }
+  /** Connected assistants (roster members outside any terminal) and their check-in. Optional: an older daemon has no
+   *  such route. */
+  /** This daemon's connected assistants, as the status and body it answered; an older daemon answers 404. A failed read
+   *  isn't an empty list, so the caller is given the status to tell them apart. */
+  async hostedMembers(): Promise<{ status: number; body: unknown }> {
+    const res = await this.optionalFetchImpl(`${this.baseUrl}/api/queue/hosted-members`, { headers: this.headers, signal: AbortSignal.timeout(5_000) });
+    return { status: res.status, body: res.ok ? await res.json().catch(() => null) : null };
   }
   queueItem(qitemId: string, options: { optional?: boolean } = {}) {
     return this.get(`/api/queue/${encodeURIComponent(qitemId)}`, options.optional ? this.optionalFetchImpl : this.fetchImpl);
@@ -313,6 +481,20 @@ export class DaemonClient {
   }
   reviewFleet() {
     return this.get(`/api/review/fleet`);
+  }
+  /** This host's open pairing requests (read-only; nothing in it is a credential). */
+  pairRequests() { return this.get("/api/hosts/pair-requests") as Promise<{ requests: import("./config/pairing.js").PairRequest[] }>; }
+  /** Decide a pairing request directly, as `rig host approve|deny` does (POST /api/hosts/pair-decision), with the operator's
+   *  action headers. Returns the HTTP outcome; a timeout or a lost connection throws, and then the outcome is unknown. */
+  async pairDecision(request: string, decision: "approve" | "deny"): Promise<{ status: number; body: Record<string, unknown> | null }> {
+    const res = await this.fetchImpl(`${this.baseUrl}/api/hosts/pair-decision`, { method: "POST",
+      headers: { ...this.actionHeaders, "Content-Type": "application/json" }, body: JSON.stringify({ request, decision }), signal: AbortSignal.timeout(10_000) });
+    return { status: res.status, body: await res.json().catch(() => null) as Record<string, unknown> | null };
+  }
+  /** The mission-control write Steering uses to answer a request (POST /api/mission-control/action). */
+  missionControlAction(input: { verb: "approve" | "answer" | "resolve"; qitemId: string; actorSession: string; questionId?: string; optionId?: string; decision?: string; authority?: "primary-user" }) {
+    return this.post("/api/mission-control/action", input, { headers: this.actionHeaders, unauthorized: ACTION_UNAUTHORIZED }) as Promise<{ verb: string; qitemId: string; closedQitem: unknown;
+      answer?: { outcome: "recorded" | "answered"; unanswered: string[]; message?: string } }>;
   }
   attentionAggregate() {
     return this.get(`/api/queue/attention-aggregate`);
@@ -333,16 +515,28 @@ export class DaemonClient {
 
   // --- drive-structure writes (BR-8: EXISTING contracts only; the ONLY two) ---
   /** the web's TerminalLauncher contract: POST /api/terminal/open {view} */
-  async terminalViews(): Promise<{ saved: Array<{ id: string; name: string; members: Array<{ seat: string }> }>; rigs: string[] }> {
-    return await this.get("/api/terminal/views") as { saved: Array<{ id: string; name: string; members: Array<{ seat: string }> }>; rigs: string[] };
+  async terminalViews(): Promise<{ saved: Array<{ id: string; name: string; members: Array<{ seat: string }> }>; rigs: string[]; rigIdentities?: Array<{ id: string; name: string }> }> {
+    return await this.get("/api/terminal/views") as { saved: Array<{ id: string; name: string; members: Array<{ seat: string }> }>; rigs: string[]; rigIdentities?: Array<{ id: string; name: string }> };
   }
-  async previewTerminal(view: string): Promise<import("./terminals/terminal-model.js").TerminalPreview> {
-    return await this.get(`/api/terminal/preview?view=${encodeURIComponent(view)}`) as import("./terminals/terminal-model.js").TerminalPreview;
+  /** The preview behind "Open terminals". That action opens through `rig terminal open --window`, which composes with
+   *  Rex's layout from inside Rex and otherwise Herdr's (falling back to plain tmux), or, from inside cmux, through
+   *  `rig terminal open --provider cmux`. Preview with the provider it will use: its planId is the open's expected plan.
+   *  A provider-less preview may pick cmux, whose plan the window opener never matches. */
+  async previewTerminal(view: string, target: import("./terminals/open-window.js").WindowTarget | "herdr" | "rex" | "cmux" = { provider: "herdr" }): Promise<import("./terminals/terminal-model.js").TerminalPreview> {
+    const t = typeof target === "string" ? { provider: target } : target;
+    // The interactive TUI has a TTY; measure each preview again after a resize. Unknown stays narrow. The cmux and
+    // herdr-app opens send no width (the view opens in that app's window, not at this TUI's width), and a wide one
+    // changes the kernel view's layout and so its plan, so their previews send none either.
+    const columns = t.provider !== "cmux" && t.provider !== "herdr-app" && process.stdout.isTTY ? process.stdout.columns : undefined;
+    const viewport = Number.isSafeInteger(columns) && columns! > 0 ? `&viewportColumns=${columns}` : "";
+    // herdr-app's plan belongs to one client: the preview names the same app home the open will.
+    const client = t.provider === "herdr-app" ? `&appHome=${encodeURIComponent(t.appHome)}` : "";
+    return await this.get(`/api/terminal/preview?view=${encodeURIComponent(view)}&provider=${t.provider}${viewport}${client}`) as import("./terminals/terminal-model.js").TerminalPreview;
   }
   async openTerminal(view: string, expectedPlan?: string): Promise<TerminalOpenResult> {
     const result = (await this.post(`/api/terminal/open`, { view, ...(expectedPlan !== undefined ? { expectedPlan } : {}) })) as TerminalOpenResult;
     if (!Array.isArray(result.opened) || result.opened.length === 0) {
-      throw new Error(`terminal open failed: ${result.error ?? result.code ?? ([...new Set(result.degraded?.map(m => m.reason))].join("; ") || "no tiles opened")}`);
+      throw new Error(`terminal open failed: ${result.error ?? result.code ?? ([...new Set(result.degraded?.map(m => `${m.code === "pane_unconfirmed" ? "Unconfirmed" : "Skipped"}: ${m.seat} — ${m.reason}`))].join("; ") || "no tiles opened")}`);
     }
     return result;
   }

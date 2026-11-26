@@ -19,7 +19,15 @@
 //      output except for the body content
 // If you update this function, update wrapSendBody in lockstep.
 
+import { isHumanSeatSessionRef } from "../domain/session-name.js";
+
 const SENDER_FALLBACK = "<unknown sender>";
+
+/** OpenRig's own sender: the daemon (`daemon@kernel`, the scheduler's existing name) or a subsystem actor (`system:health`).
+ *  No seat answers at these addresses, so their envelope doesn't offer a reply. (`…@system` isn't matched: a rig may be named
+ *  `system`, and its seats are real senders.) */
+export const OPENRIG_SENDER = "daemon@kernel";
+export const isOpenRigSender = (sender: string): boolean => sender === OPENRIG_SENDER || sender.startsWith("system:");
 
 /** Send/broadcast header envelope metadata (ruling 03c35295). The ENVELOPE carries the machine truth;
  *  the rendered header is a PROJECTION of it. Both twins (this + cli wrapSendBody) share this shape. */
@@ -43,6 +51,16 @@ export interface EnvelopeMeta {
    *  ABSENT ⇒ UNKNOWN (cross-host --from relay whose sender isn't local, or pre-tenure daemon) —
    *  the render omits it, never forges a generation. Render is a PROJECTION of this machine truth. */
   genUuid?: string;
+  /** The row this message delivers. For a person's message (an @external sender) the reply hint
+   *  names it with --reply-to, so the answer joins the Slack thread the message came from (#822
+   *  records that thread on the row). ABSENT ⇒ the hint stays the plain new-conversation form. */
+  replyToQitem?: string;
+  /** #2895 (a): false when the caller looked the sender up and `rig send` can't reach it (no session here). The reply
+   *  line then names no command, since the one it would name is known to fail. ABSENT or true ⇒ today's hint. */
+  senderReachable?: boolean;
+  /** #3268: false when the caller looked an @external sender up and the queue would refuse it as a destination (not a
+   *  registered person or shared channel). The reply line then names no command. ABSENT or true ⇒ today's hint. */
+  senderRegistered?: boolean;
 }
 
 /** The To-line projection + anti-storm scale (header-alone distinguishability, ruling pin 2). */
@@ -85,6 +103,10 @@ export function appendDeliveredSegment(envelope: string, deltaMs: number): strin
   return lines.join("\n") + rest;
 }
 
+/** The address OpenRig records an answer typed at this machine under (the daemon's UNATTRIBUTED_ACTOR). It names nobody,
+ *  and a row there asks no one (it waits on Steering and in the Feed, and OpenRig reports it as undeliverable), so a reply hint never points at it. */
+const UNATTRIBUTED_PERSON = "human@host";
+
 /** Wrap a tmux-pane body with the canonical From/To envelope. The
  *  recipient pane sees both the sender's identity and a reply hint.
  *  Cross-host nudges should NOT double-wrap: the remote rig wraps
@@ -104,6 +126,9 @@ export function wrapPaneEnvelope(
   // carries its origin triple from the forwarding boundary and rides verbatim — the wrapper
   // never appends this host's id to anything.
   const senderLabel = sender && sender.trim().length > 0 ? sender : SENDER_FALLBACK;
+  // Only reply classification uses the bare address; From and the destination retain the origin host.
+  const senderParts = senderLabel.split("@");
+  const personAddress = senderParts.length === 3 && senderParts[2] ? senderParts.slice(0, 2).join("@") : senderLabel;
   const header = [`From: ${senderLabel}`, renderToLine(recipient, meta?.scope)];
   if (meta?.stampISO) {
     // GHOST-STAGE (g): the sender's occupant generation rides the Sent: line as a short suffix
@@ -115,7 +140,17 @@ export function wrapPaneEnvelope(
     header.push(`Sent: ${renderShortStamp(meta.stampISO)}${genSuffix}`);
   }
   const reply = senderLabel.endsWith("@external")
-    ? `↩ Reply if needed: rig queue create --destination ${senderLabel} --body "..." --verify`
-    : `↩ Reply: rig send ${senderLabel} "..."`;
+    ? meta?.senderRegistered === false
+      ? `↩ No reply route: ${senderLabel} isn't a registered person (rig gateway human list lists who's registered).`
+      : `↩ Reply if needed: rig queue create --destination ${senderLabel}${meta?.replyToQitem ? ` --human-intent update --reply-to ${meta.replyToQitem}` : ""} --summary "<one line>" --body "..." --verify`
+    : personAddress === UNATTRIBUTED_PERSON
+      ? `↩ ${senderLabel} names no person: a reply there asks no one. It waits on Steering and in the Feed, and OpenRig reports it as undeliverable. To ask the person back, use their registered address (rig gateway human list lists who's registered).`
+    : isHumanSeatSessionRef(personAddress)
+      ? `↩ Reply if needed: rig queue create --destination ${senderLabel} --human-intent update --summary "<one line>" --evidence-ref "<path>" --body "..." --verify`
+      : isOpenRigSender(senderLabel)
+        ? "↩ Sent by OpenRig itself, not by a seat. Act on the row it names."
+        : meta?.senderReachable === false
+          ? `↩ No reply by rig send: ${senderLabel} has no session.`
+          : `↩ Reply: rig send ${senderLabel} "..."`;
   return [...header, "---", body, "---", reply].join("\n");
 }

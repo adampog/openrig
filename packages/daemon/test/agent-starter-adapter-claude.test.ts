@@ -34,7 +34,8 @@ function mockTmux(): TmuxAdapter {
     hasSession: vi.fn(async () => true),
     listSessions: vi.fn(async () => []),
     listWindows: vi.fn(async () => []),
-    listPanes: vi.fn(async () => []),
+    listPanes: vi.fn(async () => [{ id: "%1", index: 0, cwd: "/project", width: 80, height: 24, active: true }]),
+    getPanePid: vi.fn(async () => 4242),
     sendKeys: vi.fn(async () => ({ ok: true as const })),
     getPaneCommand: vi.fn(async () => "claude"),
     capturePaneContent: vi.fn(async () => ""),
@@ -103,7 +104,7 @@ describe("Agent Starter v1 vertical — real Claude adapter delivery (M2 R2)", (
       const eventBus = new EventBus(db);
       const tmux = mockTmux();
       const nodeLauncher = new NodeLauncher({ db, rigRepo, sessionRegistry, eventBus, tmuxAdapter: tmux });
-      const startupOrch = new StartupOrchestrator({ db, sessionRegistry, eventBus, tmuxAdapter: tmux });
+      const startupOrch = new StartupOrchestrator({ db, sessionRegistry, eventBus, tmuxAdapter: tmux, sleep: async () => {} });
 
       // Real ClaudeCodeAdapter. The fs seam is pre-loaded with the
       // registry-entry content (matching the path the resolver will hand

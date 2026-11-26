@@ -7,6 +7,7 @@ import type { SnapshotRepository } from "../src/domain/snapshot-repository.js";
 import type { SnapshotCapture } from "../src/domain/snapshot-capture.js";
 import type { RestoreOrchestrator } from "../src/domain/restore-orchestrator.js";
 import { createFullTestDb, createTestApp } from "./helpers/test-app.js";
+import { SeatIdentityStore } from "../src/domain/seat-identity-store.js";
 
 function insertStartupContextRow(db: Database.Database, nodeId: string) {
   db.prepare(
@@ -75,6 +76,24 @@ describe("Rig CRUD routes", () => {
     expect(body.nodes).toHaveLength(2);
     expect(body.edges).toHaveLength(1);
     expect(body.edges[0].kind).toBe("delegates_to");
+  });
+
+  it("GET /api/rigs/:id -> names the representative: the one delegates_to root, at its session", async () => {
+    const rig = repo.createRig("led-rig");
+    const lead = repo.addNode(rig.id, "orch.lead", { role: "orchestrator" });
+    const worker = repo.addNode(rig.id, "dev.impl", { role: "worker" });
+    repo.addEdge(rig.id, lead.id, worker.id, "delegates_to");
+    const representative = async () => ((await (await app.request(`/api/rigs/${rig.id}`)).json()) as { representative: string | null }).representative;
+
+    // A root with no session has no seat to reach.
+    expect(await representative()).toBeNull();
+    sessionRegistry.registerSession(lead.id, "orch-lead@led-rig");
+    expect(await representative()).toBe("orch-lead@led-rig");
+
+    // Two roots is no single representative.
+    const other = repo.addNode(rig.id, "qa.lead", { role: "orchestrator" });
+    repo.addEdge(rig.id, other.id, worker.id, "delegates_to");
+    expect(await representative()).toBeNull();
   });
 
   it("GET /api/rigs/:id -> unbound nodes have binding: null (not omitted)", async () => {
@@ -156,6 +175,61 @@ describe("Rig CRUD routes", () => {
       body: JSON.stringify({}),
     });
     expect(res.status).toBe(400);
+  });
+
+  it("archives a mixed healthy-plus-missing rig without force, as on main", async () => {
+    const rig = repo.createRig("mixed-archive");
+    const healthy = repo.addNode(rig.id, "dev.healthy", { runtime: "codex" });
+    const missing = repo.addNode(rig.id, "dev.missing", { runtime: "codex" });
+    const healthySession = sessionRegistry.registerSession(healthy.id, "dev-healthy@mixed-archive");
+    const missingSession = sessionRegistry.registerSession(missing.id, "dev-missing@mixed-archive");
+    for (const session of [healthySession, missingSession]) sessionRegistry.updateStatus(session.id, "running");
+    sessionRegistry.updateBinding(missing.id, {
+      tmuxSession: missingSession.sessionName, tmuxPane: "%1", attachmentType: "tmux",
+    });
+    new SeatIdentityStore(db).upsert({
+      nodeId: missing.id,
+      sessionName: missingSession.sessionName,
+      verdict: "pane_missing",
+      evidenceSource: "tmux_session",
+      reason: "session_missing",
+      evidence: { registeredPane: "%1", observedPid: null, observedCommand: null, matchedLayer: null },
+      observedAt: new Date(Date.now() + 1).toISOString(),
+    });
+
+    const res = await app.request(`/api/rigs/${rig.id}/archive`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+
+    expect(res.status).toBe(200);
+    expect(repo.getRigSummaries({ archivedOnly: true }).map((entry) => entry.id)).toContain(rig.id);
+  });
+
+  it("requires force for a live seat plus stored-detached missing seat", async () => {
+    const rig = repo.createRig("stored-detached-archive");
+    const healthy = repo.addNode(rig.id, "dev.healthy", { runtime: "codex" });
+    const missing = repo.addNode(rig.id, "dev.missing", { runtime: "codex" });
+    const healthySession = sessionRegistry.registerSession(healthy.id, "dev-healthy@stored-detached-archive");
+    const missingSession = sessionRegistry.registerSession(missing.id, "dev-missing@stored-detached-archive");
+    sessionRegistry.updateStatus(healthySession.id, "running");
+    sessionRegistry.updateStatus(missingSession.id, "detached");
+    sessionRegistry.updateBinding(missing.id, {
+      tmuxSession: missingSession.sessionName, tmuxPane: "%1", attachmentType: "tmux",
+    });
+    new SeatIdentityStore(db).upsert({
+      nodeId: missing.id, sessionName: missingSession.sessionName,
+      verdict: "pane_missing", evidenceSource: "tmux_session", reason: "session_missing",
+      evidence: { registeredPane: "%1", observedPid: null, observedCommand: null, matchedLayer: null },
+      observedAt: new Date(Date.now() + 1).toISOString(),
+    });
+
+    const archive = (force: boolean) => app.request(`/api/rigs/${rig.id}/archive`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ force }),
+    });
+    expect((await archive(false)).status).toBe(409);
+    expect((await archive(true)).status).toBe(200);
   });
 
   it("POST /api/rigs/:id/attach-self binds an external_cli agent to an existing node", async () => {
@@ -417,6 +491,21 @@ describe("Rig CRUD routes", () => {
   });
 
   // -- UX-T01b: Rig summary endpoint --
+
+  it("summary excludes a planned unlaunched hold until it has assigned work", async () => {
+    const rig = repo.createRig("held-summary");
+    const running = repo.addNode(rig.id, "dev.worker", { runtime: "codex" });
+    const held = repo.addNode(rig.id, "dev.optional", { runtime: "codex" });
+    const session = sessionRegistry.registerSession(running.id, "dev-worker@held-summary");
+    sessionRegistry.updateStatus(session.id, "running");
+    db.prepare("INSERT INTO events (rig_id, node_id, type, payload, created_at) VALUES (?, ?, 'node.held', ?, datetime('now'))")
+      .run(rig.id, held.id, JSON.stringify({ reason: "on demand" }));
+    const summary = async () => (await (await app.request("/api/rigs/summary")).json())[0];
+    expect(await summary()).toMatchObject({ lifecycleState: "running", restoreLifecycleState: "degraded" });
+    db.prepare(`INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session, destination_session, state, priority, tier, body)
+      VALUES ('q-held-summary', datetime('now'), datetime('now'), 'operator@test', 'dev-optional@held-summary', 'pending', 'routine', 'routine', 'work')`).run();
+    expect(await summary()).toMatchObject({ lifecycleState: "degraded", restoreLifecycleState: "degraded" });
+  });
 
   it("GET /api/rigs/summary -> rig list with node counts", async () => {
     const rig1 = repo.createRig("alpha");

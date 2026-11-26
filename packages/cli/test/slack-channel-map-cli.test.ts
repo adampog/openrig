@@ -30,7 +30,11 @@ describe("rig slack channel-map", () => {
     expect(cfg.channelMap).toEqual([{ match: "my-rig", channel: "C0EXAMPLE3" }, { match: "pr@my-rig", channel: "C0EXAMPLE2" }]);
     expect(cfg.channel).toBe("C0DEFAULT");
     expect(process.exitCode ?? 0).toBe(0);
-    expect(logs.filter((l) => l.startsWith("Next: Invite the app to every mapped channel"))).toHaveLength(3);
+    const next = logs.filter((l) => l.startsWith("Next: Invite the app to every mapped channel"));
+    expect(next).toHaveLength(3);
+    // The change applies at a daemon restart; disable then enable isn't offered as the way to apply it.
+    expect(next[0]).toContain("at a daemon restart (`rig daemon stop`, then `rig daemon start`)");
+    expect(next[0]).toContain("Don't use `rig slack disable` then `rig slack enable` for it");
     const receipts = readFileSync(join(home, "state", "human-channel-operations.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
     expect(receipts.filter((r) => r.effect === "applied")).toHaveLength(3);
     expect(receipts.at(-1)).toMatchObject({ action: "configure", subject: "slack", reason: "configure the slack channel map" });
@@ -45,7 +49,7 @@ describe("rig slack channel-map", () => {
     expect(readFileSync(join(home, "slack-connector.json"), "utf8")).toBe(before);
   });
 
-  // A map field written by a newer OpenRig (here PR2's `inbound`) must never be lost: every map
+  // A map field written by a newer OpenRig (here a hypothetical `policy`) must never be lost: every map
   // write refuses, exits 1, leaves the file byte-identical and records no channel operation.
   const newerFieldCases: Array<[string, string[]]> = [
     ["set of a DIFFERENT entry (pr@my-rig) while my-rig carries a newer field", ["set", "pr@my-rig", "C0EXAMPLE2"]],
@@ -57,11 +61,11 @@ describe("rig slack channel-map", () => {
     const { home, logs, run } = setup();
     const file = join(home, "slack-connector.json");
     const receipts = join(home, "state", "human-channel-operations.jsonl");
-    writeFileSync(file, JSON.stringify({ ...DEFAULT_CONFIG, channel: "C0DEFAULT", channelMap: [{ match: "my-rig", channel: "C0EXAMPLE1", inbound: "lead@my-rig" }] }));
+    writeFileSync(file, JSON.stringify({ ...DEFAULT_CONFIG, channel: "C0DEFAULT", channelMap: [{ match: "my-rig", channel: "C0EXAMPLE1", policy: "mention-only" }] }));
     const before = readFileSync(file, "utf8");
     await run(["channel-map", ...verb, "--actor", "operator@kernel"]);
     expect(process.exitCode).toBe(1);
-    expect(logs.at(-1)).toBe("✗ channel map not changed: channelMap[0] ('my-rig') has unsupported field(s) inbound: " +
+    expect(logs.at(-1)).toBe("✗ channel map not changed: channelMap[0] ('my-rig') has unsupported field(s) policy: " +
       "slack-connector.json was written by a newer OpenRig version. Upgrade OpenRig, or edit the file by hand to remove them; nothing was changed.");
     expect(logs.some((l) => l.startsWith("Next:") || l.startsWith("wrote "))).toBe(false);
     expect(readFileSync(file, "utf8")).toBe(before);
@@ -120,14 +124,17 @@ describe("rig slack channel-map", () => {
 
 describe("rig slack verify with a channel map", () => {
   // Membership answers per channel; everything else is a granted-scope auth.test.
-  const slack = (members: Record<string, boolean>, infoChannels: string[]) => async (url: string) => {
+  const slack = (members: Record<string, boolean>, infoChannels: string[], privacy: Record<string, boolean> = {}, failedInfo: Record<string, string> = {}) => async (url: string) => {
     const target = new URL(url);
     if (target.pathname.endsWith("/auth.test")) {
       return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json", "x-oauth-scopes": DEFAULT_CONFIG.requiredScopes.join(", ") } });
     }
     const channel = target.searchParams.get("channel") ?? "";
     infoChannels.push(channel);
-    return new Response(JSON.stringify({ ok: true, channel: { is_member: members[channel] ?? false, name: `name-${channel}` } }), { status: 200, headers: { "content-type": "application/json" } });
+    const body = failedInfo[channel]
+      ? { ok: false, error: failedInfo[channel] }
+      : { ok: true, channel: { is_member: members[channel] ?? false, name: `name-${channel}`, ...(Object.hasOwn(privacy, channel) ? { is_private: privacy[channel] } : {}) } };
+    return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
   };
   const map = [{ match: "my-rig", channel: "C0EXAMPLE1" }, { match: "other-rig", channel: "C0EXAMPLE1" }, { match: "pr@my-rig", channel: "C0EXAMPLE2" }];
 
@@ -144,6 +151,50 @@ describe("rig slack verify with a channel map", () => {
     expect(process.exitCode ?? 0).toBe(0);
   });
 
+  it.each([false, true])("diagnoses a known private mapped channel without changing readiness or request count (%s)", async (json) => {
+    vi.stubEnv("SLACK_BOT_TOKEN", "xoxb-local-fixture-only");
+    const { logs, run } = setup(map);
+    const asked: string[] = [];
+    await run(["verify", ...(json ? ["--json"] : [])], slack({ C0DEFAULT: true, C0EXAMPLE1: true, C0EXAMPLE2: true }, asked,
+      { C0DEFAULT: false, C0EXAMPLE1: true, C0EXAMPLE2: false }) as never);
+    expect(asked).toEqual(["C0DEFAULT", "C0EXAMPLE1", "C0EXAMPLE2"]);
+    if (json) {
+      const out = JSON.parse(logs[0]!);
+      expect(out.ready).toBe(true);
+      expect(out.member).toMatchObject({ isPrivate: false, privateScopes: { status: "not-applicable", missing: [] } });
+      expect(out.channels[1].member).toMatchObject({ isPrivate: true, privateScopes: { status: "missing", missing: ["groups:history", "groups:read"] } });
+      expect(out.channels[2].member).toMatchObject({ isPrivate: false, privateScopes: { status: "not-applicable", missing: [] } });
+    } else {
+      expect(logs).toContain("⚠ private channel C0EXAMPLE1 for my-rig, other-rig missing scopes: groups:history, groups:read. Create an app with `rig slack manifest --private-channel` and reinstall it.");
+      expect(logs.at(-1)).toBe("READY");
+    }
+    expect(process.exitCode ?? 0).toBe(0);
+  });
+
+  it.each([false, true])("reports failed mapped-channel privacy lookup without a private-scope warning or side effect (%s)", async (json) => {
+    vi.stubEnv("SLACK_BOT_TOKEN", "xoxb-local-fixture-only");
+    const { logs, run, home } = setup(map);
+    const asked: string[] = [];
+    await run(["verify", ...(json ? ["--json"] : [])], slack(
+      { C0DEFAULT: true, C0EXAMPLE1: true, C0EXAMPLE2: true }, asked, {}, { C0EXAMPLE1: "missing_scope" },
+    ) as never);
+    expect(asked).toEqual(["C0DEFAULT", "C0EXAMPLE1", "C0EXAMPLE2"]);
+    if (json) {
+      const out = JSON.parse(logs[0]!);
+      expect(out.ready).toBe(false);
+      expect(out.channels[1].matches).toEqual(["my-rig", "other-rig"]);
+      expect(out.channels[1].member).toMatchObject({ ok: false, isMember: false, isPrivate: null, error: "missing_scope", privateScopes: { status: "unknown", missing: [] } });
+    } else {
+      expect(logs).toContain("✗ NOT a member of channel C0EXAMPLE1 for my-rig, other-rig — invite the app");
+      expect(logs).toContain("… channel privacy unknown for C0EXAMPLE1 for my-rig, other-rig; private-channel scopes were not assessed.");
+      expect(logs.some(line => line.startsWith("⚠ private channel C0EXAMPLE1"))).toBe(false);
+      expect(logs.at(-1)).toBe("NOT ready");
+    }
+    const ledger = join(home, "state", "human-channel-operations.jsonl");
+    const rows = existsSync(ledger) ? readFileSync(ledger, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
+    expect(rows.filter(row => row.action === "verify")).toEqual([]);
+  });
+
   it("names the mapped channel the app is missing from and fails", async () => {
     vi.stubEnv("SLACK_BOT_TOKEN", "xoxb-local-fixture-only");
     const { logs, run, home } = setup(map);
@@ -151,8 +202,10 @@ describe("rig slack verify with a channel map", () => {
     expect(logs).toContain("✗ NOT a member of channel C0EXAMPLE2 for pr@my-rig — invite the app");
     expect(logs.at(-1)).toBe("NOT ready");
     expect(process.exitCode).toBe(1);
-    const receipts = readFileSync(join(home, "state", "human-channel-operations.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
-    expect(receipts.at(-1)).toMatchObject({ action: "verify", after: { ready: false } });
+    // verify only observes: it writes nothing to the channel-operations ledger.
+    const ledger = join(home, "state", "human-channel-operations.jsonl");
+    const rows = existsSync(ledger) ? readFileSync(ledger, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : [];
+    expect(rows.filter((r) => r.action === "verify")).toEqual([]);
   });
 
   it("JSON lists every channel's membership; without a map the JSON shape is unchanged", async () => {
@@ -177,17 +230,26 @@ describe("rig slack verify with a channel map", () => {
 
 describe("rig slack status with a channel map", () => {
   const offline = () => ({ get: vi.fn(async () => { throw new Error("offline"); }), post: vi.fn() });
+  it("set --inbound records who a person's new message in that channel reaches, and list shows it", async () => {
+    const { home, logs, run } = setup();
+    await run(["channel-map", "set", "workshop", "C0WORKSHOP", "--inbound", "dev-qa@workshop", "--actor", "operator@kernel"]);
+    expect(JSON.parse(readFileSync(join(home, "slack-connector.json"), "utf8")).channelMap).toEqual([{ match: "workshop", channel: "C0WORKSHOP", inbound: "dev-qa@workshop" }]);
+    logs.length = 0;
+    await run(["channel-map", "list"]);
+    expect(logs).toContain("workshop -> C0WORKSHOP (new messages there go to dev-qa@workshop)");
+  });
+
   it("adds one channel-map row; an ignored newer field fails that row without pointing at the manifest", async () => {
     const { home } = setup([{ match: "my-rig", channel: "C0EXAMPLE1" }]);
     const logs: string[] = [];
     await slackCommand({ home, log: (m) => logs.push(m), clientFactory: offline as never }).parseAsync(["node", "slack", "status"]);
     expect(logs).toContain("  ✓ channel-map: 1 entry over 1 channel(s); `rig slack verify` checks membership in each");
-    writeFileSync(join(home, "slack-connector.json"), JSON.stringify({ ...loadConfig(home), channelMap: [{ match: "my-rig", channel: "C0EXAMPLE1", inbound: "lead@my-rig" }] }));
+    writeFileSync(join(home, "slack-connector.json"), JSON.stringify({ ...loadConfig(home), channelMap: [{ match: "my-rig", channel: "C0EXAMPLE1", policy: "mention-only" }] }));
     logs.length = 0;
     await slackCommand({ home, log: (m) => logs.push(m), clientFactory: offline as never }).parseAsync(["node", "slack", "status", "--json"]);
     const out = JSON.parse(logs[0]!);
     expect(out.readiness.find((r: { label: string }) => r.label === "channel-map")).toMatchObject({ ok: false });
-    expect(out.readiness.find((r: { label: string }) => r.label === "channel-map").detail).toContain("IGNORED unsupported field(s) channelMap[0].inbound");
+    expect(out.readiness.find((r: { label: string }) => r.label === "channel-map").detail).toContain("IGNORED unsupported field(s) channelMap[0].policy");
   });
 
   it("the channel-map warning alone does not send the operator to the manifest", async () => {
@@ -195,7 +257,7 @@ describe("rig slack status with a channel map", () => {
     vi.stubEnv("SLACK_APP_TOKEN", "xapp-local-fixture-only");
     const { home } = setup();
     writeFileSync(join(home, "slack-connector.json"), JSON.stringify({ ...DEFAULT_CONFIG, enabled: true, channel: "C0DEFAULT",
-      channelMap: [{ match: "my-rig", channel: "C0EXAMPLE1", inbound: "lead@my-rig" }] }));
+      channelMap: [{ match: "my-rig", channel: "C0EXAMPLE1", policy: "mention-only" }] }));
     const logs: string[] = [];
     await slackCommand({ home, log: (m) => logs.push(m), clientFactory: offline as never }).parseAsync(["node", "slack", "status", "--json"]);
     const out = JSON.parse(logs[0]!);

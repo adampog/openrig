@@ -12,6 +12,7 @@ import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 import { LegacyBundleSourceResolver } from "../src/domain/bundle-source-resolver.js";
 import type { FsOps } from "../src/domain/package-resolver.js";
 import * as tar from "tar";
+import { SeatPoolSlotsRepository } from "../src/domain/seat-pool-slots.js";
 import { createHash } from "node:crypto";
 
 
@@ -189,6 +190,25 @@ describe("Bundle API routes", () => {
     expect(body.bundleName).toBe("test");
     expect(body.archiveHash).toMatch(/^[a-f0-9]{64}$/);
     expect(fs.existsSync(outputPath)).toBe(true);
+  });
+
+  it("a neutral build retains authored attribution and licence files in the archive", async () => {
+    const { specPath } = seedPackage();
+    fs.writeFileSync(path.join(tmpDir, "test-pkg", "LICENSE"), "Apache-2.0\n");
+    fs.writeFileSync(path.join(tmpDir, "test-pkg", "AUTHORS"), "Example contributors\n");
+    const bundlePath = path.join(tmpDir, "neutral.rigbundle");
+    const created = await app.request("/api/bundles/create", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ specPath, bundleName: "neutral", bundleVersion: "0.1.0", outputPath: bundlePath, provenance: { cliVersion: "0.7.23", notes: "Deliberate author note" } }),
+    });
+    expect(created.status).toBe(201);
+    const unpacked = path.join(tmpDir, "neutral-unpacked"); fs.mkdirSync(unpacked);
+    await tar.extract({ file: bundlePath, cwd: unpacked });
+    const manifest = fs.readFileSync(path.join(unpacked, "bundle.yaml"), "utf8");
+    expect(manifest).not.toContain("source_host:"); expect(manifest).not.toContain("author_session:");
+    expect(manifest).toContain("Deliberate author note");
+    expect(fs.readFileSync(path.join(unpacked, "packages/test-pkg/LICENSE"), "utf8")).toBe("Apache-2.0\n");
+    expect(fs.readFileSync(path.join(unpacked, "packages/test-pkg/AUTHORS"), "utf8")).toBe("Example contributors\n");
   });
 
   // Item 1 / slice-05: provenance round-trip through /create + /inspect
@@ -608,6 +628,43 @@ describe("Bundle API routes", () => {
     expect(body.bundleName).toBe("pod-test");
     expect(body.archiveHash).toMatch(/^[a-f0-9]{64}$/);
     expect(fs.existsSync(outputPath)).toBe(true);
+  });
+
+  it("A bundle of a pooled rig is not refused for drift without --allow-drift, because pool agents are left out of the live list", async () => {
+    const agentsDir = path.join(tmpDir, "agents", "impl");
+    fs.mkdirSync(agentsDir, { recursive: true });
+    fs.writeFileSync(path.join(agentsDir, "agent.yaml"), [
+      'name: impl-agent', 'version: "1.0.0"', 'resources:', '  skills: []', 'profiles:', '  default:', '    uses:', '      skills: []',
+    ].join("\n"));
+    const specPath = path.join(tmpDir, "rig.yaml");
+    fs.writeFileSync(specPath, [
+      'version: "0.2"', 'name: pooled-rig', 'pods:', '  - id: dev', '    label: Dev', '    members:', '      - id: impl',
+      '        agent_ref: "local:agents/impl"', '        profile: default', '        runtime: claude-code', '        cwd: .',
+      '        pool: { max: 2 }', '    edges: []', 'edges: []',
+    ].join("\n"));
+    // the rig on record: the model and one pool agent in each phase
+    const rig = setup.rigRepo.createRig("pooled-rig");
+    const model = setup.rigRepo.addNode(rig.id, "dev.impl", { runtime: "claude-code" });
+    const slots = new SeatPoolSlotsRepository(db);
+    const phases = ["adding", "live", "draining", "drained"] as const;
+    const agents = phases.map((phase, i) => {
+      const agent = setup.rigRepo.addNode(rig.id, `dev.impl-s${i + 1}`, { runtime: "claude-code" });
+      slots.insert({ modelNodeId: model.id, slotNumber: i + 1, nodeId: agent.id, phase, at: "2026-11-18T00:00:00.000Z" });
+      return agent;
+    });
+    const create = (name: string) => app.request("/api/bundles/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ specPath, bundleName: name, bundleVersion: "0.1.0", outputPath: path.join(tmpDir, `${name}.rigbundle`) }),
+    });
+    const res = await create("pooled");
+    expect(res.status).toBe(201);
+    expect(((await res.json()) as { warning?: string }).warning ?? "").not.toMatch(/drift|does not describe/i);
+    // the same seats without slot rows are ordinary members the spec doesn't declare, and the bundle refuses
+    db.prepare("DELETE FROM seat_pool_slots WHERE node_id = ?").run(agents[1]!.id);
+    const refused = await create("drifted");
+    expect(refused.status).toBe(409);
+    expect(((await refused.json()) as { error: string }).error).toContain("Refusing to bundle");
   });
 
   it("POST /api/bundles/create accepts builtin terminal pod members", async () => {
@@ -1413,6 +1470,32 @@ describe("Bundle API routes", () => {
       const comboBody = await combo.json();
       expect(comboBody.total).toBe(1);
       expect(comboBody.records[0].installedAt).toBe("2026-05-18T12:00:00Z");
+
+      // since keeps main's text comparison against installedAt. A since that isn't a date or time
+      // gets an advisory naming it; every other since gets no advisories field at all.
+      const cases: Array<[string, string[], boolean]> = [
+        ["garbage", [], true],
+        ["2026-13-45", [], true],
+        ["2026-05-18T11", ["2026-05-18T11:00:00Z", "2026-05-18T12:00:00Z"], false],
+        ["2026-05-18", ["2026-05-18T10:00:00Z", "2026-05-18T11:00:00Z", "2026-05-18T12:00:00Z"], false],
+        ["", ["2026-05-18T10:00:00Z", "2026-05-18T11:00:00Z", "2026-05-18T12:00:00Z"], false],
+        ["2026-05-18T11:00:00Z", ["2026-05-18T11:00:00Z", "2026-05-18T12:00:00Z"], false],
+      ];
+      for (const [value, installedAts, advised] of cases) {
+        const res = await app.request(`/api/bundles/history?since=${encodeURIComponent(value)}`);
+        expect(res.status, value).toBe(200);
+        const body = await res.json();
+        expect(body.records.map((r: { installedAt: string }) => r.installedAt), value).toEqual(installedAts);
+        expect(body.total, value).toBe(installedAts.length);
+        if (advised) {
+          expect(body.advisories, value).toEqual([
+            `since "${value}" was not recognised as a date or time; the existing text comparison against installedAt was used`,
+          ]);
+        } else {
+          expect("advisories" in body, value).toBe(false);
+        }
+      }
+      expect("advisories" in allBody).toBe(false);
     } finally {
       if (origHome === undefined) delete process.env.OPENRIG_HOME;
       else process.env.OPENRIG_HOME = origHome;
@@ -1466,6 +1549,7 @@ describe("Bundle API routes", () => {
     bootstrapThrows?: Error;
     expectedOutcome: "success" | "failed" | "partial";
     expectedRigId?: string;
+    provenance?: Record<string, string>;
   }): Promise<{ records: Array<Record<string, unknown>>; total: number }> {
     const { specPath } = seedPackage();
     const bundlePath = path.join(tmpDir, `${opts.bundleName}.rigbundle`);
@@ -1475,7 +1559,7 @@ describe("Bundle API routes", () => {
       await app.request("/api/bundles/create", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ specPath, bundleName: opts.bundleName, bundleVersion: "0.1.0", outputPath: bundlePath }),
+        body: JSON.stringify({ specPath, bundleName: opts.bundleName, bundleVersion: "0.1.0", outputPath: bundlePath, provenance: opts.provenance }),
       });
 
       const stub = opts.bootstrapThrows
@@ -1511,6 +1595,7 @@ describe("Bundle API routes", () => {
     try {
       const body = await runApplyAuditTest({
         bundleName: "completed-test",
+        provenance: { sourceHost: "older-bundle-host", authorSession: "builder@demo" },
         bootstrapResult: {
           status: "completed",
           runId: "test-run-completed",
@@ -1523,6 +1608,7 @@ describe("Bundle API routes", () => {
       expect(body.total).toBe(1);
       expect(body.records[0].outcome).toBe("success");
       expect(body.records[0].targetRigId).toBe("01H000000000000000COMPL01");
+      expect(body.records[0].sourceHost).toBe("older-bundle-host");
       expect(typeof body.records[0].daemonVersion).toBe("string");
     } finally {
       if (origHome === undefined) delete process.env.OPENRIG_HOME;
@@ -3437,6 +3523,22 @@ describe("POST /api/bundles/install: pre-launch routing report", () => {
 
     expect(res.status).toBe(200);
     expect(bootstrap).toHaveBeenCalledWith(expect.objectContaining({ mode: "plan", cwdOverride: "/work/openrig" }));
+  });
+
+  it.each([false, true])("includes routing warnings in the install response (prelaunch=%s)", async prelaunch => {
+    const routing = { warnings: ["mode repair fixture"], routingFailures: [{ kind: "skills", error: "copy fixture" }] };
+    const warnings = ["bootstrap fixture", ...(prelaunch ? ["mode repair fixture", "Bundle skills routing failed: copy fixture"] : [])];
+    const orchestrator = setup.bootstrapOrchestrator;
+    vi.spyOn(orchestrator, "bootstrap").mockResolvedValue({
+      status: "completed", runId: "run-warnings", rigId: "rig-warnings", stages: [], errors: [], warnings,
+      ...(prelaunch ? { bundleRouting: routing } : {}),
+    } as never);
+    const reroute = vi.spyOn(orchestrator, "routeBundleContents").mockResolvedValue(routing as never);
+    const res = await install({});
+    const body = await res.json();
+    expect(res.status).toBe(201);
+    expect(body.warnings).toEqual(["bootstrap fixture", "mode repair fixture", "Bundle skills routing failed: copy fixture"]);
+    expect(reroute).toHaveBeenCalledTimes(prelaunch ? 0 : 1);
   });
 
   it("a partial install reports its routing failures in the response and the audit", async () => {

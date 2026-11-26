@@ -4,12 +4,15 @@ import type Database from "better-sqlite3";
 import { Hono } from "hono";
 import { OPENRIG_HOME } from "../openrig-compat.js";
 import { RestoreCheckService, type RestoreCheckDeps, type NodeInventoryEntry, type StartupContextProbeResult } from "../domain/restore-check-service.js";
+import { createDesiredClaudeActivityHooksReader } from "../domain/desired-claude-activity-hooks.js";
 import { deriveRelayEvents } from "../domain/claude-activity-hooks.js";
 import { getNodeInventory } from "../domain/node-inventory.js";
+import { readMaterializedRoster } from "../domain/snapshot-capture.js";
 import { resolveLegacyTopologyRigsRoot } from "../domain/user-settings/settings-store.js";
 import type { RigRepository } from "../domain/rig-repository.js";
 import type { SnapshotRepository } from "../domain/snapshot-repository.js";
 import { assessCurrentStateRehydrateEligibility, snapshotMatchesCurrentOccupants } from "../domain/rehydrate-eligibility.js";
+import { readTopologyRoster } from "../domain/snapshot-capture.js";
 
 function getDeps(c: { get(key: never): unknown }): {
   rigRepo: RigRepository;
@@ -131,6 +134,7 @@ function getStartupContext(db: Database.Database, nodeId: string): StartupContex
           category: typeof candidate["category"] === "string" ? candidate["category"] : null,
           sourcePath: typeof candidate["sourcePath"] === "string" ? candidate["sourcePath"] : null,
           resourceType: typeof candidate["resourceType"] === "string" ? candidate["resourceType"] : null,
+          resourcePath: typeof candidate["resourcePath"] === "string" ? candidate["resourcePath"] : null,
         }];
       }),
     };
@@ -168,6 +172,9 @@ export function createRestoreCheckService(
         };
       }
     },
+    getDesiredClaudeActivityHooks: createDesiredClaudeActivityHooksReader(rigRepo.db, {
+      exists: existsSync, readFile: (path) => readFileSync(path, "utf8"),
+    }),
     getClaudeActivityHookEvents: () => deriveRelayEvents(
       { exists: existsSync, readFile: (path) => readFileSync(path, "utf-8") },
       resolve(import.meta.dirname, "../../assets/plugins/openrig-core/hooks/claude.json"),
@@ -186,6 +193,9 @@ export function createRestoreCheckService(
     getStartupContext: (nodeId: string) => {
       return getStartupContext(rigRepo.db, nodeId);
     },
+    // The roster a current-state restore uses: the latest recorded one, read as snapshot capture reads it (a malformed
+    // one throws, and restore-check reports the restore inputs as unknown).
+    getMaterializedRoster: (rigId: string) => readMaterializedRoster(rigRepo.db, rigId),
     hasSnapshot: (rigId: string) => {
       return snapshotRepo.listSnapshots(rigId).length > 0;
     },
@@ -198,9 +208,17 @@ export function createRestoreCheckService(
       if (!rig) return { unavailable: `Rig ${rigId} no longer exists` };
       const selected = snapshotRepo.selectRestoreUsable(rigId);
       if (!selected.ok || !snapshotMatchesCurrentOccupants(snapshotRepo.db, rig, selected.snapshot)) {
+        // A current-state rehydrate takes its roster from the rig's recorded topology roster, so a member outside it
+        // is left as it is there too. A malformed roster stops that restore; restore-check then claims nothing about it.
+        let notRestoredNodeIds: string[] | undefined;
+        try {
+          const roster = readTopologyRoster(snapshotRepo.db, rigId);
+          if (roster) notRestoredNodeIds = rig.nodes.map((node) => node.id).filter((nodeId) => !roster.includes(nodeId));
+        } catch { notRestoredNodeIds = undefined; }
         return {
           currentStateRehydrate: assessCurrentStateRehydrateEligibility(snapshotRepo.db, rig),
           reason: selected.ok ? "Selected snapshot names an older occupant" : selected.message,
+          ...(notRestoredNodeIds ? { notRestoredNodeIds } : {}),
         };
       }
       return { snapshot: selected.snapshot, servicesRecord: rigRepo.getServicesRecord(rigId) };

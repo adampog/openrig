@@ -1,4 +1,5 @@
 import nodePath from "node:path";
+import { readSeatEnvOverride } from "../domain/seat-env.js";
 import { Hono } from "hono";
 import { bootstrapFailureResponse } from "./bootstrap-failure-response.js";
 import type { BootstrapOrchestrator } from "../domain/bootstrap-orchestrator.js";
@@ -6,17 +7,20 @@ import type { BootstrapRepository } from "../domain/bootstrap-repository.js";
 import type { EventBus } from "../domain/event-bus.js";
 import type { UpCommandRouter } from "../domain/up-command-router.js";
 import type { RigRepository } from "../domain/rig-repository.js";
-import { summarizeSnapshot, type SnapshotRepository } from "../domain/snapshot-repository.js";
+import type { SnapshotRepository } from "../domain/snapshot-repository.js";
 import type { SnapshotCapture } from "../domain/snapshot-capture.js";
 import type { RestoreOrchestrator } from "../domain/restore-orchestrator.js";
-import { assessCurrentStateRehydrateEligibility, snapshotMatchesCurrentOccupants } from "../domain/rehydrate-eligibility.js";
-import { buildRestorePlanPreview, collectPreviewSessionRows } from "../domain/restore-plan-preview.js";
+import { chooseRestoreSnapshot, joinAutomaticRestore, JOINED_AUTOMATIC_RESTORE_WARNING, runExistingRigRestore, type ExistingRigRestoreOutcome } from "../domain/existing-rig-restore.js";
+import { normalizeCwdOverride } from "../domain/cwd-resolution.js";
+import { buildRestorePlanPreview, collectPreviewSessionRows, type RestorePermissionSeat } from "../domain/restore-plan-preview.js";
+import { planRestorePermission } from "../domain/permission-account.js";
 import { readFreshOccupantRelations } from "../domain/fresh-occupant-relation.js";
 import { loadTopologyManifest } from "../domain/topology/topology-manifest.js";
 import { MultiRigLauncher } from "../domain/topology/multi-rig-launcher.js";
 import { remoteUpLeaf } from "../domain/topology/remote-up-leaf.js";
 import { loadHostRegistry } from "../domain/hosts/hosts-registry-reader.js";
 import type { HttpHostEntry } from "../domain/hosts/hosts-registry-reader.js";
+import { tmuxAttachCommand } from "../adapters/tmux-server.js";
 
 export const upRoutes = new Hono();
 
@@ -51,7 +55,7 @@ export function buildAttentionResponse(result: {
   const nodeCount = detail.attentionNodes.length;
   const sessionAttachHints = detail.attentionNodes
     .filter((n) => n.sessionName)
-    .map((n) => `tmux attach -t ${n.sessionName}`)
+    .map((n) => tmuxAttachCommand(n.sessionName))
   const visibleAttachHints = sessionAttachHints.slice(0, 3).join(" ; ");
   const remainingAttachHintCount = Math.max(0, sessionAttachHints.length - 3);
   const attachHintText = visibleAttachHints
@@ -93,36 +97,26 @@ function getDeps(c: { get: (key: string) => unknown }) {
  * The response payload echoes `snapshotKind` so the operator/CLI can surface
  * which snapshot was used.
  *
- * Shared helper used by both /api/up (rig_name) and /api/rigs/:rigId/up (Explorer).
+ * Used by /api/up (rig_name). The Explorer's /api/rigs/:rigId/up keeps its own request and response
+ * contract and shares joinAutomaticRestore.
  */
-async function restoreByRigId(rigId: string, rigName: string | null, deps: ReturnType<typeof getDeps>, c: { json: (data: unknown, status?: number) => Response }, freshLogicalIds?: string[], plan?: boolean, nonInterruptive?: boolean) {
-  const { snapshotRepo, restoreOrchestrator } = deps;
-
-  const rig = deps.rigRepo.getRig(rigId);
-  if (!rig) {
-    return c.json({ error: `Rig ${rigId} not found`, code: "rig_not_found" }, 404);
+async function restoreByRigId(rigId: string, rigName: string | null, deps: ReturnType<typeof getDeps>, c: { json: (data: unknown, status?: number) => Response }, freshLogicalIds?: string[], plan?: boolean, nonInterruptive?: boolean, requestedCwd?: string) {
+  const { snapshotRepo } = deps;
+  // Read once, as a fresh launch reads it: a remote `rig up --host` sends --cwd as typed, and a blank value is no override.
+  const cwdOverride = normalizeCwdOverride(requestedCwd);
+  // Daemon start restores a kernel a reboot left down. A request for that same restore, made while it
+  // runs or just after, gets its outcome instead of a second launch or a refusal; see
+  // joinAutomaticRestore for when the seats still count as that restore's. A request for something
+  // else (--fresh seats, a different non-interruptive choice, a plan) takes the ordinary path.
+  const sameLaunchChoice = () => nonInterruptive === undefined || nonInterruptive === deps.rigRepo.getRigNonInterruptive(rigId);
+  // A different launch directory (`--cwd`) is a different launch: it takes the ordinary path, not the automatic one.
+  if (!plan && !freshLogicalIds?.length && !cwdOverride && sameLaunchChoice()) {
+    const joined = await joinAutomaticRestore(deps, rigId);
+    if (joined && sameLaunchChoice()) return renderExistingRestore(rigId, rigName, deps, c, joined, true);
   }
-
-  const automaticSelection = snapshotRepo.selectRestoreUsable(rigId);
-  let snapshot = automaticSelection.ok ? automaticSelection.snapshot : null;
-  let snapshotSelection = automaticSelection.ok ? automaticSelection.selection : undefined;
-  let staleSnapshot = false;
-  if (snapshot && !snapshotMatchesCurrentOccupants(snapshotRepo.db, rig, snapshot)) {
-    snapshot = null;
-    snapshotSelection = undefined;
-    staleSnapshot = true;
-  }
-  let capturedCurrentState = false;
-  if (!snapshot) {
-    const eligibility = assessCurrentStateRehydrateEligibility(snapshotRepo.db, rig);
-    if (!eligibility.ok) {
-      return c.json({
-        error: `Rig exists but ${staleSnapshot ? "its restore snapshots name an older occupant" : "has no restore-usable snapshot"} and current DB state is insufficient for rehydrate. Start fresh with: rig up <spec-path>`,
-        code: "no_snapshot",
-        blockers: eligibility.blockers,
-      }, 404);
-    }
-  }
+  const choice = chooseRestoreSnapshot(deps, rigId);
+  if (!choice.ok) return c.json(choice.body, choice.status);
+  const { rig } = choice;
 
   // OPR.0.3.4.4 — read-only plan gate, BEFORE any restore mutation. The
   // rig_name path previously early-returned past the bootstrap plan gate, so
@@ -131,33 +125,33 @@ async function restoreByRigId(rigId: string, rigName: string | null, deps: Retur
   // snapshot capture (itself a mutation) is reported as would-happen, never
   // performed.
   if (plan) {
-    return c.json(buildRestorePlanPreview(rig, snapshot ?? null, collectPreviewSessionRows(snapshotRepo.db, rig, snapshot ?? null), freshLogicalIds, Date.now(), readFreshOccupantRelations(snapshotRepo.db, rig.rig.id)), 200);
-  }
-
-  if (!snapshot) {
-    snapshot = deps.snapshotCapture.captureSnapshot(rigId, "auto-rehydrate");
-    snapshotSelection = {
-      ...summarizeSnapshot(snapshot),
-      mode: "automatic",
-      rationale: "automatic rehydrate captured current eligible state because no current-occupant snapshot was usable",
-      newerUsableAlternative: null,
-    };
-    capturedCurrentState = true;
-  }
-
-  if (!restoreOrchestrator) {
-    return c.json({ error: "Restore orchestrator not available" }, 500);
+    // Each seat's permission as this restore will start it: restore's own posture rule through the launch's resolver.
+    const restorer = deps.restoreOrchestrator;
+    const permissionOf = restorer ? (seat: RestorePermissionSeat) =>
+      planRestorePermission(snapshotRepo.db, { ...seat, restorePosture: () => restorer.resolveRestorePosture(seat.nodeId, rig.rig.id) }) : undefined;
+    return c.json(buildRestorePlanPreview(rig, choice.snapshot ?? null, collectPreviewSessionRows(snapshotRepo.db, rig, choice.snapshot ?? null, true), freshLogicalIds, Date.now(), readFreshOccupantRelations(snapshotRepo.db, rig.rig.id), undefined, permissionOf), 200);
   }
 
   const fs = await import("node:fs");
-  const result = await restoreOrchestrator.restore(snapshot.id, {
-    adapters: deps.runtimeAdapters ?? {},
-    fsOps: { exists: (p: string) => fs.existsSync(p) },
-    // OPR.0.3.4.2 — operation B opt-in seats from `rig up --existing --fresh`.
+  const run = await runExistingRigRestore(deps, choice, {
     freshLogicalIds,
     nonInterruptive,
-    snapshotSelection,
+    ...(cwdOverride ? { cwdOverride } : {}),
+    exists: (p: string) => fs.existsSync(p),
   });
+  return renderExistingRestore(rigId, rigName, deps, c, { ok: true, staleSnapshot: choice.staleSnapshot, ...run }, false);
+}
+
+async function renderExistingRestore(
+  rigId: string, rigName: string | null, deps: ReturnType<typeof getDeps>,
+  c: { json: (data: unknown, status?: number) => Response }, outcome: ExistingRigRestoreOutcome, joined: boolean,
+) {
+  if (!outcome.ok) return c.json(outcome.choice.body, outcome.choice.status);
+  const { snapshot, capturedCurrentState, result, staleSnapshot } = outcome;
+  const joinedWarning = joined ? [JOINED_AUTOMATIC_RESTORE_WARNING] : [];
+  if (!result.ok && result.code === "restore_unavailable") {
+    return c.json({ error: result.message }, 500);
+  }
   if (!result.ok) {
     if (result.code === "pre_restore_validation_failed") {
       return c.json({
@@ -171,7 +165,7 @@ async function restoreByRigId(rigId: string, rigName: string | null, deps: Retur
         remediation: result.result.blockers?.map((blocker) => blocker.remediation) ?? [],
       }, 409);
     }
-    return c.json({ error: result.message, code: result.code }, result.code === "rig_not_stopped" ? 409 : 400);
+    return c.json({ error: result.message, code: result.code, ...(joined ? { warnings: joinedWarning } : {}) }, result.code === "rig_not_stopped" ? 409 : 400);
   }
 
   // Compute attach command from first running node (same logic as /api/rigs/:id/up)
@@ -188,11 +182,15 @@ async function restoreByRigId(rigId: string, rigName: string | null, deps: Retur
     snapshotKind: snapshot.kind,
     rigResult: result.result.rigResult,
     nodes: result.result.nodes,
-    warnings: capturedCurrentState
+    // Seats this restore didn't start, with why; rig up names the ones still in the rig.
+    excludedNodes: result.result.excludedNodes,
+    // Seats this restore left stopped on purpose (a drained seat pool agent), outside `nodes` and the rig result.
+    keptDown: result.result.keptDown,
+    warnings: [...joinedWarning, ...(capturedCurrentState
       ? [staleSnapshot
-          ? "Existing restore snapshots named an older occupant; captured current DB state as auto-rehydrate snapshot for reboot recovery."
+          ? "The selected restore snapshot did not match current occupant state; captured current DB state as auto-rehydrate snapshot for reboot recovery."
           : "No restore-usable snapshot existed; captured current DB state as auto-rehydrate snapshot for reboot recovery.", ...result.result.warnings]
-      : result.result.warnings,
+      : result.result.warnings)],
     attachCommand,
   }, 200);
 }
@@ -211,6 +209,12 @@ upRoutes.post("/", async (c) => {
   if (!sourceRef) {
     return c.json({ error: "sourceRef is required" }, 400);
   }
+
+  // `rig up --env KEY=VALUE`: environment for this launch only. It is not saved with the rig.
+  const envOverride = readSeatEnvOverride(body["envOverride"]);
+  // `rig up <spec> --name <rig>`: the rig's name instead of the spec's `name:`. The launch lock below stays
+  // per source, so two simultaneous launches of one spec answer 409 even under different names.
+  const rigName = typeof body["rigName"] === "string" && body["rigName"] !== "" ? body["rigName"] : undefined;
 
   // Route source — classify raw sourceRef first, only resolve path for file-based kinds
   let sourceKind: string;
@@ -234,7 +238,8 @@ upRoutes.post("/", async (c) => {
       const freshLogicalIds = Array.isArray(body["freshLogicalIds"])
         ? (body["freshLogicalIds"] as unknown[]).filter((v): v is string => typeof v === "string")
         : undefined;
-      return restoreByRigId(rigs[0]!.id, sourceRef, getDeps(c), c, freshLogicalIds, plan, nonInterruptive) as any;
+      // `rig up <rig> --existing --cwd <dir>`: the launch directory for every restored seat, this run only.
+      return restoreByRigId(rigs[0]!.id, sourceRef, getDeps(c), c, freshLogicalIds, plan, nonInterruptive, cwdOverride) as any;
     }
 
     // File-based: resolve path now
@@ -352,6 +357,7 @@ upRoutes.post("/", async (c) => {
         sourceKind,
         cwdOverride,
         targetRoot,
+        rigName,
       });
 
       if (result.status === "planned") {
@@ -377,6 +383,8 @@ upRoutes.post("/", async (c) => {
         autoApprove,
         nonInterruptive,
         cwdOverride,
+        envOverride,
+        rigName,
         targetRoot,
         runId: run.id,
       });

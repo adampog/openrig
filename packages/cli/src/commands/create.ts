@@ -37,14 +37,16 @@ export function createCommand(depsOverride?: StatusDeps): Command {
     .action(async (name: string, opts: { runtime: string; cwd: string; json?: boolean }) => {
       const deps = getDeps();
       const status = await getDaemonStatus(deps.lifecycleDeps);
-      if (!daemonStatusGuard(status)) return;
+      if (!daemonStatusGuard(status, { json: opts.json })) return;
 
       const client = deps.clientFactory(getDaemonUrl(status));
       let agentRef: string;
       try {
-        agentRef = await resolveDefaultAgentRef(client);
+        agentRef = await resolveDefaultAgentRef(client, opts.runtime);
       } catch (err) {
-        console.error(err instanceof Error ? err.message : String(err));
+        const detail = err instanceof Error ? err.message : String(err);
+        if (opts.json) console.log(JSON.stringify({ ok: false, detail }, null, 2));
+        else console.error(detail);
         process.exitCode = 1;
         return;
       }
@@ -61,7 +63,7 @@ export function createCommand(depsOverride?: StatusDeps): Command {
             id: "lead",
             agent_ref: agentRef,
             runtime: opts.runtime,
-            profile: "default",
+            profile: opts.runtime === "terminal" ? "none" : "default",
             cwd,
           }],
           edges: [],
@@ -78,6 +80,12 @@ export function createCommand(depsOverride?: StatusDeps): Command {
       );
       const node = res.data.nodes?.find((candidate) => candidate.logicalId === logicalId);
       const ok = res.status < 400 && node?.status === "launched";
+      // The same reason in both outputs, under the key `rig grow --json` uses.
+      const detail = ok ? undefined : (res.data.errors?.join("; ")
+        ?? res.data.message
+        ?? res.data.error
+        ?? node?.error
+        ?? `Create failed (HTTP ${res.status})`);
 
       if (opts.json) {
         console.log(JSON.stringify({
@@ -88,16 +96,12 @@ export function createCommand(depsOverride?: StatusDeps): Command {
           seat: logicalId,
           source: agentRef,
           node,
+          ...(detail !== undefined ? { detail } : {}),
         }, null, 2));
       } else if (ok) {
         console.log(`Created rig ${name} (${res.data.rigId})`);
         console.log(`  Seat: ${logicalId}${node?.sessionName ? ` (${node.sessionName})` : ""}`);
       } else {
-        const detail = res.data.errors?.join("; ")
-          ?? res.data.message
-          ?? res.data.error
-          ?? node?.error
-          ?? `Create failed (HTTP ${res.status})`;
         console.error(detail);
       }
 

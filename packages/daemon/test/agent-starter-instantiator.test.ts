@@ -41,7 +41,9 @@ function mockTmux(): TmuxAdapter {
     hasSession: vi.fn(async () => true),
     listSessions: vi.fn(async () => []),
     listWindows: vi.fn(async () => []),
-    listPanes: vi.fn(async () => []),
+    listPanes: vi.fn(async () => [{ id: "%1", index: 0, cwd: "/project", width: 80, height: 24, active: true }]),
+    getPanePid: vi.fn(async () => 4242),
+    getPaneCommand: vi.fn(async () => "claude"),
     sendKeys: vi.fn(async () => ({ ok: true as const })),
   } as unknown as TmuxAdapter;
 }
@@ -150,7 +152,7 @@ function setupWithStarter(opts: {
   const eventBus = new EventBus(db);
   const tmux = mockTmux();
   const nodeLauncher = new NodeLauncher({ db, rigRepo, sessionRegistry, eventBus, tmuxAdapter: tmux });
-  const startupOrch = new StartupOrchestrator({ db, sessionRegistry, eventBus, tmuxAdapter: tmux });
+  const startupOrch = new StartupOrchestrator({ db, sessionRegistry, eventBus, tmuxAdapter: tmux, sleep: async () => {} });
   const adapter = mockAdapter("claude-code");
   const codexAdapter = mockAdapter("codex");
   const fsOps = mockFs({ [`${RIG_ROOT}/agents/impl/agent.yaml`]: agentYaml("impl") });

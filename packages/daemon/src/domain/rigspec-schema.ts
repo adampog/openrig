@@ -1,9 +1,21 @@
+import { isEscalationTargetRef } from "./escalation-target-ref.js";
+import { validateClaudePermissionRules } from "./claude-permission-rules.js";
+import { claudeAutoModeAdvisories, validateClaudeAutoMode } from "./claude-auto-mode.js";
+import { specClaudeTokenRef } from "./claude-seat-token.js";
+import { validateClaudeMcp } from "./claude-mcp.js";
+import { isLaunchWrapperRuntime, validateLaunchWrapper } from "./launch-wrapper.js";
+import { validateProcessLimits } from "./process-limits.js";
+import { validateSpecStatuslineThrottle } from "./claude-statusline-throttle.js";
+import { parsePoolBlock, poolProblemAdvisories } from "./seat-pool-spec.js";
+import { isClaudePluginChannel } from "./claude-plugin-channels.js";
+import { validateCodexMemberPermissions } from "./codex-member-permissions.js";
 import type {
   LegacyRigSpec,
   LegacyRigSpecNode,
   LegacyRigSpecEdge,
   RigSpec,
   RigSpecPod,
+  RigSpecPodMember,
   RigServicesSpec,
   RigServicesWaitTarget,
   RigServicesSurface,
@@ -16,8 +28,11 @@ import { WORKSPACE_KINDS } from "./types.js";
 import { validateSafePath } from "./path-safety.js";
 import { CLAUDE_MANAGED_BLOCK_FILES } from "./managed-blocks.js";
 import { canonicalCompactionStrategy, canonicalContinuityMechanic } from "./agent-manifest.js";
+import { unknownLevelWarning } from "./seat-effort.js";
 import { aliasModelPinAdvisory } from "./spec-validation-advisory.js";
+import { normalizeSeatEnv, validateSeatEnv } from "./seat-env.js";
 import { validatePermissionPolicyRef } from "./permission-policy/policy-ref.js";
+import { deriveCanonicalSessionName } from "./session-name.js";
 import { validateStartupBlock, normalizeStartupBlock } from "./startup-validation.js";
 import { COMPOSE_PROJECT_NAME_PATTERN, deriveComposeProjectName } from "./compose-project-name.js";
 import * as path from "node:path";
@@ -27,6 +42,13 @@ import * as path from "node:path";
 // OPR.0.3.3.24: exported so the add_member converge op validates pod-local edge
 // kinds against the SAME canonical set as a rigspec pod-local edge (no second,
 // looser edge input path).
+/** The folder a member's plugin folder is copied to in its seat storage: its last path segment, with anything outside
+ *  [A-Za-z0-9@._-] as `_`. One rule for the schema's clash check, the launch's copy and the before-install view. */
+export function seatAdditionPluginFolder(dir: string): string {
+  const parts = dir.replace(/\\/g, "/").split("/").filter((part) => part && part !== ".");
+  return (parts.at(-1) ?? "").replace(/[^A-Za-z0-9@._-]/g, "_");
+}
+
 export const VALID_EDGE_KINDS = new Set(["delegates_to", "spawned_by", "can_observe", "collaborates_with", "escalates_to"]);
 
 /** SPEC-VALIDATION CAPABILITY REGISTRY (B8-family, r2-ruled expiry coupling). Behavioral sentinel,
@@ -46,13 +68,14 @@ const VALID_WORKSPACE_KINDS = new Set<string>(WORKSPACE_KINDS as readonly string
 
 const RIG_KEYS = new Set([
   "version", "name", "summary", "culture_file", "permission_policy", "managed_blocks", "docs",
-  "startup", "services", "workspace", "pods", "edges", "non_interruptive",
+  "startup", "services", "workspace", "pods", "edges", "non_interruptive", "seat_slice", "env", "default_onboarding_pack",
 ]);
-const POD_KEYS = new Set(["id", "label", "summary", "continuity_policy", "startup", "members", "edges"]);
+const POD_KEYS = new Set(["id", "label", "summary", "continuity_policy", "startup", "members", "edges", "cold_start"]);
 const MEMBER_KEYS = new Set([
   "id", "label", "agent_ref", "profile", "runtime", "codex_config_profile",
-  "model", "effort", "role", "permission_policy", "cwd", "restore_policy",
-  "compaction_strategy", "mechanic", "startup", "session_source", "starter_ref",
+  "model", "effort", "advisor", "role", "permission_policy", "claude_permissions", "claude_auto_mode", "claude_token", "claude_mcp", "codex_permissions", "launch_wrapper", "process_limits", "statusline_throttle", "pool", "cwd", "restore_policy", "keep_alive",
+  "compaction_strategy", "mechanic", "startup", "session_source", "starter_ref", "env", "cold_start",
+  "agent_file", "append_system_prompt_file", "plugin_dirs", "plugin_channels",
 ]);
 const EDGE_KEYS = new Set(["kind", "from", "to"]);
 
@@ -180,6 +203,18 @@ export class RigSpecSchema {
       errors.push("non_interruptive: must be a boolean");
     }
 
+    // #80: opt-in grouping of the rig's seat scopes beneath its own slice; `rig` is the one value.
+    if (obj["seat_slice"] !== undefined && obj["seat_slice"] !== "rig") {
+      errors.push('seat_slice: must be "rig" (omit it to keep seats ungrouped)');
+    }
+
+    if (obj["default_onboarding_pack"] !== undefined && typeof obj["default_onboarding_pack"] !== "boolean") {
+      errors.push("default_onboarding_pack: must be a boolean");
+    }
+
+    // Launch environment for every seat in the rig; a member's own env overrides it.
+    if (obj["env"] !== undefined) errors.push(...validateSeatEnv(obj["env"], "env"));
+
     // #25: optional per-runtime managed-block destination. Only claude-code is
     // configurable in this release; Codex stays on AGENTS.md.
     if (obj["managed_blocks"] !== undefined) {
@@ -198,6 +233,8 @@ export class RigSpecSchema {
         const pod = pods[pi]!;
         errors.push(...validatePod(pod, pi, podIds, advisories));
       }
+      advisories.push(...sessionNameCollisions(obj));
+      advisories.push(...poolAdvisories(obj));
 
       // Cross-pod edge validation
       const allQualifiedIds = new Set<string>(opts?.externalQualifiedIds ?? []);
@@ -248,6 +285,7 @@ export class RigSpecSchema {
     const docs = Array.isArray(raw["docs"])
       ? (raw["docs"] as Record<string, unknown>[]).map((d) => ({ path: d["path"] as string }))
       : undefined;
+    const defaultOnboardingPack = raw["default_onboarding_pack"];
 
     return {
       version: raw["version"] as string,
@@ -256,7 +294,10 @@ export class RigSpecSchema {
       cultureFile: raw["culture_file"] as string | undefined,
       permissionPolicy: raw["permission_policy"] as string | undefined,
       nonInterruptive: raw["non_interruptive"] as boolean | undefined,
+      ...(raw["seat_slice"] === "rig" ? { seatSlice: "rig" as const } : {}),
+      env: normalizeSeatEnv(raw["env"]),
       managedBlocks: raw["managed_blocks"] as RigSpec["managedBlocks"],
+      ...(typeof defaultOnboardingPack === "boolean" ? { defaultOnboardingPack } : {}),
       docs,
       startup: raw["startup"] ? normalizeStartupBlock(raw["startup"]) : undefined,
       services: raw["services"] ? normalizeServicesBlock(raw["services"], raw["name"] as string) : undefined,
@@ -378,6 +419,54 @@ function normalizeWorkspaceBlock(raw: unknown): WorkspaceSpec | undefined {
 
 // -- Pod validation --
 
+/**
+ * Members in different pods can derive one session name (pod "a-b" + member "c" and pod "a" + member "b-c").
+ * A warning, not an error: `rig spec validate` and `rig up --plan` report it.
+ */
+export function sessionNameCollisions(spec: unknown): string[] {
+  const warnings: string[] = [];
+  if (!isMapping(spec) || !Array.isArray(spec["pods"])) return warnings;
+  const owners = new Map<string, string>();
+  const rig = typeof spec["name"] === "string" ? spec["name"] : "";
+  (spec["pods"] as unknown[]).forEach((pod, pi) => {
+    if (!isMapping(pod) || typeof pod["id"] !== "string" || !Array.isArray(pod["members"])) return;
+    (pod["members"] as unknown[]).forEach((member, mi) => {
+      if (!isMapping(member) || typeof member["id"] !== "string") return;
+      const sessionName = deriveCanonicalSessionName(pod["id"] as string, member["id"] as string, rig);
+      const owner = owners.get(sessionName);
+      const qualifiedId = `${pod["id"]}.${member["id"]}`;
+      if (owner === undefined) owners.set(sessionName, qualifiedId);
+      else if (owner !== qualifiedId) {
+        warnings.push(`pods[${pi}].members[${mi}].id: session name "${sessionName}" is already used by member "${owner}"`);
+      }
+    });
+  });
+  return warnings;
+}
+
+/**
+ * #3395: what is wrong inside each member's `pool:` block, one advisory per field, as `<pod>.<member> pool.<field>:
+ * <reason>; pool not used`. Never an error: a block with any problem is not used at all, and the rig still loads.
+ * Callers that report load and launch warnings ask for exactly these, so nothing is reported twice.
+ */
+export function poolAdvisories(spec: unknown): string[] {
+  const advisories: string[] = [];
+  if (!isMapping(spec) || !Array.isArray(spec["pods"])) return advisories;
+  (spec["pods"] as unknown[]).forEach((pod, pi) => {
+    if (!isMapping(pod) || !Array.isArray(pod["members"])) return;
+    (pod["members"] as unknown[]).forEach((member, mi) => {
+      if (!isMapping(member) || member["pool"] === undefined) return;
+      const read = parsePoolBlock(member["pool"]);
+      if (read.ok) return;
+      const label = typeof pod["id"] === "string" && typeof member["id"] === "string"
+        ? `${pod["id"]}.${member["id"]}`
+        : `pods[${pi}].members[${mi}]`;
+      advisories.push(...poolProblemAdvisories(label, read.problems));
+    });
+  });
+  return advisories;
+}
+
 function validatePod(pod: Record<string, unknown>, index: number, podIds: Set<string>, advisories: string[]): string[] {
   const errors: string[] = [];
   const prefix = `pods[${index}]`;
@@ -407,6 +496,11 @@ function validatePod(pod: Record<string, unknown>, index: number, podIds: Set<st
   // pod startup
   if (pod["startup"] !== undefined) {
     errors.push(...validateStartupBlock(pod["startup"], `${prefix}.startup`));
+  }
+
+  // #2829 slice 1 — opt-in queue-driven cold start for every seat in the pod
+  if (pod["cold_start"] !== undefined && typeof pod["cold_start"] !== "boolean") {
+    errors.push(`${prefix}.cold_start: must be a boolean`);
   }
 
   // members
@@ -440,6 +534,11 @@ function validateMember(member: Record<string, unknown>, index: number, podPrefi
   const prefix = `${podPrefix}.members[${index}]`;
   if (!isMapping(member)) return [`${prefix}: must be an object`];
   errors.push(...rejectUnknownTopologyKeys(member, MEMBER_KEYS, prefix));
+  for (const field of ["model", "label"]) {
+    if (member[field] !== undefined && typeof member[field] !== "string") {
+      errors.push(`${prefix}.${field}: must be a string`);
+    }
+  }
 
   // OPR.0.5.6.20 A5 — member-level compaction_strategy: all vocabulary decisions go
   // through the manifest's one canonical site; this leg only classifies the answer.
@@ -479,6 +578,48 @@ function validateMember(member: Record<string, unknown>, index: number, podPrefi
   if (!member["runtime"] || typeof member["runtime"] !== "string") {
     errors.push(`${prefix}.runtime: required non-empty string`);
   }
+  if (member["claude_mcp"] !== undefined) {
+    if (member["runtime"] !== "claude-code") errors.push(`${prefix}.claude_mcp: only valid when runtime is "claude-code"`);
+    try { validateClaudeMcp(member["claude_mcp"], `${prefix}.claude_mcp`); }
+    catch (error) { errors.push((error as Error).message); }
+  }
+  if (member["claude_permissions"] !== undefined) {
+    if (member["runtime"] !== "claude-code") errors.push(`${prefix}.claude_permissions: only valid when runtime is "claude-code"`);
+    try { validateClaudePermissionRules(member["claude_permissions"], `${prefix}.claude_permissions`); }
+    catch (error) { errors.push((error as Error).message); }
+  }
+  if (member["claude_auto_mode"] !== undefined) {
+    if (member["runtime"] !== "claude-code") errors.push(`${prefix}.claude_auto_mode: only valid when runtime is "claude-code"`);
+    try { advisories.push(...claudeAutoModeAdvisories(validateClaudeAutoMode(member["claude_auto_mode"], `${prefix}.claude_auto_mode`), `${prefix}.claude_auto_mode`)); }
+    catch (error) { errors.push((error as Error).message); }
+  }
+  if (member["claude_token"] !== undefined) {
+    if (member["runtime"] !== "claude-code") errors.push(`${prefix}.claude_token: only valid when runtime is "claude-code"`);
+    try { specClaudeTokenRef(member["claude_token"], `${prefix}.claude_token`); }
+    catch (error) { errors.push((error as Error).message); }
+  }
+  if (member["codex_permissions"] !== undefined) {
+    if (member["runtime"] !== "codex") errors.push(`${prefix}.codex_permissions: only valid when runtime is "codex"`);
+    try { validateCodexMemberPermissions(member["codex_permissions"], `${prefix}.codex_permissions`); }
+    catch (error) { errors.push((error as Error).message); }
+  }
+  if (member["launch_wrapper"] !== undefined) {
+    if (!isLaunchWrapperRuntime(member["runtime"])) {
+      errors.push(`${prefix}.launch_wrapper: only valid when runtime is "pi", "codex", "claude-code" or a supported community harness`);
+    }
+    try { validateLaunchWrapper(member["launch_wrapper"], `${prefix}.launch_wrapper`); }
+    catch (error) { errors.push((error as Error).message); }
+  }
+  if (member["process_limits"] !== undefined) {
+    // Valid on every runtime, terminal included: the limit is on the seat's pane, not on its harness.
+    try { validateProcessLimits(member["process_limits"], `${prefix}.process_limits`); }
+    catch (error) { errors.push((error as Error).message); }
+  }
+  if (member["statusline_throttle"] !== undefined) {
+    if (member["runtime"] !== "claude-code") errors.push(`${prefix}.statusline_throttle: only valid when runtime is "claude-code"`);
+    try { validateSpecStatuslineThrottle(member["statusline_throttle"], `${prefix}.statusline_throttle`); }
+    catch (error) { errors.push((error as Error).message); }
+  }
   if (member["codex_config_profile"] !== undefined) {
     if (typeof member["codex_config_profile"] !== "string" || !member["codex_config_profile"].trim()) {
       errors.push(`${prefix}.codex_config_profile: must be a non-empty string`);
@@ -491,7 +632,13 @@ function validateMember(member: Record<string, unknown>, index: number, podPrefi
   if (member["effort"] !== undefined) {
     if (typeof member["effort"] !== "string" || !member["effort"].trim()) {
       advisories.push(`${prefix}.effort: non-string value "${member["effort"]}" ignored; effort must be a text value`);
+    } else if (member["runtime"] === "pi") {
+      const warning = unknownLevelWarning("pi", member["effort"].trim());
+      if (warning) advisories.push(`${prefix}.effort: ${warning}`);
     }
+  }
+  if (member["advisor"] !== undefined && (typeof member["advisor"] !== "string" || !member["advisor"].trim())) {
+    advisories.push(`${prefix}.advisor: ignored; advisor must be a non-blank text value`);
   }
   if (!member["cwd"] || typeof member["cwd"] !== "string") {
     errors.push(`${prefix}.cwd: required non-empty string`);
@@ -527,6 +674,9 @@ function validateMember(member: Record<string, unknown>, index: number, podPrefi
     }
   }
 
+  if (member["env"] !== undefined) errors.push(...validateSeatEnv(member["env"], `${prefix}.env`));
+  errors.push(...validateClaudeAdditions(member, prefix, advisories));
+
   // Terminal sentinel validation: exact triple required
   const isTerminalRuntime = member["runtime"] === "terminal";
   const isTerminalRef = member["agent_ref"] === "builtin:terminal";
@@ -553,6 +703,17 @@ function validateMember(member: Record<string, unknown>, index: number, podPrefi
     if (!VALID_RESTORE_POLICIES.has(member["restore_policy"] as string)) {
       errors.push(`${prefix}.restore_policy: must be one of ${[...VALID_RESTORE_POLICIES].join(", ")} (got "${member["restore_policy"]}")`);
     }
+  }
+
+  // #2829 slice 1 — opt-in queue-driven cold start for this seat
+  if (member["cold_start"] !== undefined && typeof member["cold_start"] !== "boolean") {
+    errors.push(`${prefix}.cold_start: must be a boolean`);
+  }
+
+  // #2940: keep_alive is a plain opt-in. Valid on every runtime, terminal included: the one-seat launch that recovers a
+  // seat relaunches a terminal too, and a fresh shell is its whole restore (it has no conversation to lose).
+  if (member["keep_alive"] !== undefined && typeof member["keep_alive"] !== "boolean") {
+    errors.push(`${prefix}.keep_alive: must be true or false (got ${JSON.stringify(member["keep_alive"])})`);
   }
 
   // agent_ref: must be local: or path: with correct shape (skip for terminal sentinel)
@@ -784,6 +945,8 @@ function validatePodLocalEdge(edge: Record<string, unknown>, index: number, podP
   }
   if (!to || typeof to !== "string") {
     errors.push(`${prefix}.to: required string`);
+  } else if (kind === "escalates_to" && isEscalationTargetRef(to)) {
+    // Another rig need not exist at import time.
   } else if (to.includes(".")) {
     errors.push(`${prefix}.to: pod-local edge must use unqualified member id, not fully-qualified (got "${to}")`);
   } else if (!memberIds.has(to)) {
@@ -814,6 +977,8 @@ function validateCrossPodEdge(edge: Record<string, unknown>, index: number, allQ
   }
   if (!to || typeof to !== "string") {
     errors.push(`${prefix}.to: required string`);
+  } else if (kind === "escalates_to" && isEscalationTargetRef(to)) {
+    // Resolve the declared same-daemon address only when escalating.
   } else if (!to.includes(".")) {
     errors.push(`${prefix}.to: cross-pod edge must use fully-qualified pod.member id (got "${to}")`);
   } else if (!allQualifiedIds.has(to)) {
@@ -893,6 +1058,7 @@ function validateServicesBlock(raw: unknown, prefix: string): string[] {
 }
 
 function validateWaitTarget(raw: Record<string, unknown>, index: number, prefix: string): string[] {
+  if (!isMapping(raw)) return [`${prefix}.wait_for[${index}]: must be an object`];
   const errors: string[] = [];
   const targetPrefix = `${prefix}.wait_for[${index}]`;
   const hasService = typeof raw["service"] === "string" && raw["service"];
@@ -932,6 +1098,10 @@ function validateSurfaces(raw: unknown, prefix: string): string[] {
     } else {
       for (let i = 0; i < (obj["urls"] as unknown[]).length; i++) {
         const url = (obj["urls"] as Record<string, unknown>[])[i]!;
+        if (!isMapping(url)) {
+          errors.push(`${prefix}.surfaces.urls[${i}]: must be an object`);
+          continue;
+        }
         if (!url["name"] || typeof url["name"] !== "string") {
           errors.push(`${prefix}.surfaces.urls[${i}].name: required non-empty string`);
         }
@@ -948,6 +1118,10 @@ function validateSurfaces(raw: unknown, prefix: string): string[] {
     } else {
       for (let i = 0; i < (obj["commands"] as unknown[]).length; i++) {
         const command = (obj["commands"] as Record<string, unknown>[])[i]!;
+        if (!isMapping(command)) {
+          errors.push(`${prefix}.surfaces.commands[${i}]: must be an object`);
+          continue;
+        }
         if (!command["name"] || typeof command["name"] !== "string") {
           errors.push(`${prefix}.surfaces.commands[${i}].name: required non-empty string`);
         }
@@ -968,6 +1142,10 @@ function validateCheckpointHooks(raw: unknown, prefix: string): string[] {
   const errors: string[] = [];
   for (let i = 0; i < raw.length; i++) {
     const hook = raw[i] as Record<string, unknown>;
+    if (!isMapping(hook)) {
+      errors.push(`${prefix}.checkpoints[${i}]: must be an object`);
+      continue;
+    }
     if (!hook["id"] || typeof hook["id"] !== "string") {
       errors.push(`${prefix}.checkpoints[${i}].id: required non-empty string`);
     }
@@ -1135,6 +1313,87 @@ function normalizeSessionSource(raw: unknown): import("./types.js").SessionSourc
   return undefined;
 }
 
+/** OPR.0.7.0.9 — a Claude member's own agent file, appended prompt file and plugin folders: paths beside the spec.
+ *  #2044 — and its plugin channels, passed as Claude's `--channels`. */
+function validateClaudeAdditions(member: Record<string, unknown>, prefix: string, advisories: string[]): string[] {
+  const errors: string[] = [];
+  for (const key of ["agent_file", "append_system_prompt_file", "plugin_dirs", "plugin_channels"]) {
+    if (member[key] !== undefined && member["runtime"] !== "claude-code") {
+      errors.push(`${prefix}.${key}: only for Claude members (runtime claude-code)`);
+    }
+  }
+  for (const key of ["agent_file", "append_system_prompt_file"]) {
+    if (member[key] === undefined) continue;
+    const pathError = typeof member[key] === "string" && member[key].trim() ? validateSafePath(member[key], `${prefix}.${key}`) : `${prefix}.${key}: must be a path beside the spec`;
+    if (pathError) errors.push(pathError);
+  }
+  const dirs = member["plugin_dirs"];
+  if (dirs !== undefined) {
+    if (!Array.isArray(dirs)) {
+      errors.push(`${prefix}.plugin_dirs: must be a list of folders beside the spec`);
+    } else {
+      // Each folder is copied to a destination named by its last segment (as the launch does), so two that share one
+      // would mix their files: report it here rather than at launch.
+      const parts = (dir: string) => dir.replace(/\\/g, "/").split("/").filter((part) => part && part !== ".");
+      const destination = seatAdditionPluginFolder;
+      const seen: Array<{ path: string; destination: string }> = [];
+      dirs.forEach((dir, i) => {
+        const label = `${prefix}.plugin_dirs[${i}]`;
+        const pathError = typeof dir === "string" && dir.trim() ? validateSafePath(dir, label) : `${label}: must be a folder path beside the spec`;
+        if (pathError) { errors.push(pathError); return; }
+        const here = { path: parts(dir).join("/"), destination: destination(dir) };
+        const earlier = seen.findIndex((s) => s.path === here.path || s.destination === here.destination);
+        if (earlier >= 0) {
+          errors.push(seen[earlier]!.path === here.path ? `${label}: listed twice ("${dir}")`
+            : `${label}: would be copied where plugin_dirs[${earlier}] is (both named "${here.destination}"); rename one`);
+        }
+        seen.push(here);
+      });
+    }
+  }
+  const channels = member["plugin_channels"];
+  if (channels !== undefined) {
+    if (!Array.isArray(channels)) {
+      errors.push(`${prefix}.plugin_channels: must be a list of plugin:<name>@<marketplace> entries`);
+    } else {
+      channels.forEach((entry, i) => {
+        const label = `${prefix}.plugin_channels[${i}]`;
+        if (!isClaudePluginChannel(entry)) {
+          errors.push(typeof entry === "string" && entry.startsWith("server:")
+            ? `${label}: "${entry}" is a server entry; only plugin:<name>@<marketplace> entries are supported`
+            : `${label}: must be plugin:<name>@<marketplace>, each name letters, digits, . _ - (got ${JSON.stringify(entry)})`);
+        } else if (channels.indexOf(entry) !== i) {
+          errors.push(`${label}: listed twice ("${entry}")`);
+        }
+      });
+      // `claude_mcp: none` starts Claude with only an empty MCP server set, plugin servers left out too, so no channel
+      // could register.
+      if (channels.length > 0 && member["claude_mcp"] === "none") {
+        advisories.push(`${prefix}.plugin_channels: claude_mcp is "none", which starts Claude without MCP servers (plugin servers included), so no channel could register; remove claude_mcp: none to use the channels, or remove plugin_channels to keep the MCP opt-out`);
+      }
+    }
+  }
+  return errors;
+}
+
+/** #3395: a usable block becomes `pool` (`{}` is `null`, the clear); one that can't be used is dropped from `pool` and
+ *  kept, as authored, only for its node. It is kept as JSON, so a number JSON can't hold (`.inf`, `.nan`) is kept as
+ *  `null`, which reads back as unusable for the same field. Never throws: a block JSON can't hold at all (a YAML alias
+ *  that refers to itself) is kept as a note saying so, so the node and the launch recipe can still store it. */
+function normalizePool(raw: unknown): Pick<RigSpecPodMember, "pool" | "unusablePool"> {
+  if (raw === undefined) return {};
+  const read = parsePoolBlock(raw);
+  if (read.ok) return { pool: read.spec };
+  let stored: unknown;
+  try {
+    const text = JSON.stringify(raw);
+    stored = text === undefined ? null : JSON.parse(text);
+  } catch {
+    stored = "the authored pool block can't be stored as JSON";
+  }
+  return { unusablePool: { raw: stored } };
+}
+
 function normalizePod(raw: Record<string, unknown>): RigSpecPod {
   const members = (raw["members"] as Record<string, unknown>[]).map((m) => ({
     id: m["id"] as string,
@@ -1145,10 +1404,22 @@ function normalizePod(raw: Record<string, unknown>): RigSpecPod {
     codexConfigProfile: m["codex_config_profile"] as string | undefined,
     model: m["model"] as string | undefined,
     effort: typeof m["effort"] === "string" && m["effort"].trim() ? m["effort"].trim() : undefined,
+    advisor: typeof m["advisor"] === "string" && m["advisor"].trim() ? m["advisor"].trim() : undefined,
     role: m["role"] as string | undefined,
     permissionPolicy: m["permission_policy"] as string | undefined,
+    ...(m["claude_permissions"] === undefined ? {} : { claudePermissions: validateClaudePermissionRules(m["claude_permissions"]) }),
+    ...(m["claude_auto_mode"] === undefined ? {} : { claudeAutoMode: validateClaudeAutoMode(m["claude_auto_mode"]) }),
+    ...(m["claude_token"] === undefined ? {} : { claudeTokenRef: specClaudeTokenRef(m["claude_token"], "claude_token") }),
+    ...(m["claude_mcp"] === undefined ? {} : { claudeMcp: validateClaudeMcp(m["claude_mcp"]) }),
+    ...(m["codex_permissions"] === undefined ? {} : { codexPermissions: validateCodexMemberPermissions(m["codex_permissions"]) }),
+    ...(m["launch_wrapper"] === undefined ? {} : { launchWrapper: validateLaunchWrapper(m["launch_wrapper"]) }),
+    ...(m["process_limits"] === undefined ? {} : { processLimits: validateProcessLimits(m["process_limits"]) }),
+    ...(m["statusline_throttle"] === undefined ? {} : { statuslineThrottle: validateSpecStatuslineThrottle(m["statusline_throttle"]) }),
+    ...normalizePool(m["pool"]),
+    env: normalizeSeatEnv(m["env"]),
     cwd: m["cwd"] as string,
     restorePolicy: m["restore_policy"] as string | undefined,
+    ...(typeof m["keep_alive"] === "boolean" ? { keepAlive: m["keep_alive"] } : {}),
     // OPR.0.5.6.20 A5 — aliases normalize at ingestion; absent stays undefined so the
     // resolver's F-6 default remains the one authority for absence.
     compactionStrategy: m["compaction_strategy"] !== undefined
@@ -1160,6 +1431,11 @@ function normalizePod(raw: Record<string, unknown>): RigSpecPod {
     startup: m["startup"] ? normalizeStartupBlock(m["startup"]) : undefined,
     sessionSource: normalizeSessionSource(m["session_source"]),
     starterRef: normalizeStarterRef(m["starter_ref"]),
+    ...(typeof m["agent_file"] === "string" ? { agentFile: m["agent_file"] } : {}),
+    ...(typeof m["append_system_prompt_file"] === "string" ? { appendSystemPromptFile: m["append_system_prompt_file"] } : {}),
+    ...(Array.isArray(m["plugin_dirs"]) ? { pluginDirs: m["plugin_dirs"] as string[] } : {}),
+    ...(Array.isArray(m["plugin_channels"]) ? { pluginChannels: m["plugin_channels"] as string[] } : {}),
+    ...(m["cold_start"] === undefined ? {} : { coldStart: m["cold_start"] as boolean }),
   }));
 
   const edges = Array.isArray(raw["edges"])
@@ -1190,6 +1466,7 @@ function normalizePod(raw: Record<string, unknown>): RigSpecPod {
       } : undefined,
     } : undefined,
     startup: raw["startup"] ? normalizeStartupBlock(raw["startup"]) : undefined,
+    ...(raw["cold_start"] === undefined ? {} : { coldStart: raw["cold_start"] as boolean }),
     members,
     edges,
   };
@@ -1200,7 +1477,6 @@ function normalizePod(raw: Record<string, unknown>): RigSpecPod {
 
 const LEGACY_KNOWN_RUNTIMES = new Set(["claude-code", "codex", "pi", "omp"]);
 const LEGACY_KNOWN_RESTORE_POLICIES = new Set(["resume_if_possible", "relaunch_fresh", "checkpoint_only"]);
-const LEGACY_KNOWN_EDGE_KINDS = new Set(["delegates_to", "spawned_by", "can_observe"]);
 
 export class LegacyRigSpecSchema {
   static validate(raw: unknown): ValidationResult {
@@ -1260,10 +1536,57 @@ export class LegacyRigSpecSchema {
           errors.push(`node ${node["id"]}: unknown runtime '${node["runtime"]}'`);
         }
 
+        if (node["claude_mcp"] !== undefined) {
+          if (node["runtime"] !== "claude-code") errors.push(`nodes.${nodeWhere}.claude_mcp: only valid when runtime is "claude-code"`);
+          try { validateClaudeMcp(node["claude_mcp"], `nodes.${nodeWhere}.claude_mcp`); }
+          catch (error) { errors.push((error as Error).message); }
+        }
+        if (node["claude_permissions"] !== undefined) {
+          if (node["runtime"] !== "claude-code") errors.push(`nodes.${nodeWhere}.claude_permissions: only valid when runtime is "claude-code"`);
+          try { validateClaudePermissionRules(node["claude_permissions"], `nodes.${nodeWhere}.claude_permissions`); }
+          catch (error) { errors.push((error as Error).message); }
+        }
+        if (node["claude_auto_mode"] !== undefined) {
+          if (node["runtime"] !== "claude-code") errors.push(`nodes.${nodeWhere}.claude_auto_mode: only valid when runtime is "claude-code"`);
+          try { advisories.push(...claudeAutoModeAdvisories(validateClaudeAutoMode(node["claude_auto_mode"], `nodes.${nodeWhere}.claude_auto_mode`), `nodes.${nodeWhere}.claude_auto_mode`)); }
+          catch (error) { errors.push((error as Error).message); }
+        }
+        if (node["claude_token"] !== undefined) {
+          if (node["runtime"] !== "claude-code") errors.push(`nodes.${nodeWhere}.claude_token: only valid when runtime is "claude-code"`);
+          try { specClaudeTokenRef(node["claude_token"], `nodes.${nodeWhere}.claude_token`); }
+          catch (error) { errors.push((error as Error).message); }
+        }
+        if (node["codex_permissions"] !== undefined) {
+          if (node["runtime"] !== "codex") errors.push(`nodes.${nodeWhere}.codex_permissions: only valid when runtime is "codex"`);
+          try { validateCodexMemberPermissions(node["codex_permissions"], `nodes.${nodeWhere}.codex_permissions`); }
+          catch (error) { errors.push((error as Error).message); }
+        }
+        if (node["launch_wrapper"] !== undefined) {
+          if (!isLaunchWrapperRuntime(node["runtime"])) {
+            errors.push(`nodes.${nodeWhere}.launch_wrapper: only valid when runtime is "pi", "codex", "claude-code" or a supported community harness`);
+          }
+          try { validateLaunchWrapper(node["launch_wrapper"], `nodes.${nodeWhere}.launch_wrapper`); }
+          catch (error) { errors.push((error as Error).message); }
+        }
+        if (node["process_limits"] !== undefined) {
+          try { validateProcessLimits(node["process_limits"], `nodes.${nodeWhere}.process_limits`); }
+          catch (error) { errors.push((error as Error).message); }
+        }
+        if (node["statusline_throttle"] !== undefined) {
+          if (node["runtime"] !== "claude-code") errors.push(`nodes.${nodeWhere}.statusline_throttle: only valid when runtime is "claude-code"`);
+          try { validateSpecStatuslineThrottle(node["statusline_throttle"], `nodes.${nodeWhere}.statusline_throttle`); }
+          catch (error) { errors.push((error as Error).message); }
+        }
         if (node["effort"] !== undefined) {
           if (typeof node["effort"] !== "string" || !node["effort"].trim()) {
             advisories.push(`nodes.${nodeWhere}.effort: non-string value "${node["effort"]}" ignored; effort must be a text value`);
+          } else if (node["runtime"] === "pi") {
+            const warning = unknownLevelWarning("pi", node["effort"].trim());
+            if (warning) advisories.push(`nodes.${nodeWhere}.effort: ${warning}`);
           }
+        }
+        if (node["advisor"] !== undefined && (typeof node["advisor"] !== "string" || !node["advisor"].trim())) {
+          advisories.push(`nodes.${nodeWhere}.advisor: ignored; advisor must be a non-blank text value`);
         }
 
         if (node["restore_policy"] != null && !LEGACY_KNOWN_RESTORE_POLICIES.has(node["restore_policy"] as string)) {
@@ -1292,8 +1615,9 @@ export class LegacyRigSpecSchema {
 
         if (from === to) errors.push(`self-edge not allowed: ${from} -> ${to}`);
         if (from && !nodeIds.has(from)) errors.push(`edge references nonexistent node: '${from}'`);
-        if (to && !nodeIds.has(to)) errors.push(`edge references nonexistent node: '${to}'`);
-        if (kind && !LEGACY_KNOWN_EDGE_KINDS.has(kind)) errors.push(`unknown edge kind: '${kind}'`);
+        if (to && !nodeIds.has(to) && !(kind === "escalates_to" && isEscalationTargetRef(to))) errors.push(`edge references nonexistent node: '${to}'`);
+        // The same five kinds as a pod-aware spec, so an edge that `rig edge add` put on a flat rig exports and imports again.
+        if (kind && !VALID_EDGE_KINDS.has(kind)) errors.push(`unknown edge kind: '${kind}'`);
       }
     }
 
@@ -1316,6 +1640,15 @@ export class LegacyRigSpecSchema {
       role: (n["role"] as string) ?? undefined,
       model: (n["model"] as string) ?? undefined,
       effort: typeof n["effort"] === "string" && n["effort"].trim() ? n["effort"].trim() : undefined,
+      advisor: typeof n["advisor"] === "string" && n["advisor"].trim() ? n["advisor"].trim() : undefined,
+      ...(n["claude_permissions"] === undefined ? {} : { claudePermissions: validateClaudePermissionRules(n["claude_permissions"]) }),
+      ...(n["claude_auto_mode"] === undefined ? {} : { claudeAutoMode: validateClaudeAutoMode(n["claude_auto_mode"]) }),
+      ...(n["claude_token"] === undefined ? {} : { claudeTokenRef: specClaudeTokenRef(n["claude_token"], "claude_token") }),
+      ...(n["claude_mcp"] === undefined ? {} : { claudeMcp: validateClaudeMcp(n["claude_mcp"]) }),
+      ...(n["codex_permissions"] === undefined ? {} : { codexPermissions: validateCodexMemberPermissions(n["codex_permissions"]) }),
+      ...(n["launch_wrapper"] === undefined ? {} : { launchWrapper: validateLaunchWrapper(n["launch_wrapper"]) }),
+      ...(n["process_limits"] === undefined ? {} : { processLimits: validateProcessLimits(n["process_limits"]) }),
+      ...(n["statusline_throttle"] === undefined ? {} : { statuslineThrottle: validateSpecStatuslineThrottle(n["statusline_throttle"]) }),
       cwd: (n["cwd"] as string) ?? undefined,
       surfaceHint: (n["surface_hint"] as string) ?? undefined,
       workspace: (n["workspace"] as string) ?? undefined,

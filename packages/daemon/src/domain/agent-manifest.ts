@@ -1,4 +1,5 @@
 import { parse as parseYaml } from "yaml";
+import { isClaudeJsonFragmentType } from "./types.js";
 import type {
   AgentSpec, ImportSpec, StartupBlock, StartupFile, StartupAction,
   LifecycleDefaults, AgentResources, ProfileSpec,
@@ -105,6 +106,9 @@ function validateLifecycle(raw: unknown, prefix: string): { errors: string[]; ad
   if (obj["restore_policy"] !== undefined && !VALID_RESTORE_POLICIES.has(obj["restore_policy"] as string)) {
     errors.push(`${prefix}.restore_policy: must be one of ${[...VALID_RESTORE_POLICIES].join(", ")} (got "${obj["restore_policy"]}")`);
   }
+  if (obj["keep_alive"] !== undefined && typeof obj["keep_alive"] !== "boolean") {
+    errors.push(`${prefix}.keep_alive: must be true or false (got ${JSON.stringify(obj["keep_alive"])})`);
+  }
   return { errors, advisories };
 }
 
@@ -115,6 +119,10 @@ function validateResourcePaths(resources: Array<{ id: string; path: string }>, c
   const ids = new Set<string>();
   for (let i = 0; i < resources.length; i++) {
     const r = resources[i]!;
+    if (!r || typeof r !== "object" || Array.isArray(r)) {
+      errors.push(`resources.${category}[${i}]: must be an object`);
+      continue;
+    }
     if (!r.id || typeof r.id !== "string") {
       errors.push(`resources.${category}[${i}].id: must be a non-empty string`);
     } else if (ids.has(r.id)) {
@@ -167,6 +175,10 @@ export function validateAgentSpec(raw: unknown): ValidationResult {
     } else {
       for (let i = 0; i < (obj["imports"] as unknown[]).length; i++) {
         const imp = (obj["imports"] as Record<string, unknown>[])[i]!;
+        if (!imp || typeof imp !== "object" || Array.isArray(imp)) {
+          errors.push(`imports[${i}]: must be an object`);
+          continue;
+        }
         const refErr = validateImportRef(imp["ref"] as string, i);
         if (refErr) errors.push(refErr);
         const verErr = validateImportVersion(imp["version"], i);
@@ -175,7 +187,7 @@ export function validateAgentSpec(raw: unknown): ValidationResult {
     }
   }
 
-  // Defaults lifecycle + effort advisory
+  // Defaults lifecycle + launch preference advisories
   if (obj["defaults"] && typeof obj["defaults"] === "object") {
     const defaults = obj["defaults"] as Record<string, unknown>;
     if (defaults["lifecycle"]) {
@@ -188,6 +200,9 @@ export function validateAgentSpec(raw: unknown): ValidationResult {
     if (defaults["effort"] !== undefined && (typeof defaults["effort"] !== "string" || !(defaults["effort"] as string).trim())) {
       advisories.push(`defaults.effort: non-string value "${defaults["effort"]}" ignored; effort must be a text value`);
     }
+    if (defaults["advisor"] !== undefined && (typeof defaults["advisor"] !== "string" || !(defaults["advisor"] as string).trim())) {
+      advisories.push("defaults.advisor: ignored; advisor must be a non-blank text value");
+    }
   }
 
   // Startup
@@ -198,7 +213,7 @@ export function validateAgentSpec(raw: unknown): ValidationResult {
     errors.push("profiles: must be a map (object), not an array or scalar");
   }
 
-  // Profile startup + lifecycle + effort advisory
+  // Profile startup + lifecycle + launch preference advisories
   if (obj["profiles"] && typeof obj["profiles"] === "object" && !Array.isArray(obj["profiles"])) {
     for (const [profileName, profileRaw] of Object.entries(obj["profiles"] as Record<string, unknown>)) {
       if (profileRaw && typeof profileRaw === "object") {
@@ -216,6 +231,9 @@ export function validateAgentSpec(raw: unknown): ValidationResult {
           const prefsObj = prefs as Record<string, unknown>;
           if (prefsObj["effort"] !== undefined && (typeof prefsObj["effort"] !== "string" || !(prefsObj["effort"] as string).trim())) {
             advisories.push(`profiles.${profileName}.preferences.effort: non-string value "${prefsObj["effort"]}" ignored; effort must be a text value`);
+          }
+          if (prefsObj["advisor"] !== undefined && (typeof prefsObj["advisor"] !== "string" || !(prefsObj["advisor"] as string).trim())) {
+            advisories.push(`profiles.${profileName}.preferences.advisor: ignored; advisor must be a non-blank text value`);
           }
         }
       }
@@ -252,24 +270,42 @@ export function validateAgentSpec(raw: unknown): ValidationResult {
           errors.push(`resources.${category}: must be an array`);
         } else {
           const entries = items as Array<Record<string, unknown>>;
+          // A blank list item (`- `) parses to null; the per-category validators below
+          // report it, so the id bookkeeping and runtime checks just skip it.
+          const mappingEntries = entries.filter((e) => e && typeof e === "object" && !Array.isArray(e));
 
           if (category === "plugins") {
             // Plugin entries have a different shape (id + source object) — validate inline
             errors.push(...validatePluginResources(entries));
-            allLocalIds[category] = new Set(entries.map((e) => e["id"] as string).filter(Boolean));
+            allLocalIds[category] = new Set(mappingEntries.map((e) => e["id"] as string).filter(Boolean));
           } else {
             errors.push(...validateResourcePaths(entries as Array<{ id: string; path: string }>, category));
-            allLocalIds[category] = new Set(entries.map((e) => e["id"] as string).filter(Boolean));
+            allLocalIds[category] = new Set(mappingEntries.map((e) => e["id"] as string).filter(Boolean));
+          }
+
+          if (category === "skills") {
+            entries.forEach((entry, i) => {
+              const onRestore = entry && typeof entry === "object" ? entry["on_restore"] : undefined;
+              if (onRestore !== undefined && onRestore !== "keep_saved" && onRestore !== "follow_source") {
+                advisories.push(`resources.skills[${i}].on_restore: unknown value "${String(onRestore)}"; expected "keep_saved" | "follow_source"; using "keep_saved"`);
+              }
+            });
           }
 
           // runtime_resources must have runtime field
           if (category === "runtime_resources") {
             for (let i = 0; i < entries.length; i++) {
+              if (!entries[i] || typeof entries[i] !== "object" || Array.isArray(entries[i])) continue;
               if (!entries[i]!["runtime"] || typeof entries[i]!["runtime"] !== "string") {
                 errors.push(`resources.runtime_resources[${i}].runtime: required non-empty string`);
               }
               if (!entries[i]!["type"] || typeof entries[i]!["type"] !== "string") {
                 errors.push(`resources.runtime_resources[${i}].type: required non-empty string`);
+              }
+              const onRestore = entries[i]!["on_restore"];
+              if (onRestore !== undefined && onRestore !== "keep_saved"
+                  && (onRestore !== "follow_source" || entries[i]!["runtime"] !== "claude-code" || !isClaudeJsonFragmentType(entries[i]!["type"]))) {
+                advisories.push(`resources.runtime_resources[${i}].on_restore: follow_source is supported for Claude MCP and settings fragments; using "keep_saved"`);
               }
             }
           }
@@ -285,7 +321,9 @@ export function validateAgentSpec(raw: unknown): ValidationResult {
     for (const [profileName, profileRaw] of Object.entries(obj["profiles"] as Record<string, unknown>)) {
       if (profileRaw && typeof profileRaw === "object") {
         const p = profileRaw as Record<string, unknown>;
-        if (p["uses"] && typeof p["uses"] === "object") {
+        if (p["uses"] != null && (typeof p["uses"] !== "object" || (Array.isArray(p["uses"]) && p["uses"].length > 0))) {
+          advisories.push(`profiles.${profileName}.uses: expected an object; ignored`);
+        } else if (p["uses"] && typeof p["uses"] === "object") {
           const uses = p["uses"] as Record<string, unknown>;
 
           // Reject legacy profile.uses.hooks field with explicit migration error.
@@ -294,10 +332,29 @@ export function validateAgentSpec(raw: unknown): ValidationResult {
             errors.push(`profiles.${profileName}.uses.hooks: removed in plugin-primitive (Phase 3a). Reference plugins via profiles.${profileName}.uses.plugins[] instead.`);
           }
 
-          for (const category of ["skills", "guidance", "subagents", "plugins", "runtime_resources"]) {
+          // Any other key selects nothing; say so rather than ignore it silently (a typo such as "skils").
+          for (const key of Object.keys(uses)) {
+            if (key !== "hooks" && !USES_CATEGORIES.includes(key)) {
+              advisories.push(`profiles.${profileName}.uses.${key}: unknown key ignored; known keys are ${USES_CATEGORIES.join(", ")}`);
+            }
+          }
+
+          for (const category of USES_CATEGORIES) {
             const refs = uses[category];
+            if (typeof refs === "string" && refs.trim()) {
+              advisories.push(`profiles.${profileName}.uses.${category}: scalar ID accepted; use a list instead`);
+              continue;
+            }
+            if (refs != null && !Array.isArray(refs)) {
+              advisories.push(`profiles.${profileName}.uses.${category}: expected an array of resource IDs; ignored`);
+              continue;
+            }
             if (Array.isArray(refs)) {
-              for (const ref of refs as string[]) {
+              for (const [index, ref] of refs.entries()) {
+                if (typeof ref !== "string" || !ref.trim()) {
+                  advisories.push(`profiles.${profileName}.uses.${category}[${index}]: expected a non-empty resource ID; a member using this profile fails to launch`);
+                  continue;
+                }
                 // Qualified refs (namespace:id) are accepted for later resolution
                 if (typeof ref === "string" && ref.includes(":")) {
                   const parts = ref.split(":");
@@ -345,7 +402,8 @@ export function normalizeAgentSpec(raw: Record<string, unknown>): AgentSpec {
   const profiles: Record<string, ProfileSpec> = {};
   if (raw["profiles"] && typeof raw["profiles"] === "object" && !Array.isArray(raw["profiles"])) {
     for (const [name, profileRaw] of Object.entries(raw["profiles"] as Record<string, unknown>)) {
-      profiles[name] = normalizeProfile(profileRaw as Record<string, unknown>);
+      // A bare `default:` parses to null; treat it as an empty profile, same as `default: {}`.
+      profiles[name] = normalizeProfile((profileRaw ?? {}) as Record<string, unknown>);
     }
   }
 
@@ -373,6 +431,9 @@ export function normalizeAgentSpec(raw: Record<string, unknown>): AgentSpec {
       model: defaults["model"] as string | undefined,
       effort: typeof defaults["effort"] === "string" && defaults["effort"].trim()
         ? defaults["effort"].trim()
+        : undefined,
+      advisor: typeof defaults["advisor"] === "string" && defaults["advisor"].trim()
+        ? defaults["advisor"].trim()
         : undefined,
       lifecycle: {
         ...lifecycle,
@@ -405,9 +466,13 @@ function normalizeLifecycle(raw: Record<string, unknown>): LifecycleDefaults {
     restorePolicy: raw["restore_policy"] !== undefined
       ? (raw["restore_policy"] as LifecycleDefaults["restorePolicy"])
       : undefined,
+    // #2940: absent stays absent at every level, the defaults one included (off is the resolver's default), so a spec
+    // without keep_alive normalizes exactly as before.
+    ...(typeof raw["keep_alive"] === "boolean" ? { keepAlive: raw["keep_alive"] } : {}),
   };
 }
 
+/** Normalize validated resource declarations, retaining each skill's optional restore policy. */
 function normalizeResources(raw: unknown): AgentResources {
   if (!raw || typeof raw !== "object") {
     return { skills: [], guidance: [], subagents: [], plugins: [], runtimeResources: [] };
@@ -416,7 +481,8 @@ function normalizeResources(raw: unknown): AgentResources {
 
   return {
     skills: Array.isArray(obj["skills"])
-      ? (obj["skills"] as Record<string, unknown>[]).map((s) => ({ id: s["id"] as string, path: s["path"] as string }))
+      ? (obj["skills"] as Record<string, unknown>[]).map((s) => ({ id: s["id"] as string, path: s["path"] as string,
+          onRestore: s["on_restore"] === "follow_source" ? "follow_source" : "keep_saved" }))
       : [],
     guidance: Array.isArray(obj["guidance"])
       ? (obj["guidance"] as Record<string, unknown>[]).map((g) => ({
@@ -434,6 +500,8 @@ function normalizeResources(raw: unknown): AgentResources {
       ? (obj["runtime_resources"] as Record<string, unknown>[]).map((r) => ({
           id: r["id"] as string, path: r["path"] as string,
           runtime: r["runtime"] as string, type: r["type"] as string,
+          ...(r["on_restore"] === "follow_source" && r["runtime"] === "claude-code" && isClaudeJsonFragmentType(r["type"])
+            ? { onRestore: "follow_source" as const } : {}),
         }))
       : [],
   };
@@ -461,6 +529,10 @@ function validatePluginResources(entries: Array<Record<string, unknown>>): strin
   const ids = new Set<string>();
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i]!;
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      errors.push(`resources.plugins[${i}]: must be an object`);
+      continue;
+    }
     if (!entry["id"] || typeof entry["id"] !== "string") {
       errors.push(`resources.plugins[${i}].id: must be a non-empty string`);
     } else if (ids.has(entry["id"] as string)) {
@@ -496,6 +568,14 @@ function validatePluginResources(entries: Array<Record<string, unknown>>): strin
   return errors;
 }
 
+/** The resource categories a profile's `uses` selects from. */
+const USES_CATEGORIES = ["skills", "guidance", "subagents", "plugins", "runtime_resources"];
+
+function normalizeUses(value: unknown): string[] {
+  if (Array.isArray(value)) return value as string[];
+  return typeof value === "string" && value.trim() ? [value] : [];
+}
+
 function normalizeProfile(raw: Record<string, unknown>): ProfileSpec {
   const uses = raw["uses"] as Record<string, unknown> | undefined;
   return {
@@ -507,16 +587,19 @@ function normalizeProfile(raw: Record<string, unknown>): ProfileSpec {
           effort: typeof (raw["preferences"] as Record<string, unknown>)["effort"] === "string" && ((raw["preferences"] as Record<string, unknown>)["effort"] as string).trim()
             ? ((raw["preferences"] as Record<string, unknown>)["effort"] as string).trim()
             : undefined,
+          advisor: typeof (raw["preferences"] as Record<string, unknown>)["advisor"] === "string" && ((raw["preferences"] as Record<string, unknown>)["advisor"] as string).trim()
+            ? ((raw["preferences"] as Record<string, unknown>)["advisor"] as string).trim()
+            : undefined,
         }
       : undefined,
     startup: raw["startup"] ? normalizeStartupBlock(raw["startup"]) : undefined,
     lifecycle: raw["lifecycle"] ? normalizeLifecycle(raw["lifecycle"] as Record<string, unknown>) : undefined,
     uses: {
-      skills: Array.isArray(uses?.["skills"]) ? uses["skills"] as string[] : [],
-      guidance: Array.isArray(uses?.["guidance"]) ? uses["guidance"] as string[] : [],
-      subagents: Array.isArray(uses?.["subagents"]) ? uses["subagents"] as string[] : [],
-      plugins: Array.isArray(uses?.["plugins"]) ? uses["plugins"] as string[] : [],
-      runtimeResources: Array.isArray(uses?.["runtime_resources"]) ? uses["runtime_resources"] as string[] : [],
+      skills: normalizeUses(uses?.["skills"]),
+      guidance: normalizeUses(uses?.["guidance"]),
+      subagents: normalizeUses(uses?.["subagents"]),
+      plugins: normalizeUses(uses?.["plugins"]),
+      runtimeResources: normalizeUses(uses?.["runtime_resources"]),
     },
     activity: normalizeActivityBlock(raw["activity"]),
   };

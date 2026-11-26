@@ -23,7 +23,9 @@ function clearEnv(): () => void {
     "OPENRIG_WORKSPACE_ROOT", "OPENRIG_DOGFOOD_EVIDENCE_ROOT",
     "OPENRIG_WORKSPACE_PROJECTS_ROOT", "OPENRIG_WORKSPACE_CATALOG_PATH",
     "OPENRIG_CONTEXT_ROOT", "OPENRIG_CONTEXT_PACKS_ROOT",
-    "OPENRIG_LAUNCH_NON_INTERRUPTIVE",
+    "OPENRIG_LAUNCH_NON_INTERRUPTIVE", "OPENRIG_TMUX_SERVER",
+    "OPENRIG_POLICIES_CLAUDE_COMPACTION_PREPARATION_ROOT",
+    "OPENRIG_BUNDLE_SERVICES_ENABLED",
     "OPENRIG_POLICIES_CLAUDE_COMPACTION_ENABLED",
     "OPENRIG_POLICIES_CLAUDE_COMPACTION_THRESHOLD_PERCENT",
     "OPENRIG_POLICIES_CLAUDE_COMPACTION_PRE_COMPACT_INSTRUCTION",
@@ -86,10 +88,10 @@ describe("config routes (User Settings v0)", () => {
     // + 1 OPR.0.4.0.1 (ui.terminal.max_live_terminals)
     // + 2 OPR.0.4.6.MH1 (host.selected / host.name)
     // + 1 OPR.0.4.6.WF5 (workflow.exception_routing)
-    // + 1 OPR.0.4.6.02 (terminal.status_bar — the ratified sole v1 terminal key)
+    // + 1 OPR.0.4.6.02 (terminal.status_bar)
     // + 5 OPR.0.4.6.FS-1 W2 (retention.enabled / transitions_days / watchdog_days /
     //   watchdog_keep_per_job / batch_size — the CLI-settable queue-retention knobs;
-    //   + retention.usage_samples_days, 51-08 A2)
+    //   + retention.usage_samples_days, 51-08 A2; + retention.events_days)
     // + 2 OPR.0.5.1 W2c (policies.idle_gate_qitem.scan_interval_seconds /
     //   active_wake_interval_seconds)
     // + 2 B6 founder ruling (policies.idle_gate_qitem.auto_register /
@@ -108,7 +110,60 @@ describe("config routes (User Settings v0)", () => {
     // + 1 S07 local-time preference.
     // + 1 ui.enabled (web UI and its terminal WebSocket; default off).
     // + 1 launch.non_interruptive (new-rig launch default; default off).
-    expect(Object.keys(body.settings).length).toBe(72);
+    // + 1 queue.wake_human_rung (#811; default "always").
+    // + 1 output.compact (slice 15 compact command-output switch; default off).
+    // + 1 provider.usage_windows (slice 01 Codex usage windows; default off).
+    // + 1 output.whoami_peers (slice 15 P5 whoami peer bound; default 8).
+    // + 1 usage.pi_cost_facts (slice 02 Pi cost from persisted entries; default off).
+    // + 1 usage.pi_openrouter_charge (slice 02 K4 OpenRouter charge beside the Pi estimate; default off).
+    // + 1 terminal.fixed_geometry (web pin opt-in; default off).
+    expect(body.settings["terminal.fixed_geometry"]).toMatchObject({ value: false, source: "default" });
+    // + 1 terminal.tmux_server (per-instance server selection; default inherit).
+    expect(body.settings["terminal.tmux_server"]).toMatchObject({ value: "inherit", source: "default" });
+    // + 1 transport.verify_input_box (input-box evidence for verified Claude Code and Codex sends; default off).
+    expect(body.settings["policies.claude_compaction.preparation_root"]).toMatchObject({ value: "", source: "default" });
+    // + 1 bundle.services_enabled (service archive packing, preview and target installs; default off).
+    expect(body.settings["transport.local_user_guard"]).toMatchObject({ value: false, source: "default", defaultValue: false });
+    expect(body.settings["bundle.services_enabled"]).toMatchObject({ value: false, source: "default", defaultValue: false });
+    // (provider.subscription_moves was removed with the subscription move record, which nothing acted on.)
+    // + 1 terminal.history_limit (rows of tmux scrollback in the block rig setup writes; default 10000).
+    // + 1 skills.router_line.enabled (the seat-skills bootstrap line; default off).
+    // + 1 instance-wide Claude compaction preparation root (#1445).
+    // + 3 decisions.enabled / consumers / template_dir (slice 22 typed decisions; default off, none, shipped).
+    // + 1 daemon.db_conflict (warn by default; optional pre-open conflict stop).
+    // + 1 provider.selected (the providers chosen at rig setup --providers; default empty).
+    // + 2 retention.stream_days / stream_max_items (slice 22 outcome 9 stream retention; default 30, 20000).
+    // + 1 specs.builtins_visible (show built-in library entries by default).
+    // + 1 stream.intake (issue #1856 queue intake routing; default queue.worker).
+    // + 1 launch.codex_login_shell (defer to Codex's own login-shell setting; default off).
+    // + 1 transport.draft_delivery (whether ordinary sends reach a seat whose prompt holds a draft; default deliver).
+    // + 1 acp.to (the ACP agent's receiver; default empty).
+    // + 1 daemon.seat_poll_interval_ms (#2687 the seat pollers' cadence; startup-only, default 1000).
+    // + 1 retention.events_days (the history-only event types of events; default 0 = keep).
+    // + 2 retention.closed_content_days, retention.closed_metadata_days (closed-work erasure; default 0 = keep).
+    // + 1 retention.erasure_ledger (queue erasure's replay ledger; default empty = none).
+    // + 1 ui.topology_remote_seats (read a remote rig's seats in the TUI topology; default off).
+    // + 1 output.rebuild_recaps (optional rebuild briefing preview; default 3).
+    // + 1 daemon.identity_poll_interval_ms (#3146 the identity reconciler's cadence; startup-only, default 5000).
+    // + 1 daemon.start_readiness_wait_seconds (#3637 how long a start waits for its child's readiness; default 180).
+    expect(Object.keys(body.settings).length).toBe(108);
+    expect(body.settings["daemon.identity_poll_interval_ms"]).toMatchObject({ value: 5000, source: "default", defaultValue: 5000 });
+    expect(body.settings["output.rebuild_recaps"]).toMatchObject({ value: 3, source: "default", defaultValue: 3 });
+    expect(body.settings["launch.codex_login_shell"]).toMatchObject({ value: false, source: "default", defaultValue: false });
+    expect(body.settings["ui.topology_remote_seats"]).toMatchObject({ value: false, source: "default", defaultValue: false });
+    expect(body.settings["transport.draft_delivery"]).toMatchObject({ value: "deliver", source: "default", defaultValue: "deliver" });
+    expect(body.settings["retention.events_days"]).toMatchObject({ value: 0, source: "default", defaultValue: 0 });
+    expect(body.settings["retention.closed_content_days"]).toMatchObject({ value: 0, source: "default", defaultValue: 0 });
+    expect(body.settings["retention.closed_metadata_days"]).toMatchObject({ value: 0, source: "default", defaultValue: 0 });
+    expect(body.settings["retention.erasure_ledger"]).toMatchObject({ value: "", source: "default", defaultValue: "" });
+    expect(body.settings["specs.builtins_visible"]).toMatchObject({ value: true, source: "default", defaultValue: true });
+    expect(body.settings["stream.intake"]).toMatchObject({ value: "queue.worker", source: "default", defaultValue: "queue.worker" });
+    expect(body.settings["retention.stream_days"]).toMatchObject({ value: 30, source: "default", defaultValue: 30 });
+    expect(body.settings["retention.stream_max_items"]).toMatchObject({ value: 20000, source: "default", defaultValue: 20000 });
+    expect(body.settings["decisions.enabled"]).toMatchObject({ value: false, source: "default", defaultValue: false });
+    expect(body.settings["provider.selected"]).toMatchObject({ value: "", source: "default", defaultValue: "" });
+    expect(body.settings["terminal.history_limit"]).toMatchObject({ value: 10000, source: "default", defaultValue: 10000 });
+    expect(body.settings).not.toHaveProperty("provider.subscription_moves");
     expect(body.settings["launch.non_interruptive"]).toMatchObject({ value: false, source: "default" });
     expect(body.settings["runtime.readiness_timeout_seconds"]).toMatchObject({ value: 30, source: "default" });
     expect(body.settings["ui.enabled"]).toMatchObject({ value: false, source: "default" });
@@ -148,6 +203,29 @@ describe("config routes (User Settings v0)", () => {
     const body = await res.json() as { value: string; source: string };
     expect(body.value).toBe("/custom/ws");
     expect(body.source).toBe("file");
+  });
+
+  it("GET /api/config/retention.events_days shows the default 0, POST 3 keeps 3 and POST 0 keeps 0", async () => {
+    const app = buildApp();
+    const before = await app.request("/api/config/retention.events_days");
+    expect(before.status).toBe(200);
+    expect(await before.json()).toMatchObject({ value: 0, source: "default" });
+    const res = await app.request("/api/config/retention.events_days", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ value: "3" }),
+    });
+    expect(res.status).toBe(200);
+    const after = await app.request("/api/config/retention.events_days");
+    expect(await after.json()).toMatchObject({ value: 3, source: "file" });
+    expect(JSON.parse(readFileSync(configPath, "utf-8")).retention.eventsDays).toBe(3);
+    const zero = await app.request("/api/config/retention.events_days", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ value: "0" }),
+    });
+    expect(zero.status).toBe(200);
+    expect(await (await app.request("/api/config/retention.events_days")).json()).toMatchObject({ value: 0, source: "file" });
   });
 
   it("GET /api/config rebases persisted legacy workspace defaults", async () => {

@@ -1,0 +1,316 @@
+# Choosing the tmux server for an OpenRig instance
+
+`terminal.tmux_server` controls where the daemon creates and reads managed seats.
+It accepts `inherit` (the default) or `isolated`. The environment override is
+`OPENRIG_TMUX_SERVER`.
+
+To keep managed seats out of your personal `tmux ls`, set this before starting a
+new instance, or before a deliberate restart of an existing daemon:
+
+```sh
+rig config set terminal.tmux_server isolated
+```
+
+Isolation separates the seats from your own tmux server, so a server-wide command
+on yours, such as `tmux kill-server`, doesn't end them. It doesn't protect the
+seats' server from the agents running on it: each seat's pane carries tmux's `TMUX`
+value for that server, so a tmux command an agent runs there without `-L` or `-S`,
+`tmux kill-server` included, acts on the seats' own server and can end every seat
+on it.
+
+The setting is read once at daemon startup, and a restart keeps the previous server
+while registered sessions remain on it (see
+[Existing teams and deferred migration](#existing-teams-and-deferred-migration)).
+Changing it does not move a running seat. Inspect the effective choice with:
+
+```sh
+rig terminal status --json
+```
+
+The `tmux` object reports `requestedMode` (read at the last startup), effective
+`mode`, `socketPath`, `serverArgs`, `migrationPending`, and `blockingSessions`.
+The settings browser shows the configured value; terminal status shows what the
+running daemon actually uses.
+
+## Server identity and configuration
+
+In `inherit` mode, a new instance uses the launching shell's `TMUX` socket, or the
+default socket under `TMUX_TMPDIR` (otherwise `/tmp`) when outside tmux. Native
+commands retain tmux's existing environment-based selection. Printed attachments
+and terminal metadata name a non-default server so a new terminal can reach it.
+The default mode does not require a server record or an additional instance
+identity check to start the daemon or use existing attachment paths.
+
+In `isolated` mode, the socket is named `openrig-<hash>` under tmux's per-user
+directory. The hash identifies the canonical `OPENRIG_HOME`: different homes get
+different servers, and symlink aliases of one home share a server. Choose a short
+`TMUX_TMPDIR` before the first isolated start if your normal temporary path would
+exceed the platform's Unix socket path limit.
+
+When isolation is requested or active, the daemon records the effective socket in
+`OPENRIG_HOME/tmux-server.json` using an atomic, owner-only write. Keep this file
+and the durable `tmux-server.initialized` marker with the instance state. A later shell
+with different `TMUX` or `TMUX_TMPDIR` does not redirect an established isolated
+instance. An invalid or unreadable isolation record is reported rather than overwritten.
+If the record disappears while isolation is selected, startup and `destroy --all` stop before
+touching sessions. Restore the record from an instance backup, or inspect the
+running daemon's `rig terminal status --json` to recover its effective selection.
+An ordinary inherited instance may record its socket for a later migration, but
+missing, invalid or unwritable records do not prevent its normal startup.
+The record's `pinned` flag distinguishes a fixed isolated or migration socket
+from an advisory inherited record. Returning to ordinary inheritance commits
+`pinned: false` and removes the active marker; an interrupted update must not
+leave startup using one server and offline cleanup selecting another. A valid
+unpinned record takes precedence over a leftover marker. Legacy inherited records
+and the old `1` marker do not make ordinary inheritance depend on that file.
+
+A newly started server loads tmux's normal system and user configuration,
+including `~/.tmux.conf`; OpenRig does not substitute an empty configuration.
+Existing OpenRig session options, such as `terminal.status_bar`, still apply.
+An existing server does not reread its configuration merely because the daemon
+restarts. Settings and sessions in a separate personal server are left alone.
+
+When OpenRig creates a tmux server on macOS or Linux, its creating client tries
+to raise the soft open-file limit to 8192, bounded by the inherited hard limit.
+An already higher soft limit is preserved. A failed raise produces an advisory
+and the start continues with the inherited limit. Connecting to an existing
+server does not change that server's limit or restart its sessions.
+
+## Existing teams and deferred migration
+
+At startup, the daemon checks the previously selected server before switching.
+If registered sessions still exist there, it keeps that server and reports a
+pending migration. Explicit `OPENRIG_HOME` ownership markers distinguish another
+instance's namesakes; unmarked legacy sessions are retained conservatively. If
+the old server cannot be inspected, the daemon also keeps it and reports why.
+
+Stop the listed sessions deliberately, then restart the daemon again to apply the
+new selection. Merely editing the setting or waiting for the last seat to stop
+does not switch a running daemon. The same rule applies when returning to
+`inherit` from isolation. A normal inherited start continues to follow its launching
+environment, as before. No
+live pane is moved, restarted or killed by server selection. Old viewing windows
+can be closed separately after their conversations have stopped.
+
+Bring a stopped team back with `rig up <name> --existing`. Its normal restoration
+rules still apply: a seat without usable provider history requires an explicit
+fresh-start choice before it launches.
+
+On the first upgrade from a version without a socket record, the old-server
+candidate comes from the launching environment. If live seats use a non-default
+server, start the upgraded daemon from that original server to establish its
+record, or stop those seats before changing servers. Earlier versions did not
+persist enough information to find an arbitrary old socket from a different shell.
+
+## Moving an existing team onto tmux control mode
+
+`OPENRIG_TMUX_CONTROL=1` in the daemon's environment sends its routine tmux commands
+through one long-lived control-mode client instead of a new tmux client each time,
+which saves a process start per command on a busy host. It takes effect only on a
+tmux server at 3.7c or later. The version of the server that is running decides,
+not the tmux binary on `PATH`, and a server keeps the version it started with until
+it exits. So installing a newer tmux changes nothing for a server that is already up.
+On an older server the daemon uses a spawned client for every command. It says so
+once in its log (`[tmux] OPENRIG_TMUX_CONTROL=1 is set, but this daemon's tmux server
+runs tmux 3.4 …`), and `rig doctor` reports it as `tmux_control_mode`.
+
+To move a team that runs on an older server:
+
+1. Install tmux 3.7c or later where the daemon finds it first on its `PATH`. For a
+   daemon run as a service, that's the service's environment.
+2. Choose the server the team will use. `isolated` gives this OpenRig home a server of
+   its own, started by the daemon with that tmux, and leaves your own tmux sessions
+   alone: `rig config set terminal.tmux_server isolated`. In `inherit` mode the team
+   shares your default server, which runs the new version only after every session
+   on it, yours included, has ended.
+3. Stop each rig deliberately with `rig down <rig>`. Its seats' sessions end, and a
+   turn in progress stops. Queue rows, rigs and seats stay as they are. A session
+   OpenRig didn't start, such as a seat joined with `rig attach --self` from a tmux
+   pane, is left running and `rig down` exits 2; stop it with the commands it prints, or it stays on
+   the old server.
+4. Restart the daemon with `OPENRIG_TMUX_CONTROL=1` in its environment.
+   `rig terminal status --json` should show `migrationPending: false`. If it's still
+   `true`, `blockingSessions` names the sessions still on the old server.
+5. Bring each rig back with `rig up <rig> --existing`. Each seat resumes its
+   conversation where its harness allows, under the restoration rules above.
+6. Check: the daemon's log says `[tmux] Control mode is on`, and `rig doctor` passes
+   `tmux_control_mode`.
+
+## Attachments, discovery and cleanup
+
+`rig capture`, managed launch/stop/recovery, terminal previews and desktop viewers
+use the effective server. `rig ps --nodes --json` includes `tmuxServerArgs` and a
+matching `tmuxAttachCommand` for bound tmux seats. `rig tui --shared` uses that
+metadata. To attach a terminal directly, use the canonical session name:
+
+```sh
+rig terminal attach '<session>'
+rig terminal attach --read-only -- '<session>'
+```
+
+These commands attach on the daemon's machine. They do not create a seat or
+switch somebody else's tmux client. A local CLI pointed at an HTTP remote daemon
+cannot attach a same-named local session. For an effectively isolated server,
+terminal attachment, shared TUI and desktop windows also compare the daemon's
+instance identity with the local durable identity before using local terminal
+tools. A loopback URL through a port forward does not bypass this isolation check;
+use the matching `OPENRIG_HOME` on the daemon's machine. Inherited servers retain
+the existing local-host checks without requiring a matching durable identity.
+SSH view tiles follow the viewing instance's effective mode. In `inherit`, they
+use remote tmux through `ssh -t`, including `-r` for read-only views, and keep the
+bounded, identity-checked reattachment when a seat's session is replaced. The
+remote host needs only tmux and a POSIX shell, not OpenRig. Copyable recovery
+commands remain plain `ssh -t ... tmux attach`. In `isolated`, tiles run
+`rig terminal attach` on the remote host,
+using that host's local instance and socket; both the remote CLI and daemon must
+support this command. The remote shell must select the right `OPENRIG_HOME` when
+using a custom home. Local socket paths are never sent to it, and an isolated
+attachment failure does not fall back to a same-named default-server session.
+An inherited view does not discover an isolated remote instance's socket; use
+the remote instance's `rig terminal attach` directly for that mixed setup.
+
+Discovery and adoption see the selected server. Existing sessions on another
+server are not imported automatically. `rig attach --self` reports its current
+socket and, for an isolated instance, rejects a different server before binding
+or adding a node; an older
+CLI without socket metadata must be updated to self-attach to an isolated
+instance. A shell outside tmux can still attach as `external_cli`.
+
+`rig destroy --all` reads the recorded effective server before stopping the daemon
+or removing its state when isolation or a deferred migration pins it. Ordinary
+`inherit` cleanup uses the invoking environment's normal tmux selection, as before;
+an old advisory socket is not used to redirect it. Cleanup kills only registered
+session names on the selected server.
+
+Dedicated selection requires POSIX tmux. On native Windows (not a supported platform;
+the [README](../../README.md) covers WSL2), psmux retains its existing server behavior; requesting `isolated` produces a status note and a pending choice.
+
+## Background work after a pane disappears
+
+When an unexpectedly missing seat pane or session is positively observed, `rig ps`
+reports that background work is unknown. It also lists descendants sampled under
+that occupant before the loss when their PID and start time still match a later
+process observation. The executable name is shown without arguments or paths.
+This is a partial observation, not a complete process inventory: unsampled or
+unreadable work, a daemon restart, or changed process identity can leave the
+list empty while work is still running. Explicitly stopped seats are not labeled
+as unexpected loss. OpenRig does not terminate these processes.
+Live-pane samples are taken only on identity-check passes that already inspect
+native processes; if no such pass occurs before the loss, attribution remains
+unknown. On a host with only token-bound Claude seats, these native-process
+samples are not taken, so the process list remains empty. A later check of previously sampled identities shares the existing
+process-table reader and does not create a new polling loop.
+
+## When the server stops answering
+
+The tmux server can go away while the daemon keeps running: something kills it, or
+its socket is removed. The daemon records that once, when it happens (the
+`tmux.server_gone` event and a log line), and again once when the server answers
+(`tmux.server_back`). The record is kept in memory, so "once" holds per daemon
+run: a daemon restarted during a loss records it again. In between:
+
+- Automatic delivery to the seats on that server is held. Watchdog reminders, park wakes,
+  queue wakes, the wake ladder and the stuck sweep keep the work owed without
+  spending retries or escalating it, and send it when the server answers again.
+  An explicit `rig send` is still attempted and says the server could not be
+  reached.
+- Holding is not a verdict on the seats: `rig ps` still reads each seat from its
+  own evidence (a seat whose process went with the server reads stopped). Seats
+  on another tmux server, and seats that are not on tmux, are not held, and the
+  hook bridge, which reaches a live agent without tmux, keeps delivering.
+- Only a server that a running seat depends on counts. tmux exits with its last
+  session, so no server while no seat runs is the normal idle state, not a loss.
+- The daemon checks for the return with a read-only probe, every few seconds at
+  first and at most once a minute. It does not restart the server or the seats;
+  `rig up <rig>` (or whatever brought the server back) does. When the server
+  answers, held wakes go out to the seats that run on it.
+- A return probe that can't be read (a permission error, for example) is not
+  evidence the server is still gone: the daemon reads it as `unknown`, keeps the
+  loss as history, and stops holding, so ordinary delivery resumes. It does not
+  record a return. The next delivery's own probe records the loss again or the
+  return.
+- `rig status` and `rig ps` print a `Terminals:` line naming the socket and since
+  when it has not answered, `rig doctor` fails the `terminal_server` check, and
+  healthz carries the state in `terminals` while `status` stays `ok`, because the
+  daemon itself is up.
+
+To bring the seats back after the server has died, including when it left its
+socket file behind (as after `tmux kill-server`), run `rig up <rig> --existing`
+for each rig that ran on it. The restore finds the seats' sessions gone, starts the
+tmux server again, and resumes each seat's conversation where its provider history
+allows; a seat without usable history waits for an explicit fresh-start choice, as
+in the restoration rules above. The command talks to the daemon, not to tmux, so
+run it from any terminal that wasn't on the lost server.
+
+`rig seat launch <seat> --fresh --reason "<why>"` can also reopen a dead server
+whose socket file remains, one seat at a time, unless the seat's recorded process
+is still running: then it refuses, launches nothing and asks you to end that process
+first, because the server may only have lost its socket. That is a deliberate blank
+replacement, not a resume: the seat starts a new conversation and none of its
+earlier ones is resumed. `--reason` is required. Use it when you want that seat to
+start over, not to get its conversation back.
+
+## Two instances on one machine
+
+Isolation selects only a tmux server. Give each daemon its own OpenRig home,
+database and port as well. For example, from a directory where you want to keep
+the two instances:
+
+```sh
+mkdir -p .openrig-a .openrig-b
+env OPENRIG_HOME="$PWD/.openrig-a" OPENRIG_DB="$PWD/.openrig-a/rig.db" \
+  OPENRIG_PORT=5311 OPENRIG_TMUX_SERVER=isolated rig daemon start
+env OPENRIG_HOME="$PWD/.openrig-b" OPENRIG_DB="$PWD/.openrig-b/rig.db" \
+  OPENRIG_PORT=5312 OPENRIG_TMUX_SERVER=isolated rig daemon start
+```
+
+Use the same instance-specific environment for every subsequent command, including
+`rig up`, `rig terminal status --json`, attachment and `rig daemon stop`. Do not
+reuse a database between these homes. Other inherited `OPENRIG_*` variables still
+apply; start from a shell without selectors for another running instance.
+
+The operating-system home, provider credentials and provider conversation history
+remain shared unless configured separately. This setting does not isolate the
+filesystem or network. Both inherited and isolated servers support the opt-in
+`OPENRIG_TMUX_CONTROL=1` execution path; its control client connects to the same
+server as the daemon's other tmux commands. On servers older than tmux 3.7c, or
+whose version cannot be recognized as a fixed release, OpenRig uses spawned
+clients instead: starting a control client while another session is created can
+crash those servers (#2304). This avoids creating OpenRig's own control client;
+it cannot protect the server from other tools' control clients.
+
+On a large fleet, the daemon's two seat-activity pollers (the activity sampler and the
+structural pane cache) are a large share of its tmux traffic: each runs once a second.
+The setting `daemon.seat_poll_interval_ms` slows both down, from the 1000 ms default up to
+2000 ms. Set it with `rig config set daemon.seat_poll_interval_ms 2000` (saved in
+`config.json`; `rig config` shows it with its source) or with `OPENRIG_SEAT_POLL_INTERVAL_MS`,
+which overrides the saved value. It is startup-only: the daemon reads it once when it starts,
+so a change takes a daemon restart. `rig config set` refuses a value outside 1000..2000; an
+environment value outside it is dropped with a warning and the daemon keeps the saved value or
+the default.
+A slower cadence makes activity and idle changes show up later, and a Codex permission prompt
+can also show up as much as one interval later. Keep the default if a structural sweep of your
+tmux server can take more than about 2 s (about 3 s at the default): past that, a sweep that
+runs over skips the next tick, the Codex working-frame proof expires, and a working Codex seat
+can briefly read idle. At 2000 ms the remaining 1 s margin is also what a lagging event loop
+uses up. The two settings compose: `OPENRIG_TMUX_CONTROL=1` makes each tmux command cheaper,
+and this one makes there be fewer of them.
+
+The seat identity reconciler is a third poller: every 5 s it reads each running seat's pane
+process from tmux, and for some seats the host's process table, to record whether the pane still
+runs the seat's agent. The setting `daemon.identity_poll_interval_ms` slows it down, from the
+5000 ms default up to 30000 ms. Set it with `rig config set daemon.identity_poll_interval_ms 15000`
+or with `OPENRIG_IDENTITY_POLL_INTERVAL_MS`, which overrides the saved value. Like the seat poll
+interval, it is startup-only (a change takes a daemon restart), `rig config set` refuses a value
+outside 5000..30000, and an environment value outside it is dropped with a warning.
+The cost is staleness. A longer interval can delay the sweep noticing a stopped seat or a changed
+pane process, updating the seat's identity verdict, and revoking the activity grants that go with
+it. The verdict feeds the running and active views, and sends and reads that name an expected
+identity (and resume of the original conversation) need a verified one: a seat that `rig up` has
+just launched answers those with `expected_identity_unavailable` until a sweep verifies it.
+The setting caps the cadence: the first scheduled sweep comes one interval after daemon start,
+and then at most one sweep starts per interval. It is not a freshness deadline. A tick that
+comes due while a sweep's reads are still pending is skipped (more than one can be), and a
+change seen after a sweep began waits for a later sweep, so a successful verification, or a
+revocation, can take longer than one interval. Keep the default unless the reconciler's reads
+are a measured share of the daemon's load.

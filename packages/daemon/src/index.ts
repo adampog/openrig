@@ -1,10 +1,15 @@
+import { beginStartupPhase, recordStartupPhase } from "./domain/startup-phase-timing.js";
+import { makeKernelHookReviewReader } from "./domain/kernel-hook-review.js";
 import { serve, type ServerType } from "@hono/node-server";
+import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { closeHttpServer, createDaemonShutdown, DAEMON_SHUTDOWN_RECEIPT, trackHttpServerResponses } from "./daemon-shutdown.js";
+import { endProbeGroupsOnStartupSignal, stopRuntimeProbes } from "./adapters/bounded-probe-exec.js";
+import { closeHttpServer, createDaemonShutdown, DAEMON_LISTEN_FAILED_EXIT_CODE, DAEMON_SHUTDOWN_RECEIPT, occupiedPortGuidance, trackHttpServerResponses } from "./daemon-shutdown.js";
 import { readOpenRigEnv, OPENRIG_HOME } from "./openrig-compat.js";
 import { makeOperatorDeliveryEngine } from "./domain/gateway/operator-delivery-engine.js";
 import { resolveDaemonDbPath } from "./daemon-db-path.js";
+import { createGuestActivityApp } from "./server.js";
 import { createDaemon } from "./startup.js";
 import { removeParentSessionEnv } from "./domain/parent-session-env.js";
 import { resolveBindPlan } from "./domain/bind-plan.js";
@@ -16,6 +21,8 @@ import {
 } from "./domain/queue-stuck-sweep.js";
 import {
   createWakeLadderStatus,
+  makePermissionPromptReader,
+  makePromptKindReader,
   makePromptStateReader,
   resolveWakeRetryIntervalSeconds,
   runWakeLadderTick,
@@ -31,6 +38,8 @@ import {
 import type { SlowOperationInstrumentation } from "./domain/slow-op-recorder.js";
 import type { ProviderService } from "./domain/provider/provider-service.js";
 import { SettingsStore } from "./domain/user-settings/settings-store.js";
+import { startSeatPollers } from "./domain/seat-activity-service.js";
+import { startIdentityReconciler } from "./domain/seat-identity-reconciler.js";
 import {
   ensureOpenRigInstance,
   formatInstanceInitializationConflicts,
@@ -113,7 +122,9 @@ export function startPeriodicSnapshotScheduler(deps: {
 
 /** OPR.0.4.6.FS-1 W2 — start the queue-retention maintenance sweep (arch D3): a
  *  boot sweep + a daily tick that archives aged terminal `queue_transitions`
- *  (never-delete) and prunes `watchdog_history`, both in bounded batches with
+ *  (never-delete) and prunes `watchdog_history`, `usage_samples`, stream items and
+ *  the history-only event types of `events`, and (opt-in) erases closed work
+ *  (`retention.closed_content_days`, `retention.closed_metadata_days`), all in bounded batches with
  *  event-loop yields. Reads the `retention.*` settings (baked defaults via
  *  RETENTION_DEFAULTS). Fire-and-forget with error logging — a sweep failure must
  *  never crash the daemon. Returns the daily interval handle (cleared on
@@ -130,6 +141,10 @@ export function startQueueRetentionScheduler(deps: {
     const v = store ? store.resolveOne(key).value : fallback;
     return typeof v === "number" ? v : fallback;
   };
+  const ledger = (): string | undefined => {
+    const v = store ? store.resolveOne("retention.erasure_ledger").value : undefined;
+    return typeof v === "string" && v.length > 0 ? v : undefined;
+  };
   const runOnce = (): void => {
     void runQueueRetentionSweep(db, {
       nowIso: new Date().toISOString(),
@@ -137,7 +152,13 @@ export function startQueueRetentionScheduler(deps: {
       watchdogRetentionDays: num("retention.watchdog_days", RETENTION_DEFAULTS.watchdogRetentionDays),
       watchdogKeepPerJob: num("retention.watchdog_keep_per_job", RETENTION_DEFAULTS.watchdogKeepPerJob),
       usageSamplesRetentionDays: num("retention.usage_samples_days", RETENTION_DEFAULTS.usageSamplesRetentionDays),
+      streamRetentionDays: num("retention.stream_days", RETENTION_DEFAULTS.streamRetentionDays),
+      streamMaxItems: num("retention.stream_max_items", RETENTION_DEFAULTS.streamMaxItems),
       batchSize: num("retention.batch_size", RETENTION_DEFAULTS.batchSize),
+      eventsRetentionDays: num("retention.events_days", RETENTION_DEFAULTS.eventsRetentionDays),
+      closedContentDays: num("retention.closed_content_days", RETENTION_DEFAULTS.closedContentDays),
+      closedMetadataDays: num("retention.closed_metadata_days", RETENTION_DEFAULTS.closedMetadataDays),
+      ...(ledger() ? { erasureLedgerPath: ledger() } : {}),
     }).catch((err: unknown) => {
       console.error(`[queue-retention] sweep error: ${err instanceof Error ? err.message : String(err)}`);
     });
@@ -165,12 +186,26 @@ export function startStuckSweepScheduler(deps: {
   const status = createStuckSweepStatus();
   deps.stuckSweepStatus = status; // healthz reads this snapshot
   const db = deps.rigRepo.db;
+  // A pass yields the event loop, so a tick could start a second pass over the first one (a pass longer than the
+  // interval): one pass at a time, and a tick that finds one still running is skipped.
+  let runningSince: string | null = null;
+  let skipped = 0;
   const runOnce = (): void => {
+    if (runningSince) {
+      // Never silent: a pass that hangs (an awaited send that never settles) shows up here on every tick.
+      skipped++;
+      status.pass({ runningSince, skippedTicks: skipped });
+      console.error(`[stuck-sweep] tick skipped: the pass started at ${runningSince} is still running (${skipped} tick(s) skipped)`);
+      return;
+    }
+    runningSince = new Date().toISOString();
+    skipped = 0;
+    status.pass({ runningSince, skippedTicks: 0 });
     // runStuckSweep never throws (failure is recorded loudly on the status surface);
     // the catch is the never-crash-the-daemon belt for the promise chain itself.
     void runStuckSweep({ db, queueRepo, status }).catch((err: unknown) => {
       console.error(`[stuck-sweep] scheduler error: ${err instanceof Error ? err.message : String(err)}`);
-    });
+    }).finally(() => { runningSince = null; status.pass({ runningSince: null, skippedTicks: skipped }); });
   };
   runOnce(); // boot sweep (fire-and-forget)
   return setInterval(runOnce, resolveStuckSweepIntervalSeconds() * 1000);
@@ -188,9 +223,12 @@ export function startWakeLadderScheduler(deps: {
   wakeLadderStatus?: import("./domain/queue-wake-ladder.js").WakeLadderStatus;
   providerService?: Pick<ProviderService, "getReadModel">;
   usageLimitJitterSeconds?: number;
-  seatActivityService?: Pick<import("./domain/seat-activity-service.js").SeatActivityService, "getSeatState">;
-  agentActivityStore?: Pick<import("./domain/agent-activity-store.js").AgentActivityStore, "getLatestForNode">;
-  gatewaySubsystem?: { dispatch: (op: string, entityBindingRef: string, payload: unknown, opts?: { decisionId?: string }) => import("./domain/gateway/dispatcher.js").DispatchResult };
+  seatActivityService?: Pick<import("./domain/seat-activity-service.js").SeatActivityService, "getSeatState">
+    & Partial<Pick<import("./domain/seat-activity-service.js").SeatActivityService, "codexPermissionState">>;
+  agentActivityStore?: Pick<import("./domain/agent-activity-store.js").AgentActivityStore, "getLatestForNode">
+    & Partial<Pick<import("./domain/agent-activity-store.js").AgentActivityStore, "findPermissionPromptStart">>;
+  tmuxAdapter?: Pick<import("./adapters/tmux.js").TmuxAdapter, "listPanes" | "readAllPaneProcesses" | "capturePaneScreen" | "getPanePid">;
+  gatewaySubsystem?: { status?: () => { state?: unknown }; dispatch: (op: string, entityBindingRef: string, payload: unknown, opts?: { decisionId?: string }) => import("./domain/gateway/dispatcher.js").DispatchResult };
 }): WakeLadderScheduler | null {
   const queueRepo = deps.queueRepo;
   if (!queueRepo) return null;
@@ -205,6 +243,7 @@ export function startWakeLadderScheduler(deps: {
     ? makeOperatorDeliveryEngine({
         home: OPENRIG_HOME,
         queueRepo,
+        gatewayState: () => String(deps.gatewaySubsystem?.status?.().state ?? "unavailable"),
         dispatch: (op, ref, payload, opts) => deps.gatewaySubsystem!.dispatch(op, ref, payload, opts),
       })
     : undefined;
@@ -214,11 +253,24 @@ export function startWakeLadderScheduler(deps: {
       queueRepo,
       status,
       ...(deliveryEngine ? { deliveryEngine } : {}),
+      ...(deps.tmuxAdapter ? { readHookReviews: makeKernelHookReviewReader({ db, tmux: deps.tmuxAdapter }) } : {}),
+      readPermissionPrompts: makePermissionPromptReader({ db,
+        getLatestHook: (sessionName, runtime) => deps.agentActivityStore?.getLatestForNode({ sessionName,
+          order: runtime === "claude-code" ? "source" : "arrival" }),
+        getPromptStart: (sessionName, generation) => deps.agentActivityStore?.findPermissionPromptStart?.({ sessionName, generation }),
+        getCodexPermissionState: (nodeId, raisedAt) => deps.seatActivityService?.codexPermissionState?.(nodeId, raisedAt),
+        getSeatState: (nodeId) => deps.seatActivityService?.getSeatState(nodeId),
+      }),
       readPromptState: makePromptStateReader({
         db,
         getSeatState: (nodeId) => deps.seatActivityService?.getSeatState(nodeId),
-        getLatestHook: (sessionName) => deps.agentActivityStore?.getLatestForNode({ sessionName }),
+        getLatestHook: (sessionName, runtime) => deps.agentActivityStore?.getLatestForNode({
+          sessionName,
+          order: runtime === "claude-code" ? "source" : "arrival",
+        }),
+        getCodexPermissionState: (nodeId, raisedAt, after) => deps.seatActivityService?.codexPermissionState?.(nodeId, raisedAt, after),
       }),
+      readPromptKind: makePromptKindReader({ db, getSeatState: (nodeId) => deps.seatActivityService?.getSeatState(nodeId) }),
       ...(deps.providerService
         ? { getProviderReadModel: () => deps.providerService!.getReadModel() }
         : {}),
@@ -242,8 +294,28 @@ async function isTrustedLocalOrTailnetBind(host: string): Promise<boolean> {
   return false;
 }
 
+/** A listener that fails to bind ends the process cleanly: one `OPENRIG_LISTEN_FAILED` line and the distinct exit
+ *  code, without the shutdown, so it writes no shutdown receipt and records no stop. In a multi-bind, a listener
+ *  that came up first may have started the monitors; the exit ends them, as the unhandled error did before. Once a
+ *  listener is up, its later server errors keep their usual path. */
+function exitOnListenFailure(server: ServerType, host: string, port: number, portHint: boolean): void {
+  const onError = (error: NodeJS.ErrnoException): void => {
+    const code = error.code ?? "UNKNOWN";
+    const address = host.includes(":") ? `[${host}]:${port}` : `${host}:${port}`;
+    const guidance = code === "EADDRINUSE" && portHint ? occupiedPortGuidance(port) : error.message;
+    // Synchronous: the process exits next, and a supervisor's stderr can be an asynchronous pipe.
+    try { fs.writeSync(2, `OPENRIG_LISTEN_FAILED ${code} ${address} ${guidance}\n`); } catch { /* the exit code still says it */ }
+    process.exit(DAEMON_LISTEN_FAILED_EXIT_CODE);
+  };
+  server.once("error", onError);
+  server.once("listening", () => server.off("error", onError));
+}
+
 export async function startServer(port?: number) {
   const p = port ?? parseInt(readOpenRigEnv("OPENRIG_PORT", "RIGGED_PORT") ?? "7433", 10);
+  const guestPort = process.env.OPENRIG_GUEST_ACTIVITY_PORT ? Number(process.env.OPENRIG_GUEST_ACTIVITY_PORT) : undefined;
+  if (guestPort !== undefined && (!Number.isInteger(guestPort) || guestPort < 1 || guestPort > 65535 || guestPort === p))
+    throw new Error("OPENRIG_GUEST_ACTIVITY_PORT must be a distinct valid listener port");
   // D15 — anchor the default db under OPENRIG_HOME, never a bare CWD-relative
   // filename (which could open the shared fleet db). Explicit OPENRIG_DB wins.
   const dbPath = resolveDaemonDbPath(readOpenRigEnv("OPENRIG_DB", "RIGGED_DB"), OPENRIG_HOME);
@@ -258,6 +330,10 @@ export async function startServer(port?: number) {
   if (!initialization.ok) {
     throw new Error(`OpenRig instance initialization blocked: ${formatInstanceInitializationConflicts(initialization)}`);
   }
+  if (initialization.workspaceExistingProject) {
+    console.log(`[openrig] workspace.root holds a project of its own (${initialization.workspaceExistingProject}); `
+      + "OpenRig left it as it is and reads that project's own id.");
+  }
 
   // bug-fix slice auth-bearer-tailscale-trust: distinguish "explicit
   // operator opt-in" from "default" by treating an undefined env as
@@ -269,8 +345,8 @@ export async function startServer(port?: number) {
   // The overloaded routing env (OPENRIG_HOST/RIGGED_HOST) is observed for the
   // provenance line below and NEVER selects the bind branch: a managed environment's
   // injected endpoint is byte-indistinguishable from opt-in, and the parent daemon
-  // silently lost its Tailscale listener to exactly that (operator baton
-  // qitem-20260827070400). The auth-bearer-tailscale-trust ruling rides the new
+  // silently lost its Tailscale listener to exactly that (operator baton).
+  // The auth-bearer-tailscale-trust ruling rides the new
   // surface unchanged.
   const bindPlan = resolveBindPlan({
     bindHostEnv: process.env.OPENRIG_BIND_HOST,
@@ -304,8 +380,11 @@ export async function startServer(port?: number) {
     bindHosts = bindPlan.hosts;
   }
 
-  const { app, contextMonitor, deps, eventLoopMonitor, injectWebSocket } = await createDaemon({
+  // The fresh-DB Codex probe runs inside createDaemon, before the shutdown handlers below exist.
+  const disarmStartupSignals = endProbeGroupsOnStartupSignal();
+  const { app, contextMonitor, deps, eventLoopMonitor, injectWebSocket, wakeRecovery } = await createDaemon({
     dbPath,
+    guestActivityPort: guestPort,
     bearerToken,
     terminalBearerToken,
     // S20 — the effective bind plan rides the health surface so adoption gates verify
@@ -324,16 +403,36 @@ export async function startServer(port?: number) {
   // P7 — lifecycle heartbeat: advance last-seen every tick while running.
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   const servers: ServerType[] = [];
+  if (guestPort !== undefined) {
+    const guest = createGuestActivityApp(deps);
+    const endGuestBind = beginStartupPhase("bind", "guest");
+    const guestHost = process.env.OPENRIG_GUEST_ACTIVITY_HOST ?? "127.0.0.1";
+    const guestServer = serve({ fetch: guest.fetch, port: guestPort, hostname: guestHost }, () => {
+      recordStartupPhase(deps.slowOpRecorder, endGuestBind());
+    });
+    // The --port remedy names the daemon port, not OPENRIG_GUEST_ACTIVITY_PORT: this line carries the errno message.
+    exitOnListenFailure(guestServer, guestHost, guestPort, false);
+    trackHttpServerResponses(guestServer);
+    servers.push(guestServer);
+  }
   for (const host of bindHosts) {
+    const endBind = beginStartupPhase("bind", host === bindHosts[0] ? "primary" : "secondary");
     const srv = serve({ fetch: app.fetch, port: p, hostname: host }, (info) => {
+      recordStartupPhase(deps.slowOpRecorder, endBind());
       console.log(`OpenRig daemon listening on http://${host}:${info.port}`);
       if (!monitorsStarted) {
         monitorsStarted = true;
         contextMonitor.start();
+        // Recovered queue notifications are seat deliveries: they run once listening, never before readiness.
+        wakeRecovery.start();
         // PL-004 Phase C: start watchdog scheduler. Joins the supervision
         // tree post-bind so the HTTP surface is ready before the first
         // tick (matches contextMonitor pattern).
         deps.watchdogScheduler?.start();
+        // #2940: keep_alive seats are watched from here on; boot-time recovery stays with the kernel boot in createDaemon.
+        deps.keepAliveSupervisor?.start();
+        deps.networkConnector?.start();
+        deps.sessionTransport?.guardedDelivery?.recover();
         // S10 — start the gateway subsystem's NETWORK services (replay, outbound poll,
         // Socket Mode inbound) post-bind, contextMonitor pattern: the composed wire is
         // already active; only its dial-out half waits for the supervision tree.
@@ -342,19 +441,27 @@ export async function startServer(port?: number) {
         // Polls every running tmux-bound seat's window_activity timestamp so
         // PsProjectionService + node-inventory enrichment serve
         // fresh data on each request.
-        deps.seatActivityService?.start(deps.rigRepo.db);
-        // 5b82324b — the structural pane-activity cache, on the same 1Hz cadence.
-        deps.seatStructuralActivityService?.start(deps.rigRepo.db);
+        // 5b82324b — the structural pane-activity cache runs on the same cadence.
+        // daemon.seat_poll_interval_ms (OPENRIG_SEAT_POLL_INTERVAL_MS) slows both pollers down (default 1 s,
+        // unchanged); startup-only: read once here.
+        startSeatPollers(
+          { activity: deps.seatActivityService, structural: deps.seatStructuralActivityService },
+          deps.rigRepo.db,
+        );
         // OPR.0.4.3.19 — start the liveness identity reconciler (5s default).
         // Persists the per-seat pane PID/command verdict so node-inventory
         // gates the running/active projection on verified process identity.
-        deps.seatIdentityReconciler?.start();
+        // daemon.identity_poll_interval_ms (OPENRIG_IDENTITY_POLL_INTERVAL_MS) slows it down (default 5 s,
+        // unchanged); startup-only: read once here.
+        startIdentityReconciler(deps.seatIdentityReconciler);
         startPeriodicSnapshotScheduler(deps);
         // OPR.0.4.6.FS-1 W2 — boot sweep + daily retention tick (bounded,
         // yields between batches; a sweep failure is logged, never fatal).
         retentionTimer = startQueueRetentionScheduler(deps);
         // S02 — the standing stuck sweep: nobody has to remember to run the verbs.
         stuckSweepTimer = startStuckSweepScheduler(deps);
+        // Issue #1856: stream intake for the queue worker.
+        deps.streamIntakeCoordinator?.start();
         // S01 — wake-or-escalate on batons: a failed baton wake retries on schedule,
         // then escalates through recorded rungs; never a silent park.
         wakeLadderScheduler = startWakeLadderScheduler(deps);
@@ -370,6 +477,7 @@ export async function startServer(port?: number) {
         }, HEARTBEAT_INTERVAL_MS);
       }
     });
+    exitOnListenFailure(srv, host, p, true);
     injectWebSocket(srv);
     trackHttpServerResponses(srv, deps.requestPhaseObserver?.observeRequest);
     servers.push(srv);
@@ -382,14 +490,27 @@ export async function startServer(port?: number) {
   const shutdown = createDaemonShutdown({
     receiptPath: path.join(OPENRIG_HOME, DAEMON_SHUTDOWN_RECEIPT),
     phases: [
+      // First, so no keep_alive relaunch starts while the daemon goes down; a tick in flight gets a short bounded wait.
+      // Nothing is written to sessions: seats that survive stay as they are.
+      ["keep-alive", () => deps.keepAliveSupervisor?.stop()],
+      // While transport still works: let the delivery in flight finish; the rest wait for the next start.
+      ["wake-recovery", () => wakeRecovery.stop()],
+      ["terminal-following", () => deps.terminalService?.stop()],
+      ["rex-status", () => deps.rexStatusRelay?.stop()],
       ["timers", () => {
+        deps.resumeMetadataRefresher?.stop();
         if (heartbeatTimer) clearInterval(heartbeatTimer);
         if (retentionTimer) clearInterval(retentionTimer);
         if (stuckSweepTimer) clearInterval(stuckSweepTimer);
       }],
+      ["runtime-probes", () => stopRuntimeProbes()],
       ["proof-source-watch", () => deps.proofSourceWatch?.close()],
       ["health-diagnosis", () => deps.healthDiagnosis?.stop()],
       ["watchdog", () => deps.watchdogScheduler?.stop()],
+      ["terminal-reachability", () => deps.terminalReachability?.stop()],
+      ["network-connector", () => deps.networkConnector?.stop()],
+      ["stream-intake", () => deps.streamIntakeCoordinator?.stop()],
+      ["draft-delivery", () => deps.sessionTransport?.guardedDelivery?.stop()],
       ["seat-activity", () => deps.seatActivityService?.stop()],
       ["seat-structural-activity", () => deps.seatStructuralActivityService?.stop()],
       ["seat-identity", () => deps.seatIdentityReconciler?.stop()],
@@ -398,6 +519,8 @@ export async function startServer(port?: number) {
       ["wake-ladder", () => wakeLadderScheduler?.stop()],
       ["event-loop-monitor", () => eventLoopMonitor.stop()],
       ["connections", () => Promise.all(servers.map((srv) => closeHttpServer(srv)))],
+      // After the last request: the tmux control client ends and its session goes with it.
+      ["tmux-control", () => deps.tmuxAdapter.closeControlClient()],
       ["recorder", async () => {
         deps.requestPhaseObserver?.close();
         if (await drainSlowOpRecorderOnShutdown(deps.slowOpRecorder) !== 0) {
@@ -409,6 +532,7 @@ export async function startServer(port?: number) {
     markClean: () => deps.daemonLifecycleStore.recordStop(deps.daemonBootEpoch, new Date().toISOString()),
   });
   // Repeated signals join the first shutdown instead of bypassing its evidence.
+  disarmStartupSignals();
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 

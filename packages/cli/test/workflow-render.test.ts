@@ -1,10 +1,13 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
+import stringWidth from "string-width";
 import {
   renderTraceTree,
   renderInstanceList,
   renderInstanceShow,
   humanDuration,
   statusGlyph,
+  composeAttentionRollup,
+  renderStatus,
 } from "../src/commands/workflow-render.js";
 import type { WorkflowDeps } from "../src/commands/workflow.js";
 import { createProgram } from "../src/index.js";
@@ -84,6 +87,17 @@ describe("workflow-render (WF3 FR-2)", () => {
     expect(noBranch).not.toContain("branch:");
   });
 
+  it("a resume line shows the redrive owner and whether it was named or resolved", () => {
+    const resume = (ownerSource: string) => ({
+      stepId: "build", closedAt: "2026-07-06T21:09:00.000Z", closureReason: "resumed", actorSession: "orch@rig",
+      closureEvidence: { resume: { ownerSession: "builder-slot-2@rig", ownerSource } }, nextQitemId: "Q4", priorQitemId: "Q3",
+    });
+    const named = renderTraceTree(INSTANCE, [...TRAIL, resume("named")], NOW).join("\n");
+    expect(named).toContain("↻ build");
+    expect(named).toContain("↳ owner: builder-slot-2@rig (named)");
+    expect(renderTraceTree(INSTANCE, [...TRAIL, resume("resolved")], NOW).join("\n")).toContain("↳ owner: builder-slot-2@rig (resolved)");
+  });
+
   it("failed steps carry the ✖ glyph", () => {
     const lines = renderTraceTree(
       { ...INSTANCE, status: "failed", currentStepId: null },
@@ -101,6 +115,22 @@ describe("workflow-render (WF3 FR-2)", () => {
     expect(lines[1]).toContain("WF01ABC");
     expect(lines[1]).toContain("10m");
     expect(lines[2]).toContain("◐");
+  });
+
+  it("list and trace columns stay aligned in terminal columns for wide workflow names and step ids", () => {
+    const statusColumn = (line: string) => stringWidth(line.slice(0, line.search(/active|waiting|STATUS/)));
+    const lines = renderInstanceList([
+      INSTANCE,
+      { ...INSTANCE, instanceId: "WF02", workflowName: "品質レビュー" },
+      { ...INSTANCE, instanceId: "WF03", workflowName: "リリース前の品質レビュー工程とその確認", status: "waiting" },
+    ], NOW);
+    expect(lines.map(statusColumn)).toEqual([54, 54, 54, 54]);
+    expect(lines[3]).toContain("リリース前の品質レビ… waiting");
+
+    const trace = renderTraceTree(INSTANCE, [{ ...TRAIL[0], stepId: "計画レビュー" }, TRAIL[1]], NOW);
+    const actorColumn = (line: string) => stringWidth(line.slice(0, line.search(/planner@rig|builder@rig/)));
+    const [wideStep, asciiStep] = trace.filter((line) => /planner@rig|builder@rig/.test(line)).map(actorColumn);
+    expect(wideStep).toBe(asciiStep);
   });
 
   it("FR-3a attention markers: failed and waiting rows marked; active/completed unmarked", () => {
@@ -146,8 +176,8 @@ describe("workflow-render (WF3 FR-2)", () => {
     const show = renderInstanceShow(lifecycle, NOW).join("\n");
     expect(show).toContain("Q-LEFT  step=left  owner=left@rig");
     expect(show).toContain("Q-RIGHT  step=right  owner=right@rig  state=blocked  blocked_on=gate-2");
-    expect(show).toContain("project --instance WF01ABC --current-packet Q-LEFT --exit <handoff|waiting|done|failed> --actor-session left@rig");
-    expect(show).toContain("project --instance WF01ABC --current-packet Q-RIGHT --exit <handoff|waiting|done|failed> --actor-session right@rig");
+    expect(show).toContain("project --instance WF01ABC --current-packet Q-LEFT --exit <handoff|waiting|done|failed>");
+    expect(show).toContain("project --instance WF01ABC --current-packet Q-RIGHT --exit <handoff|waiting|done|failed>");
     expect(show).toContain("--occurrence Q-FAILED");
     expect(show).toContain("unknown:  frontier packet Q-GHOST has no queue row");
 
@@ -276,4 +306,30 @@ it("shows the exception selection, unavailable evidence and owning obligation wi
   expect(lines).toContain("inventory read failed");
   expect(lines).toContain("qitem-existing · owner=prior@rig · state=pending");
   expect(lines).toContain("rig workflow revise WF01ABC");
+});
+
+// #2730: what a run is for, kept on the instance, where a person reads the instance.
+describe("a workflow instance's root objective", () => {
+  const base = { instanceId: "WF01ROOT", workflowName: "ship", workflowVersion: "1", createdBySession: "lead@rig", createdAt: "2026-11-08T05:00:00.000Z", hopCount: 0, currentFrontier: [] };
+  const NOW = "2026-11-08T06:00:00.000Z";
+
+  it("show and trace name it, and an instance that doesn't record it reads as before", () => {
+    const kept = { ...base, status: "active", rootObjective: "TICKET-123 ship the thing" };
+    expect(renderInstanceShow(kept, NOW)).toContain("  objective: TICKET-123 ship the thing");
+    expect(renderTraceTree(kept, [], NOW)).toContain("  objective: TICKET-123 ship the thing");
+    const older = { ...base, status: "active", rootObjective: null };
+    expect(renderInstanceShow(older, NOW)).toEqual(renderInstanceShow({ ...base, status: "active" }, NOW));
+    expect(renderTraceTree(older, [], NOW).some((line) => line.includes("objective:"))).toBe(false);
+  });
+
+  it("status says what each failed or stuck run was carrying, in its JSON and under its row", () => {
+    const rollup = composeAttentionRollup([
+      { ...base, status: "failed", rootObjective: "TICKET-123 ship the thing" },
+      { ...base, instanceId: "WF01OLD", status: "failed", rootObjective: null },
+    ]);
+    expect(rollup.attention.map((row) => [row.instanceId, row.rootObjective])).toEqual([["WF01ROOT", "TICKET-123 ship the thing"], ["WF01OLD", null]]);
+    const lines = renderStatus(rollup);
+    expect(lines.filter((line) => line.includes("objective:"))).toEqual(["      objective: TICKET-123 ship the thing"]);
+    expect(lines.findIndex((line) => line.includes("objective:"))).toBe(lines.findIndex((line) => line.includes("WF01ROOT")) + 1);
+  });
 });

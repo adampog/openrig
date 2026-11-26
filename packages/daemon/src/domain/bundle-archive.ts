@@ -11,9 +11,9 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import nodePath from "node:path";
 import * as tar from "tar";
-import { verifyIntegrity, type IntegrityFsOps } from "./bundle-integrity.js";
+import { verifyIntegrity, isHarnessLoginPath, type IntegrityFsOps } from "./bundle-integrity.js";
 // TODO: AS-T12 — migrate to pod-aware bundle types
-import { parseLegacyBundleManifest as parseBundleManifest, normalizeLegacyBundleManifest as normalizeBundleManifest } from "./bundle-types.js";
+import { parseLegacyBundleManifest as parseBundleManifest, normalizeLegacyBundleManifest as normalizeBundleManifest, normalizeIncludedLoginFiles } from "./bundle-types.js";
 
 /**
  * Pack a staging directory into a .rigbundle archive (deterministic tar.gz).
@@ -109,7 +109,7 @@ export async function collectUnsafeArchiveEntries(archivePath: string): Promise<
  * Rejects symlinks, hardlinks, path traversal, and absolute paths.
  * Runs content integrity verification after extraction.
  */
-export async function unpack(archivePath: string, outputDir: string): Promise<void> {
+export async function unpack(archivePath: string, outputDir: string): Promise<{ warnings: string[] } | undefined> {
   // Step 1: Verify archive-level digest
   const digestResult = verifyArchiveDigest(archivePath);
   if (!digestResult.valid) {
@@ -124,6 +124,7 @@ export async function unpack(archivePath: string, outputDir: string): Promise<vo
   }
 
   // Step 3: Extract (safe — pre-scanned and defensively filtered)
+  const fileModes: Array<{ file: string; mode: number }> = [];
   fs.mkdirSync(outputDir, { recursive: true });
   await tar.extract({
     file: archivePath,
@@ -131,7 +132,11 @@ export async function unpack(archivePath: string, outputDir: string): Promise<vo
     filter: (p, entry) => {
       if ("isSymbolicLink" in entry && typeof entry.isSymbolicLink === "function" && entry.isSymbolicLink()) return false;
       const type = "type" in entry ? (entry as { type?: string }).type : undefined;
-      return unsafeArchiveEntryReason(p, type) === null;
+      if (unsafeArchiveEntryReason(p, type) !== null) return false;
+      if ((type === "File" || type === "OldFile" || type === "ContiguousFile") && typeof entry.mode === "number") {
+        fileModes.push({ file: nodePath.resolve(outputDir, p), mode: entry.mode & 0o777 });
+      }
+      return true;
     },
   });
 
@@ -173,8 +178,8 @@ export async function unpack(archivePath: string, outputDir: string): Promise<vo
       walkFiles: (dir) => walkFilesSync(dir),
     };
 
-    // verifyIntegrity only reads manifest.integrity — safe to cast
-    const result = verifyIntegrity(outputDir, { integrity } as unknown as Parameters<typeof verifyIntegrity>[1], fsOps);
+    const includedLoginFiles = normalizeIncludedLoginFiles(raw["included_login_files"]);
+    const result = verifyIntegrity(outputDir, { integrity, includedLoginFiles } as unknown as Parameters<typeof verifyIntegrity>[1], fsOps);
     if (!result.passed) {
       const details = [
         ...result.mismatches.map((f) => `tampered: ${f}`),
@@ -184,6 +189,34 @@ export async function unpack(archivePath: string, outputDir: string): Promise<vo
       ];
       throw new Error(`Content integrity verification failed: ${details.join("; ")}`);
     }
+    const warnings = [...(result.warnings ?? [])];
+    // Keep every header in archive order: aliases and duplicates can interleave.
+    // POSIX device/inode identity groups aliases without folding distinct names
+    // on case-sensitive volumes. Read bigint IDs to avoid number precision loss.
+    if (process.platform !== "win32") {
+      const files = new Map<string, { file: string; mode: number; extracted: number; login: boolean }>();
+      for (const { file, mode } of fileModes) {
+        const stat = fs.lstatSync(file, { throwIfNoEntry: false, bigint: true });
+        // A later entry may have replaced this file with a directory.
+        if (!stat?.isFile()) continue;
+        const identity = `${stat.dev}:${stat.ino}`;
+        const login = isHarnessLoginPath(nodePath.relative(outputDir, file)) || !!files.get(identity)?.login;
+        files.set(identity, { file, mode, extracted: Number(stat.mode) & 0o7777, login });
+      }
+      for (const { file, mode, extracted, login } of files.values()) {
+        // Restore owner bits only. Keep extracted group/other read/execute bits,
+        // excluding group/other write and all special bits even on external tars.
+        const target = login ? mode & 0o600 : (mode & 0o700) | (extracted & 0o055);
+        if (extracted === target) continue;
+        try {
+          fs.chmodSync(file, target);
+        } catch {
+          const relative = nodePath.relative(outputDir, file);
+          warnings.push(`Bundle mode repair warning: chmod failed for '${relative}' (observed mode ${extracted.toString(8).padStart(4, "0")}). ${login ? "The owner-only login cap could not be applied. " : ""}Extract to a private folder on a filesystem that supports permissions.`);
+        }
+      }
+    }
+    if (warnings.length > 0) return { warnings };
   }
 }
 

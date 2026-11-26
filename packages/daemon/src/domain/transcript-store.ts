@@ -1,8 +1,8 @@
 import { mkdirSync, appendFileSync, existsSync, openSync, readSync, closeSync, statSync, fstatSync, readFileSync } from "node:fs";
 import { join, dirname, relative, isAbsolute, sep } from "node:path";
-import { StringDecoder } from "node:string_decoder";
 import { getCompatibleOpenRigPath } from "../openrig-compat.js";
-import { getLastCaptureAt, DEFAULT_TRANSCRIPT_STALE_AFTER_MS } from "./transcript-rotation.js";
+import { getLastCaptureAt, getLastCheckedAt, DEFAULT_TRANSCRIPT_STALE_AFTER_MS } from "./transcript-rotation.js";
+import { scanTranscriptGrep } from "./transcript-grep.js";
 
 export interface TranscriptStoreOpts {
   transcriptsRoot?: string;
@@ -14,7 +14,7 @@ export type TranscriptIngestState = "live" | "degraded" | "unavailable";
 
 export interface TranscriptIngestHealth {
   state: TranscriptIngestState;
-  reason: "capture_fresh" | "capture_stale" | "capture_empty" | "capture_missing" | "capture_disabled" | "capture_unreadable";
+  reason: "capture_fresh" | "capture_unchanged" | "capture_stale" | "capture_empty" | "capture_missing" | "capture_disabled" | "capture_unreadable";
   lastCapturedAt: string | null;
 }
 
@@ -132,7 +132,10 @@ function readTailChunked(filePath: string, rawLines: number): string | null {
   try {
     const stat = fstatSync(fd);
     if (stat.size === 0) return null;
-    let text = "";
+    // Count each chunk once and join only after the backwards scan. Rescanning
+    // the accumulated tail makes long lines quadratic in the number of chunks.
+    const chunks: string[] = [];
+    let newlineCount = 0;
     let offset = stat.size;
 
     while (offset > 0) {
@@ -159,13 +162,15 @@ function readTailChunked(filePath: string, rawLines: number): string | null {
       }
 
       const chunk = buf.subarray(skipBytes).toString("utf-8");
-      text = chunk + text;
+      chunks.push(chunk);
+      newlineCount += countNewlines(chunk);
 
-      const newlineCount = countNewlines(text);
-      if (newlineCount >= rawLines) break;
+      // A trailing newline terminates the last line; it does not establish
+      // the start of the first requested line when this chunk starts mid-line.
+      if (newlineCount >= rawLines + (chunks[0]!.endsWith("\n") ? 1 : 0)) break;
     }
 
-    const lines = text.split("\n");
+    const lines = chunks.reverse().join("").split("\n");
     if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
     const tail = lines.slice(-rawLines);
     return tail.join("\n");
@@ -245,10 +250,12 @@ export class TranscriptStore {
       if (stat.size === 0) {
         return { state: "degraded", reason: "capture_empty", lastCapturedAt };
       }
-      if (Date.now() - lastCaptureMs > this.staleAfterMs) {
+      // Between captures of a pane that has not changed, rotation's check keeps ingest live; lastCapturedAt stays the capture.
+      const lastCheckedMs = Math.max(lastCaptureMs, getLastCheckedAt(sessionName) ?? 0);
+      if (Date.now() - lastCheckedMs > this.staleAfterMs) {
         return { state: "degraded", reason: "capture_stale", lastCapturedAt };
       }
-      return { state: "live", reason: "capture_fresh", lastCapturedAt };
+      return { state: "live", reason: Date.now() - lastCaptureMs > this.staleAfterMs ? "capture_unchanged" : "capture_fresh", lastCapturedAt };
     } catch {
       return { state: "degraded", reason: "capture_unreadable", lastCapturedAt: null };
     }
@@ -283,7 +290,16 @@ export class TranscriptStore {
       // for the first restore on a fresh rig.
       mkdirSync(dirname(filePath), { recursive: true });
       const marker = `--- SESSION BOUNDARY: ${reason} at ${new Date().toISOString()} ---\n`;
-      appendFileSync(filePath, marker, "utf-8");
+      // Markers must start on their own line: history search and rotation both recognize only whole marker lines.
+      const fd = openSync(filePath, "a+");
+      try {
+        const size = fstatSync(fd).size;
+        const lastByte = Buffer.alloc(1);
+        if (size > 0 && readSync(fd, lastByte, 0, 1, size - 1) !== 1) throw new Error("Transcript changed during read");
+        appendFileSync(fd, `${size > 0 && lastByte[0] !== 10 ? "\n" : ""}${marker}`, "utf-8");
+      } finally {
+        closeSync(fd);
+      }
       return true;
     } catch {
       return false;
@@ -358,7 +374,7 @@ export class TranscriptStore {
       .filter((line) => !isUiChromeLine(line))
       .filter((line) => !isSpinnerOnlyLine(line))
       .filter((line) => !isLikelyTuiFragment(line))
-      .filter((line, index) => !isPromptRedrawDuplicate(line, filtered[index + 1]));
+      .filter((line, index, lines) => !isPromptRedrawDuplicate(line, lines[index + 1]));
   }
 
   /**
@@ -385,60 +401,14 @@ export class TranscriptStore {
     }
   }
 
-  grep(rigName: string, sessionName: string, pattern: string): string[] | null {
-    try {
-      const filePath = this.getTranscriptPath(rigName, sessionName);
-      if (!existsSync(filePath)) return null;
-      return this.grepSync(filePath, pattern);
-    } catch {
-      return null;
-    }
-  }
-
-  private grepSync(filePath: string, pattern: string): string[] {
-    const regex = new RegExp(pattern);
-    const matches: string[] = [];
-    const fd = openSync(filePath, "r");
-    const decoder = new StringDecoder("utf-8");
-    try {
-      const stat = fstatSync(fd);
-      const CHUNK_SIZE = 64 * 1024;
-      let remainder = "";
-
-      for (let offset = 0; offset < stat.size; offset += CHUNK_SIZE) {
-        const readSize = Math.min(CHUNK_SIZE, stat.size - offset);
-        const buf = readTranscriptChunk(fd, readSize, offset);
-        // StringDecoder handles incomplete multibyte sequences at chunk boundaries
-        const chunk = remainder + decoder.write(buf);
-        const lines = chunk.split("\n");
-        remainder = lines.pop() ?? "";
-
-        for (const rawLine of lines) {
-          const stripped = this.stripAnsi(rawLine);
-          for (const subLine of stripped.split("\n")) {
-            const cleaned = stripShellPromptPrefix(subLine);
-            if (cleaned && regex.test(cleaned)) {
-              matches.push(cleaned);
-            }
-          }
-        }
-      }
-
-      // Flush any remaining bytes from the decoder
-      const finalChunk = remainder + decoder.end();
-      if (finalChunk) {
-        const stripped = this.stripAnsi(finalChunk);
-        for (const subLine of stripped.split("\n")) {
-          const cleaned = stripShellPromptPrefix(subLine);
-          if (cleaned && regex.test(cleaned)) {
-            matches.push(cleaned);
-          }
-        }
-      }
-    } finally {
-      closeSync(fd);
-    }
-
-    return matches;
+  /** Scan this session's transcript for a pattern.
+   *
+   *  The scan runs on its own thread with a deadline (domain/transcript-grep.ts): a pattern the route
+   *  accepts as valid syntax can backtrack catastrophically, and on this thread that would stop every
+   *  other request and every sweep for as long as it ran. Returns null when the file is missing, and
+   *  rejects with TranscriptGrepTimeoutError when the scan outlived its bound.
+   */
+  async grep(rigName: string, sessionName: string, pattern: string): Promise<string[] | null> {
+    return scanTranscriptGrep(this.getTranscriptPath(rigName, sessionName), pattern);
   }
 }

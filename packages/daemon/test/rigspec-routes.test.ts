@@ -18,6 +18,12 @@ import { RigRepository as RigRepoClass } from "../src/domain/rig-repository.js";
 import { SessionRegistry } from "../src/domain/session-registry.js";
 import { createApp } from "../src/server.js";
 import type { ExecFn } from "../src/adapters/tmux.js";
+import fs from "node:fs";
+import nodePath from "node:path";
+import os from "node:os";
+import { seatSkillPaths } from "../src/domain/seat-skill-storage.js";
+import { prepareSeatLaunchAdditions } from "../src/domain/seat-launch-additions.js";
+import { SeatPoolSlotsRepository } from "../src/domain/seat-pool-slots.js";
 
 const VALID_YAML = `
 schema_version: 1
@@ -52,6 +58,34 @@ describe("Rigspec export routes", () => {
 
   afterEach(() => {
     db.close();
+  });
+
+  it("#1631 names unknown member startup on YAML and JSON export without inventing a declaration", async () => {
+    const rig = rigRepo.createRig("old-pod");
+    const pod = new PodRepository(db).createPod(rig.id, "dev", "Dev");
+    rigRepo.addNode(rig.id, "dev.old", { runtime: "codex", podId: pod.id, agentRef: "local:agents/old", profile: "default", cwd: "." });
+    const yamlResponse = await app.request(`/api/rigs/${rig.id}/spec`);
+    expect(yamlResponse.status).toBe(200);
+    const yaml = await yamlResponse.text();
+    expect(yaml).toContain('# Member startup not carried for "dev.old" (source unavailable)');
+    const spec = PodRigSpecSchema.normalize(PodRigSpecCodec.parse(yaml) as Record<string, unknown>);
+    expect(spec.pods[0]!.members[0]!.startup).toBeUndefined();
+    const jsonResponse = await app.request(`/api/rigs/${rig.id}/spec.json`);
+    expect(JSON.parse(decodeURIComponent(jsonResponse.headers.get("X-OpenRig-Export-Warnings")!)))
+      .toEqual([{ logicalId: "dev.old", reason: "source unavailable" }]);
+  });
+
+  it("names an unreadable claude_auto_mode in the export warnings header of both formats, and exports without it", async () => {
+    const rig = rigRepo.createRig("auto-mode-export");
+    const node = rigRepo.addNode(rig.id, "worker", { runtime: "claude-code" });
+    db.prepare("UPDATE nodes SET claude_auto_mode_json='broken' WHERE id=?").run(node.id);
+    const warning = [{ logicalId: "worker", reason: "claude_auto_mode can't be read; not carried" }];
+    for (const path of ["spec", "spec.json"]) {
+      const response = await app.request(`/api/rigs/${rig.id}/${path}`);
+      expect(response.status).toBe(200);
+      expect(JSON.parse(decodeURIComponent(response.headers.get("X-OpenRig-Export-Warnings")!))).toEqual(warning);
+      expect(await response.text()).not.toMatch(/claude_auto_mode:|"claudeAutoMode"/);
+    }
   });
 
   it("GET /api/rigs/:rigId/spec -> 200 + YAML content-type", async () => {
@@ -104,6 +138,110 @@ describe("Rigspec export routes", () => {
     expect(PodRigSpecSchema.normalize(parsed as Record<string, unknown>).workspace).toEqual(workspace);
   });
 
+  it("names each seat whose launch additions the export doesn't carry (OPR.0.7.0.9)", async () => {
+    const home = fs.mkdtempSync(nodePath.join(os.tmpdir(), "export-additions-"));
+    const saved = process.env["OPENRIG_HOME"];
+    try {
+      process.env["OPENRIG_HOME"] = home;
+      const rig = rigRepo.createRig("r99");
+      rigRepo.addNode(rig.id, "dev.impl", { runtime: "claude-code" });
+      rigRepo.addNode(rig.id, "dev.plain", { runtime: "claude-code" });
+      const prompt = nodePath.join(home, "house.md");
+      fs.writeFileSync(prompt, "House rules.\n");
+      expect(prepareSeatLaunchAdditions(seatSkillPaths({ rigId: rig.id, logicalId: "dev.impl", runtime: "claude-code" }), { appendSystemPromptFile: prompt }).ok).toBe(true);
+      const text = await (await app.request(`/api/rigs/${rig.id}/spec`)).text();
+      expect(text).toContain("# Not carried: dev.impl's launch additions");
+      expect(text).not.toContain("dev.plain's launch additions");
+    } finally {
+      if (saved === undefined) delete process.env["OPENRIG_HOME"]; else process.env["OPENRIG_HOME"] = saved;
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it.each([undefined, "none"] as const)("carries a seat's plugin channels into the exported member with claude_mcp=%s (#2044)", async claudeMcp => {
+    const home = fs.mkdtempSync(nodePath.join(os.tmpdir(), "export-channels-"));
+    const saved = process.env["OPENRIG_HOME"];
+    try {
+      process.env["OPENRIG_HOME"] = home;
+      const rig = rigRepo.createRig("r98");
+      const pod = new PodRepository(db).createPod(rig.id, "dev", "Dev");
+      const member = { podId: pod.id, agentRef: "local:agents/impl", profile: "default", cwd: "/workspace" };
+      rigRepo.addNode(rig.id, "dev.impl", { ...member, runtime: "claude-code", claudeMcp });
+      rigRepo.addNode(rig.id, "dev.plain", { ...member, runtime: "claude-code" });
+      const channels = ["plugin:example-channel@example", "plugin:second@example"];
+      expect(prepareSeatLaunchAdditions(seatSkillPaths({ rigId: rig.id, logicalId: "dev.impl", runtime: "claude-code" }), { pluginChannels: channels }).ok).toBe(true);
+      const text = await (await app.request(`/api/rigs/${rig.id}/spec`)).text();
+      expect(text).not.toContain("# Not carried:");
+      const parsed = PodRigSpecCodec.parse(text);
+      expect(PodRigSpecSchema.validate(parsed)).toMatchObject({ valid: true });
+      const members = PodRigSpecSchema.normalize(parsed as Record<string, unknown>).pods[0]!.members;
+      expect(members.find((m) => m.id === "impl")?.pluginChannels).toEqual(channels);
+      expect(members.find((m) => m.id === "impl")?.claudeMcp).toBe(claudeMcp);
+      expect(members.find((m) => m.id === "plain")?.pluginChannels).toBeUndefined();
+      expect(members.find((m) => m.id === "plain")?.claudeMcp).toBeUndefined();
+    } finally {
+      if (saved === undefined) delete process.env["OPENRIG_HOME"]; else process.env["OPENRIG_HOME"] = saved;
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["legacy", "pod-aware"])("names dormant Claude MCP choices in the %s YAML export without changing JSON", async (format) => {
+    const rig = rigRepo.createRig("mcp-export");
+    const pod = format === "pod-aware" ? new PodRepository(db).createPod(rig.id, "dev", "Dev") : undefined;
+    const member = { runtime: "claude-code", podId: pod?.id, agentRef: "local:agents/worker", profile: "default", cwd: "/workspace" };
+    const switched = rigRepo.addNode(rig.id, "dev.switched", { ...member, claudeMcp: "none" });
+    rigRepo.addNode(rig.id, "dev.claude", { ...member, claudeMcp: "none" });
+    rigRepo.addNode(rig.id, "dev.plain", { ...member, runtime: "codex" });
+    // Runtime switches retain the saved Claude choice, while the exported declaration describes Codex.
+    db.prepare("UPDATE nodes SET runtime = 'codex' WHERE id = ?").run(switched.id);
+
+    const response = await app.request(`/api/rigs/${rig.id}/spec`);
+    expect(response.status).toBe(200);
+    const yaml = await response.text();
+    expect(yaml.split("\n").filter((line) => line.startsWith("# Not carried:"))).toEqual([
+      "# Not carried: dev.switched's claude_mcp: none; add it again if this exported copy is switched back to Claude.",
+    ]);
+    const parsed = PodRigSpecCodec.parse(yaml);
+    if (format === "pod-aware") expect(PodRigSpecSchema.validate(parsed).valid).toBe(true);
+
+    const jsonResponse = await app.request(`/api/rigs/${rig.id}/spec.json`);
+    expect(jsonResponse.status).toBe(200);
+    const json = await jsonResponse.json();
+    const members: Array<{ id: string; runtime: string; claudeMcp?: string }> = format === "pod-aware" ? json.pods[0].members : json.nodes;
+    const id = (name: string) => format === "pod-aware" ? name : `dev.${name}`;
+    expect(members.find((entry) => entry.id === id("switched"))).toMatchObject({ runtime: "codex" });
+    expect(members.find((entry) => entry.id === id("switched"))).not.toHaveProperty("claudeMcp");
+    expect(members.find((entry) => entry.id === id("claude"))).toMatchObject({ runtime: "claude-code", claudeMcp: "none" });
+    expect(members.find((entry) => entry.id === id("plain"))).not.toHaveProperty("claudeMcp");
+    expect(json).not.toHaveProperty("notCarried");
+    expect(rigRepo.getRig(rig.id)?.nodes.find((node) => node.id === switched.id)?.claudeMcp).toBe("none");
+  });
+
+  it("GET /api/rigs/:rigId/spec encodes non-ASCII X-Rig-Root header safely", async () => {
+    const rig = rigRepo.createRig("non-ascii-rig");
+    const pod = new PodRepository(db).createPod(rig.id, "dev", "Dev");
+    rigRepo.addNode(rig.id, "dev.worker", {
+      runtime: "claude-code",
+      podId: pod.id,
+      agentRef: "local:agents/worker",
+      profile: "default",
+      cwd: "/workspace/app",
+    });
+    rigRepo.setRigStartupLayers(rig.id, {
+      root: "/fixtures/项目/team",
+      cultureFile: "culture.md",
+      startup: {
+        files: [{ kind: "file", path: "start.md", orientation: "role", deliveryHint: "guidance_merge", required: true, appliesOn: ["fresh_start"] }],
+        actions: [],
+      },
+    });
+
+    const res = await app.request(`/api/rigs/${rig.id}/spec`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-rig-root")).toBe(encodeURIComponent("/fixtures/项目/team"));
+    expect(decodeURIComponent(res.headers.get("x-rig-root")!)).toBe("/fixtures/项目/team");
+  });
+
   it("GET nonexistent rig -> 404", async () => {
     const res = await app.request("/api/rigs/nonexistent/spec");
     expect(res.status).toBe(404);
@@ -117,6 +255,112 @@ describe("Rigspec export routes", () => {
 
     const res = await app.request(`/api/rigs/${rig.id}/spec`);
     expect(res.status).toBe(500);
+  });
+
+  it("#3253: a seat's unreadable process_limits exports the rest of the rig and names the seat, on YAML and JSON, flat and pod-aware", async () => {
+    const flat = rigRepo.createRig("limits-flat");
+    const flatBad = rigRepo.addNode(flat.id, "worker", { runtime: "codex", cwd: ".", processLimits: { tasksMax: 512 } });
+    rigRepo.addNode(flat.id, "capped", { runtime: "codex", cwd: ".", processLimits: { tasksMax: 64 } });
+    const podded = rigRepo.createRig("limits-pod");
+    const pod = new PodRepository(db).createPod(podded.id, "dev", "Dev");
+    const podBad = rigRepo.addNode(podded.id, "dev.impl", { runtime: "codex", podId: pod.id, agentRef: "local:agents/impl", profile: "default",
+      cwd: ".", processLimits: { tasksMax: 512 } });
+    rigRepo.addNode(podded.id, "dev.qa", { runtime: "codex", podId: pod.id, agentRef: "local:agents/qa", profile: "default",
+      cwd: ".", processLimits: { tasksMax: 64 } });
+    for (const [rig, bad, seat] of [[flat, flatBad, "worker"], [podded, podBad, "dev.impl"]] as const) {
+      db.prepare("UPDATE nodes SET process_limits = ? WHERE id = ?").run("{not json", bad.id);
+      const warning = [{ logicalId: seat, reason: "process_limits can't be read; not carried" }];
+      // these fixture seats have no recorded source, so the pod-aware rig also names their member startup
+      const limitWarnings = (res: Response) => (JSON.parse(decodeURIComponent(res.headers.get("X-OpenRig-Export-Warnings")!)) as
+        Array<{ logicalId: string; reason: string }>).filter((w) => w.reason.startsWith("process_limits"));
+      const yamlRes = await app.request(`/api/rigs/${rig.id}/spec`);
+      expect(yamlRes.status, seat).toBe(200);
+      expect(limitWarnings(yamlRes)).toEqual(warning);
+      const yaml = await yamlRes.text();
+      expect(yaml).toContain(`# Not carried: ${seat}'s process_limits, because the saved value can't be read; it stays stored as it is. ` +
+        "Fix it by re-applying the spec with process_limits: { tasks_max: <N>, memory_max: <size> }, or clear it with process_limits: {}");
+      // the other seat's valid limit still exports; the unreadable one isn't invented or emptied
+      expect(yaml.split("\n").filter((line) => !line.startsWith("#") && line.includes("tasks_max:")).map((line) => line.trim()))
+        .toEqual(["tasks_max: 64"]);
+      const jsonRes = await app.request(`/api/rigs/${rig.id}/spec.json`);
+      expect(jsonRes.status, seat).toBe(200);
+      expect(limitWarnings(jsonRes)).toEqual(warning);
+      expect((await jsonRes.text()).match(/"tasksMax":\d+/g)).toEqual(['"tasksMax":64']);
+      expect(db.prepare("SELECT process_limits FROM nodes WHERE id = ?").get(bad.id)).toEqual({ process_limits: "{not json" });
+    }
+  });
+
+  /** dev.impl is the model of a seat pool whose agent dev.impl-s1 is live; dev.qa and arch.reviewer are ordinary. */
+  function seedPooledRig(name: string) {
+    const rig = rigRepo.createRig(name);
+    const pods = new PodRepository(db);
+    const dev = pods.createPod(rig.id, "dev", "Dev");
+    const arch = pods.createPod(rig.id, "arch", "Arch");
+    const member = { agentRef: "local:agents/impl", profile: "default", cwd: "." };
+    const model = rigRepo.addNode(rig.id, "dev.impl", { ...member, runtime: "claude-code", podId: dev.id,
+      pool: { spec: { max: 2, min: 0, dispatchAfterSeconds: 60, idleGraceSeconds: 300, cooldownSeconds: 60, dispatchTag: null, cwdTemplate: null, drain: false } } });
+    const qa = rigRepo.addNode(rig.id, "dev.qa", { ...member, runtime: "codex", podId: dev.id });
+    const reviewer = rigRepo.addNode(rig.id, "arch.reviewer", { ...member, runtime: "codex", podId: arch.id });
+    const agent = rigRepo.addNode(rig.id, "dev.impl-s1", { ...member, runtime: "claude-code", podId: dev.id });
+    new SeatPoolSlotsRepository(db).insert({ modelNodeId: model.id, slotNumber: 1, nodeId: agent.id, phase: "live", at: "2026-11-18T00:00:00.000Z" });
+    return { rig, model, qa, reviewer, agent };
+  }
+
+  const headerWarnings = (res: Response) =>
+    JSON.parse(decodeURIComponent(res.headers.get("X-OpenRig-Export-Warnings") ?? "%5B%5D")) as Array<{ logicalId: string; reason: string }>;
+
+  it("An edge that touches a pool agent is left out of edges and named in both the YAML # Not carried line and the X-OpenRig-Export-Warnings header", async () => {
+    const { rig, model, qa, reviewer, agent } = seedPooledRig("pool-edges");
+    rigRepo.addEdge(rig.id, model.id, qa.id, "can_observe");
+    rigRepo.addEdge(rig.id, qa.id, agent.id, "delegates_to");
+    rigRepo.addEdge(rig.id, agent.id, reviewer.id, "escalates_to");
+    const edgeWarnings = [
+      { logicalId: "dev.impl-s1", reason: "escalates_to edge to arch.reviewer touches a seat pool agent; not carried" },
+      { logicalId: "dev.qa", reason: "delegates_to edge to dev.impl-s1 touches a seat pool agent; not carried" },
+    ];
+    const yamlRes = await app.request(`/api/rigs/${rig.id}/spec`);
+    expect(yamlRes.status).toBe(200);
+    expect(headerWarnings(yamlRes).filter((w) => w.reason.includes(" edge "))).toEqual(edgeWarnings);
+    const yaml = await yamlRes.text();
+    expect(yaml.split("\n").filter((line) => line.startsWith("# Not carried:") && line.includes(" edge "))).toEqual([
+      "# Not carried: the escalates_to edge from dev.impl-s1 to arch.reviewer, because it touches a seat pool agent, which an export leaves out.",
+      "# Not carried: the delegates_to edge from dev.qa to dev.impl-s1, because it touches a seat pool agent, which an export leaves out.",
+    ]);
+    const spec = PodRigSpecSchema.normalize(PodRigSpecCodec.parse(yaml) as Record<string, unknown>);
+    expect(spec.pods.find((p) => p.id === "dev")!.edges).toEqual([{ kind: "can_observe", from: "impl", to: "qa" }]);
+    expect(spec.edges).toEqual([]);
+    const jsonRes = await app.request(`/api/rigs/${rig.id}/spec.json`);
+    expect(jsonRes.status).toBe(200);
+    expect(headerWarnings(jsonRes).filter((w) => w.reason.includes(" edge "))).toEqual(edgeWarnings);
+    const json = await jsonRes.json() as import("../src/domain/types.js").RigSpec;
+    expect(json.pods.find((p) => p.id === "dev")!.edges).toEqual([{ kind: "can_observe", from: "impl", to: "qa" }]);
+    expect(json.edges).toEqual([]);
+  });
+
+  it.each(["{not json", JSON.stringify({ max: -1 })])("A stored block that can't be read (%s) is left out of the export and named in a # Not carried line and in the header, and the rest of the rig exports", async (stored) => {
+    const { rig, model } = seedPooledRig("pool-unreadable");
+    db.prepare("UPDATE nodes SET pool = ? WHERE id = ?").run(stored, model.id);
+    const poolWarning = [{ logicalId: "dev.impl", reason: "pool can't be read; not carried" }];
+    const yamlRes = await app.request(`/api/rigs/${rig.id}/spec`);
+    expect(yamlRes.status).toBe(200);
+    expect(headerWarnings(yamlRes).filter((w) => w.reason.startsWith("pool"))).toEqual(poolWarning);
+    const yaml = await yamlRes.text();
+    expect(yaml.split("\n").filter((line) => line.startsWith("# Not carried:") && line.includes("pool"))).toEqual([
+      "# Not carried: dev.impl's pool, because the saved block can't be read; it stays stored as it is. Fix it by re-applying the spec " +
+        "with a pool block that can be used, or clear it with pool: {}.",
+    ]);
+    expect(yaml.split("\n").filter((line) => !line.startsWith("#") && /^\s*pool:/.test(line))).toEqual([]);
+    const parsed = PodRigSpecCodec.parse(yaml);
+    expect(PodRigSpecSchema.validate(parsed).valid).toBe(true);
+    const spec = PodRigSpecSchema.normalize(parsed as Record<string, unknown>);
+    expect(spec.pods.find((p) => p.id === "dev")!.members.map((m) => m.id).sort()).toEqual(["impl", "qa"]);
+    expect(spec.pods.find((p) => p.id === "arch")!.members.map((m) => m.id)).toEqual(["reviewer"]);
+    const jsonRes = await app.request(`/api/rigs/${rig.id}/spec.json`);
+    expect(jsonRes.status).toBe(200);
+    expect(headerWarnings(jsonRes).filter((w) => w.reason.startsWith("pool"))).toEqual(poolWarning);
+    const json = await jsonRes.json() as import("../src/domain/types.js").RigSpec;
+    expect(json.pods.find((p) => p.id === "dev")!.members.find((m) => m.id === "impl")?.pool).toBeUndefined();
+    expect(db.prepare("SELECT pool FROM nodes WHERE id = ?").get(model.id)).toEqual({ pool: stored });
   });
 });
 
@@ -658,6 +902,159 @@ describe("Rigspec import routes (pod-aware dual-stack)", () => {
 
     expect(db.prepare("SELECT workspace_json, updated_at FROM rigs WHERE id = ?").get(rig.id)).toEqual(preimage);
     expect(rigRepo.listRigs()).toHaveLength(1);
+  });
+
+  it("#1631 materialize and re-import preserve a member-only startup root and declaration", async () => {
+    const originalRoot = nodePath.resolve(os.tmpdir(), "original-member-root");
+    const yaml = POD_AWARE_YAML.replace('agent_ref: "local:agents/impl"', 'agent_ref: "builtin:terminal"').replace("runtime: claude-code", "runtime: terminal").replace("profile: default", "profile: none").replace("        cwd: /tmp", `        cwd: /tmp
+        startup:
+          files:
+            - path: notes/member.md
+              delivery_hint: send_text
+          actions:
+            - type: send_text
+              value: orient
+              phase: after_ready
+              idempotent: true`);
+    const created = await app.request("/api/rigs/import/materialize", {
+      method: "POST", headers: { "Content-Type": "text/yaml", "X-Rig-Root": originalRoot }, body: yaml,
+    });
+    const first = await created.json();
+    expect(created.status, JSON.stringify(first)).toBe(201);
+    const rigId = first.rigId as string;
+    expect(rigRepo.getRigStartupLayers(rigId)?.root).toBe(originalRoot);
+    const exportedResponse = await app.request(`/api/rigs/${rigId}/spec`);
+    expect(decodeURIComponent(exportedResponse.headers.get("X-Rig-Root")!)).toBe(originalRoot);
+    const exported = await exportedResponse.text();
+    const normalized = PodRigSpecSchema.normalize(PodRigSpecCodec.parse(exported) as Record<string, unknown>);
+    const startup = normalized.pods[0]!.members[0]!.startup!;
+    expect(startup.files[0]!.path).toBe("notes/member.md");
+    expect(startup.actions[0]!.value).toBe("orient");
+    expect(nodePath.resolve(originalRoot, startup.files[0]!.path)).toBe(nodePath.join(originalRoot, "notes", "member.md"));
+    const restored = await app.request("/api/rigs/import/materialize", {
+      method: "POST", headers: { "Content-Type": "text/yaml", "X-Rig-Root": originalRoot },
+      body: exported.replace("name: pod-rig", "name: restored-rig"),
+    });
+    expect(restored.status).toBe(201);
+    const second = await restored.json();
+    const reexport = await (await app.request(`/api/rigs/${second.rigId}/spec`)).text();
+    const roundTrip = PodRigSpecSchema.normalize(PodRigSpecCodec.parse(reexport) as Record<string, unknown>);
+    expect(roundTrip.pods[0]!.members[0]!.startup).toEqual(startup);
+    expect(sessionRegistry.getSessionsForRig(rigId)).toEqual([]);
+    expect(sessionRegistry.getSessionsForRig(second.rigId)).toEqual([]);
+  });
+
+  it("#1631 materializes and exports action-only pod startup without launching", async () => {
+    const root = nodePath.resolve(os.tmpdir(), "pod-action-root");
+    const yaml = POD_AWARE_YAML.replace('agent_ref: "local:agents/impl"', 'agent_ref: "builtin:terminal"')
+      .replace("runtime: claude-code", "runtime: terminal").replace("profile: default", "profile: none")
+      .replace("    label: Dev", `    label: Dev
+    startup:
+      actions:
+        - type: send_text
+          value: orient pod
+          phase: after_ready
+          idempotent: true
+          applies_on: [fresh_start]`);
+    const created = await app.request("/api/rigs/import/materialize", { method: "POST",
+      headers: { "Content-Type": "text/yaml", "X-Rig-Root": root }, body: yaml });
+    expect(created.status).toBe(201);
+    const { rigId } = await created.json();
+    const exported = await (await app.request(`/api/rigs/${rigId}/spec`)).text();
+    const parsed = PodRigSpecSchema.normalize(PodRigSpecCodec.parse(exported) as Record<string, unknown>);
+    expect(parsed.pods[0]!.startup?.actions).toMatchObject([{ type: "send_text", value: "orient pod", phase: "after_ready", idempotent: true, appliesOn: ["fresh_start"] }]);
+    const restored = await app.request("/api/rigs/import/materialize", { method: "POST",
+      headers: { "Content-Type": "text/yaml", "X-Rig-Root": root }, body: exported.replace("name: pod-rig", "name: restored-pod") });
+    expect(restored.status).toBe(201);
+    const second = await restored.json();
+    const again = await (await app.request(`/api/rigs/${second.rigId}/spec`)).text();
+    const roundTrip = PodRigSpecSchema.normalize(PodRigSpecCodec.parse(again) as Record<string, unknown>);
+    expect(roundTrip.pods[0]!.startup).toEqual(parsed.pods[0]!.startup);
+    expect(sessionRegistry.getSessionsForRig(rigId)).toEqual([]);
+    expect(sessionRegistry.getSessionsForRig(second.rigId)).toEqual([]);
+  });
+
+  it("#1631 exports pod actions and member startup together", async () => {
+    const root = nodePath.resolve(os.tmpdir(), "pod-member-root");
+    const yaml = POD_AWARE_YAML.replace('agent_ref: "local:agents/impl"', 'agent_ref: "builtin:terminal"')
+      .replace("runtime: claude-code", "runtime: terminal").replace("profile: default", "profile: none")
+      .replace("    label: Dev", `    label: Dev
+    startup:
+      actions:
+        - type: send_text
+          value: pod orientation
+          phase: after_ready
+          idempotent: true
+          applies_on: [fresh_start]`)
+      .replace("        cwd: /tmp", `        cwd: /tmp
+        startup:
+          files:
+            - path: member.md
+              required: false`);
+    const created = await app.request("/api/rigs/import/materialize", { method: "POST",
+      headers: { "Content-Type": "text/yaml", "X-Rig-Root": root }, body: yaml });
+    expect(created.status).toBe(201);
+    const { rigId } = await created.json();
+    const response = await app.request(`/api/rigs/${rigId}/spec`);
+    const parsed = PodRigSpecSchema.normalize(PodRigSpecCodec.parse(await response.text()) as Record<string, unknown>);
+    expect(parsed.pods[0]!.startup?.actions[0]?.value).toBe("pod orientation");
+    expect(parsed.pods[0]!.members[0]!.startup?.files[0]?.path).toBe("member.md");
+    expect(sessionRegistry.getSessionsForRig(rigId)).toEqual([]);
+  });
+
+  it("#1631 preserves mixed pod files and actions with their original root", async () => {
+    const root = nodePath.resolve(os.tmpdir(), "mixed-pod-root");
+    const yaml = POD_AWARE_YAML.replace('agent_ref: "local:agents/impl"', 'agent_ref: "builtin:terminal"')
+      .replace("runtime: claude-code", "runtime: terminal").replace("profile: default", "profile: none")
+      .replace("    label: Dev", `    label: Dev
+    startup:
+      files:
+        - path: docs/pod.md
+          required: false
+      actions:
+        - type: send_text
+          value: orient pod
+          phase: after_ready
+          idempotent: true
+          applies_on: [fresh_start]`);
+    const created = await app.request("/api/rigs/import/materialize", { method: "POST",
+      headers: { "Content-Type": "text/yaml", "X-Rig-Root": root }, body: yaml });
+    expect(created.status).toBe(201);
+    const { rigId } = await created.json();
+    const response = await app.request(`/api/rigs/${rigId}/spec`);
+    expect(decodeURIComponent(response.headers.get("X-Rig-Root")!)).toBe(root);
+    const parsed = PodRigSpecSchema.normalize(PodRigSpecCodec.parse(await response.text()) as Record<string, unknown>);
+    expect(parsed.pods[0]!.startup?.files[0]?.path).toBe("docs/pod.md");
+    expect(nodePath.resolve(root, parsed.pods[0]!.startup!.files[0]!.path)).toBe(nodePath.join(root, "docs", "pod.md"));
+    expect(parsed.pods[0]!.startup?.actions[0]?.value).toBe("orient pod");
+    expect(rigRepo.getRigStartupLayers(rigId)?.podStartupFiles?.dev?.[0]?.path).toBe("docs/pod.md");
+  });
+
+  it("#1631 exports files and actions for the valid __proto__ pod id", async () => {
+    const root = nodePath.resolve(os.tmpdir(), "proto-pod-root");
+    const yaml = POD_AWARE_YAML.replace('agent_ref: "local:agents/impl"', 'agent_ref: "builtin:terminal"')
+      .replace("runtime: claude-code", "runtime: terminal").replace("profile: default", "profile: none")
+      .replace("  - id: dev", "  - id: __proto__")
+      .replace("    label: Dev", `    label: Dev
+    startup:
+      files:
+        - path: docs/pod.md
+          required: false
+      actions:
+        - type: send_text
+          value: orient pod
+          phase: after_ready
+          idempotent: true
+          applies_on: [fresh_start]`);
+    const created = await app.request("/api/rigs/import/materialize", { method: "POST",
+      headers: { "Content-Type": "text/yaml", "X-Rig-Root": root }, body: yaml });
+    expect(created.status, JSON.stringify(await created.clone().json())).toBe(201);
+    const { rigId } = await created.json();
+    const response = await app.request(`/api/rigs/${rigId}/spec`);
+    const parsed = PodRigSpecSchema.normalize(PodRigSpecCodec.parse(await response.text()) as Record<string, unknown>);
+    expect(parsed.pods[0]!.id).toBe("__proto__");
+    expect(parsed.pods[0]!.startup?.files[0]?.path).toBe("docs/pod.md");
+    expect(parsed.pods[0]!.startup?.actions[0]?.value).toBe("orient pod");
   });
 
   it("POST /api/rigs/import/materialize creates rig structure without launching", async () => {

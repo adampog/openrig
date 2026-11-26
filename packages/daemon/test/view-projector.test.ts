@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { Hono } from "hono";
+import { viewsRoutes } from "../src/routes/views.js";
 import type Database from "better-sqlite3";
 import { createDb } from "../src/db/connection.js";
 import { migrate } from "../src/db/migrate.js";
@@ -134,6 +136,32 @@ describe("ViewProjector (PL-004 Phase B; L5 read-only projections)", () => {
     expect(result.rowCount).toBe(3); // all 3 product-lab qitems
   });
 
+  it.each(["dev_team", "dev%team", "dev\\team"])("HTTP rig filter treats %s as a literal session suffix, in recently-active and activity", async (rig) => {
+    const exact = [];
+    for (const [sourceSession, destinationSession] of [
+      [`alice@${rig}`, "bob@elsewhere"],
+      ["alice@elsewhere", `bob@${rig}`],
+    ]) {
+      exact.push((await queueRepo.create({ sourceSession, destinationSession, body: "exact rig", nudge: false })).qitemId);
+    }
+    await queueRepo.create({ sourceSession: "alice@devXteam", destinationSession: "bob@dev-other-team", body: "different rig", nudge: false });
+    const app = new Hono();
+    app.use("*", async (c, next) => {
+      c.set("viewProjector" as never, projector as never);
+      c.set("eventBus" as never, bus as never);
+      await next();
+    });
+    app.route("/api/views", viewsRoutes());
+    // activity has its own rig clause over the transitions join; each row here is one created transition.
+    for (const lens of ["recently-active", "activity"]) {
+      const response = await app.request(`/api/views/${lens}?rig=${encodeURIComponent(rig)}`);
+      expect(response.status).toBe(200);
+      const result = await response.json();
+      expect(result.rows.map((row: { qitem_id: string }) => row.qitem_id).sort()).toEqual(exact.sort());
+      expect(result.rowCount).toBe(2);
+    }
+  });
+
   it("show <unknown-view> throws view_not_found", () => {
     expect(() => projector.show("nonexistent-view")).toThrow(ViewProjectorError);
   });
@@ -201,15 +229,20 @@ describe("ViewProjector (PL-004 Phase B; L5 read-only projections)", () => {
     expect(result.custom[0]!.viewName).toBe("my-view");
   });
 
-  it("notifyViewChanged persists view.changed for the enclosing drain without direct delivery", () => {
+  it("notifyViewChanged delivers view.changed in memory and stores no row", () => {
     const captured: unknown[] = [];
     bus.subscribe((e) => captured.push(e));
+    const before = bus.maxSeq();
     projector.notifyViewChanged("recently-active", "queue.created");
-    expect(captured).toEqual([]);
-    expect(bus.replayAll(0).at(-1)).toMatchObject({
+    expect(captured).toHaveLength(1);
+    expect(captured[0]).toMatchObject({
       type: "view.changed",
       viewName: "recently-active",
       cause: "queue.created",
+      transient: true,
+      seq: before,
     });
+    expect(bus.replayAll(0).filter((event) => event.type === "view.changed")).toEqual([]);
+    expect(bus.maxSeq()).toBe(before);
   });
 });

@@ -6,13 +6,13 @@ topics: [coordination, observability]
 domains: [engineering-advisor, operating-advisor, orchestrator, human-operator]
 applies-when: |
   Need to know how the daemon-backed Mission Control surface works — the
-  seven views, the eight write verbs, the action audit table, the
+  seven views, the nine write verbs, the action audit table, the
   bearer-token middleware, or how queue observability maps to the
   coordination primitive's sources.
 siblings: [coordination-primitive.md, workflow-runtime.md, ../ui/project-and-for-you.md]
 prerequisite-reads: [../README.md, coordination-primitive.md]
-last-verified-against-source: 2caac7dd1bb16585138a6f7c1dd8b1f0752c49f7
-last-updated: 2026-10-05
+last-verified-against-source: e8f0ab340db773392ec8be75b072d1c0f3068a50
+last-updated: 2026-10-08
 ---
 
 # Mission Control — Queue Observability + Verb Contract
@@ -20,12 +20,12 @@ last-updated: 2026-10-05
 Mission Control is the daemon's queue-observability and operator-action
 surface, mounted at `/api/mission-control` over the coordination primitive's
 `queue_items` and `stream_items` (see `coordination-primitive.md`). It has
-seven views, eight verbs, a recent-ships cap of 10
+seven views, nine verbs, a recent-ships cap of 10
 (`mission-control-read-layer.ts:107`), and a daemon-backed action audit
 table. In the web UI the old `/mission-control` page now redirects to
 `/for-you`, and the For You feed carries the verb actions (§6).
 
-> Verified against source at main `2caac7dd1bb16585138a6f7c1dd8b1f0752c49f7`. A bare file name such as
+> Verified against source at main `e8f0ab340db773392ec8be75b072d1c0f3068a50`. A bare file name such as
 > `mission-control-read-layer.ts:31` is in
 > `packages/daemon/src/domain/mission-control/`; `domain/…`, `routes/…`,
 > `middleware/…`, `db/…`, `index.ts`, `server.ts` and `startup.ts` are under
@@ -85,14 +85,14 @@ There is no filesystem fallback. When no `StreamStore` is wired,
 > `rig` or `rig tui` is called the "mission-control TUI" in source
 > (`packages/tui/README.md:1`), but it does not call these routes.
 
-## 2. The eight verbs (the write contract)
+## 2. The nine verbs (the write contract)
 
-`MISSION_CONTROL_VERBS` (`mission-control-action-log.ts:14–26`) is the verb
+`MISSION_CONTROL_VERBS` (`mission-control-action-log.ts:14–29`) is the verb
 list. The verbs execute through `MissionControlWriteContract.act`
 (`mission-control-write-contract.ts:131`); the closure mapping is
 `verbToClosure` (`:509`).
 
-Verbs: **8** — `sed -n '/^export const MISSION_CONTROL_VERBS = \[/,/\] as const;/p' packages/daemon/src/domain/mission-control/mission-control-action-log.ts | grep -c '^  "'`
+Verbs: **9** — `sed -n '/^export const MISSION_CONTROL_VERBS = \[/,/\] as const;/p' packages/daemon/src/domain/mission-control/mission-control-action-log.ts | grep -c '^  "'`
 
 | Verb | Effect |
 |---|---|
@@ -103,7 +103,8 @@ Verbs: **8** — `sed -n '/^export const MISSION_CONTROL_VERBS = \[/,/\] as cons
 | `hold` | `state="blocked"`, `closure_reason="blocked_on"` |
 | `drop` | `state="done"`, `closure_reason="canceled"` |
 | `handoff` | same closure and new destination item as `route`; the 4-step shape (see below) |
-| `resolve` | only for a `blocked` item parked on a human seat: moves it to `in-progress` with the required decision text as the transition note; no closure and no new item (`:369`, `:386`, `:410–411`). After commit it sends a best-effort nudge with the decision text to the item's owner unless `notify: false` (`:450–467`); the CLI wrapper is `rig queue resolve <qitemId> --decision <text>` (`packages/cli/src/commands/queue.ts:828`) |
+| `resolve` | for a `blocked` item parked on a human seat or a well-formed typed gate (`external:`, `fold:`, `auth:`): moves it to `in-progress` with required decision/satisfaction evidence in the transition note; typed waits are recorded as blocker resolutions, not human decisions. Qitem dependencies, malformed gates and non-blocked items are refused; no closure and no new item (`:369`, `:386`, `:410–411`). After commit it sends a best-effort nudge with the decision text to the item's owner unless `notify: false` (`:450–467`); the CLI wrapper is `rig queue resolve <qitemId> --decision <text>` (`packages/cli/src/commands/queue.ts:828`) |
+| `answer` | only for a `pending` ask addressed to the acting person: a choice (`questionId` + `optionId`) through `QueueRepository.recordHumanAnswer`, or their words (`decision`) through `resolveDirectHumanReply`, each with its existing meaning (a partial choice set stays pending; words fill the first unanswered question). Once answered, one reply row goes to the asking seat (`human-answer` tag, `replyTo` the ask, an id derived from the ask) and then the ask closes once with `human-decision-resolved`, the order Slack's answer continuation uses. With neither a choice nor words, a complete question set whose return didn't finish is sent again with exactly its recorded answers. A closed ask answers 409 `qitem_already_terminal` and records nothing; a refused answer is 400 `answer_not_recorded`; 409 `answer_not_closed` means the ask stayed open: its return failed, it changed before its close, or a retry came in other words than the reply already returned (that retry isn't sent). The TUI's Feed sends it |
 
 `annotate` requires `annotation`, `hold` and `drop` require `reason`, `route`
 and `handoff` require `destinationSession`, and `resolve` requires a non-empty
@@ -113,12 +114,12 @@ the audit record instead; the wrapped `reason_required` error has no status
 mapping, so it returns 500 (`mission-control-action-log.ts:128–133`,
 `mission-control-write-contract.ts:245–248`). Items already `done` or
 `handed-off` are refused with 409 `qitem_already_terminal`, except under
-`resolve`, which answers 409 `qitem_not_leg1_parked` for any item not parked on
-a human seat. An unknown item returns 404 `qitem_not_found`
+`resolve`, which answers 409 `qitem_not_leg1_parked` for any item that is not
+blocked on a human seat or a well-formed typed gate (`external:`, `fold:`, `auth:`). An unknown item returns 404 `qitem_not_found`
 (`routes/mission-control.ts:240–251`, `:330–341`).
 
-Each verb is one atomic daemon transaction: the queue mutation via
-`QueueRepository.updateWithinTransaction()` (`domain/queue-repository.ts:2361`,
+Each verb except `answer` is one atomic daemon transaction (`answer`'s queue writes are the repository's own, in the order above, then its audit row and event): the queue mutation via
+`QueueRepository.updateWithinTransaction()` (`domain/queue-repository.ts:2371`,
 which keeps the hot-potato closure validation — see
 `coordination-primitive.md` §3), an audit row in `mission_control_actions`
 (`mission-control-write-contract.ts:207`), and a persisted
@@ -134,7 +135,7 @@ created in the same transaction (`createWithinTransaction`, `:173`), along
 with the successor's wake intent (`stageWakeIntent`, `:195`, checked by
 `assertTerminalClosureHasIntent`, `:242`). The wake itself runs after commit
 (`deliverWakeForSuccessor`, `:264`). It is on unless the caller passes
-`notify: false` (`domain/queue-repository.ts:1174`), and a notify failure
+`notify: false` (`domain/queue-repository.ts:1182`), and a notify failure
 does NOT roll back durable mutations (`mission-control-write-contract.ts:272–275`).
 A failed destination create rolls back the source closure, the audit row and
 the new item together
@@ -209,7 +210,7 @@ in `audit_notes_json` (`domain/scope/scope-approve.ts:292`). The audit browse
   `GET /api/mission-control/audit` (`routes/mission-control.ts:441`) with
   filters (including `scope_tier`, `scope_id`, `scope_path` and
   `approval_scope` for scope-approval rows) and `(limit, before_id)`
-  pagination cursored on SQLite `rowid` (`audit-browse.ts:134`); the page size
+  pagination cursored on `(acted_at, rowid)` (`audit-browse.ts:134`); the page size
   defaults to 50 and is capped at 200 (`audit-browse.ts:61–62`).
 
 ## 5. Mission Control events

@@ -9,6 +9,12 @@ import { DaemonClient } from "../src/client.js";
 import { STATE_FILE, type LifecycleDeps, type DaemonState } from "../src/daemon-lifecycle.js";
 import type { StatusDeps } from "../src/commands/status.js";
 
+const receiptWrites = vi.hoisted(() => vi.fn());
+vi.mock("../src/lib/bundle-source.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../src/lib/bundle-source.js")>(),
+  writeBundleBuildReceipt: receiptWrites,
+}));
+
 function mockLifecycleDeps(overrides?: Partial<LifecycleDeps>): LifecycleDeps {
   return {
     spawn: vi.fn(() => ({ pid: 1, unref: vi.fn() }) as never),
@@ -154,13 +160,17 @@ describe("Bundle CLI", () => {
         // Capture query for assertion if needed; for now return a static fixture
         const url = new URL(req.url, "http://x");
         const rigFilter = url.searchParams.get("rig");
+        const since = url.searchParams.get("since");
         const allRecs = [
           { installedAt: "2026-05-18T10:00:00Z", bundlePath: "/tmp/a.rigbundle", targetRigName: "alpha", outcome: "success" },
           { installedAt: "2026-05-18T11:00:00Z", bundlePath: "/tmp/b.rigbundle", targetRigName: "beta", outcome: "failed" },
         ];
-        const recs = rigFilter ? allRecs.filter((r) => r.targetRigName === rigFilter) : allRecs;
+        // Like the daemon: since is compared as text, with an advisory for the values it doesn't read as a date or time.
+        const recs = allRecs.filter((r) => (!rigFilter || r.targetRigName === rigFilter) && (!since || r.installedAt >= since));
+        const advised = since === "garbage" || since === "2026-13-45";
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ records: recs, total: recs.length }));
+        res.end(JSON.stringify({ records: recs, total: recs.length,
+          ...(advised ? { advisories: [`since "${since}" was not recognised as a date or time; the existing text comparison against installedAt was used`] } : {}) }));
       } else {
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "not found" }));
@@ -402,6 +412,22 @@ describe("Bundle CLI", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it("default bundle create keeps the authored rig despite an inconsistent recommendation", async () => {
+    const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "cli-default-config-"));
+    try {
+      const spec = nodePath.join(dir, "rig.yaml");
+      fs.writeFileSync(spec, 'version: "0.2"\nname: r\npods:\n  - id: build\n    members:\n      - { id: lead, agent_ref: "local:a", profile: lead, runtime: claude-code }\n');
+      fs.writeFileSync(nodePath.join(dir, "configurations.yaml"), "schema: openrig.bundle-configurations/v1\nrecommended: all-pi\nseats:\n  build.lead: { runtimes: { claude-code: lead, pi: lead-pi } }\npresets:\n  authored: { build.lead: claude-code }\n  all-pi: { build.lead: pi }\n");
+      capturedCreateBodies = [];
+      await captureLogs(async () => {
+        await makeCmd().parseAsync(["node", "rig", "bundle", "create", spec, "-o", nodePath.join(dir, "out.rigbundle")]);
+      });
+      expect(capturedCreateBodies).toHaveLength(1);
+      expect(capturedCreateBodies[0]!["specPath"]).toBe(spec);
+      expect(capturedCreateBodies[0]!["configuration"]).toBeUndefined();
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it("bundle create names the bundle after the rig unless --name says otherwise", async () => {
     const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "cli-name-"));
     fs.writeFileSync(nodePath.join(dir, "rig.yaml"), 'version: "0.2"\nname: tipjar-team\npods: []\n');
@@ -483,26 +509,42 @@ describe("Bundle CLI", () => {
     expect(provenance!["notes"]).toBe("checkpoint-2-part-3 fixture");
   });
 
-  // Item 1 / slice-05: provenance auto-includes hostname + cliVersion at invoke time
-  it("bundle create automatically includes hostname + cliVersion in provenance (no flag needed)", async () => {
+  it.each([false, true])("builder identity is private unless explicitly included (%s)", async includeIdentity => {
     capturedCreateBodies = [];
-    await captureLogs(async () => {
-      await makeCmd().parseAsync([
-        "node", "rig", "bundle", "create", "/tmp/rig.yaml",
-        "-o", "/tmp/test.rigbundle",
-      ]);
+    receiptWrites.mockClear();
+    const previous = process.env.OPENRIG_SESSION_NAME;
+    process.env.OPENRIG_SESSION_NAME = "builder@demo";
+    try {
+      await captureLogs(async () => {
+        await makeCmd().parseAsync([
+          "node", "rig", "bundle", "create", "/tmp/rig.yaml", "-o", "/tmp/test.rigbundle",
+          ...(includeIdentity ? ["--include-builder-identity"] : []),
+        ]);
+      });
+      const provenance = capturedCreateBodies.at(-1)!["provenance"] as Record<string, unknown>;
+      expect(typeof provenance.cliVersion).toBe("string");
+      if (includeIdentity) expect(provenance).toMatchObject({ sourceHost: os.hostname(), authorSession: "builder@demo" });
+      else {
+        expect(provenance).not.toHaveProperty("sourceHost");
+        expect(provenance).not.toHaveProperty("authorSession");
+      }
+      expect(receiptWrites).toHaveBeenLastCalledWith(
+        "/tmp/test.rigbundle.build.json", "/tmp/test.rigbundle", expect.any(Object),
+        expect.objectContaining({ sourceHost: os.hostname(), authorSession: "builder@demo" }),
+      );
+    } finally {
+      if (previous === undefined) delete process.env.OPENRIG_SESSION_NAME;
+      else process.env.OPENRIG_SESSION_NAME = previous;
+    }
+  });
+
+  it("a receipt write warning keeps the created archive result and JSON warning", async () => {
+    receiptWrites.mockReturnValueOnce("Bundle created, but its private receipt could not be written");
+    const result = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "create", "/tmp/rig.yaml", "-o", "/tmp/test.rigbundle", "--json"]);
     });
-    const createBody = capturedCreateBodies[capturedCreateBodies.length - 1];
-    expect(createBody).toBeTruthy();
-    const provenance = createBody!["provenance"] as Record<string, unknown> | undefined;
-    expect(provenance).toBeTruthy();
-    // hostname and cliVersion auto-populate (real os.hostname() + CLI package.json read)
-    expect(typeof provenance!["sourceHost"]).toBe("string");
-    expect((provenance!["sourceHost"] as string).length).toBeGreaterThan(0);
-    expect(typeof provenance!["cliVersion"]).toBe("string");
-    expect((provenance!["cliVersion"] as string).length).toBeGreaterThan(0);
-    // notes is undefined when --notes not passed (no empty string sent)
-    expect(provenance!["notes"]).toBeUndefined();
+    expect(JSON.parse(result.stdout.at(-1)!)).toMatchObject({ archiveHash: expect.any(String), warning: expect.stringContaining("private receipt") });
+    expect(result.exitCode).not.toBe(2);
   });
 
   // Item 2 / slice-05: --min-daemon-version + --min-cli-version flags wire into request body compatibility
@@ -632,6 +674,42 @@ describe("Bundle CLI", () => {
     expect(parsed.records[0].targetRigName).toBe("alpha");
   });
 
+  it.each(["garbage", "2026-13-45"])("bundle history --since %s prints the advisory on stderr and keeps the empty result", async (since) => {
+    const { logs, stdout, exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "history", "--since", since]);
+    });
+    const note = `Note: since "${since}" was not recognised as a date or time; the existing text comparison against installedAt was used`;
+    expect(logs).toContain(note);
+    expect(stdout).not.toContain(note);
+    expect(stdout).toEqual(["No bundle install audit records found."]);
+    expect(exitCode).toBeUndefined();
+  });
+
+  it("bundle history --since garbage --json stays one parseable payload carrying the advisory", async () => {
+    const { logs, stdout, exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "history", "--since", "garbage", "--json"]);
+    });
+    expect(logs).toEqual(stdout);
+    expect(stdout).toHaveLength(1);
+    const parsed = JSON.parse(stdout[0]!);
+    expect(parsed.records).toEqual([]);
+    expect(parsed.advisories).toHaveLength(1);
+    expect(exitCode).toBeUndefined();
+  });
+
+  it.each([
+    ["2026-05-18T11", 1],
+    ["2026-05-18", 2],
+    ["2026-05-18T11:00:00Z", 1],
+  ])("bundle history --since %s lists as before with no advisory", async (since, count) => {
+    const { logs, stdout, exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "bundle", "history", "--since", since]);
+    });
+    expect(logs).toEqual(stdout);
+    expect(stdout[0]).toBe(`Bundle install history (${count} record${count === 1 ? "" : "s"}):`);
+    expect(exitCode).toBeUndefined();
+  });
+
   // Item 2 / slice-05: no flags → compatibility omitted (no empty object sent)
   it("bundle create with neither min-version flag omits compatibility from request body", async () => {
     capturedCreateBodies = [];
@@ -646,16 +724,16 @@ describe("Bundle CLI", () => {
     expect(createBody!["compatibility"]).toBeUndefined();
   });
 
-  // Item 1 / slice-05: authorSession populates when OPENRIG_SESSION_NAME env is set
-  it("bundle create includes authorSession when OPENRIG_SESSION_NAME env is set", async () => {
+  // Public authorSession is deliberate; default receipt-only behavior is covered above.
+  it("bundle create includes authorSession only with the builder-identity opt-in", async () => {
     capturedCreateBodies = [];
     const origEnv = process.env.OPENRIG_SESSION_NAME;
-    process.env.OPENRIG_SESSION_NAME = "velocity-driver@openrig-velocity";
+    process.env.OPENRIG_SESSION_NAME = "builder@demo";
     try {
       await captureLogs(async () => {
         await makeCmd().parseAsync([
           "node", "rig", "bundle", "create", "/tmp/rig.yaml",
-          "-o", "/tmp/test.rigbundle",
+          "-o", "/tmp/test.rigbundle", "--include-builder-identity",
         ]);
       });
     } finally {
@@ -666,6 +744,6 @@ describe("Bundle CLI", () => {
     expect(createBody).toBeTruthy();
     const provenance = createBody!["provenance"] as Record<string, unknown> | undefined;
     expect(provenance).toBeTruthy();
-    expect(provenance!["authorSession"]).toBe("velocity-driver@openrig-velocity");
+    expect(provenance!["authorSession"]).toBe("builder@demo");
   });
 });

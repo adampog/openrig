@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { ClosureReason } from "./hot-potato-enforcer.js";
 import { archiveWhereClause } from "./rig-repository.js";
@@ -5,6 +6,198 @@ import { isHumanSeatSessionRef, parseSessionName } from "./session-name.js";
 
 export const OWNER_NOTIFICATION_LEVELS = ["RECORD", "NOTICE", "ALERT"] as const;
 export type OwnerNotificationLevel = (typeof OWNER_NOTIFICATION_LEVELS)[number];
+
+export const RELAY_OWNER_NOTIFICATION_ACCEPTED_PREFIX = "relay-owner-notification-accepted" as const;
+export const RELAY_OWNER_NOTIFICATION_TRANSPORT_FAILED_PREFIX = "relay-owner-notification-transport-failed" as const;
+
+export interface RelayOwnerNotificationReceipt {
+  notificationKey: string;
+  deliveryId: string | null;
+  connectorRef: string | null;
+  replyRef: string | null;
+  replyRefHash: string | null;
+  revision: string | null;
+  episodeKey: string | null;
+  level: OwnerNotificationLevel | null;
+  kind: string | null;
+  digest: string | null;
+}
+
+export interface FormatRelayOwnerNotificationAcceptedInput {
+  notificationKey: string;
+  deliveryId?: string | null;
+  connectorRef?: string | null;
+  replyRef?: string | null;
+  replyRefHash?: string | null;
+  revision?: string | null;
+  episodeKey?: string | null;
+  level?: OwnerNotificationLevel | string | null;
+  kind?: string | null;
+  digest?: string | null;
+}
+
+export interface RelayOwnerNotificationTransportFailure {
+  notificationKey: string;
+  connectorRef: string | null;
+  failureClass: string;
+  error: string;
+}
+
+export interface FormatRelayOwnerNotificationTransportFailedInput {
+  notificationKey: string;
+  connectorRef?: string | null;
+  failureClass: string;
+  detail: string;
+}
+
+function encodeReceiptToken(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return null;
+  return trimmed.replace(/%|[\s=]/g, (ch) => encodeURIComponent(ch));
+}
+
+function encodeConnectorRefToken(value: string | null | undefined): string | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+  return encodeURIComponent(value);
+}
+
+function decodeReceiptToken(value: string | null | undefined): string | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return null;
+  }
+}
+
+export function formatRelayOwnerNotificationAccepted(input: FormatRelayOwnerNotificationAcceptedInput): string {
+  const notificationKey = typeof input.notificationKey === "string" ? input.notificationKey.trim() : "";
+  if (!notificationKey || /\s/.test(notificationKey)) {
+    throw new Error("formatRelayOwnerNotificationAccepted requires a non-empty notificationKey");
+  }
+  const deliveryId = encodeReceiptToken(input.deliveryId);
+  const connectorRef = encodeConnectorRefToken(input.connectorRef ?? null);
+  const rawReplyRef = typeof input.replyRef === "string" && input.replyRef.trim().length > 0 ? input.replyRef.trim() : null;
+  const replyRef = encodeReceiptToken(rawReplyRef);
+  const replyRefHash =
+    encodeReceiptToken(input.replyRefHash) ??
+    (rawReplyRef ? createHash("sha256").update(rawReplyRef).digest("hex") : null);
+  const revision = encodeReceiptToken(input.revision);
+  const episodeKey = encodeReceiptToken(input.episodeKey);
+  const level = encodeReceiptToken(input.level);
+  const kind = encodeReceiptToken(input.kind);
+  const digest = encodeReceiptToken(input.digest);
+
+  const tokens = [`${RELAY_OWNER_NOTIFICATION_ACCEPTED_PREFIX}`, `notification_key=${notificationKey}`];
+  if (deliveryId) tokens.push(`delivery_id=${deliveryId}`);
+  if (connectorRef) tokens.push(`connector_ref=${connectorRef}`);
+  if (replyRef) tokens.push(`reply_ref=${replyRef}`);
+  if (replyRefHash) tokens.push(`reply_ref_hash=${replyRefHash}`);
+  if (revision) tokens.push(`revision=${revision}`);
+  if (episodeKey) tokens.push(`episode_key=${episodeKey}`);
+  if (level) tokens.push(`level=${level}`);
+  if (kind) tokens.push(`kind=${kind}`);
+  if (digest) tokens.push(`digest=${digest}`);
+  return tokens.join(" ");
+}
+
+export function parseRelayOwnerNotificationAccepted(
+  note: string | null | undefined,
+): RelayOwnerNotificationReceipt | null {
+  if (!note || !note.startsWith(`${RELAY_OWNER_NOTIFICATION_ACCEPTED_PREFIX} `)) return null;
+  const fields = note.trim().split(/\s+/);
+  const rawValue = (...names: string[]): string | null => {
+    for (const name of names) {
+      const prefix = `${name}=`;
+      const found = fields.find((field) => field.startsWith(prefix));
+      if (found) {
+        const sliced = found.slice(prefix.length);
+        if (sliced.length > 0) return sliced;
+      }
+    }
+    return null;
+  };
+  const decodedValue = (...names: string[]): string | null => decodeReceiptToken(rawValue(...names));
+  const notificationKey = rawValue("notification_key");
+  if (!notificationKey) return null;
+  const replyRef = decodedValue("reply_ref");
+  const replyRefHash =
+    decodedValue("reply_ref_hash") ??
+    (replyRef ? createHash("sha256").update(replyRef).digest("hex") : null);
+  const rawLevel = decodedValue("level");
+  const level =
+    rawLevel && OWNER_NOTIFICATION_LEVELS.includes(rawLevel as OwnerNotificationLevel)
+      ? (rawLevel as OwnerNotificationLevel)
+      : null;
+  return {
+    notificationKey,
+    deliveryId: decodedValue("delivery_id"),
+    connectorRef: decodedValue("connector_ref"),
+    replyRef,
+    replyRefHash,
+    revision: decodedValue("revision"),
+    episodeKey: decodedValue("episode_key"),
+    level,
+    kind: decodedValue("kind"),
+    digest: decodedValue("digest"),
+  };
+}
+
+export function formatRelayOwnerNotificationTransportFailed(
+  input: FormatRelayOwnerNotificationTransportFailedInput,
+): string {
+  const notificationKey = typeof input.notificationKey === "string" ? input.notificationKey.trim() : "";
+  if (!notificationKey || /\s/.test(notificationKey)) {
+    throw new Error("formatRelayOwnerNotificationTransportFailed requires a non-empty notificationKey");
+  }
+  const connectorRef = encodeConnectorRefToken(input.connectorRef ?? null);
+  const failureClass = encodeReceiptToken(input.failureClass);
+  if (!failureClass) {
+    throw new Error("formatRelayOwnerNotificationTransportFailed requires a non-empty failureClass");
+  }
+  const detail = typeof input.detail === "string" ? input.detail.replace(/[\r\n]+/g, " ").trim() : "";
+  const tokens = [
+    `${RELAY_OWNER_NOTIFICATION_TRANSPORT_FAILED_PREFIX}`,
+    `notification_key=${notificationKey}`,
+  ];
+  if (connectorRef) tokens.push(`connector_ref=${connectorRef}`);
+  tokens.push(`class=${failureClass}`);
+  tokens.push(`error=${detail}`);
+  return tokens.join(" ");
+}
+
+export function parseRelayOwnerNotificationTransportFailed(
+  note: string | null | undefined,
+): RelayOwnerNotificationTransportFailure | null {
+  if (!note || !note.startsWith(`${RELAY_OWNER_NOTIFICATION_TRANSPORT_FAILED_PREFIX} `)) return null;
+  const trimmed = note.trim();
+  const fields = trimmed.split(/\s+/);
+  const rawValue = (...names: string[]): string | null => {
+    for (const name of names) {
+      const prefix = `${name}=`;
+      const found = fields.find((field) => field.startsWith(prefix));
+      if (found) {
+        const sliced = found.slice(prefix.length);
+        if (sliced.length > 0) return sliced;
+      }
+    }
+    return null;
+  };
+  const notificationKey = rawValue("notification_key");
+  if (!notificationKey) return null;
+  const connectorRef = decodeReceiptToken(rawValue("connector_ref"));
+  const failureClass = decodeReceiptToken(rawValue("class"));
+  if (!failureClass) return null;
+  const errorIdx = trimmed.indexOf(" error=");
+  const error = errorIdx >= 0 ? trimmed.slice(errorIdx + " error=".length) : (rawValue("error") ?? "");
+  return {
+    notificationKey,
+    connectorRef,
+    failureClass,
+    error,
+  };
+}
 
 export function ownerNotificationLevelAtLeast(
   level: OwnerNotificationLevel,
@@ -25,6 +218,9 @@ export interface QueueTransition {
   /** P21 §4 era-stamp: how actorSession was established. `transport:v1` = derived from the
    *  transport chokepoint; null/absent = claimed-era (pre-verification), never re-labeled. */
   identityProvenance: string | null;
+  /** With `principal:v1`, the checked MCP caller (JSON: source, id and optional grant/version).
+   *  With `gateway:slack:v1`, the registered person's entity id mapped from Slack. Otherwise null. */
+  identityPrincipal: string | null;
   ownerNotificationKind: string | null;
   ownerNotificationLevel: OwnerNotificationLevel;
 }
@@ -39,6 +235,8 @@ export interface QueueTransitionInput {
   /** P21 §4 era-stamp: the route passes `transport:v1` when actorSession came from the transport
    *  header chokepoint; omit (null) for system/claimed-era transitions — absence is the marker. */
   identityProvenance?: string | null;
+  /** The MCP principal (`principal:v1`) or registered person (`gateway:slack:v1`) that made this change. */
+  identityPrincipal?: string | null;
   ownerNotificationKind?: string | null;
   ownerNotificationLevel?: OwnerNotificationLevel | null;
 }
@@ -48,15 +246,22 @@ export type RecentQueueTransitionScope = { kind: "instance" } | { kind: "rig"; r
 
 /** A compact product event derived only from typed queue state and closure fields.
  * The authored queue summary is presentation only; it never participates in
- * event normalization. transition_note and body remain excluded so prose cannot
- * silently become event semantics. */
+ * event normalization. transition_note and body remain excluded from event
+ * semantics so prose cannot silently become one; `bodyPreview` below is display text only. */
 export interface RecentQueueTransition {
   transitionId: number;
   qitemId: string;
   ts: string;
   actorSession: string;
   change: string;
+  /** The authored queue summary, trimmed; null when the row has none. Never filled with derived text. */
   summary: string | null;
+  /** Display text derived from the body, only for a row with no authored summary (null otherwise).
+   * It is the first non-blank line within the first 2,000 characters of the body, trimmed and cut to at
+   * most 240 code points (the last three being "..." when cut). It is null when the summary is
+   * present, the body is empty, or no non-blank line occurs within those 2,000 characters. SQLite's text
+   * substr stops at an embedded NUL, so the line also ends there, and a NUL before any text gives null. */
+  bodyPreview: string | null;
   rig: string;
   targetKind: RecentQueueTransitionTargetKind;
   target: string;
@@ -72,6 +277,7 @@ interface QueueTransitionRow {
   closure_reason: string | null;
   closure_target: string | null;
   identity_provenance?: string | null;
+  identity_principal?: string | null;
   owner_notification_kind?: string | null;
   owner_notification_level?: string | null;
 }
@@ -86,9 +292,29 @@ interface RecentQueueTransitionRow {
   closure_target: string | null;
   tags: string | null;
   summary: string | null;
+  /** The first 2,000 characters of the body, read only when the summary is blank (null otherwise). */
+  body_head: string | null;
   previous_state: string | null;
   destination_session: string;
   source_session: string;
+}
+
+export const DEFAULT_RECENT_TRANSITIONS_LIMIT = 20;
+export const MAX_RECENT_TRANSITIONS_LIMIT = 1000;
+
+/** How much of a body is read for bodyPreview, and the longest preview shown (the Story card's preview bound). */
+const BODY_HEAD_CODE_POINTS = 2000;
+const BODY_PREVIEW_MAX_CODE_POINTS = 240;
+/** The characters String.prototype.trim() strips, for SQLite's ltrim (whose default strips spaces only): a summary made of
+ * these alone is blank, which is when the body is read for bodyPreview. */
+const TRIM_CHARS = String.fromCharCode(9, 10, 11, 12, 13, 32, 160, 5760, ...Array.from({ length: 11 }, (_, i) => 8192 + i), 8232, 8233, 8239, 8287, 12288, 65279);
+/** The first non-blank line of a body's head, for a row that has no summary: the rule the TUI already applied
+ * to rows it had loaded. Cut by code point, so a multibyte character is never split. */
+function bodyPreview(bodyHead: string | null): string | null {
+  const line = bodyHead?.split("\n").find((candidate) => candidate.trim())?.trim();
+  if (!line) return null;
+  const points = Array.from(line);
+  return points.length > BODY_PREVIEW_MAX_CODE_POINTS ? `${points.slice(0, BODY_PREVIEW_MAX_CODE_POINTS - 3).join("")}...` : line;
 }
 
 function sessionRig(session: string, knownRigs: ReadonlySet<string>): string | null {
@@ -127,17 +353,34 @@ function recentChange(row: RecentQueueTransitionRow): string | null {
   return null;
 }
 
+/** The recent-activity qualifying rule, as a predicate on a transition and its predecessor's state.
+ * A same-state note (blocked after blocked, in-progress after in-progress) never qualifies. */
+function qualifiesAsRecent(row: Pick<RecentQueueTransitionRow, "state" | "closure_reason">, previousState: string | null): boolean {
+  return (row.state === "in-progress" && (previousState === "pending" || previousState === "blocked"))
+    || (row.state === "blocked" && previousState !== null && previousState !== "blocked")
+    || row.closure_reason === "handed_off_to"
+    || (row.state === "done" && row.closure_reason === "no-follow-on")
+    || ["failed", "denied", "canceled"].includes(row.state)
+    || ["denied", "canceled", "escalation"].includes(row.closure_reason ?? "");
+}
+
 /**
  * Append-only transition log. Domain code MUST NOT update or delete rows here.
  * This log is the authoritative audit trail for queue state evolution.
  */
+/** The prefix `rig queue block --continuation` writes on the park transition, matched exactly. */
+export const CONTINUATION_MARKER = "continuation: ";
+
 export class QueueTransitionLog {
   readonly db: Database.Database;
   /** P21 §4: detected once — a curated-migration test DB (or a pre-067 daemon) may lack the
    *  era-stamp column, so the writer degrades (omits it) instead of throwing. */
   private readonly hasIdentityProvenanceColumn: boolean;
   private readonly hasOwnerNotificationColumns: boolean;
+  private readonly hasIdentityPrincipalColumn: boolean;
   private readonly historySource: string;
+  /** The history tables this schema has: the live table, and the archive where it exists. */
+  private readonly historyTables: string[];
 
   constructor(db: Database.Database) {
     this.db = db;
@@ -148,13 +391,16 @@ export class QueueTransitionLog {
       (this.db.prepare("PRAGMA table_info(queue_transitions)").all() as Array<{ name: string }>).map((c) => c.name),
     );
     this.hasOwnerNotificationColumns = columns.has("owner_notification_kind") && columns.has("owner_notification_level");
+    this.hasIdentityPrincipalColumn = columns.has("identity_principal");
     // One explicit projection for all history readers, including old nullable schemas.
     // SELECT * cannot union the archive's extra archived_at column with the live table.
     const fields = ["transition_id", "qitem_id", "ts", "state", "transition_note", "actor_session",
-      "closure_reason", "closure_target", "identity_provenance", "owner_notification_kind", "owner_notification_level"];
+      "closure_reason", "closure_target", "identity_provenance", "identity_principal", "owner_notification_kind", "owner_notification_level"];
+    this.historyTables = [];
     const sources = ["queue_transitions", "queue_transitions_archive"].flatMap((table) => {
       const available = new Set((db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((c) => c.name));
       if (available.size === 0) return [];
+      this.historyTables.push(table);
       return [`SELECT ${fields.map((field) => available.has(field) ? field : `NULL AS ${field}`).join(", ")} FROM ${table}`];
     });
     this.historySource = `(${sources.join(" UNION ALL ")})`;
@@ -178,9 +424,16 @@ export class QueueTransitionLog {
       input.closureReason ?? null,
       input.closureTarget ?? null,
     ];
+    // Preserve the recorded caller or mapped Slack person; this attribution grants no permission.
+    const principal = (input.identityProvenance === "principal:v1" || input.identityProvenance === "gateway:slack:v1")
+      && this.hasIdentityPrincipalColumn ? input.identityPrincipal ?? null : null;
     if (this.hasIdentityProvenanceColumn) {
       columns.push("identity_provenance");
-      values.push(input.identityProvenance ?? null);
+      values.push(input.identityProvenance === "principal:v1" && !principal ? "transport:v1" : input.identityProvenance ?? null);
+    }
+    if (principal) {
+      columns.push("identity_principal");
+      values.push(principal);
     }
     if (this.hasOwnerNotificationColumns) {
       columns.push("owner_notification_kind", "owner_notification_level");
@@ -204,6 +457,29 @@ export class QueueTransitionLog {
       )
       .all(qitemId) as QueueTransitionRow[];
     return rows.map((r) => this.rowToTransition(r));
+  }
+
+  /**
+   * OPR.0.7.0.12 — the continuation `rig queue block --continuation` recorded for the row's
+   * CURRENT park. The current park is the trailing run of `blocked` transitions: the daemon
+   * appends its own later blocked transitions (e.g. "parked-owner episode closed"), so the latest
+   * one is not the park, and an earlier park's plan must never resurface.
+   *
+   * One newest-first seek on idx_queue_transitions_qitem_id_order (migration 098) that stops at
+   * the first non-blocked transition, so the work is bounded by the current park, not the row's
+   * history. The marker match is exact-case, as `rig queue block` writes it. The live table
+   * suffices: retention archives only terminal rows, and a parked row is not terminal.
+   */
+  currentParkContinuation(qitemId: string): string | null {
+    const newestFirst = this.db.prepare(
+      "SELECT state, transition_note FROM queue_transitions WHERE qitem_id = ? ORDER BY transition_id DESC",
+    );
+    // Leaving the loop early releases the statement (better-sqlite3 closes the iterator).
+    for (const row of newestFirst.iterate(qitemId) as Iterable<{ state: string; transition_note: string | null }>) {
+      if (row.state !== "blocked") return null;
+      if (row.transition_note?.startsWith(CONTINUATION_MARKER)) return row.transition_note.slice(CONTINUATION_MARKER.length);
+    }
+    return null;
   }
 
   /** Bounded source adapter: apply the time window and limit before materializing rows. */
@@ -233,6 +509,15 @@ export class QueueTransitionLog {
     return rows.map((row) => this.rowToTransition(row));
   }
 
+  /** The first transition after `afterTransitionId` of any of these rows, live or archived: retention may archive
+   * the member whose transition opened a health ceremony episode, and the episode must keep its name (#3192). */
+  firstAfter(qitemIds: string[], afterTransitionId: number): { transitionId: number; ts: string } | undefined {
+    if (qitemIds.length === 0) return undefined;
+    return this.db.prepare(`SELECT transition_id AS transitionId, ts FROM ${this.historySource}
+      WHERE qitem_id IN (${qitemIds.map(() => "?").join(",")}) AND transition_id > ?
+      ORDER BY transition_id ASC LIMIT 1`).get(...qitemIds, afterTransitionId) as { transitionId: number; ts: string } | undefined;
+  }
+
   listForActor(actorSession: string, limit = 100): QueueTransition[] {
     const rows = this.db
       .prepare(
@@ -246,10 +531,10 @@ export class QueueTransitionLog {
    * newest last. The window function observes the complete per-qitem state
    * sequence before the allowlist is applied, so note-only same-state writes
    * cannot masquerade as claims, resumes, or blocks. */
-  listRecent(scope: RecentQueueTransitionScope, requestedLimit = 20): RecentQueueTransition[] {
+  listRecent(scope: RecentQueueTransitionScope, requestedLimit = DEFAULT_RECENT_TRANSITIONS_LIMIT): RecentQueueTransition[] {
     const limit = Number.isFinite(requestedLimit)
-      ? Math.min(20, Math.max(1, Math.floor(requestedLimit)))
-      : 20;
+      ? Math.min(MAX_RECENT_TRANSITIONS_LIMIT, Math.max(1, Math.floor(requestedLimit)))
+      : DEFAULT_RECENT_TRANSITIONS_LIMIT;
     const activeRigWhere = archiveWhereClause("archived_at");
     const rigNames = scope.kind === "rig"
       ? [scope.rig]
@@ -257,47 +542,7 @@ export class QueueTransitionLog {
     if (rigNames.length === 0) return [];
     const knownRigs = new Set(rigNames);
     const sessionPatterns = rigNames.map((rig) => `%@${rig.replace(/%/g, "\\%").replace(/_/g, "\\_")}`);
-    const scopeSql = sessionPatterns.map(() => "(q.destination_session LIKE ? ESCAPE '\\' OR q.source_session LIKE ? ESCAPE '\\')").join(" OR ");
-    const scopeParams = sessionPatterns.flatMap((pattern) => [pattern, pattern]);
-    // Keep display metadata out of the full-history window/sort. Fetch it only
-    // for the qualified window; limiting raw history would change predecessors.
-    const rows = this.db.prepare(`
-      WITH rig_history AS (
-        SELECT
-          t.transition_id,
-          t.qitem_id,
-          t.ts,
-          t.state,
-          t.actor_session,
-          t.closure_reason,
-          t.closure_target,
-          LAG(t.state) OVER (
-            PARTITION BY t.qitem_id
-            ORDER BY t.transition_id
-          ) AS previous_state
-        FROM ${this.historySource} t
-        JOIN queue_items q ON q.qitem_id = t.qitem_id
-        WHERE ${scopeSql}
-      ), qualifying AS (
-        SELECT * FROM rig_history
-        WHERE (state = 'in-progress' AND previous_state IN ('pending', 'blocked'))
-           OR (state = 'blocked' AND previous_state IS NOT NULL AND previous_state <> 'blocked')
-           OR closure_reason = 'handed_off_to'
-           OR (state = 'done' AND closure_reason = 'no-follow-on')
-           OR state IN ('failed', 'denied', 'canceled')
-           OR closure_reason IN ('denied', 'canceled', 'escalation')
-      ), latest AS (
-        SELECT * FROM qualifying
-        ORDER BY ts DESC, transition_id DESC
-        LIMIT ?
-      )
-      SELECT t.transition_id, t.qitem_id, t.ts, t.state, t.actor_session,
-             t.closure_reason, t.closure_target, q.tags, q.summary, t.previous_state,
-             q.destination_session, q.source_session
-      FROM latest t
-      JOIN queue_items q ON q.qitem_id = t.qitem_id
-      ORDER BY t.ts DESC, t.transition_id DESC
-    `).all(...scopeParams, limit) as RecentQueueTransitionRow[];
+    const rows = this.newestQualifying(sessionPatterns, limit);
 
     return rows.reverse().flatMap((row) => {
       const change = recentChange(row);
@@ -313,13 +558,67 @@ export class QueueTransitionLog {
         actorSession: row.actor_session,
         change,
         summary: row.summary?.trim() || null,
+        bodyPreview: row.body_head === null ? null : bodyPreview(row.body_head),
         rig,
         ...recentTarget(row),
       }];
     });
   }
 
-  listRecentForRig(rig: string, requestedLimit = 20): RecentQueueTransition[] {
+  /** The newest `limit` qualifying in-scope transitions, newest first. The scope's items are resolved
+   * once; live and archived history is then walked newest-first in (ts, transition_id) order on an
+   * index that carries qitem_id, so a transition outside the scope is rejected from its index entry
+   * without reading its row, and the walk stops at the limit. A candidate's predecessor is the same
+   * item's greatest earlier transition_id across both tables: the value LAG over the item's full
+   * history gave, so a same-state note never qualifies. */
+  private newestQualifying(sessionPatterns: string[], limit: number): RecentQueueTransitionRow[] {
+    // The scope is the items whose destination or source session matches a pattern. Each column is
+    // matched on its own index and the ids are read from the primary-key index, so resolving the scope
+    // never reads queue_items' rows, which carry every body. UNION ALL, not UNION: a merged UNION
+    // wants rowid order, which SQLite gets by scanning the table; a duplicate is harmless in IN.
+    const matches = (column: string) => sessionPatterns.map(() => `q.${column} LIKE ? ESCAPE '\\'`).join(" OR ");
+    // `+t.qitem_id` keeps the scope list from driving a per-item index lookup (which would then sort);
+    // the walk order comes from the (ts, transition_id, qitem_id) index, and the two tables merge.
+    const walk = this.db.prepare(`
+      WITH scope_rows(rid) AS MATERIALIZED (
+        SELECT q.rowid FROM queue_items q WHERE ${matches("destination_session")}
+        UNION ALL SELECT q.rowid FROM queue_items q WHERE ${matches("source_session")}
+      ), scope_items(qitem_id) AS MATERIALIZED (SELECT q.qitem_id FROM queue_items q WHERE +q.rowid IN (SELECT rid FROM scope_rows))
+      ${this.historyTables.map((table) => `
+      SELECT t.transition_id, t.qitem_id, t.ts, t.state, t.actor_session, t.closure_reason, t.closure_target
+      FROM ${table} t
+      WHERE +t.qitem_id IN (SELECT qitem_id FROM scope_items)`).join(" UNION ALL ")}
+      ORDER BY ts DESC, transition_id DESC`);
+    // max() with a bare column reads the state from the row holding the max, one per table.
+    const predecessors = this.historyTables.map((table) => this.db.prepare(
+      `SELECT MAX(transition_id) AS transition_id, state FROM ${table} WHERE qitem_id = ? AND transition_id < ?`,
+    ));
+    const metadata = this.db.prepare(
+      "SELECT tags, summary, destination_session, source_session, CASE WHEN summary IS NULL OR ltrim(summary, ?) = '' THEN substr(body, 1, ?) END AS body_head FROM queue_items WHERE qitem_id = ?",
+    );
+    type WalkedRow = Pick<RecentQueueTransitionRow, "transition_id" | "qitem_id" | "ts" | "state" | "actor_session" | "closure_reason" | "closure_target">;
+    const previousState = (row: WalkedRow): string | null => {
+      let found: { transition_id: number | null; state: string | null } = { transition_id: null, state: null };
+      for (const predecessor of predecessors) {
+        const candidate = predecessor.get(row.qitem_id, row.transition_id) as { transition_id: number | null; state: string | null };
+        if (candidate.transition_id !== null && (found.transition_id === null || candidate.transition_id > found.transition_id)) found = candidate;
+      }
+      return found.state;
+    };
+    const rows: RecentQueueTransitionRow[] = [];
+    // Reads inside the loop are allowed while the walk's iterator is open, and they see the walk's
+    // snapshot; leaving the loop releases it.
+    for (const row of walk.iterate(...sessionPatterns, ...sessionPatterns) as Iterable<WalkedRow>) {
+      const previous = row.state === "in-progress" || row.state === "blocked" ? previousState(row) : null;
+      if (!qualifiesAsRecent(row, previous)) continue;
+      const item = metadata.get(TRIM_CHARS, BODY_HEAD_CODE_POINTS, row.qitem_id) as Pick<RecentQueueTransitionRow, "tags" | "summary" | "destination_session" | "source_session" | "body_head">;
+      rows.push({ ...row, ...item, previous_state: previous });
+      if (rows.length >= limit) break;
+    }
+    return rows;
+  }
+
+  listRecentForRig(rig: string, requestedLimit = DEFAULT_RECENT_TRANSITIONS_LIMIT): RecentQueueTransition[] {
     return this.listRecent({ kind: "rig", rig }, requestedLimit);
   }
 
@@ -335,14 +634,213 @@ export class QueueTransitionLog {
     return row ? this.rowToTransition(row) : null;
   }
 
+  private ownerNotificationsStatement?: Database.Statement;
+
+  /** The owner notifications a delivery ledger reads, by qitem, newest first: a qitem's latest (the first,
+   *  latestOwnerNotificationForQitem's), and its latest outbound one (a kind other than human-decision-resolved) when
+   *  that is older. One read for a whole listing. */
+  ownerNotificationsForQitems(qitemIds: readonly string[]): Map<string, QueueTransition[]> {
+    const byQitem = new Map<string, QueueTransition[]>();
+    if (!this.hasOwnerNotificationColumns || qitemIds.length === 0) return byQitem;
+    this.ownerNotificationsStatement ??= this.db.prepare(
+      `SELECT * FROM (
+         SELECT history.*, ROW_NUMBER() OVER (
+           PARTITION BY qitem_id, (owner_notification_kind IS NOT NULL AND owner_notification_kind != 'human-decision-resolved')
+           ORDER BY transition_id DESC) AS newest
+           FROM ${this.historySource} history
+          WHERE qitem_id IN (SELECT value FROM json_each(?)) AND owner_notification_level IS NOT NULL)
+        WHERE newest = 1
+        ORDER BY transition_id DESC`,
+    );
+    for (const row of this.ownerNotificationsStatement.all(JSON.stringify(qitemIds)) as QueueTransitionRow[]) {
+      const transitions = byQitem.get(row.qitem_id);
+      if (transitions) transitions.push(this.rowToTransition(row));
+      else byQitem.set(row.qitem_id, [this.rowToTransition(row)]);
+    }
+    return byQitem;
+  }
+
+  /** Startup catch-up includes retained terminal rows, unlike active-episode selection. */
+  postedHumanAskIds(): string[] {
+    if (!this.hasOwnerNotificationColumns) return [];
+    return (this.db.prepare(`SELECT DISTINCT qitem_id FROM ${this.historySource}
+      WHERE (transition_note LIKE 'slack-owner-notification-posted %' OR transition_note LIKE 'slack-owner-notification-marked %')
+        AND qitem_id IN (SELECT qitem_id FROM queue_items)
+        AND instr(' ' || transition_note || ' ', ' kind=human-required ') > 0`).all() as Array<{ qitem_id: string }>).map((r) => r.qitem_id);
+  }
+
   hasOwnerNotificationReceipt(qitemId: string, notificationKey: string): boolean {
+    return (
+      this.getOwnerNotificationReceipt(qitemId, notificationKey) !== null ||
+      this.getRelayOwnerNotificationReceipt(qitemId, notificationKey) !== null
+    );
+  }
+
+  hasRelayOwnerNotificationReceipt(qitemId: string, notificationKey?: string, deliveryId?: string): boolean {
+    return this.getRelayOwnerNotificationReceipt(qitemId, notificationKey, deliveryId) !== null;
+  }
+
+/** The latest owner-notification episode per ACTIVE queue row, in queue order. One query
+ *  joins every eligibility rule into the selection — the row is active, it carries an owner
+ *  notification, and (when `includePosted` is false, the alert sweep's path) no posted
+ *  receipt exists for that notification's key — so rows that cannot matter never reach a
+ *  per-row lookup. There is no row cap: an eligible item older than any window still comes
+ *  back, and `posted` reports the receipt state for callers that list both.
+ *
+ *  The eligible set is restricted to active queue items before any ranking happens, so a
+ *  large notification archive never adds scan or ranking work to a sweep with no active item. */
+  activeOwnerNotificationEpisodes(includePosted = false): Array<{ qitemId: string; transition: QueueTransition; posted: boolean }> {
+    if (!this.hasOwnerNotificationColumns) return [];
+    // Exact token match with no wildcard risk: pad both ends so a key at the note's
+    // start or end still matches, and instr() compares literally (qitem ids may
+    // contain characters LIKE would treat as wildcards).
+    const receipt = (qitemIdExpr: string, transitionIdExpr: string) =>
+      `EXISTS (
+         SELECT 1 FROM ${this.historySource} r
+         WHERE r.qitem_id = ${qitemIdExpr}
+           AND (r.transition_note LIKE 'slack-owner-notification-posted %' OR r.transition_note LIKE 'slack-owner-notification-marked %' OR r.transition_note LIKE 'relay-owner-notification-accepted %')
+           AND instr(' ' || r.transition_note || ' ', ' notification_key=' || ${qitemIdExpr} || ':' || ${transitionIdExpr} || ' ') > 0
+       )`;
+    const postedFilter = includePosted ? "" : `AND NOT ${receipt("latest.qitem_id", "latest.transition_id")}`;
+    const rows = this.db
+      .prepare(
+        `WITH active_ids AS (
+           SELECT qitem_id FROM queue_items WHERE state IN ('pending', 'in-progress', 'blocked')
+         ),
+         active AS (
+           SELECT qitem_id, ts_created FROM queue_items WHERE state IN ('pending', 'in-progress', 'blocked')
+         ),
+         history_active AS (
+           SELECT h.* FROM ${this.historySource} h
+           WHERE h.qitem_id IN (SELECT qitem_id FROM active_ids)
+             AND h.owner_notification_level IS NOT NULL
+         ),
+         ranked AS (
+           SELECT h.*, ROW_NUMBER() OVER (PARTITION BY h.qitem_id ORDER BY h.transition_id DESC) AS rn
+           FROM history_active h
+         ),
+         latest AS (
+           SELECT * FROM ranked WHERE rn = 1
+         )
+         SELECT latest.*, ${receipt("latest.qitem_id", "latest.transition_id")} AS posted
+           FROM active
+           JOIN latest ON latest.qitem_id = active.qitem_id
+          ${postedFilter}
+           ORDER BY active.ts_created DESC`,
+      )
+      .all() as Array<QueueTransitionRow & { posted: 0 | 1 }>;
+    return rows.map((row) => ({
+      qitemId: row.qitem_id,
+      transition: this.rowToTransition(row),
+      posted: row.posted === 1,
+    }));
+  }
+
+  getOwnerNotificationReceipt(qitemId: string, notificationKey: string): { messageTs: string | null; threadTs: string | null; digest: string | null } | null {
     const rows = this.db
       .prepare(
         `SELECT transition_note FROM ${this.historySource}
-          WHERE qitem_id = ? AND transition_note LIKE 'slack-owner-notification-posted %'`,
+          WHERE qitem_id = ? AND (transition_note LIKE 'slack-owner-notification-posted %' OR transition_note LIKE 'slack-owner-notification-marked %')
+          ORDER BY transition_id DESC`,
       )
       .all(qitemId) as Array<{ transition_note: string }>;
-    return rows.some((row) => row.transition_note.split(/\s+/).includes(`notification_key=${notificationKey}`));
+    for (const row of rows) {
+      const fields = row.transition_note.split(/\s+/);
+      if (!fields.includes(`notification_key=${notificationKey}`)) continue;
+      const value = (name: string) => fields.find((field) => field.startsWith(`${name}=`))?.slice(name.length + 1) ?? null;
+      return { messageTs: value("message_ts"), threadTs: value("thread_ts"), digest: value("digest") };
+    }
+    return null;
+  }
+
+  listRelayOwnerNotificationReceipts(qitemId: string): RelayOwnerNotificationReceipt[] {
+    const rows = this.db
+      .prepare(
+        `SELECT transition_id, transition_note FROM ${this.historySource}
+          WHERE qitem_id = ? AND transition_note LIKE 'relay-owner-notification-accepted %'
+          ORDER BY transition_id DESC`,
+      )
+      .all(qitemId) as Array<{ transition_id: number; transition_note: string }>;
+    const receipts: RelayOwnerNotificationReceipt[] = [];
+    for (const row of rows) {
+      const parsed = parseRelayOwnerNotificationAccepted(row.transition_note);
+      if (parsed) receipts.push(parsed);
+    }
+    return receipts;
+  }
+
+  getRelayOwnerNotificationReceipt(
+    qitemId: string,
+    notificationKey?: string,
+    deliveryId?: string,
+  ): RelayOwnerNotificationReceipt | null {
+    for (const parsed of this.listRelayOwnerNotificationReceipts(qitemId)) {
+      if (notificationKey !== undefined && parsed.notificationKey !== notificationKey) {
+        continue;
+      }
+      if (deliveryId !== undefined && parsed.deliveryId !== deliveryId) {
+        continue;
+      }
+      return parsed;
+    }
+    return null;
+  }
+
+  findRelayOwnerNotificationReceiptByReplyRef(
+    replyRef: string,
+  ): (RelayOwnerNotificationReceipt & { qitemId: string }) | null {
+    const trimmed = replyRef.trim();
+    if (!trimmed) return null;
+    const fullHash = createHash("sha256").update(trimmed, "utf8").digest("hex");
+    const rows = this.db
+      .prepare(
+        `SELECT qitem_id, transition_note FROM ${this.historySource}
+          WHERE transition_note LIKE 'relay-owner-notification-accepted %'
+            AND (
+              instr(' ' || transition_note || ' ', ' reply_ref_hash=' || ? || ' ') > 0
+              OR instr(' ' || transition_note || ' ', ' reply_ref=' || ? || ' ') > 0
+            )
+          ORDER BY transition_id DESC`,
+      )
+      .all(fullHash, trimmed) as Array<{ qitem_id: string; transition_note: string }>;
+    for (const row of rows) {
+      const parsed = parseRelayOwnerNotificationAccepted(row.transition_note);
+      if (!parsed) continue;
+      if (parsed.replyRef !== null) {
+        if (parsed.replyRef === trimmed && parsed.replyRefHash === fullHash) {
+          return { qitemId: row.qitem_id, ...parsed };
+        }
+        continue;
+      }
+      if (parsed.replyRefHash === fullHash) {
+        return { qitemId: row.qitem_id, ...parsed };
+      }
+    }
+    return null;
+  }
+
+  findRelayOwnerNotificationReceiptByDeliveryId(
+    deliveryId: string,
+  ): (RelayOwnerNotificationReceipt & { qitemId: string }) | null {
+    const trimmed = deliveryId.trim();
+    if (!trimmed) return null;
+    const encoded = encodeReceiptToken(trimmed);
+    if (!encoded) return null;
+    const rows = this.db
+      .prepare(
+        `SELECT qitem_id, transition_note FROM ${this.historySource}
+          WHERE transition_note LIKE 'relay-owner-notification-accepted %'
+            AND instr(' ' || transition_note || ' ', ' delivery_id=' || ? || ' ') > 0
+          ORDER BY transition_id DESC`,
+      )
+      .all(encoded) as Array<{ qitem_id: string; transition_note: string }>;
+    for (const row of rows) {
+      const parsed = parseRelayOwnerNotificationAccepted(row.transition_note);
+      if (parsed && parsed.deliveryId === trimmed) {
+        return { qitemId: row.qitem_id, ...parsed };
+      }
+    }
+    return null;
   }
 
   private rowToTransition(row: QueueTransitionRow): QueueTransition {
@@ -356,6 +854,7 @@ export class QueueTransitionLog {
       closureReason: row.closure_reason as ClosureReason | null,
       closureTarget: row.closure_target,
       identityProvenance: row.identity_provenance ?? null,
+      identityPrincipal: row.identity_principal ?? null,
       ownerNotificationKind: row.owner_notification_kind ?? null,
       ownerNotificationLevel: OWNER_NOTIFICATION_LEVELS.includes(row.owner_notification_level as OwnerNotificationLevel)
         ? row.owner_notification_level as OwnerNotificationLevel

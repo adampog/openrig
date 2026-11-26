@@ -1,0 +1,16 @@
+# Install as $OPENRIG_HOME/community-harnesses/cursor.yaml, with openrig-cursor-launch on the seat's PATH.
+format: 1
+name: cursor
+command: openrig-cursor-launch
+maintainer: Your name or team
+limits:
+  - resume reads a chat as missing unless its store is in the seat's Cursor config folder, under the seat's working directory
+  - no guidance, skills or startup files are placed
+  - needs-input and approval prompts are read from the screen only
+launch_result: true
+resume: true
+startup_assisted: false
+first_input: true
+# passes_model: checked with OpenRig 0.7.19 (738e7a7e) and Cursor CLI 2026.10.19-6bbf2c4. Model passing was checked for a
+# new chat only: the launcher applies the model only to new chats, and resume is not verified.
+passes_model: true               # the launcher maps OPENRIG_MODEL to --model for a new session

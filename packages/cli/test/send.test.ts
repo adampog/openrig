@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { sendCommand, type SendDeps } from "../src/commands/send.js";
-import { DaemonClient } from "../src/client.js";
+import { DaemonClient, DaemonConnectionError, DaemonResponseError, DaemonTimeoutError } from "../src/client.js";
 import { STATE_FILE, type LifecycleDeps, type DaemonState } from "../src/daemon-lifecycle.js";
 import type { StatusDeps } from "../src/commands/status.js";
 
@@ -81,6 +81,7 @@ function runningDeps(port: number, clientFactory?: StatusDeps["clientFactory"]):
 describe("Send CLI", () => {
   let server: http.Server;
   let port: number;
+  let refusedUrl: string;
   let lastSendBody: Record<string, unknown> | null = null;
   let lastBroadcastBody: Record<string, unknown> | null = null;
   // S3 (OPR.0.5.4.6): every /send body in order, so the no-double-delivery
@@ -98,6 +99,18 @@ describe("Send CLI", () => {
           lastBroadcastBody = parsed;
           const sessions: string[] = (parsed.sessions as string[] | undefined)
             ?? ["seat-a@my-rig", "seat-b@my-rig"]; // pod/rig/global resolve to a fixed pair
+          if (parsed.text === "compaction-notice") {
+            const notice = (who: string) => ({ stage: "restoring", observed: "before_send", notice: `${who} was mid-restore (as recorded). This doesn't mean the restore has finished.` });
+            const results = [
+              { ok: true, sessionName: "a@r", managedCompaction: notice("a@r") },
+              { ok: true, sessionName: "b@r" },
+              { ok: false, sessionName: "c@r", error: "paste failed", managedCompaction: notice("c@r") },
+              { ok: true, sessionName: "d@r", outcome: "retained", sent: false, managedCompaction: notice("d@r") },
+            ];
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ total: 4, sent: 2, failed: 1, retained: 1, results }));
+            return;
+          }
           if (parsed.text === "partial") {
             const results = [
               { ok: true, sessionName: sessions[0] },
@@ -133,6 +146,9 @@ describe("Send CLI", () => {
             // does NOT match this send's identity (+100 lines vs a 1-line payload)
             // — someone else's staged content; unverifiable, never this send.
             "unrelated-paste-session": "❯ [Pasted text #7 +100 lines]\n  ⏵⏵ accept edits on (shift+tab to cycle)",
+            // #79: Codex 0.153 renders the composer prompt as `»`; the shared glyph set
+            // must read it exactly like `❯`/`›`.
+            "codex153-session": "» hello there\n  ⏵⏵ accept edits on (shift+tab to cycle)",
           };
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: true, sessionName: parsed.session, content: panes[parsed.session as string] ?? "❯ " }));
@@ -142,7 +158,20 @@ describe("Send CLI", () => {
           const parsed = JSON.parse(body);
           lastSendBody = parsed;
           sendBodies.push(parsed);
-          if (parsed.session === "staged-session" || parsed.session === "consumed-session" || parsed.session === "stale-scroll-session" || parsed.session === "unrelated-paste-session") {
+          if (parsed.session === "slow-session") {
+            // A completed send can answer after the ordinary client's five-second deadline.
+            setTimeout(() => {
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ ok: true, sessionName: parsed.session }));
+            }, 6_000);
+            return;
+          }
+          if (parsed.session === "lost-response-session") {
+            // The message was accepted, but no response headers reach the caller.
+            res.destroy();
+            return;
+          }
+          if (parsed.session === "staged-session" || parsed.session === "consumed-session" || parsed.session === "stale-scroll-session" || parsed.session === "unrelated-paste-session" || parsed.session === "codex153-session") {
             // S3 RED fixture: the TRANSPORT believes it delivered (its verify
             // is measured-unreliable in exactly this direction) — the staged
             // truth is visible only by pane effect.
@@ -165,6 +194,20 @@ describe("Send CLI", () => {
           } else if (parsed.session === "busy-session") {
             res.writeHead(409, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ ok: false, sessionName: "busy-session", reason: "mid_work", error: "Target pane appears mid-task. Use force: true to send anyway." }));
+          } else if (parsed.session === "restoring-seat" || parsed.session === "restoring-failed") {
+            const managedCompaction = { stage: "restoring", observed: "before_send", notice: "restoring-seat was mid-restore (as recorded). This doesn't mean the restore has finished." };
+            const failed = parsed.session === "restoring-failed";
+            res.writeHead(failed ? 502 : 200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(failed ? { ok: false, sessionName: parsed.session, error: "paste failed", managedCompaction }
+              : { ok: true, sessionName: parsed.session, managedCompaction }));
+          } else if (parsed.session === "limited-seat") {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: true, sessionName: "limited-seat", outcome: "delivered",
+              usageLimit: { asOf: "2026-11-19T19:40:00.000Z", resetsAt: "2026-11-19T23:00:00.000Z", notice: "limited-seat was at its usage limit when this send started." } }));
+          } else if (parsed.session === "request-seat") {
+            const inputRequest = { observedAt: "2026-11-20T03:30:00.000Z", notice: "request-seat's main session made a permission or elicitation request (as recorded). That doesn't establish that a dialog is open." };
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: true, sessionName: parsed.session, inputRequest }));
           } else if (parsed.session === "unknown-advisory") {
             // OPR.0.4.3.28 — unknown telemetry now PROCEEDS with a non-blocking advisory (warning).
             res.writeHead(200, { "Content-Type": "application/json" });
@@ -180,6 +223,12 @@ describe("Send CLI", () => {
     });
     await new Promise<void>((resolve) => { server.listen(0, resolve); });
     port = (server.address() as { port: number }).port;
+    // Use an actual connection refusal: fetch blocks port1 before connecting,
+    // without a cause code, so it cannot exercise the coded no-connect branch.
+    const closed = http.createServer();
+    await new Promise<void>((resolve) => { closed.listen(0, "127.0.0.1", resolve); });
+    refusedUrl = `http://127.0.0.1:${(closed.address() as { port: number }).port}`;
+    await new Promise<void>((resolve, reject) => { closed.close((err) => err ? reject(err) : resolve()); });
   });
 
   afterAll(() => { server.close(); });
@@ -200,6 +249,8 @@ describe("Send CLI", () => {
     // (Hermetic-gate default is env-UNSET, so without this env-less delivery would render the unknown
     // marker.) Nested describes that stub their own envs re-run after this; the block afterEach restores.
     vi.stubEnv("OPENRIG_SESSION_NAME", "sender@my-rig");
+    // A runner inside tmux would otherwise let the managed-pane fallback recover the runner's own seat.
+    vi.stubEnv("TMUX_PANE", "");
     vi.stubEnv("RIGGED_SESSION_NAME", "");
   });
   afterEach(() => { vi.unstubAllEnvs(); });
@@ -209,6 +260,381 @@ describe("Send CLI", () => {
       await makeCmd().parseAsync(["node", "rig", "send", "dev-impl@my-rig", "hello world"]);
     });
     expect(logs.join("\n")).toContain("Sent to dev-impl@my-rig");
+  });
+
+  it.each([{ json: false, remote: false }, { json: true, remote: false }, { json: false, remote: true }, { json: true, remote: true }])("a recorded send never prints sent or probes delivery (%j)", async ({ json, remote }) => {
+    const data = { ok: true, outcome: "recorded", persisted: true, sent: false, verified: false,
+      outboxIds: ["outbox-fixture"], warning: "Message recorded in the sender outbox, not delivered.",
+      destinationStatus: { status: "missing", message: "No live seat by this name." } };
+    const post = vi.fn(async () => ({ status: 200, data }));
+    const client = { post } as unknown as DaemonClient;
+    const testDeps: SendDeps = { ...runningDeps(port), clientFactory: () => client,
+      hostRegistryLoader: () => ({ ok: true, registry: { hosts: [{ id: "remote-fixture", transport: "http", url: "http://fixture.test:7433" }] } }) };
+    const result = await captureChannels(() => makeCmd(testDeps).parseAsync([
+      "node", "rig", "send", "reader@missing-rig", "keep work", "--verify", ...(json ? ["--json"] : []), ...(remote ? ["--host", "remote-fixture"] : []),
+    ]));
+    expect(result.exitCode).toBe(1);
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(result.stdout.join("\n")).not.toContain("Sent to");
+    if (json) { expect(result.stdout).toHaveLength(1); const encoded = JSON.parse(result.stdout[0]!); expect(remote ? encoded.result.data : encoded).toEqual(data); }
+    else { expect(result.stdout.join("\n")).toContain("Recorded, not delivered"); expect(result.stderr.join("\n")).toContain("No live seat"); }
+  });
+
+  it("a --host text send prints the remote seat's usage-limit notice, as a local send does", async () => {
+    const seat = ["limited", "remote-rig"].join("@");
+    const notice = "The seat was at its usage limit when this send started (OpenRig recorded it at 2026-11-19T19:40:00.000Z; it resets at 2026-11-19T23:00:00.000Z). The message reached its input, or may have; the agent isn't expected to read it before then.";
+    const post = vi.fn(async () => ({ status: 200, data: { ok: true, sessionName: seat, outcome: "delivered",
+      usageLimit: { asOf: "2026-11-19T19:40:00.000Z", resetsAt: "2026-11-19T23:00:00.000Z", notice } } }));
+    const testDeps: SendDeps = { ...runningDeps(port), clientFactory: () => ({ post }) as unknown as DaemonClient,
+      hostRegistryLoader: () => ({ ok: true, registry: { hosts: [{ id: "remote-fixture", transport: "http", url: "http://fixture.test:7433" }] } }) };
+    const result = await captureChannels(() => makeCmd(testDeps).parseAsync(["node", "rig", "send", seat, "hello", "--host", "remote-fixture"]));
+    expect(result.stdout.join("\n")).toContain(`Sent to ${seat}`);
+    expect(result.stdout).toContain(`Notice: ${notice}`);
+  });
+
+  it("a --host text send that fails with the usage-limit record (HTTP 502) prints the notice beside the failure", async () => {
+    const seat = ["limited", "remote-rig"].join("@");
+    const notice = "The seat was at its usage limit when this send started (OpenRig recorded it at 2026-11-19T19:40:00.000Z; it resets at 2026-11-19T23:00:00.000Z). The message reached its input, or may have; the agent isn't expected to read it before then.";
+    const post = vi.fn(async () => ({ status: 502, data: { ok: false, sessionName: seat, error: "delivery uncertain: the paste may not have landed",
+      usageLimit: { asOf: "2026-11-19T19:40:00.000Z", resetsAt: "2026-11-19T23:00:00.000Z", notice } } }));
+    const testDeps: SendDeps = { ...runningDeps(port), clientFactory: () => ({ post }) as unknown as DaemonClient,
+      hostRegistryLoader: () => ({ ok: true, registry: { hosts: [{ id: "remote-fixture", transport: "http", url: "http://fixture.test:7433" }] } }) };
+    const result = await captureChannels(() => makeCmd(testDeps).parseAsync(["node", "rig", "send", seat, "hello", "--host", "remote-fixture"]));
+    expect(result.stdout.join("\n")).not.toContain("Sent to");
+    expect(result.stderr).toContain(`Notice: ${notice}`);
+  });
+
+  it.each([false, true])("native pending and unknown receipts bypass every pane check and remedial Enter (json=%s)", async json => {
+    for (const unknown of [false, true]) {
+      const posts: Array<{ path: string; body: Record<string, unknown> }> = [];
+      const receipt = { version: 1, requestId: "native-id", stage: unknown ? "completed" : "pending", ...(unknown ? { result: { completion: "unknown", submissionUnknown: true } } : {}) };
+      const client = { post: async (path: string, body: Record<string, unknown>) => {
+        posts.push({ path, body });
+        return path === "/api/transport/capture" ? { status: 200, data: { content: "❯ make test" } }
+          : { status: 200, data: { ok: true, sessionName: "native@r", verified: false, runnerReceipt: receipt } };
+      } } as unknown as DaemonClient;
+      const result = await captureLogs(() => makeCmd({ ...runningDeps(port), clientFactory: () => client }).parseAsync([
+        "node", "rig", "send", "native@r", "make test", "--verify", ...(json ? ["--json"] : []),
+      ]));
+      expect(posts.filter(post => post.path === "/api/transport/capture" || post.body["submitOnly"])).toEqual([]);
+      expect(result.logs.join("\n")).not.toContain("Sent to");
+      if (json) expect(JSON.parse(result.logs.find(line => line.startsWith("{"))!)).toMatchObject({ runnerReceipt: receipt, verified: false });
+      else expect(result.logs.join("\n")).toContain("Native input receipt");
+      expect(result.exitCode).toBe(unknown ? 1 : undefined);
+    }
+  });
+  it("fanout JSON does not promote pending native custody into a sent count under --verify", async () => {
+    const client = { post: async (path: string) => path === "/api/transport/capture"
+      ? { status: 200, data: { content: "no staged input" } }
+      : { status: 200, data: { total: 1, sent: 0, failed: 0, pendingNative: 1,
+        results: [{ ok: true, sessionName: "native@r", runnerReceipt: { requestId: "pending", stage: "pending" } }] } } } as unknown as DaemonClient;
+    const result = await captureLogs(() => makeCmd({ ...runningDeps(port), clientFactory: () => client }).parseAsync([
+      "node", "rig", "send", "--to", "native@r", "make test", "--verify", "--json",
+    ]));
+    expect(JSON.parse(result.logs[0]!).sent).toBe(0);
+  });
+
+  it.each([[false, false], [true, false], [false, true], [true, true]])("fanout keeps native custody out of pane verification and sent counts (json=%s, verify=%s)", async (json, verify) => {
+    for (const stage of ["pending", "offered", "accepted", "submitted", "completed", "rejected", "unknown", "reconciled", "erased"]) {
+      const unknown = ["unknown", "reconciled", "erased"].includes(stage);
+      const submitted = ["submitted", "completed"].includes(stage);
+      const receipt = { requestId: "native-fanout", stage: unknown ? "completed" : stage,
+        ...(stage === "unknown" ? { result: { submissionUnknown: true } } : {}),
+        ...(stage === "reconciled" ? { reconciliation: "receiver_state_lost" } : {}), ...(stage === "erased" ? { erasedAt: "2026-11-16" } : {}) };
+      const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
+      const client = { post: async (path: string, body: Record<string, unknown>) => {
+        calls.push({ path, body });
+        if (path === "/api/transport/capture") return { status: 200, data: { content: "❯ make test" } };
+        if (body.submitOnly) return { status: 409, data: { sent: false } };
+        return { status: 200, data: { total: 1, sent: submitted ? 1 : 0, failed: stage === "rejected" ? 1 : 0,
+          ...(unknown ? { indeterminateNative: 1 } : submitted || stage === "rejected" ? {} : { pendingNative: 1 }),
+          results: [{ ok: stage !== "rejected", sessionName: "native@r", ...(submitted ? { sent: true } : {}), runnerReceipt: receipt }] } };
+      } } as unknown as DaemonClient;
+      const result = await captureLogs(() => makeCmd({ ...runningDeps(port), clientFactory: () => client }).parseAsync([
+        "node", "rig", "send", "--to", "native@r", "make test", ...(verify ? ["--verify"] : []), ...(json ? ["--json"] : []),
+      ]));
+      expect(calls.map(call => call.path)).toEqual(["/api/transport/broadcast"]);
+      if (json) {
+        const encoded = JSON.parse(result.logs[0]!);
+        expect(encoded.sent).toBe(submitted ? 1 : 0);
+        expect(encoded.results[0]).toMatchObject({ runnerReceipt: receipt });
+        expect(encoded.effectChecks).toEqual(verify ? [] : undefined);
+      } else {
+        expect(result.logs.join("\n")).not.toContain(": sent");
+        expect(result.logs.join("\n")).toContain("request native-fanout");
+        if (!submitted) expect(result.logs.join("\n")).toContain("0/1 delivered");
+      }
+      expect(result.exitCode).toBe(unknown || stage === "rejected" ? 1 : undefined);
+    }
+  });
+
+  it.each([false, true])("mixed fanout verifies only the typed recipient and counts its submission (json=%s)", async json => {
+    const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
+    const client = { post: async (path: string, body: Record<string, unknown>) => {
+      calls.push({ path, body });
+      return path === "/api/transport/capture" ? { status: 200, data: { content: "no staged input" } }
+        : { status: 200, data: { total: 2, sent: 1, failed: 0, pendingNative: 1, results: [
+          { ok: true, sessionName: "native@r", runnerReceipt: { requestId: "pending", stage: "accepted" } },
+          { ok: true, sessionName: "typed@r" },
+        ] } };
+    } } as unknown as DaemonClient;
+    const result = await captureLogs(() => makeCmd({ ...runningDeps(port), clientFactory: () => client }).parseAsync([
+      "node", "rig", "send", "--to", "native@r,typed@r", "make test", "--verify", ...(json ? ["--json"] : []),
+    ]));
+    expect(calls.filter(call => call.path !== "/api/transport/broadcast").map(call => call.body.session)).toEqual(["typed@r"]);
+    expect(calls.some(call => call.body.submitOnly)).toBe(false);
+    if (json) expect(JSON.parse(result.logs[0]!)).toMatchObject({ sent: 1, pendingNative: 1, effectChecks: [{ sessionName: "typed@r" }] });
+    else {
+      expect(result.logs.join("\n")).toContain("request pending");
+      expect(result.logs.join("\n")).toContain("typed@r: sent");
+      expect(result.logs.join("\n")).toContain("1/2 delivered; 1 native pending");
+    }
+    expect(result.exitCode).toBeUndefined();
+  });
+
+  it("a terminal seat: sends exactText beside the envelope, prints the note, and --verify checks the exact text", async () => {
+    const posts: Array<{ path: string; body: Record<string, unknown> }> = [];
+    let captures = 0;
+    const client = {
+      post: async (path: string, body: Record<string, unknown>) => {
+        posts.push({ path, body });
+        if (path === "/api/transport/capture") {
+          captures += 1;
+          return { status: 200, data: { ok: true, content: captures === 1 ? "❯ make test" : "❯ " } };
+        }
+        if (body["submitOnly"]) return { status: 200, data: { ok: true, submitOnly: true } };
+        return { status: 200, data: { ok: true, sessionName: "infra-ui@term-rig", verified: true, outcome: "delivered", envelopeOmitted: true } };
+      },
+    } as unknown as DaemonClient;
+
+    const { logs } = await captureLogs(async () => {
+      await makeCmd({ ...runningDeps(port), clientFactory: () => client }).parseAsync([
+        "node", "rig", "send", "infra-ui@term-rig", "make test", "--verify",
+      ]);
+    });
+
+    const sends = posts.filter((p) => p.path === "/api/transport/send");
+    // An older daemon ignores exactText and still types the enveloped text.
+    expect(sends[0]!.body["text"]).toContain("From: sender@my-rig");
+    expect(sends[0]!.body["exactText"]).toBe("make test");
+    // The staged check and its one guarded Enter look for what the terminal seat was given.
+    const submit = sends.find((p) => p.body["submitOnly"]);
+    expect(submit?.body["expectedStagedText"]).toBe("make test");
+    const output = logs.join("\n");
+    expect(output).toContain("Sent to infra-ui@term-rig");
+    expect(output).toContain("Note: sent as exact text, without the From/To envelope, because infra-ui@term-rig is a terminal seat.");
+  });
+
+  it.each([
+    { json: false, missingPrompt: false }, { json: true, missingPrompt: false },
+    { json: false, missingPrompt: true }, { json: true, missingPrompt: true },
+  ])("keeps the send unresolved when the post-submit capture is unusable ($json, $missingPrompt)", async ({ json, missingPrompt }) => {
+    let captures = 0, submits = 0;
+    const client = {
+      post: async (path: string, body: Record<string, unknown>) => {
+        if (path === "/api/transport/capture") {
+          captures++;
+          return captures === 1 ? { status: 200, data: { content: "❯ make test" } }
+            : missingPrompt ? { status: 200, data: { content: "redrawing" } }
+              : { status: 503, data: { error: "capture unavailable" } };
+        }
+        if (body["submitOnly"]) { submits++; return { status: 200, data: { ok: true } }; }
+        return { status: 200, data: { ok: true, sessionName: "infra-ui@term-rig", verified: true, outcome: "delivered", envelopeOmitted: true } };
+      },
+    } as unknown as DaemonClient;
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCmd({ ...runningDeps(port), clientFactory: () => client }).parseAsync([
+        "node", "rig", "send", "infra-ui@term-rig", "make test", "--verify", ...(json ? ["--json"] : []),
+      ]);
+    });
+    expect(submits).toBe(1);
+    if (json) {
+      const result = JSON.parse(logs.find(line => line.trim().startsWith("{")) ?? "{}");
+      expect(result).toMatchObject({ verified: false, outcome: "submission-unconfirmed", effectCheck: { state: "staged", remedy: "submit-unconfirmed" } });
+    } else {
+      expect(logs.join("\n")).toContain("submission unconfirmed");
+      expect(logs.join("\n")).not.toContain("staged text left the prompt");
+    }
+    expect(exitCode).toBe(1);
+  });
+
+  it.each([false, true])("reports a lost guarded Enter response as unconfirmed (json: %s)", async json => {
+    let captures = 0, submits = 0;
+    const client = {
+      post: async (path: string, body: Record<string, unknown>) => {
+        if (path === "/api/transport/capture") { captures++; return { status: 200, data: { content: "❯ make test" } }; }
+        if (body["submitOnly"]) { submits++; throw new Error("Enter response lost"); }
+        return { status: 200, data: { ok: true, sessionName: "infra-ui@term-rig", verified: true, outcome: "delivered", envelopeOmitted: true } };
+      },
+    } as unknown as DaemonClient;
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCmd({ ...runningDeps(port), clientFactory: () => client }).parseAsync([
+        "node", "rig", "send", "infra-ui@term-rig", "make test", "--verify", ...(json ? ["--json"] : []),
+      ]);
+    });
+    expect(submits).toBe(1);
+    expect(captures).toBe(1);
+    expect(exitCode).toBe(1);
+    if (json) {
+      const result = JSON.parse(logs.find(line => line.trim().startsWith("{")) ?? "{}");
+      expect(result).toMatchObject({ verified: false, outcome: "submission-unconfirmed", effectCheck: { remedy: "submit-unconfirmed" } });
+    } else expect(logs.join("\n")).toContain("submission unconfirmed");
+  });
+
+  it.each([false, true])("reports a failed guarded Enter after attempted input as unconfirmed (json: %s)", async json => {
+    let submits = 0;
+    const client = {
+      post: async (path: string, body: Record<string, unknown>) => {
+        if (path === "/api/transport/capture") return { status: 200, data: { content: "❯ make test" } };
+        if (body["submitOnly"]) { submits++; return { status: 500, data: { ok: false, reason: "submit_failed", inputPhase: "attempted", error: "submission unconfirmed" } }; }
+        return { status: 200, data: { ok: true, sessionName: "infra-ui@term-rig", verified: true, outcome: "delivered", envelopeOmitted: true } };
+      },
+    } as unknown as DaemonClient;
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCmd({ ...runningDeps(port), clientFactory: () => client }).parseAsync([
+        "node", "rig", "send", "infra-ui@term-rig", "make test", "--verify", ...(json ? ["--json"] : []),
+      ]);
+    });
+    expect(submits).toBe(1);
+    expect(exitCode).toBe(1);
+    if (json) {
+      const result = JSON.parse(logs.find(line => line.trim().startsWith("{")) ?? "{}");
+      expect(result).toMatchObject({ verified: false, outcome: "submission-unconfirmed", effectCheck: { remedy: "submit-unconfirmed" } });
+    } else expect(logs.join("\n")).toContain("submission unconfirmed");
+  });
+
+  it.each([
+    [{ reason: "submit_failed", error: "older daemon" }, "submit-unconfirmed"],
+    [{ reason: "staged_mismatch", sent: false, inputPhase: "not_reached", error: "changed" }, "submit-refused"],
+  ] as const)("classifies guarded Enter failure %j as %s", async (failure, remedy) => {
+    const client = {
+      post: async (path: string, body: Record<string, unknown>) => {
+        if (path === "/api/transport/capture") return { status: 200, data: { content: "❯ make test" } };
+        if (body["submitOnly"]) return { status: 500, data: { ok: false, ...failure } };
+        return { status: 200, data: { ok: true, sessionName: "infra-ui@term-rig", verified: true, outcome: "delivered", envelopeOmitted: true } };
+      },
+    } as unknown as DaemonClient;
+    const { logs } = await captureLogs(async () => {
+      await makeCmd({ ...runningDeps(port), clientFactory: () => client }).parseAsync([
+        "node", "rig", "send", "infra-ui@term-rig", "make test", "--verify", "--json",
+      ]);
+    });
+    const result = JSON.parse(logs.find(line => line.trim().startsWith("{")) ?? "{}");
+    expect(result.effectCheck.remedy).toBe(remedy);
+    expect(result.outcome).toBe("submission-unconfirmed");
+  });
+
+  it("does not claim the earlier staged text is still unconsumed after a refused Enter", async () => {
+    const client = {
+      post: async (path: string, body: Record<string, unknown>) => {
+        if (path === "/api/transport/capture") return { status: 200, data: { content: "❯ make test" } };
+        if (body["submitOnly"]) return { status: 409, data: { ok: false, reason: "staged_mismatch", inputPhase: "not_reached", sent: false, error: "changed" } };
+        return { status: 200, data: { ok: true, sessionName: "infra-ui@term-rig", verified: true, outcome: "delivered", envelopeOmitted: true } };
+      },
+    } as unknown as DaemonClient;
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCmd({ ...runningDeps(port), clientFactory: () => client }).parseAsync([
+        "node", "rig", "send", "infra-ui@term-rig", "make test", "--verify",
+      ]);
+    });
+    expect(exitCode).toBe(1);
+    expect(logs.join("\n")).toContain("guarded Enter was refused");
+    expect(logs.join("\n")).not.toContain("typed, never submitted");
+  });
+
+  it("fan-out text output keeps each recipient's own advisory, such as unreadable input", async () => {
+    const unreadable = "Input could not be read and was not cleared; this send may join or submit existing text.";
+    const client = {
+      post: async (path: string) => {
+        if (path === "/api/transport/broadcast") return { status: 200, data: {
+          total: 2, sent: 2, failed: 0, results: [
+            { sessionName: "worker@test", ok: true, existingInput: { classification: "unreadable", fullContentsVisible: false }, warning: unreadable },
+            { sessionName: "sibling@test", ok: true, existingInput: { classification: "unreadable", fullContentsVisible: false }, warning: `${unreadable} No trailing Enter.` },
+          ],
+        } };
+        throw new Error("unexpected request");
+      },
+    } as unknown as DaemonClient;
+    const { logs } = await captureLogs(async () => {
+      await makeCmd({ ...runningDeps(port), clientFactory: () => client }).parseAsync([
+        "node", "rig", "send", "--to", "worker@test,sibling@test", "1", "--dangerously-interact", "--reason", "fixture",
+      ]);
+    });
+    const output = logs.join("\n");
+    expect(output).toContain(`worker@test: Advisory: ${unreadable}`);
+    expect(output).toContain(`sibling@test: Advisory: ${unreadable} No trailing Enter.`);
+    expect(output).toContain("worker@test: Existing input: unreadable");
+    expect(output).toContain("2/2 delivered");
+  });
+
+  it("reports a fan-out refusal as unconfirmed alongside a successful recipient", async () => {
+    let submits = 0;
+    const client = {
+      post: async (path: string, body: Record<string, unknown>) => {
+        if (path === "/api/transport/broadcast") return { status: 200, data: {
+          total: 2, sent: 2, failed: 0, results: [
+            { sessionName: "seat-a@rig", ok: true, outcome: "delivered" },
+            { sessionName: "seat-b@rig", ok: true, outcome: "delivered" },
+          ],
+        } };
+        if (path === "/api/transport/capture") return { status: 200, data: {
+          content: body["session"] === "seat-a@rig" ? "❯ make test" : "❯ ",
+        } };
+        if (body["submitOnly"]) {
+          submits++;
+          return { status: 409, data: { ok: false, reason: "staged_mismatch", inputPhase: "not_reached", sent: false, error: "pane changed" } };
+        }
+        throw new Error("unexpected request");
+      },
+    } as unknown as DaemonClient;
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCmd({ ...runningDeps(port), clientFactory: () => client }).parseAsync([
+        "node", "rig", "send", "--to", "seat-a@rig,seat-b@rig", "make test", "--verify",
+      ]);
+    });
+    const output = logs.join("\n");
+    expect(output).toContain("seat-a@rig: Delivery: unconfirmed");
+    expect(output).toContain("guarded Enter was refused (pane changed)");
+    expect(output).not.toContain("staged, not consumed");
+    expect(output).toContain("seat-b@rig: sent");
+    expect(output).toContain("1/2 delivered, 1 submission-unconfirmed");
+    expect(submits).toBe(1);
+    expect(exitCode).toBe(1);
+  });
+
+  it("reports an unconfirmed post-submit recheck per recipient in fan-out JSON", async () => {
+    let captures = 0, submits = 0;
+    const client = {
+      post: async (path: string, body: Record<string, unknown>) => {
+        if (path === "/api/transport/broadcast") return { status: 200, data: {
+          total: 1, sent: 1, failed: 0, results: [{ sessionName: "infra-ui@term-rig", ok: true, verified: true, outcome: "delivered" }],
+        } };
+        if (path === "/api/transport/capture") {
+          captures++;
+          return captures === 1 ? { status: 200, data: { content: "❯ make test" } }
+            : { status: 503, data: { error: "capture unavailable" } };
+        }
+        if (body["submitOnly"]) { submits++; return { status: 200, data: { ok: true } }; }
+        throw new Error("unexpected request");
+      },
+    } as unknown as DaemonClient;
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCmd({ ...runningDeps(port), clientFactory: () => client }).parseAsync([
+        "node", "rig", "send", "--to", "infra-ui@term-rig", "make test", "--verify", "--json",
+      ]);
+    });
+    const result = JSON.parse(logs.find(line => line.trim().startsWith("{")) ?? "{}");
+    expect(submits).toBe(1);
+    expect(result).toMatchObject({ sent: 0, failed: 1, results: [{ ok: false, verified: false, outcome: "submission-unconfirmed" }] });
+    expect(exitCode).toBe(1);
+  });
+
+  it("--raw sends no exactText", async () => {
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "send", "dev-impl@my-rig", "/help", "--raw"]);
+    });
+    expect(lastSendBody!["text"]).toBe("/help");
+    expect(lastSendBody!["exactText"]).toBeUndefined();
   });
 
   it.each(["", "  \t\n"])("refuses an empty or whitespace-only direct message before transport", async (message) => {
@@ -221,6 +647,7 @@ describe("Send CLI", () => {
     expect(output).toMatch(/empty or whitespace-only/i);
     expect(output).toMatch(/backtick|\$\(\)/i);
     expect(output).toMatch(/--body-file|stdin/i);
+    expect(output).not.toContain("UNCONFIRMED");
   });
 
   it("refuses an empty resolved context before send transport", async () => {
@@ -354,11 +781,95 @@ describe("Send CLI", () => {
       await makeCmd().parseAsync(["node", "rig", "send", "busy-session", "hello"]);
     });
     expect(logs.join("\n")).toContain("mid-task");
+    expect(logs.join("\n")).not.toContain("UNCONFIRMED");
     expect(exitCode).toBe(1);
+  });
+
+  it.each([false, true])("waits for a slow successful send without repeating it (json=%s)", { timeout: 15_000 }, async (json) => {
+    const { stdout, stderr, exitCode } = await captureChannels(async () => {
+      await makeCmd().parseAsync(["node", "rig", "send", "slow-session", "hello", ...(json ? ["--json"] : [])]);
+    });
+    expect(sendBodies).toHaveLength(1);
+    expect(exitCode).toBeUndefined();
+    expect(stderr).toEqual([]);
+    if (json) expect(JSON.parse(stdout[0])).toMatchObject({ ok: true, sessionName: "slow-session" });
+    else expect(stdout).toContain("Sent to slow-session");
+  });
+
+  it("gives a local fan-out the send response budget", async () => {
+    const post = vi.fn().mockResolvedValue({ status: 200, data: { total: 1, sent: 1, failed: 0, results: [] } });
+    await captureLogs(() => makeCmd(runningDeps(port, () => ({ post } as unknown as DaemonClient)))
+      .parseAsync(["node", "rig", "send", "--to", "a@r", "hello"]).then(() => {}));
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post.mock.calls[0][2]).toMatchObject({ timeoutMs: 60_000 });
+  });
+
+  it.each([false, true])("losing the response after acceptance is unconfirmed (json=%s), with no resend", async (json) => {
+    const { stdout, stderr, exitCode } = await captureChannels(async () => {
+      await makeCmd().parseAsync(["node", "rig", "send", "lost-response-session", "hello", ...(json ? ["--json"] : [])]);
+    });
+    expect(exitCode).toBe(1);
+    expect(sendBodies).toHaveLength(1);
+    expect(sendBodies[0]).toMatchObject({ session: "lost-response-session", exactText: "hello" });
+    const output = json ? JSON.parse(stdout[0]).error : { consequence: stderr[1], action: stderr[2] };
+    expect(output.consequence).toContain("Delivery UNCONFIRMED");
+    expect(output.action).toContain("duplicate");
+    expect(output.action).toContain("off-screen");
+    expect(output.action).toContain("does not prove non-delivery");
+    expect([...stdout, ...stderr].join("\n")).not.toMatch(/was not sent|Sent to/);
+    if (json) { expect(stdout).toHaveLength(1); expect(stderr).toEqual([]); }
+    else expect(stdout).toEqual([]);
+  });
+
+  describe.each([false, true])("uncertain local connection errors (fan-out=%s)", (fanOut) => {
+    it.each([
+      ["timeout", () => new DaemonTimeoutError("Request timed out after 5000ms")],
+      ["reset", () => new DaemonConnectionError("fetch failed", "ECONNRESET")],
+      ["unknown cause", () => new DaemonConnectionError("fetch failed")],
+    ] as const)("%s reports uncertainty in human and JSON output without retry", async (_name, failure) => {
+      for (const json of [false, true]) {
+        const post = vi.fn().mockRejectedValue(failure());
+        const deps = runningDeps(port, () => ({ post } as unknown as DaemonClient));
+        const args = fanOut ? ["--to", "dev-impl@my-rig", "hello"] : ["dev-impl@my-rig", "hello"];
+        const { stdout, stderr, exitCode } = await captureChannels(async () => {
+          await makeCmd(deps).parseAsync(["node", "rig", "send", ...args, ...(json ? ["--json"] : [])]);
+        });
+        expect(exitCode).toBe(1);
+        expect(post).toHaveBeenCalledTimes(1);
+        expect(post.mock.calls[0]?.[0]).toBe(fanOut ? "/api/transport/broadcast" : "/api/transport/send");
+        const output = json ? JSON.parse(stdout[0]).error : { consequence: stderr[1], action: stderr[2] };
+        expect(output.consequence).toContain("Delivery UNCONFIRMED");
+        expect(output.action).toContain("duplicate");
+        expect([...stdout, ...stderr].join("\n")).not.toMatch(/was not sent|Sent to/);
+        if (json) { expect(stdout).toHaveLength(1); expect(stderr).toEqual([]); }
+        else expect(stdout).toEqual([]);
+      }
+    });
   });
 
   // OPR.0.4.3.28 correction — an unknown-telemetry send PROCEEDS and PRINTS the advisory on
   // human output (not only in --json).
+  it("prints the input-request notice beside the send's own result", async () => {
+    const sent = await captureLogs(async () => { await makeCmd().parseAsync(["node", "rig", "send", "request-seat", "hello"]); });
+    expect(sent.logs.join("\n")).toContain("Sent to request-seat\nNotice: request-seat's main session made a permission or elicitation request (as recorded). That doesn't establish that a dialog is open.");
+  });
+
+  it("prints the managed compaction notice beside the send's own result, sent or failed", async () => {
+    const sent = await captureLogs(async () => { await makeCmd().parseAsync(["node", "rig", "send", "restoring-seat", "hello"]); });
+    expect(sent.logs.join("\n")).toContain("Sent to restoring-seat\nNotice: restoring-seat was mid-restore (as recorded). This doesn't mean the restore has finished.");
+    const failed = await captureLogs(async () => { await makeCmd().parseAsync(["node", "rig", "send", "restoring-failed", "hello"]); });
+    expect(failed.logs.join("\n")).toContain("paste failed");
+    expect(failed.logs.join("\n")).toContain("Notice: restoring-seat was mid-restore");
+    expect(failed.logs.join("\n")).not.toContain("Sent to");
+    expect(failed.exitCode).toBe(2);
+  });
+
+  it("prints the usage-limit record beside a delivered send's own result", async () => {
+    const sent = await captureLogs(async () => { await makeCmd().parseAsync(["node", "rig", "send", "limited-seat", "hello"]); });
+    expect(sent.logs.join("\n")).toContain("Sent to limited-seat\nNotice: limited-seat was at its usage limit when this send started.");
+    expect(sent.exitCode ?? 0).toBe(0);
+  });
+
   it("prints the Advisory on an unknown-proceed send (human output)", async () => {
     const { logs, exitCode } = await captureLogs(async () => {
       await makeCmd().parseAsync(["node", "rig", "send", "unknown-advisory", "hello"]);
@@ -451,7 +962,7 @@ describe("Send CLI", () => {
         text: expect.stringContaining("hello"),
         waitForIdleMs: 30000,
       }),
-      { timeoutMs: 35000 },
+      { timeoutMs: 90000 },
     );
     const sentText = postFn.mock.calls[0]?.[1] as { text: string } | undefined;
     expect(sentText?.text).toContain("To: dev-impl@my-rig");
@@ -459,7 +970,52 @@ describe("Send CLI", () => {
     expect(sentText?.text).toContain('↩ Reply: rig send');
   });
 
-  it("send without wait-for-idle uses default client timeout path", async () => {
+  // Node's fetch gives up on a response that hasn't started within 300 s, and a waiting send answers only when its wait
+  // ends. A longer wait is still one request, so the daemon keeps one deadline and one binding to the seat's occupant.
+  it("send --wait-for-idle over 300 s whose answer is cut off after the headers never reads as not sent", async () => {
+    let sends = 0;
+    const cut = http.createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        if (req.method !== "POST" || req.url !== "/api/transport/send") { res.writeHead(404).end(); return; }
+        // The daemon delivered and answered, then the connection dropped partway through the body.
+        sends += 1;
+        res.writeHead(200, { "Content-Type": "application/json", "Content-Length": "64" });
+        res.write('{"ok":true,"sent":tr');
+        setTimeout(() => res.socket?.destroy(), 20);
+      });
+    });
+    await new Promise<void>((resolve) => { cut.listen(0, resolve); });
+    try {
+      let thrown: unknown;
+      const { logs } = await captureLogs(async () => {
+        await makeCmd(runningDeps((cut.address() as { port: number }).port))
+          .parseAsync(["node", "rig", "send", "dev-impl@my-rig", "hello", "--wait-for-idle", "400"]).catch((err: unknown) => { thrown = err; });
+      });
+      expect(sends).toBe(1);
+      expect(thrown).toBeInstanceOf(DaemonResponseError);
+      expect((thrown as DaemonResponseError).status).toBe(200);
+      expect(logs.join("\n")).not.toContain("The message was not sent.");
+    } finally {
+      cut.closeAllConnections();
+      cut.close();
+    }
+  });
+
+  it("send --wait-for-idle longer than 300 s is one request carrying the whole wait, and the daemon's answer as it came", async () => {
+    const postFn = vi.fn().mockResolvedValueOnce({ status: 409, data: { ok: false, sessionName: "dev-impl@my-rig", reason: "wait_for_idle_timeout",
+      sent: false, waitedMs: 600000, error: "Target was still busy (running) when the 600000ms wait ended (8 checks). No text was sent." } });
+    const deps = runningDeps(port, () => ({ post: postFn } as unknown as DaemonClient));
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCmd(deps).parseAsync(["node", "rig", "send", "dev-impl@my-rig", "hello", "--wait-for-idle", "600"]);
+    });
+    expect(postFn.mock.calls.map((call) => [(call[1] as { waitForIdleMs: number }).waitForIdleMs, call[2]])).toEqual([[600000, { timeoutMs: 660000 }]]);
+    expect(logs.join("\n")).toContain("when the 600000ms wait ended (8 checks). No text was sent.");
+    expect(logs.join("\n")).not.toMatch(/did not respond|consecutive/i);
+    expect(exitCode).toBe(1);
+  });
+
+  it("send without wait-for-idle uses the 60 s response budget", async () => {
     const postFn = vi.fn(async () => ({
       status: 200,
       data: { ok: true, sessionName: "dev-impl@my-rig" },
@@ -468,7 +1024,7 @@ describe("Send CLI", () => {
     await captureLogs(async () => {
       await makeCmd(deps).parseAsync(["node", "rig", "send", "dev-impl@my-rig", "hello"]);
     });
-    expect(postFn.mock.calls[0]?.[2]).toBeUndefined();
+    expect(postFn.mock.calls[0]?.[2]).toEqual({ timeoutMs: 60_000 });
   });
 
   // Slice-03 Atom 6b — --context delivery flag.
@@ -558,6 +1114,24 @@ describe("Send CLI", () => {
     }
   });
 
+  it("send --urgent marks the message urgent; without it nothing is marked", async () => {
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "send", "dev-impl@my-rig", "the build is red", "--urgent"]);
+    });
+    expect(lastSendBody?.urgent).toBe(true);
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "send", "dev-impl@my-rig", "routine"]);
+    });
+    expect("urgent" in (lastSendBody ?? {})).toBe(false);
+  });
+
+  it("send --urgent --dangerously-interact posts the exact answer with both marks; the daemon keeps the label out of the keys", async () => {
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "send", "dev-impl@my-rig", "1", "--dangerously-interact", "--reason", "pick 1", "--urgent"]);
+    });
+    expect(lastSendBody).toMatchObject({ text: "1", dangerouslyInteract: true, urgent: true });
+  });
+
   it("send --dangerously-interact --reason posts the override fields with raw (exact) text", async () => {
     await captureLogs(async () => {
       await makeCmd().parseAsync(["node", "rig", "send", "dev-impl@my-rig", "1", "--dangerously-interact", "--reason", "unblock stuck prompt"]);
@@ -566,6 +1140,29 @@ describe("Send CLI", () => {
     expect(lastSendBody?.reason).toBe("unblock stuck prompt");
     expect(lastSendBody?.text).toBe("1"); // implies --raw: no envelope
     expect("actorSession" in (lastSendBody ?? {})).toBe(true);
+  });
+
+  it("explicit unchecked interaction is forwarded, and cannot be used as an ordinary send", async () => {
+    const args = ["node", "rig", "send", "dev-impl@my-rig", "1", "--type-without-checking"];
+    expect((await captureLogs(() => makeCmd().parseAsync(args).then(() => {}))).exitCode).toBe(1);
+    expect(lastSendBody).toBeNull();
+    await captureLogs(() => makeCmd().parseAsync([...args, "--dangerously-interact", "--reason", "deliberate input"]).then(() => {}));
+    expect(lastSendBody).toMatchObject({ dangerouslyInteract: true, typeWithoutChecking: true, text: "1" });
+  });
+
+  it("shows typed input separately from suggestions to the caller, escaping control bytes", async () => {
+    const existingInput = { classification: "typed_or_pasted", rows: ["私の下書き😀\n\u001b[31m"], suggestionRows: ["suggested next"],
+      cursor: { x: 3, y: 2, width: 120, height: 40 }, fullContentsVisible: false };
+    const post = vi.fn(async () => ({ status: 409, data: { ok: false, existingInput, error: "Nothing typed. Deliberately clear, then retry." } }));
+    const result = await captureChannels(() => makeCmd(runningDeps(port, () => ({ post } as unknown as DaemonClient)))
+      .parseAsync(["node", "rig", "send", "dev-impl@my-rig", "1", "--dangerously-interact", "--reason", "inspect"]).then(() => {}));
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.join("\n")).toContain("typed or pasted; author unknown");
+    expect(result.stderr.join("\n")).toContain(JSON.stringify(existingInput.rows));
+    expect(result.stderr.join("\n")).toContain("Suggestion rows (display only)");
+    expect(result.stderr.join("\n")).not.toContain("\u001b");
+    expect(post).toHaveBeenCalledTimes(1); // No retry and no capture text sent back to the seat.
+    expect(JSON.stringify(post.mock.calls)).not.toContain("suggested next");
   });
 
   it("send --dangerously-interact without --reason is rejected before contacting the daemon", async () => {
@@ -595,15 +1192,53 @@ describe("Send CLI", () => {
       crossHostRun: async (_host, argv) => { captured = argv; return { ok: true, stdout: "remote ok", stderr: "" }; },
     };
     await captureLogs(async () => {
-      await makeCmd(deps).parseAsync(["node", "rig", "send", "dev-impl@my-rig", "1", "--host", "vm-test", "--raw", "--dangerously-interact", "--reason", "why now"]);
+      await makeCmd(deps).parseAsync(["node", "rig", "send", "dev-impl@my-rig", "1", "--host", "vm-test", "--raw", "--dangerously-interact", "--type-without-checking", "--reason", "why now"]);
     });
     expect(captured).not.toBeNull();
     const argv = captured as unknown as string[];
     expect(argv).toContain("--raw");
     expect(argv).toContain("--dangerously-interact");
+    expect(argv).toContain("--type-without-checking");
     const ri = argv.indexOf("--reason");
     expect(ri).toBeGreaterThan(-1);
     expect(argv[ri + 1]).toBe("why now");
+  });
+
+
+  it("send --host over ssh forwards --urgent, so the remote seat's level sees the mark", async () => {
+    let captured: readonly string[] | null = null;
+    const deps: SendDeps = {
+      ...runningDeps(port),
+      hostRegistryLoader: () => ({ ok: true, registry: { hosts: [{ id: "vm-test", transport: "ssh", target: "vm.local" }] } }),
+      crossHostRun: async (_host, argv) => { captured = argv; return { ok: true, stdout: "remote ok", stderr: "" }; },
+    };
+    await captureLogs(async () => {
+      await makeCmd(deps).parseAsync(["node", "rig", "send", "dev-impl@my-rig", "the build is red", "--host", "vm-test", "--urgent"]);
+    });
+    expect(captured).toContain("--urgent");
+  });
+
+  it.each(["\r", "\x1b", "\t", " "])("preserves an explicit interaction byte in SSH argv (%#)", async answer => {
+    let captured: readonly string[] = [];
+    const deps: SendDeps = { ...runningDeps(port),
+      hostRegistryLoader: () => ({ ok: true, registry: { hosts: [{ id: "vm-test", transport: "ssh", target: "vm.local" }] } }),
+      crossHostRun: async (_host, argv) => { captured = argv; return { ok: true, stdout: "remote ok", stderr: "" }; } };
+    const result = await captureLogs(async () => {
+      await makeCmd(deps).parseAsync(["node", "rig", "send", "dev-impl@my-rig", answer,
+        "--host", "vm-test", "--dangerously-interact", "--reason", "explicit key"]);
+    });
+    expect(result.exitCode).toBeFalsy();
+    expect(captured.slice(0, 4)).toEqual(["rig", "send", "dev-impl@my-rig", answer]);
+    expect(captured).toContain("--dangerously-interact");
+    expect(captured[captured.indexOf("--reason") + 1]).toBe("explicit key");
+  });
+
+  it.each(["\r", "\t", " "])("--raw alone retains whitespace refusal (%#)", async answer => {
+    const result = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "send", "dev-impl@my-rig", answer, "--raw"]);
+    });
+    expect(result.exitCode).toBe(1);
+    expect(lastSendBody).toBeNull();
   });
 
   // Slice-03 Atom 6b QA fix — the agent@rig@host SUGAR host folds in AFTER the
@@ -717,6 +1352,14 @@ describe("Send CLI", () => {
       // "Verified: yes" and no staged report exists.
       expect(output).toMatch(/staged/i);
       expect(output).toMatch(/not (yet )?consumed|not submitted|still at the prompt/i);
+    });
+
+    it("PROOF-1b: a `»` Codex 0.153 prompt is staged evidence through the shared glyph set", async () => {
+      const { logs } = await captureLogs(async () => {
+        await makeCmd().parseAsync(["node", "rig", "send", "codex153-session", "hello there", "--verify"]);
+      });
+      const output = logs.join("\n");
+      expect(output).toMatch(/staged/i);
     });
 
     it("PROOF-2: a genuinely consumed send verifies positively and is NEVER reported staged", async () => {
@@ -840,6 +1483,19 @@ describe("Send CLI", () => {
     });
   });
 
+  it("fan-out prints each recipient's compaction notice under that recipient's line; exit code unchanged", async () => {
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "send", "--to", "a@r,b@r,c@r,d@r", "compaction-notice"]);
+    });
+    const output = logs.join("\n");
+    expect(output).toContain("a@r: sent\nNotice: a@r was mid-restore (as recorded). This doesn't mean the restore has finished.\nb@r: sent\n");
+    expect(output).toContain("c@r: FAILED — paste failed\nNotice: c@r was mid-restore");
+    expect(output).toContain("d@r: retained, not delivered; inspect with rig seat held-messages\nNotice: d@r was mid-restore");
+    expect(output).toContain("2/4 delivered, 1 held");
+    expect(output.match(/^Notice: /gm)).toHaveLength(3); // none for b@r
+    expect(exitCode).toBe(1); // a failed recipient, as before
+  });
+
   // S2 (OPR.0.5.4.3): the fan-out renderer must SURFACE an additive warning —
   // an env-less operator sees the notice, never "sent" lines alone.
   it("fan-out renderer surfaces the unknown-sender notice from the response warning", async () => {
@@ -863,9 +1519,10 @@ describe("Send CLI", () => {
 
   it("fan-out --dangerously-interact --reason plumbs the danger fields (bare text, no envelope)", async () => {
     await captureLogs(async () => {
-      await makeCmd().parseAsync(["node", "rig", "send", "--to", "dev-impl@my-rig,dev-qa@my-rig", "1", "--dangerously-interact", "--reason", "drive stuck prompts"]);
+      await makeCmd().parseAsync(["node", "rig", "send", "--to", "dev-impl@my-rig,dev-qa@my-rig", "1", "--dangerously-interact", "--type-without-checking", "--reason", "drive stuck prompts"]);
     });
     expect(lastBroadcastBody?.dangerouslyInteract).toBe(true);
+    expect(lastBroadcastBody?.typeWithoutChecking).toBe(true);
     expect(lastBroadcastBody?.reason).toBe("drive stuck prompts");
     expect(lastBroadcastBody?.text).toBe("1");
     expect("envelopeSender" in (lastBroadcastBody ?? {})).toBe(false);
@@ -1024,6 +1681,19 @@ describe("Send CLI", () => {
       expect(String(lastSendBody?.text)).toContain("To: dev-impl@my-rig");
     });
 
+    it("single-seat send with a trailing-slash OPENRIG_URL reaches <url>/api/..., not <url>//api/...", async () => {
+      vi.stubEnv("OPENRIG_URL", `http://127.0.0.1:${port}/`);
+      vi.stubEnv("RIGGED_URL", "");
+      lastSendBody = null;
+      const rc = recordingRealClient();
+      const { logs } = await captureLogs(async () => {
+        await makeCmd(probeFailNoStateDeps(rc.factory)).parseAsync(["node", "rig", "send", "dev-impl@my-rig", "hello"]);
+      });
+      expect(logs.join("\n")).toContain("Sent to dev-impl@my-rig");
+      expect(rc.seen()).toBe(`http://127.0.0.1:${port}`);
+      expect(String(lastSendBody?.text)).toContain("To: dev-impl@my-rig");
+    });
+
     it("R2 RED: fan-out --to + OPENRIG_URL + probe-stopped -> actual /broadcast lands with per-recipient results", async () => {
       vi.stubEnv("OPENRIG_URL", `http://127.0.0.1:${port}`);
       vi.stubEnv("RIGGED_URL", "");
@@ -1164,7 +1834,7 @@ describe("Send CLI", () => {
     });
 
     it("R7 RED: REAL down fails honestly — actual connection error names the target; the bare preflight restart line never appears", async () => {
-      vi.stubEnv("OPENRIG_URL", "http://127.0.0.1:1");
+      vi.stubEnv("OPENRIG_URL", refusedUrl);
       vi.stubEnv("RIGGED_URL", "");
       const rc = recordingRealClient();
       const { logs, exitCode } = await captureLogs(async () => {
@@ -1177,7 +1847,7 @@ describe("Send CLI", () => {
       // preflight-derived guess. (Also covers 1b45cf21's explicit/custom
       // target-preservation pin: the resolved target survives verbatim into
       // the fact line rather than being flattened into a generic message.)
-      expect(out).toContain("Cannot connect to the OpenRig daemon at http://127.0.0.1:1:");
+      expect(out).toContain(`Cannot connect to the OpenRig daemon at ${refusedUrl}:`);
       expect(out).not.toContain("Daemon not running. Start it with: rig daemon start");
       // 1b45cf21 — a real transport failure must also carry the repo's
       // fact/consequence/action remediation. The fact line above is the
@@ -1204,7 +1874,7 @@ describe("Send CLI", () => {
     // "characterization" while it is an intentional RED is exactly the kind of
     // stale label this slice keeps finding elsewhere.
     it("R7b RED: fan-out REAL down fails honestly too — target-specific connection error, exit 1, no restart line, and the same remediation as single-seat", async () => {
-      vi.stubEnv("OPENRIG_URL", "http://127.0.0.1:1");
+      vi.stubEnv("OPENRIG_URL", refusedUrl);
       vi.stubEnv("RIGGED_URL", "");
       const rc = recordingRealClient();
       const { logs, exitCode } = await captureLogs(async () => {
@@ -1215,7 +1885,7 @@ describe("Send CLI", () => {
       });
       const out = logs.join("\n");
       expect(exitCode).toBe(1);
-      expect(out).toContain("Cannot connect to the OpenRig daemon at http://127.0.0.1:1:");
+      expect(out).toContain(`Cannot connect to the OpenRig daemon at ${refusedUrl}:`);
       expect(out).not.toContain("Daemon not running. Start it with: rig daemon start");
       // 1b45cf21 — SYMMETRY PIN. Fan-out must carry byte-identical
       // remediation to single-seat; divergence between the two paths is the
@@ -1235,7 +1905,7 @@ describe("Send CLI", () => {
     // discriminator is unambiguous: stdout carries exactly one JSON record and
     // stderr is empty (and the human path is the mirror image).
     it("R7c RED: single-seat --json transport failure emits exactly one parseable stdout JSON envelope, empty stderr, exit 1", async () => {
-      vi.stubEnv("OPENRIG_URL", "http://127.0.0.1:1");
+      vi.stubEnv("OPENRIG_URL", refusedUrl);
       vi.stubEnv("RIGGED_URL", "");
       const rc = recordingRealClient();
       const { stdout, stderr, exitCode } = await captureChannels(async () => {
@@ -1247,7 +1917,7 @@ describe("Send CLI", () => {
       expect(stdout).toHaveLength(1);
       expect(JSON.parse(stdout[0])).toEqual({
         error: {
-          fact: expect.stringContaining("Cannot connect to the OpenRig daemon at http://127.0.0.1:1:"),
+          fact: expect.stringContaining(`Cannot connect to the OpenRig daemon at ${refusedUrl}:`),
           consequence: "The message was not sent.",
           action: expect.stringContaining("Inspect the configured target with 'rig status'; a failed health probe does not prove the daemon is stopped."),
         },
@@ -1257,7 +1927,7 @@ describe("Send CLI", () => {
     });
 
     it("R7d RED: fan-out --json transport failure emits exactly one parseable stdout JSON envelope, empty stderr, exit 1", async () => {
-      vi.stubEnv("OPENRIG_URL", "http://127.0.0.1:1");
+      vi.stubEnv("OPENRIG_URL", refusedUrl);
       vi.stubEnv("RIGGED_URL", "");
       const rc = recordingRealClient();
       const { stdout, stderr, exitCode } = await captureChannels(async () => {
@@ -1268,7 +1938,7 @@ describe("Send CLI", () => {
       expect(stdout).toHaveLength(1);
       expect(JSON.parse(stdout[0])).toEqual({
         error: {
-          fact: expect.stringContaining("Cannot connect to the OpenRig daemon at http://127.0.0.1:1:"),
+          fact: expect.stringContaining(`Cannot connect to the OpenRig daemon at ${refusedUrl}:`),
           consequence: "The message was not sent.",
           action: expect.stringContaining("Inspect the configured target with 'rig status'; a failed health probe does not prove the daemon is stopped."),
         },
@@ -1277,7 +1947,7 @@ describe("Send CLI", () => {
     });
 
     it("R7e: single-seat HUMAN transport failure keeps stdout empty (mirror of R7c) — the 3 remediation lines are stderr-only, exit 1", async () => {
-      vi.stubEnv("OPENRIG_URL", "http://127.0.0.1:1");
+      vi.stubEnv("OPENRIG_URL", refusedUrl);
       vi.stubEnv("RIGGED_URL", "");
       const rc = recordingRealClient();
       const { stdout, stderr, exitCode } = await captureChannels(async () => {
@@ -1286,13 +1956,13 @@ describe("Send CLI", () => {
       expect(exitCode).toBe(1);
       expect(stdout).toEqual([]); // human path must never write to stdout
       const err = stderr.join("\n");
-      expect(err).toContain("Cannot connect to the OpenRig daemon at http://127.0.0.1:1:");
+      expect(err).toContain(`Cannot connect to the OpenRig daemon at ${refusedUrl}:`);
       expect(err).toContain("The message was not sent.");
       expect(err).toContain("Inspect the configured target with 'rig status'; a failed health probe does not prove the daemon is stopped.");
     });
 
     it("R7f: fan-out HUMAN transport failure keeps stdout empty (mirror of R7d) — stderr-only remediation, exit 1", async () => {
-      vi.stubEnv("OPENRIG_URL", "http://127.0.0.1:1");
+      vi.stubEnv("OPENRIG_URL", refusedUrl);
       vi.stubEnv("RIGGED_URL", "");
       const rc = recordingRealClient();
       const { stdout, stderr, exitCode } = await captureChannels(async () => {
@@ -1301,7 +1971,7 @@ describe("Send CLI", () => {
       expect(exitCode).toBe(1);
       expect(stdout).toEqual([]);
       const err = stderr.join("\n");
-      expect(err).toContain("Cannot connect to the OpenRig daemon at http://127.0.0.1:1:");
+      expect(err).toContain(`Cannot connect to the OpenRig daemon at ${refusedUrl}:`);
       expect(err).toContain("The message was not sent.");
     });
 

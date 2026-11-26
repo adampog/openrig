@@ -1,10 +1,10 @@
-import type { ProjectRead } from "./workspace/project-read.js";
+import { projectIds, type ProjectRead } from "./workspace/project-read.js";
 import type Database from "better-sqlite3";
 import { lastMeaningfulTransition } from "./queue-waiting.js";
 import { derivePickup } from "./queue-pickup.js";
 import { ulid } from "ulid";
 import type { EventBus } from "./event-bus.js";
-import { buildExecutionView, type ExecutionViewDeps } from "./execution-view.js";
+import { buildExecutionView, compactionOwedSinceOf, type ExecutionViewDeps } from "./execution-view.js";
 
 /**
  * View projector (PL-004 Phase B; L5 View — read-only projections).
@@ -53,6 +53,10 @@ interface ViewShowOptions {
   limit?: number;
   mission?: string;
   project?: ProjectRead | null;
+  /** With `project`: every current and former id the catalogued projects claim. */
+  cataloguedProjectIds?: readonly string[];
+  /** The execution view's caller: an aborted signal skips a queued build and stops a running one at its next window. */
+  signal?: AbortSignal;
 }
 
 export interface CustomView {
@@ -71,6 +75,10 @@ interface CustomViewRow {
   registered_by_session: string;
   registered_at: string;
   last_evaluated_at: string | null;
+}
+
+function customDefinitionHasLimit(definition: string): boolean {
+  return definition.toLowerCase().includes("limit");
 }
 
 export class ViewProjectorError extends Error {
@@ -119,6 +127,10 @@ export class ViewProjector {
   setExecutionDeps(deps: ExecutionViewDeps): void {
     this.executionDeps = deps;
   }
+  // Execution builds run one at a time, in arrival order, each reading fresh when it starts: a build holds a full
+  // candidate array through its Git awaits, so two must not overlap. A failed build never blocks the next one.
+  // This queue is the projector's own; other views and other routes do not wait on it.
+  private executionTail: Promise<unknown> = Promise.resolve();
 
   /**
    * Run a view by name. Built-in names (BUILT_IN_VIEW_NAMES) dispatch to
@@ -140,8 +152,18 @@ export class ViewProjector {
           "execution view deps are not wired on this daemon (setExecutionDeps was never called)",
         );
       }
-      return buildExecutionView(opts?.project ? { ...this.executionDeps, slicesRoot: () => opts.project!.missionsRoot } : this.executionDeps, { mission: opts?.mission, rig: opts?.rig, project: opts?.project?.id })
-        .then(doc => ({ viewName: "execution", generatedAt: this.now().toISOString(), rows: [doc], rowCount: 1 }));
+      const build = () => {
+        opts?.signal?.throwIfAborted();
+        const deps = this.executionDeps!;
+        return buildExecutionView(opts?.project ? { ...deps, slicesRoot: () => opts.project!.missionsRoot } : deps, { mission: opts?.mission, rig: opts?.rig, project: opts?.project?.id, signal: opts?.signal,
+          ...(opts?.project ? { projectIds: projectIds(opts.project), cataloguedProjectIds: opts.cataloguedProjectIds, aliasWarnings: opts.project.aliasWarnings } : {}) })
+          .then(doc => ({ viewName: "execution" as const, generatedAt: this.now().toISOString(), rows: [doc], rowCount: 1 }));
+      };
+      // A caller inside a transaction keeps its uncommitted visibility: its build starts now, outside the queue.
+      if (this.executionDeps.db.inTransaction) return build();
+      const job = this.executionTail.then(build);
+      this.executionTail = job.catch(() => undefined);
+      return job;
     }
     if ((BUILT_IN_VIEW_NAMES as readonly string[]).includes(viewName)) {
       return this.runBuiltIn(viewName as BuiltInViewName, opts?.rig, limit);
@@ -153,14 +175,25 @@ export class ViewProjector {
     return this.runCustom(custom, limit);
   }
 
+  /** #586: whether showing this view binds `limit` into SQL. The execution view
+   *  never reads it, a custom view with its own LIMIT keeps that one, and an
+   *  unregistered name is refused before any SQL runs. */
+  bindsLimit(viewName: string): boolean {
+    if (viewName === "execution") return false;
+    if ((BUILT_IN_VIEW_NAMES as readonly string[]).includes(viewName)) return true;
+    const custom = this.getCustomView(viewName);
+    return custom !== null && !customDefinitionHasLimit(custom.definition);
+  }
+
   list(): { builtIn: BuiltInViewName[]; custom: CustomView[] } {
     return { builtIn: [...BUILT_IN_VIEW_NAMES], custom: this.listCustomViews() };
   }
 
   private runBuiltIn(name: BuiltInViewName, rig: string | undefined, limit: number): ViewQueryResult {
     const fixtureClause = fixtureExclusionClause();
-    const rigClause = rig ? `AND (destination_session LIKE ? OR source_session LIKE ?)` : "";
-    const rigParams: unknown[] = rig ? [`%@${rig}`, `%@${rig}`] : [];
+    const rigClause = rig ? `AND (destination_session LIKE ? ESCAPE '\\' OR source_session LIKE ? ESCAPE '\\')` : "";
+    const rigPattern = rig ? `%@${rig.replace(/[\\%_]/g, "\\$&")}` : undefined;
+    const rigParams: unknown[] = rigPattern ? [rigPattern, rigPattern] : [];
 
     // S04 — the pickup lens post-processes through the ONE shared derivation rule
     // (derivePickup), never a second SQL copy of it: claimed live rows, oldest claim first,
@@ -186,7 +219,9 @@ export class ViewProjector {
         const activity = this.executionDeps?.seatActivity?.getSeatStateBySession(String(r.destination_session));
         const receipt = derivePickup({
           lastMeaningfulAt: lastMeaningfulTransition(this.db, String(r.qitem_id))?.at,
-          activity: activity?.activity, needsInput: activity?.needsInput.count,
+          activity: activity?.activity, needsInput: activity?.needsInput.count, needsInputReason: activity?.needsInput.reason,
+          backgroundWork: activity?.backgroundWork ?? null,
+          compactionOwedSince: this.executionDeps ? compactionOwedSinceOf(this.executionDeps, String(r.destination_session)) : null,
           state: String(r.state),
           claimedAt: (r.claimed_at as string | null) ?? null,
           lastHeartbeat: (r.last_heartbeat as string | null) ?? null,
@@ -196,6 +231,7 @@ export class ViewProjector {
           ...r,
           pickup_state: receipt.state,
           ...(receipt.evidence ? { pickup_evidence: receipt.evidence } : {}),
+          ...(receipt.stall ? { pickup_stall: receipt.stall } : {}),
         };
       });
       return { viewName: name, generatedAt: this.now().toISOString(), rows: projected, rowCount: projected.length };
@@ -294,7 +330,7 @@ export class ViewProjector {
               q.source_session NOT LIKE '%@fixture-%'
             )`;
         const rigClauseQI = rig
-          ? `AND (q.destination_session LIKE ? OR q.source_session LIKE ?)`
+          ? `AND (q.destination_session LIKE ? ESCAPE '\\' OR q.source_session LIKE ? ESCAPE '\\')`
           : "";
         sql = `
           SELECT t.transition_id, t.qitem_id, t.ts, t.state, t.actor_session, t.transition_note,
@@ -325,10 +361,12 @@ export class ViewProjector {
   }
 
   private runCustom(view: CustomView, limit: number): ViewQueryResult {
-    // Custom view definitions are operator-supplied SQL. Append LIMIT if
-    // the operator's SQL does not already include one. We do not parse SQL;
-    // operators are responsible for the definition's correctness.
-    const sql = view.definition.toLowerCase().includes("limit")
+    // Custom definitions are operator-supplied SQL, stored unchanged. This method appends LIMIT unless
+    // the text contains "limit"; that is a substring check, not SQL parsing or read-only enforcement.
+    // better-sqlite3 prepares one statement, and a returning write can run through all() when the
+    // resulting SQL is valid. Prepare and execution errors become view_query_failed. Execution uses the
+    // daemon's database connection and is not sandboxed.
+    const sql = customDefinitionHasLimit(view.definition)
       ? view.definition
       : `${view.definition.trim().replace(/;$/, "")} LIMIT ${limit}`;
     let rows: Record<string, unknown>[];
@@ -356,6 +394,8 @@ export class ViewProjector {
    * Register a custom view. UNIQUE on view_name; re-registration of the
    * same name updates the definition (operator-friendly: edit views.yaml,
    * re-register, get the new query).
+   *
+   * The definition is stored as given; what happens to it, and what it may be, is stated at runCustom.
    */
   registerCustomView(input: {
     viewName: string;
@@ -411,13 +451,16 @@ export class ViewProjector {
    * Used by routes/views.ts to emit view.changed when underlying state
    * changes. Phase B does not auto-evaluate; callers (route SSE handlers)
    * subscribe to event-bus events and trigger this notify.
+   *
+   * view.changed is transient: delivered to the live subscribers (the view SSE streams) and never stored, so it costs
+   * no row in the events table. `causeSeq` is the seq of the stored event that caused it (the SSE id it goes out with).
    */
-  notifyViewChanged(viewName: string, cause: string): void {
-    this.eventBus.persistWithinTransaction({
+  notifyViewChanged(viewName: string, cause: string, causeSeq?: number): void {
+    this.eventBus.publishTransient({
       type: "view.changed",
       viewName,
       cause,
-    });
+    }, causeSeq);
   }
 
   private getCustomViewByIdOrThrow(viewId: string): CustomView {

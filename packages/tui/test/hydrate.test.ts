@@ -5,6 +5,8 @@ import { DaemonClient } from "../src/daemon-client.js";
 import { hydrateSnapshot } from "../src/hydrate.js";
 import { renderScreen } from "../src/render.js";
 import { createViewState } from "../src/state.js";
+import { rowStatusGlyph, statusGlyph } from "../src/topology/glyphs.js";
+import { displayTime } from "../src/time.js";
 
 // Fixtures mirror the SERVED shapes traced firsthand at 5f3b5bd4 (Phase-2
 // endpoint-shape survey): real field names, real enum values, real evidence
@@ -12,6 +14,7 @@ import { createViewState } from "../src/state.js";
 
 const FIXTURES: Record<string, unknown> = {
   "/healthz": { ok: true, selfHostId: "mm2-openrig1" },
+  "/api/hosts": { ownName: "localhost", selected: "local", hosts: [] },
   "/api/health?limit=200": {
     schema: "openrig.health-list/v0alpha1",
     evaluatedAt: "2026-09-05T12:00:00.000Z",
@@ -158,20 +161,33 @@ const FIXTURES: Record<string, unknown> = {
   "/api/queue/list?state=in-progress": [],
   // PULSE ○ UP NEXT + ✓ JUST FINISHED lane sources (increment 3) — same /list route
   "/api/queue/list?state=pending&limit=50": [],
-  "/api/queue/list?state=done,handed-off&limit=20": [],
+  "/api/queue/list?state=done,handed-off&sort=updated&limit=20": [],
   "/api/queue/recent-transitions?scope=rig&rig=myrig&limit=20": [],
+  "/api/queue/hosted-members": { hostId: "mm2-openrig1", members: [] },
 };
 
-function fixtureClient(overrides: Record<string, { status: number } | undefined> = {}, responses: Record<string, unknown> = {}): DaemonClient {
+function fixtureClient(
+  overrides: Record<string, { status: number; body?: unknown } | undefined> = {},
+  responses: Record<string, unknown> = {},
+  calls?: string[],
+): DaemonClient {
   const fetchImpl = (async (url: unknown) => {
     const route = String(url).replace("http://x", "");
+    calls?.push(route);
     const failure = overrides[route];
-    if (failure) return { ok: false, status: failure.status, json: async () => ({}) } as Response;
+    // Status 0 stands for a read that never got an answer, such as a dropped connection.
+    if (failure?.status === 0) throw new Error("fetch failed");
+    if (failure) return { ok: false, status: failure.status, json: async () => failure.body ?? null } as Response;
     if (route in responses) return { ok: true, json: async () => responses[route] } as Response;
     if (!(route in FIXTURES)) throw new Error(`unexpected route in test: ${route}`);
     return { ok: true, json: async () => FIXTURES[route] } as Response;
   }) as typeof fetch;
   return new DaemonClient({ baseUrl: "http://x", fetchImpl });
+}
+
+// The summary serves myrig before downrig (creation order); the snapshot lists rigs by name.
+function myrig(snap: Awaited<ReturnType<typeof hydrateSnapshot>>) {
+  return snap.hosts.find((h) => h.id === "local")!.rigs.find((r) => r.name === "myrig")!;
 }
 
 function expectIncompleteNeedsTruth(snap: Awaited<ReturnType<typeof hydrateSnapshot>>): void {
@@ -197,12 +213,196 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
       truncated: false,
       records: [{ id: "health-context-dev-impl", scope: { seatId: "01JNODEIMPL" } }],
     });
-    expect(snap.hosts[0]?.rigs[0]?.pods[0]?.agents[0]).toMatchObject({ nodeId: "01JNODEIMPL" });
+    expect(myrig(snap).pods[0]?.agents[0]).toMatchObject({ nodeId: "01JNODEIMPL" });
+  });
+  it("shows attention as unknown when an older daemon omits the seat flag", async () => {
+    const snap = await hydrateSnapshot(fixtureClient());
+    expect(myrig(snap).pods[0]!.agents[0]!.needsAttention).toBeNull();
+    const view = createViewState({ instanceId: "t", getSnapshot: () => snap });
+    view.dispatch({ type: "drill", resource: "host", name: snap.hosts[0]!.name });
+    const output = renderScreen(view.get(), snap, { cols: 160, rows: 60 });
+    expect(output.lines.join("\n")).toContain("attention unknown");
+  });
+  it.each([
+    { agentActivity: { state: "needs_input" }, startupStatus: "ready" as const, status: "needs_input" },
+    { agentActivity: null, startupStatus: "attention_required" as const, status: "attention_required" },
+  ])("keeps an older daemon's $status visible in rows and graph", async ({ status, ...fields }) => {
+    const base = (FIXTURES["/api/rigs/01JRIG/nodes"] as Array<Record<string, unknown>>)[0]!;
+    const snap = await hydrateSnapshot(fixtureClient({}, { "/api/rigs/01JRIG/nodes": [{ ...base, ...fields }] }));
+    const agent = myrig(snap).pods[0]!.agents[0]!;
+    expect(agent.needsAttention).toBeNull();
+    expect(agent.status).toBe(status);
+    expect(rowStatusGlyph(agent).glyph).toBe("◐");
+    const graph = { logicalId: agent.name, runtime: agent.runtime, model: null, nodeKind: "agent" as const,
+      contextUsedPercentage: null, status: "running", ...fields };
+    expect(statusGlyph(graph).glyph).toBe("◐");
+    expect(statusGlyph({ ...graph, needsAttention: false }).glyph).not.toBe("◐");
+  });
+  it.each([
+    ["runtime_hook", "hook"], ["pane_heuristic", "pane"], [undefined, "unknown"],
+  ])("shows a raw prompt as needs_input with %s evidence labelled %s", async (evidenceSource, label) => {
+    const base = (FIXTURES["/api/rigs/01JRIG/nodes"] as Array<Record<string, unknown>>)[0]!;
+    const snap = await hydrateSnapshot(fixtureClient({}, { "/api/rigs/01JRIG/nodes": [{ ...base,
+      needsAttention: true, arbitratedNeedsInput: null, agentActivity: { state: "needs_input", evidenceSource },
+    }] }));
+    const agent = myrig(snap).pods[0]!.agents[0]!;
+    expect(agent.status).toBe("needs_input");
+    const view = createViewState({ instanceId: "t", getSnapshot: () => snap });
+    view.dispatch({ type: "drill", resource: "agent", name: agent.name, target: { host: "mm2-openrig1", rig: "myrig" } });
+    expect(renderScreen(view.get(), snap, { cols: 180, rows: 60 }).lines.join("\n")).toContain(`needs-input evidence ${label}`);
   });
   it("leaves health unassessed when a focused view skips the projection read", async () => {
     const context = { section: "topology" as const, viewTab: "table" as const, drill: [] };
     const snap = await hydrateSnapshot(fixtureClient(), undefined, undefined, undefined, undefined, context);
     expect(snap.health).toBeUndefined();
+  });
+  it("lists rigs by name as rig ps does, not in the summary's creation order (#2130)", async () => {
+    const rig = (id: string, name: string) => ({ id, name, nodeCount: 0, hasServices: false, latestSnapshotAt: null,
+      latestSnapshotId: null, archivedAt: null, lifecycleState: "running" });
+    // Creation order, as the summary serves it. rig ps orders by name as SQLite compares it: uppercase before
+    // lowercase, and two rigs with the same name stay in creation order.
+    const summary = [rig("r1", "web"), rig("r2", "api"), rig("r3", "Zeta"), rig("r4", "build"), rig("r5", "api")];
+    const context = { section: "topology" as const, viewTab: "table" as const, drill: [] };
+    const snap = await hydrateSnapshot(fixtureClient({}, { "/api/rigs/summary": summary }), undefined, undefined, undefined, undefined, context);
+    expect(snap.hosts.find((h) => h.id === "local")?.rigs.map((r) => r.id)).toEqual(["r3", "r2", "r5", "r4", "r1"]);
+  });
+  // The focused views that render the HEALTH summary line must hydrate the projection they read.
+  const focusedHealthViews = [
+    ["instance Table", { resource: "host", name: "mm2-openrig1" }, "table"],
+    ["rig Table", { resource: "rig", name: "myrig", target: { host: "mm2-openrig1" } }, "table"],
+    ["rig Overview", { resource: "rig", name: "myrig", target: { host: "mm2-openrig1" } }, "overview"],
+    ["pod Table", { resource: "pod", name: "dev", target: { host: "mm2-openrig1", rig: "myrig" } }, "table"],
+    ["pod Overview", { resource: "pod", name: "dev", target: { host: "mm2-openrig1", rig: "myrig" } }, "overview"],
+    ["agent detail", { resource: "agent", name: "dev.impl", target: { host: "mm2-openrig1", rig: "myrig", pod: "dev" } }, "table"],
+  ] as const;
+  it.each(focusedHealthViews)("loads health for the focused %s so its summary reports the served findings", async (_label, drill, tab) => {
+    const calls: string[] = [];
+    const coverage = [{ source: "passive-ceremony", unit: "handoff families", limit: 2, total: 3,
+      evaluated: 2, omitted: 1, partial: true, order: "fixture order" }];
+    const health = { ...(FIXTURES["/api/health?limit=200"] as Record<string, unknown>), coverage };
+    const full = await hydrateSnapshot(fixtureClient());
+    const view = createViewState({ instanceId: "t", getSnapshot: () => full });
+    view.dispatch({ type: "drill", ...drill } as never);
+    view.dispatch({ type: "tab", tab });
+    const { section, viewTab, drill: segments } = view.get();
+    const snap = await hydrateSnapshot(fixtureClient({}, {
+      "/api/health?limit=200": health,
+      "/api/seat/effort/dev.impl%40myrig": { ok: true, saved: { effective: "high", source: "seat_choice" } },
+    }, calls), undefined, undefined, undefined, segments.find((part) => part.kind === "rig")?.name, { section, viewTab, drill: segments });
+    expect(calls.filter(route => route === "/api/health?limit=200")).toEqual(["/api/health?limit=200"]);
+    expect(calls.filter(route => route === "/healthz")).toEqual(["/healthz"]);
+    expect(snap.health).toMatchObject({ availability: "loaded", total: 1, truncated: false, coverage,
+      records: [{ id: "health-context-dev-impl", scope: { rigId: "01JRIG", seatId: "01JNODEIMPL" }, severity: "warning" }] });
+    const text = renderScreen(view.get(), snap, { cols: 220, rows: 60 }).lines.join("\n");
+    if (_label === "agent detail") {
+      expect(text).toContain("── HEALTH");
+      expect(text).toContain("WARNING       Seat context utilization reached 96%.");
+    } else {
+      expect(text).toMatch(/HEALTH\s+ACTIVE.*WARN 1.*COVERAGE 2\/3.*context 1/);
+    }
+    expect(text).toContain("Seat context utilization reached 96%.");
+    expect(text).not.toContain("Not assessed");
+  });
+  it.each(focusedHealthViews)("marks the focused %s summary unavailable when findings fail despite a healthy control plane", async (_label, drill, tab) => {
+    const calls: string[] = [];
+    const full = await hydrateSnapshot(fixtureClient());
+    const view = createViewState({ instanceId: "t", getSnapshot: () => full });
+    view.dispatch({ type: "drill", ...drill } as never);
+    view.dispatch({ type: "tab", tab });
+    const { section, viewTab, drill: segments } = view.get();
+    const snap = await hydrateSnapshot(fixtureClient({ "/api/health?limit=200": { status: 503 } }, {
+      "/api/seat/effort/dev.impl%40myrig": { ok: true, saved: { effective: "high", source: "seat_choice" } },
+    }, calls), undefined, undefined, undefined, segments.find((part) => part.kind === "rig")?.name, { section, viewTab, drill: segments });
+    expect(calls.filter(route => route === "/api/health?limit=200")).toEqual(["/api/health?limit=200"]);
+    expect(snap.controlPlane).toMatchObject({ ok: true, selfHostId: "mm2-openrig1" });
+    expect(snap.health).toMatchObject({ availability: "unavailable", records: [] });
+    expect(snap.readErrors.join("\n")).toMatch(/health-findings:.*503/);
+    const text = renderScreen(view.get(), snap, { cols: 220, rows: 60 }).lines.join("\n");
+    expect(text).toMatch(/HEALTH\s+Unknown.*Unavailable.*canonical health records could not be read/);
+    expect(text).not.toContain("Not assessed");
+    expect(text).not.toContain("Seat context utilization reached 96%.");
+  });
+  // Views that do not render the summary stay lazy: no health request, nothing to assess.
+  it.each([
+    ["instance Overview", { resource: "host", name: "mm2-openrig1" }, "overview"],
+    ["instance Graph", { resource: "host", name: "mm2-openrig1" }, "graph"],
+    ["rig Graph", { resource: "rig", name: "myrig", target: { host: "mm2-openrig1" } }, "graph"],
+    ["rig Recent", { resource: "rig", name: "myrig", target: { host: "mm2-openrig1" } }, "recent"],
+  ] as const)("does not read health for the focused %s", async (_label, drill, tab) => {
+    const calls: string[] = [];
+    const full = await hydrateSnapshot(fixtureClient());
+    const view = createViewState({ instanceId: "t", getSnapshot: () => full });
+    view.dispatch({ type: "drill", ...drill } as never);
+    view.dispatch({ type: "tab", tab });
+    const { section, viewTab, drill: segments } = view.get();
+    const snap = await hydrateSnapshot(fixtureClient({}, {}, calls), undefined, undefined, undefined, segments.find((part) => part.kind === "rig")?.name, { section, viewTab, drill: segments });
+    expect(calls).not.toContain("/api/health?limit=200");
+    expect(calls.filter(route => route === "/healthz")).toEqual(["/healthz"]);
+    expect(snap.controlPlane).toMatchObject({ ok: true });
+    expect(snap.health).toBeUndefined();
+  });
+  it("reads the rig's RECENT window on a pod's Recent tab, and only there among the pod's tabs", async () => {
+    const route = "/api/queue/recent-transitions?scope=rig&rig=myrig&limit=20";
+    const transitions = [{ transitionId: 7, qitemId: "q-7", ts: "2026-09-05T11:58:00.000Z", actorSession: "dev-impl@myrig",
+      change: "completed", summary: "Ship the pod recent window", targetKind: "qitem", target: "q-7" }];
+    const pod = async (tab: "table" | "recent" | "overview" | "graph" | "health") => {
+      const calls: string[] = [];
+      const full = await hydrateSnapshot(fixtureClient());
+      const view = createViewState({ instanceId: "t", getSnapshot: () => full });
+      view.dispatch({ type: "drill", resource: "pod", name: "dev", target: { host: "mm2-openrig1", rig: "myrig" } } as never);
+      view.dispatch({ type: "tab", tab });
+      const { section, viewTab, drill: segments } = view.get();
+      const snap = await hydrateSnapshot(fixtureClient({}, { [route]: transitions }, calls), undefined, undefined, undefined, "myrig", { section, viewTab, drill: segments });
+      return { calls, text: renderScreen(view.get(), snap, { cols: 220, rows: 60 }).lines.join("\n") };
+    };
+    const recent = await pod("recent");
+    expect(recent.calls.filter((call) => call === route)).toEqual([route]);
+    expect(recent.text).toContain("RECENT · rig myrig");
+    expect(recent.text).toContain("Ship the pod recent window");
+    expect(recent.text).not.toContain("RECENT window not served");
+    // The pod's other tabs draw no RECENT window (the pod Table leaves out the rig's strip), so they skip the read.
+    for (const tab of ["table", "overview", "graph", "health"] as const) expect((await pod(tab)).calls).not.toContain(route);
+  });
+  it("hydrates the seat queue on the focused topology table so Q / WORK / NOW can fill", async () => {
+    const row = (qitemId: string, state: string, destinationSession: string) => ({ qitemId, state, destinationSession, blockedOn: null, handedOffTo: null, tier: null, tags: ["slice:OPR.1.0.2.7"], summary: `work ${qitemId}`, body: "", claimedAt: null, tsUpdated: "2026-09-12T10:00:00.000Z" });
+    const context = { section: "topology" as const, viewTab: "table" as const, drill: [{ kind: "rig" as const, name: "myrig" }] };
+    const snap = await hydrateSnapshot(fixtureClient({}, {
+      "/api/queue/list?state=in-progress": [row("qi1", "in-progress", "dev-a@rig")],
+      "/api/queue/list?state=pending&limit=50": [row("qp1", "pending", "dev-a@rig")],
+    }), undefined, undefined, undefined, undefined, context);
+    expect(snap.inProgress.map((q) => q.qitemId)).toEqual(["qi1"]);
+    expect(snap.pending.map((q) => q.qitemId)).toEqual(["qp1"]);
+    expect(snap.recentlyFinished).toEqual([]);
+  });
+  it("hydrates the seat's recently finished items on an agent page so RECENTLY FINISHED can fill", async () => {
+    const row = (qitemId: string, state: string, destinationSession: string) => ({ qitemId, state, destinationSession, blockedOn: null, handedOffTo: null, tier: null, tags: [], summary: `work ${qitemId}`, body: "", claimedAt: null, tsUpdated: "2026-09-12T10:00:00.000Z" });
+    const seatRead = "/api/queue/list?state=done,handed-off&sort=updated&limit=20&destinationSession=dev-impl%40myrig";
+    const instanceRead = "/api/queue/list?state=done,handed-off&sort=updated&limit=20";
+    // The instance window holds only another seat's finishes, as it does once 20 of them follow this seat's.
+    const finished = { [seatRead]: [row("qd1", "done", "dev-impl@myrig")], [instanceRead]: [row("qd2", "done", "dev-qa@myrig")] };
+    const page = async (drill: Record<string, unknown>, tab: "table" | "graph" = "table") => {
+      const calls: string[] = [];
+      const full = await hydrateSnapshot(fixtureClient());
+      const view = createViewState({ instanceId: "t", getSnapshot: () => full });
+      view.dispatch({ type: "drill", ...drill } as never);
+      view.dispatch({ type: "tab", tab });
+      const { section, viewTab, drill: segments } = view.get();
+      const snap = await hydrateSnapshot(fixtureClient({}, finished, calls), undefined, undefined, undefined, "myrig", { section, viewTab, drill: segments });
+      return { calls, snap, text: renderScreen(view.get(), snap, { cols: 220, rows: 120 }).lines.join("\n") };
+    };
+    const agent = await page({ resource: "agent", name: "dev.impl", target: { host: "mm2-openrig1", rig: "myrig", pod: "dev" } });
+    expect(agent.calls).toContain(seatRead);
+    expect(agent.calls).not.toContain(instanceRead);
+    expect(agent.snap.recentlyFinished.map((q) => q.qitemId)).toEqual(["qd1"]);
+    expect(agent.text).toContain("RECENTLY FINISHED · bounded window");
+    expect(agent.text).toContain("qd1 · done");
+    expect(agent.text).not.toContain("qd2");
+    // The rig table and graph draw no finished items, so they keep that read off.
+    for (const tab of ["table", "graph"] as const) {
+      const rig = await page({ resource: "rig", name: "myrig", target: { host: "mm2-openrig1" } }, tab);
+      expect(rig.calls).not.toContain(instanceRead);
+      expect(rig.calls).not.toContain(seatRead);
+    }
   });
   it("marks health unavailable when the selected health view read fails", async () => {
     const context = { section: "topology" as const, viewTab: "health" as const, drill: [] };
@@ -237,9 +437,8 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
   });
   it("maps topology: pods grouped, agent rows VERBATIM from the maintained projection (PIN 2)", async () => {
     const snap = await hydrateSnapshot(fixtureClient());
-    const local = snap.hosts.find((h) => h.id === "local");
-    expect(local?.rigs[0]?.name).toBe("myrig");
-    const dev = local?.rigs[0]?.pods.find((p) => p.name === "dev");
+    const rig = myrig(snap);
+    const dev = rig.pods.find((p) => p.name === "dev");
     expect(dev?.agents.map((a) => a.name)).toEqual(["dev.impl", "dev.qa"]);
     const impl = dev?.agents[0];
     expect(impl).toMatchObject({
@@ -251,7 +450,7 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
     const qa = dev?.agents[1];
     expect(qa).toMatchObject({ context: null, tokens: null, status: "unknown", canRun: true });
     // infrastructure nodes are not agent rows
-    expect(local?.rigs[0]?.pods.flatMap((p) => p.agents.map((a) => a.name))).not.toContain("svc.db");
+    expect(rig.pods.flatMap((p) => p.agents.map((a) => a.name))).not.toContain("svc.db");
   });
 
   it("keeps the two stuck legs DISTINCT — served evidence/threshold strings verbatim, no client threshold", async () => {
@@ -405,18 +604,111 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
     expectIncompleteNeedsTruth(snap);
   });
 
-  it("gives failed, attention, and needs-input truth precedence over terminal active/idle", async () => {
+  it("carries configured effort and its provenance from the node inventory", async () => {
     const base = (FIXTURES["/api/rigs/01JRIG/nodes"] as Array<Record<string, unknown>>)[0]!;
     const nodes = [
+      { ...base, logicalId: "dev.choice", effort: "high", effortSource: "seat_choice" },
+      { ...base, logicalId: "dev.authored", effort: "medium", effortSource: "authored" },
+      { ...base, logicalId: "dev.default", effort: null, effortSource: "runtime_default" },
+      // An older daemon omits both fields: that is unknown, not a runtime default.
+      { ...base, logicalId: "dev.old" },
+    ];
+    const snap = await hydrateSnapshot(fixtureClient({}, { "/api/rigs/01JRIG/nodes": nodes }));
+    const byName = Object.fromEntries(myrig(snap).pods[0]!.agents.map((agent) => [agent.name, agent]));
+    expect(byName["dev.choice"]).toMatchObject({ effort: "high", effortSource: "seat_choice" });
+    expect(byName["dev.authored"]).toMatchObject({ effort: "medium", effortSource: "authored" });
+    expect(byName["dev.default"]).toMatchObject({ effort: null, effortSource: "runtime_default" });
+    expect(byName["dev.old"]).toMatchObject({ effort: null, effortSource: null });
+  });
+
+  it("carries the configured account and leaves old-daemon values unknown", async () => {
+    const base = (FIXTURES["/api/rigs/01JRIG/nodes"] as Array<Record<string, unknown>>)[0]!;
+    const nodes = [
+      { ...base, logicalId: "dev.label", configuredAccount: "long-account-label" },
+      { ...base, logicalId: "dev.old" },
+    ];
+    const snap = await hydrateSnapshot(fixtureClient({}, { "/api/rigs/01JRIG/nodes": nodes }));
+    const byName = Object.fromEntries(myrig(snap).pods[0]!.agents.map((agent) => [agent.name, agent]));
+    expect(byName["dev.label"]?.configuredAccount).toBe("long-account-label");
+    expect(byName["dev.old"]?.configuredAccount).toBeNull();
+  });
+
+  it("reads seat effort once on agent detail and not at all on the rig table", async () => {
+    const calls: string[] = [];
+    const rigContext = { section: "topology" as const, viewTab: "table" as const, drill: [{ kind: "rig" as const, name: "myrig" }] };
+    const tableSnap = await hydrateSnapshot(fixtureClient({}, {}, calls), undefined, undefined, undefined, "myrig", rigContext);
+    expect(tableSnap.seatEffort).toBeUndefined();
+    expect(calls.filter((route) => route.startsWith("/api/seat/effort/"))).toEqual([]);
+
+    calls.length = 0;
+    const detailContext = {
+      section: "topology" as const, viewTab: "table" as const,
+      drill: [
+        { kind: "host" as const, name: "local" },
+        { kind: "rig" as const, name: "myrig" },
+        { kind: "pod" as const, name: "dev" },
+        { kind: "agent" as const, name: "dev.impl" },
+      ],
+    };
+    const report = { ok: true, saved: { effective: "high", source: "seat_choice" } };
+    const detailSnap = await hydrateSnapshot(
+      fixtureClient({}, { "/api/seat/effort/dev.impl%40myrig": report }, calls),
+      undefined, undefined, undefined, "myrig", detailContext,
+    );
+    expect(detailSnap.seatEffort).toEqual({ seatRef: "dev.impl@myrig", report });
+    expect(calls.filter((route) => route.startsWith("/api/seat/effort/"))).toHaveLength(1);
+  });
+
+  it("keeps a refused seat-effort report in the agent detail", async () => {
+    const detailContext = {
+      section: "topology" as const, viewTab: "table" as const,
+      drill: [
+        { kind: "host" as const, name: "local" },
+        { kind: "rig" as const, name: "myrig" },
+        { kind: "pod" as const, name: "dev" },
+        { kind: "agent" as const, name: "dev.impl" },
+      ],
+    };
+    const report = { ok: false, code: "effort_unsupported_runtime", message: "runtime does not report effort" };
+    const snap = await hydrateSnapshot(
+      fixtureClient({ "/api/seat/effort/dev.impl%40myrig": { status: 409, body: report } }),
+      undefined, undefined, undefined, "myrig", detailContext,
+    );
+    expect(snap.seatEffort).toEqual({ seatRef: "dev.impl@myrig", report });
+    expect(snap.readErrors.some((error) => error.startsWith("seat-effort"))).toBe(false);
+  });
+
+  it("keeps the agent detail usable when the seat-effort read is missing", async () => {
+    const detailContext = {
+      section: "topology" as const, viewTab: "table" as const,
+      drill: [
+        { kind: "host" as const, name: "local" },
+        { kind: "rig" as const, name: "myrig" },
+        { kind: "pod" as const, name: "dev" },
+        { kind: "agent" as const, name: "dev.impl" },
+      ],
+    };
+    const snap = await hydrateSnapshot(
+      fixtureClient({ "/api/seat/effort/dev.impl%40myrig": { status: 404 } }),
+      undefined, undefined, undefined, "myrig", detailContext,
+    );
+    expect(snap.seatEffort).toEqual({ seatRef: "dev.impl@myrig", report: null });
+    expect(snap.readErrors.some((error) => error.startsWith("seat-effort"))).toBe(false);
+  });
+
+  it("gives failed, attention, and needs-input truth precedence over terminal active/idle", async () => {
+    const base = (FIXTURES["/api/rigs/01JRIG/nodes"] as Array<Record<string, unknown>>)[0]!;
+
+    const nodes = [
       { ...base, logicalId: "dev.failed", startupStatus: "failed", lifecycleState: "attention_required", terminalActive: true },
-      { ...base, logicalId: "dev.attention", startupStatus: "attention_required", lifecycleState: "attention_required", terminalActive: false },
-      { ...base, logicalId: "dev.input", startupStatus: "ready", agentActivity: { state: "needs_input" }, terminalActive: true },
+      { ...base, logicalId: "dev.attention", needsAttention: true, startupStatus: "attention_required", lifecycleState: "attention_required", terminalActive: false },
+      { ...base, logicalId: "dev.input", needsAttention: true, arbitratedNeedsInput: true, startupStatus: "ready", agentActivity: { state: "needs_input" }, terminalActive: true },
       { ...base, logicalId: "dev.active", startupStatus: "ready", agentActivity: { state: "running" }, terminalActive: true },
       { ...base, logicalId: "dev.mismatch", startupStatus: "ready", lifecycleState: "attention_required", agentActivity: { state: "running" }, terminalActive: true, identityVerdict: { verdict: "mismatch" } },
       { ...base, logicalId: "dev.missing", startupStatus: "ready", lifecycleState: "attention_required", agentActivity: { state: "running" }, terminalActive: true, identityVerdict: { verdict: "pane_missing" } },
     ];
     const snap = await hydrateSnapshot(fixtureClient({}, { "/api/rigs/01JRIG/nodes": nodes }));
-    const statuses = Object.fromEntries(snap.hosts[0]!.rigs[0]!.pods[0]!.agents.map((agent) => [agent.name, agent.status]));
+    const statuses = Object.fromEntries(myrig(snap).pods[0]!.agents.map((agent) => [agent.name, agent.status]));
     expect(statuses).toEqual({
       "dev.failed": "failed",
       "dev.attention": "attention_required",
@@ -425,7 +717,7 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
       "dev.mismatch": "attention_required",
       "dev.missing": "attention_required",
     });
-    const byName = Object.fromEntries(snap.hosts[0]!.rigs[0]!.pods[0]!.agents.map((agent) => [agent.name, agent]));
+    const byName = Object.fromEntries(myrig(snap).pods[0]!.agents.map((agent) => [agent.name, agent]));
     expect(byName["dev.mismatch"]?.canRun).toBe(false);
     expect(byName["dev.missing"]?.canRun).toBe(false);
     const view = createViewState({ instanceId: "t", getSnapshot: () => snap });
@@ -433,6 +725,165 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
     const output = renderScreen(view.get(), snap, { cols: 140, rows: 34 });
     expect(output.lines.find((line) => /\bmismatch\s/.test(line))).not.toContain("run ▸");
     expect(output.lines.find((line) => /\bmissing\s/.test(line))).not.toContain("run ▸");
+  });
+  it("shows a quiet seat the daemon reads as unknown as unknown, never idle, for a community harness and a built-in runtime alike", async () => {
+    const base = (FIXTURES["/api/rigs/01JRIG/nodes"] as Array<Record<string, unknown>>)[0]!;
+    const quiet = { startupStatus: "ready", sessionStatus: "running", terminalActive: false, agentActivity: { state: "unknown" },
+      activityState: { activity: "unknown", display: "unknown", needsInput: { count: 0, reason: null }, decidedBy: null } };
+    const nodes = [
+      { ...base, ...quiet, logicalId: "dev.app-quiet", runtime: "synth-harness", communityHarness: { harness: "synth-harness" } },
+      { ...base, ...quiet, logicalId: "dev.app-moving", runtime: "synth-harness", communityHarness: { harness: "synth-harness" }, terminalActive: true },
+      { ...base, ...quiet, logicalId: "dev.app-prompt", needsAttention: true, arbitratedNeedsInput: null, runtime: "synth-harness", communityHarness: { harness: "synth-harness" }, agentActivity: { state: "needs_input" } },
+      { ...base, ...quiet, logicalId: "dev.pi-quiet", runtime: "pi" },
+      { ...base, ...quiet, logicalId: "dev.claude-quiet", runtime: "claude-code" },
+    ];
+    const snap = await hydrateSnapshot(fixtureClient({}, { "/api/rigs/01JRIG/nodes": nodes }));
+    const statuses = Object.fromEntries(myrig(snap).pods[0]!.agents.map((agent) => [agent.name, agent.status]));
+    expect(statuses).toEqual({
+      "dev.app-quiet": "unknown",
+      "dev.app-moving": "active",
+      "dev.app-prompt": "needs_input",
+      "dev.pi-quiet": "unknown",
+      "dev.claude-quiet": "unknown",
+    });
+  });
+
+  it("keeps the daemon's idle and working words, and the screen fallback only for a daemon that serves no activity word", async () => {
+    const base = (FIXTURES["/api/rigs/01JRIG/nodes"] as Array<Record<string, unknown>>)[0]!;
+    const running = { startupStatus: "ready", sessionStatus: "running", runtime: "claude-code", agentActivity: { state: "unknown" } };
+    const served = (display: string) => ({ activity: display === "idle" ? "idle-at-prompt" : display, display, needsInput: { count: 0, reason: null }, decidedBy: null });
+    const nodes = [
+      { ...base, ...running, logicalId: "dev.served-idle", terminalActive: false, activityState: served("idle") },
+      { ...base, ...running, logicalId: "dev.served-working", terminalActive: false, activityState: served("working") },
+      { ...base, ...running, logicalId: "dev.unknown-moving", terminalActive: true, activityState: served("unknown") },
+      { ...base, ...running, logicalId: "dev.legacy-quiet", terminalActive: false, activityState: undefined },
+    ];
+    const snap = await hydrateSnapshot(fixtureClient({}, { "/api/rigs/01JRIG/nodes": nodes }));
+    const statuses = Object.fromEntries(myrig(snap).pods[0]!.agents.map((agent) => [agent.name, agent.status]));
+    expect(statuses).toEqual({
+      "dev.served-idle": "idle",
+      "dev.served-working": "active",
+      "dev.unknown-moving": "active",
+      "dev.legacy-quiet": "idle",
+    });
+  });
+
+  it("lists connected assistants and their check-in under the seat tables, one rig's in the rig view", async () => {
+    const hosted = { hostId: "mm2-openrig1", members: [
+      { seat: "chat@myrig", rung: false, status: "check-in-overdue", lastCheckInAt: "2026-11-12T13:05:00.000Z", expectedMinutes: 60, onRequest: false, reporter: "openrig-observed" },
+      { seat: "desk@myrig", rung: false, status: "on-request", lastCheckInAt: "2026-11-12T12:00:00.000Z", expectedMinutes: null, onRequest: true, reporter: "openrig-observed" },
+      { seat: "bot@downrig", rung: false, status: "a-newer-status", lastCheckInAt: null, expectedMinutes: null, onRequest: false, reporter: "openrig-observed", reason: "not shown" },
+    ] };
+    const snap = await hydrateSnapshot(fixtureClient({}, { "/api/queue/hosted-members": hosted }));
+    expect(snap.readErrors.some((error) => error.includes("hosted"))).toBe(false);
+
+    const rigView = createViewState({ instanceId: "t", getSnapshot: () => snap });
+    rigView.dispatch({ type: "drill", resource: "rig", name: "myrig" });
+    const rigLines = renderScreen(rigView.get(), snap, { cols: 220, rows: 60 }).lines.join("\n");
+    expect(rigLines).toContain("Connected assistants (outside the terminal; each checks its own queue):");
+    expect(rigLines).toContain(`chat@myrig  overdue: last check-in ${displayTime("2026-11-12T13:05:00.000Z")}, expected every 60 min; its schedule may be off or waiting for an approval`);
+    expect(rigLines).toContain(`desk@myrig  on request: it checks its queue when a person asks it; last check-in ${displayTime("2026-11-12T12:00:00.000Z")}`);
+    expect(rigLines).not.toContain("bot@downrig");
+
+    const instanceView = createViewState({ instanceId: "t", getSnapshot: () => snap });
+    instanceView.dispatch({ type: "drill", resource: "host", name: snap.hosts[0]!.name });
+    const instanceLines = renderScreen(instanceView.get(), snap, { cols: 160, rows: 60 }).lines.join("\n");
+    expect(instanceLines).toContain("chat@myrig  overdue:");
+    // A status this TUI doesn't know reads unknown, without the newer daemon's reason.
+    expect(instanceLines).toContain("bot@downrig  unknown");
+    expect(instanceLines).not.toContain("not shown");
+  });
+
+  it("shows inherited-property check-in statuses as unknown", async () => {
+    const hosted = { members: ["constructor", "toString"].map((status, i) => ({
+      seat: `guest${i}@myrig`, status, reason: "unrecognized reason",
+    })) };
+    const snap = await hydrateSnapshot(fixtureClient({}, { "/api/queue/hosted-members": hosted }));
+    const view = createViewState({ instanceId: "t", getSnapshot: () => snap });
+    view.dispatch({ type: "drill", resource: "rig", name: "myrig" });
+    const lines = renderScreen(view.get(), snap, { cols: 160, rows: 60 }).lines.join("\n");
+    expect(lines).toContain("guest0@myrig  unknown");
+    expect(lines).toContain("guest1@myrig  unknown");
+    expect(lines).not.toContain("unrecognized reason");
+  });
+
+  it("shows connected check-ins beside a failed rig nodes read", async () => {
+    const hosted = { members: [
+      { seat: "chat@myrig", status: "on-request", lastCheckInAt: null },
+      { seat: "other@downrig", status: "checking-in", lastCheckInAt: null },
+    ] };
+    const snap = await hydrateSnapshot(fixtureClient({ "/api/rigs/01JRIG/nodes": { status: 500 } },
+      { "/api/queue/hosted-members": hosted }));
+    const view = createViewState({ instanceId: "t", getSnapshot: () => snap });
+    view.dispatch({ type: "drill", resource: "rig", name: "myrig" });
+    const lines = renderScreen(view.get(), snap, { cols: 160, rows: 60 }).lines.join("\n");
+    expect(lines).toContain("Inventory unavailable for myrig");
+    expect(lines).toContain("chat@myrig  on request:");
+    expect(lines).not.toContain("other@downrig");
+  });
+
+  it("a known-empty list of connected assistants stays quiet", async () => {
+    const snap = await hydrateSnapshot(fixtureClient());
+    expect(snap.hosts[0]!.connectedAssistants).toEqual([]);
+    expect(snap.hosts[0]!.connectedAssistantsUnavailable).toBeUndefined();
+    const view = createViewState({ instanceId: "t", getSnapshot: () => snap });
+    view.dispatch({ type: "drill", resource: "rig", name: "myrig" });
+    expect(renderScreen(view.get(), snap, { cols: 160, rows: 60 }).lines.join("\n")).not.toContain("Connected assistants");
+  });
+
+  it.each([
+    ["an older daemon without the route", { overrides: { "/api/queue/hosted-members": { status: 404 } } }, "this daemon doesn't serve it"],
+    ["a failed read", { overrides: { "/api/queue/hosted-members": { status: 500 } } }, "the read failed: HTTP 500"],
+    ["a dropped connection", { overrides: { "/api/queue/hosted-members": { status: 0 } } }, "the read failed: fetch failed"],
+    ["an answer without a members list", { responses: { "/api/queue/hosted-members": { hostId: "mm2-openrig1" } } }, "the daemon's answer couldn't be read"],
+  ])("%s says check-in is unavailable, not that there are none", async (_case, setup, reason) => {
+    const snap = await hydrateSnapshot(fixtureClient("overrides" in setup ? setup.overrides : {}, "responses" in setup ? setup.responses : {}));
+    expect(snap.hosts[0]!.connectedAssistants).toBeUndefined();
+    expect(snap.hosts[0]!.connectedAssistantsUnavailable).toBe(reason);
+    // Optional, like the other enrichment: the page itself still reads as whole.
+    expect(snap.readErrors).toEqual([]);
+    const line = `Connected assistants: check-in unavailable (${reason})`;
+
+    const rigView = createViewState({ instanceId: "t", getSnapshot: () => snap });
+    rigView.dispatch({ type: "drill", resource: "rig", name: "myrig" });
+    const rigLines = renderScreen(rigView.get(), snap, { cols: 160, rows: 60 }).lines.join("\n");
+    expect(rigLines).toContain(line);
+    expect(rigLines).not.toContain("each checks its own queue");
+
+    const instanceView = createViewState({ instanceId: "t", getSnapshot: () => snap });
+    instanceView.dispatch({ type: "drill", resource: "host", name: snap.hosts[0]!.name });
+    expect(renderScreen(instanceView.get(), snap, { cols: 160, rows: 60 }).lines.join("\n")).toContain(line);
+  });
+
+  it.each(["session_missing", "session_missing_tmux_unavailable"])("shows confirmed missing sessions as detached unless lifecycle still requires attention: %s", async reason => {
+    const base = (FIXTURES["/api/rigs/01JRIG/nodes"] as Array<Record<string, unknown>>)[0]!;
+    const nodes = [
+      {
+        ...base,
+        logicalId: "dev.missing-session",
+        sessionStatus: "detached",
+        startupStatus: "failed",
+        lifecycleState: "detached",
+        terminalActive: false,
+        identityVerdict: { verdict: "pane_missing", reason },
+      },
+      {
+        ...base,
+        logicalId: "dev.missing-attention",
+        needsAttention: true,
+        sessionStatus: "detached",
+        startupStatus: "attention_required",
+        lifecycleState: "attention_required",
+        terminalActive: false,
+        identityVerdict: { verdict: "pane_missing", reason },
+      },
+    ];
+    const snap = await hydrateSnapshot(fixtureClient({}, { "/api/rigs/01JRIG/nodes": nodes }));
+    const statuses = Object.fromEntries(myrig(snap).pods[0]!.agents.map((agent) => [agent.name, agent.status]));
+    expect(statuses).toEqual({
+      "dev.missing-session": "detached",
+      "dev.missing-attention": "attention_required",
+    });
   });
 
   it("joins Specs↔Topology over existing reads: rig agentRefs + agent usedByRigs", async () => {
@@ -491,7 +942,7 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
     ];
     const snap = await hydrateSnapshot(fixtureClient({}, {
       "/api/queue/list?state=pending&limit=50": pending,
-      "/api/queue/list?state=done,handed-off&limit=20": finished,
+      "/api/queue/list?state=done,handed-off&sort=updated&limit=20": finished,
     }));
     expect(snap.pending.map((q) => q.qitemId)).toEqual(["qp1"]);
     expect(snap.recentlyFinished.map((q) => q.qitemId)).toEqual(["qf1", "qf2"]);
@@ -505,7 +956,7 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
     expect(snap.humanQueueProbed).toBe(false);
     expect(snap.needs).toEqual([]);
     expect(snap.readErrors).toEqual([expect.stringMatching(/review-fleet: .*503/)]);
-    expect(snap.hosts.find((h) => h.id === "local")?.rigs[0]?.name).toBe("myrig");
+    expect(snap.hosts.find((h) => h.id === "local")?.rigs.map((r) => r.name)).toContain("myrig");
     expectIncompleteNeedsTruth(snap);
   });
 });
@@ -637,6 +1088,22 @@ describe("S05 authored source and observed consumers", () => {
     expect(view.get()).toMatchObject({ drill: origin.drill, filter: "implementer", contentOffset: 6, viewTab: origin.viewTab });
   });
 
+  it("does not report an agent spec's running seats as none when the Specs page did not read them", async () => {
+    const specPage = async (focused: boolean) => {
+      const full = await hydrateSnapshot(fixtureClient());
+      const view = createViewState({ instanceId: "proof", getSnapshot: () => full });
+      view.dispatch({ type: "jump", section: "specs" });
+      view.dispatch({ type: "drill", resource: "spec", name: "implementer" });
+      // The live TUI hydrates with the view context; the Specs page reads the library, not the seat inventory.
+      const snap = focused ? await hydrateSnapshot(fixtureClient({}, { "/api/files/roots": { roots: [] } }), undefined, undefined, undefined, undefined, view.get()) : full;
+      return renderScreen(view.get(), snap, { cols: 160, rows: 80 }).lines.join("\n");
+    };
+    expect(await specPage(false)).toMatch(/seats now:\s+dev\.impl/);
+    const text = await specPage(true);
+    expect(text).toContain("Consumer projection unavailable.");
+    expect(text).toMatch(/seats now:\s+not loaded in this view/);
+    expect(text).not.toMatch(/seats now:\s+\(none\)/);
+  });
   it("refreshes the selected file even with the same library revision and does not hide a later failure behind its cache", async () => {
     const cache = new Map();
     const context = { section: "specs", viewTab: "configuration" as const, drill: [{ kind: "spec" as const, name: "myrig" }] };

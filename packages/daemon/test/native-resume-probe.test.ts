@@ -4,12 +4,96 @@ import {
   assessNativeResumeProbe,
   buildNativeResumeCommand,
   buildCodexResumeCore,
+  claudeTrustPromptFocus,
   isProbeShellReady,
+  noConversationFoundOwner,
 } from "../src/domain/native-resume-probe.js";
 
 import { CLAUDE_BYPASS_CONSENT } from "./fixtures/claude-bypass-consent.js";
 
 const currentUpdatePrompt = fs.readFileSync(new URL("./fixtures/codex-update-0.160.0.txt", import.meta.url), "utf8");
+// Codex's own rust-v0.156.1 snapshot at b412ff32c417f855c2b2d1581b77058eed87c84b:
+// https://github.com/openai/codex/blob/b412ff32c417f855c2b2d1581b77058eed87c84b/codex-rs/tui/src/onboarding/snapshots/codex_tui__onboarding__trust_directory__tests__renders_snapshot_for_git_repo.snap
+const currentTrustPrompt = fs.readFileSync(new URL("./fixtures/codex-trust-0.156.1.txt", import.meta.url), "utf8");
+const firstLoginPrompt = fs.readFileSync(new URL("./fixtures/codex-first-login.txt", import.meta.url), "utf8");
+const legacyFirstLoginPrompt = fs.readFileSync(new URL("./fixtures/codex-first-login-0.162.1.txt", import.meta.url), "utf8");
+const apiKeyLoginPrompt = fs.readFileSync(new URL("./fixtures/codex-api-key-login.txt", import.meta.url), "utf8");
+const narrowFirstLoginPrompt = fs.readFileSync(new URL("./fixtures/codex-first-login-80x24.txt", import.meta.url), "utf8");
+const managedFirstLoginPrompts = ["codex-first-login-no-daemon.txt", "codex-first-login-no-daemon-80x24.txt", "codex-api-key-login-no-daemon.txt", "codex-first-login-0.171.0.txt"]
+  .map(name => fs.readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8"));
+
+describe("Codex first-login readiness", () => {
+  it.each([
+    firstLoginPrompt,
+    legacyFirstLoginPrompt,
+    legacyFirstLoginPrompt.replace("> 1.", "  1.").replace("  2.", "> 2."),
+    legacyFirstLoginPrompt.replace("> 1.", "  1.").replace("  3.", "> 3."),
+    firstLoginPrompt.replace("> 1.", "  1.").replace("  2.", "> 2."),
+    firstLoginPrompt.replace("> 1.", "  1.").replace("  3.", "> 3."),
+    firstLoginPrompt.replace("> 1.", "  1.").replace("  4.", "> 4."),
+    apiKeyLoginPrompt,
+    narrowFirstLoginPrompt,
+    ...managedFirstLoginPrompts,
+  ])("identifies the current sign-in screen as login_required", (paneContent) => {
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "codex", paneContent }))
+      .toMatchObject({ status: "attention_required", code: "login_required" });
+  });
+
+  it.each([firstLoginPrompt, legacyFirstLoginPrompt])("identifies a first-login picker under a verified native process wrapper", (paneContent) => {
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "bash", paneContent,
+      codexProcessVerified: true }))
+      .toMatchObject({ status: "attention_required", code: "login_required" });
+  });
+
+  it.each(["bash", "zsh", "node"])("does not infer a live login from an unverified %s pane", (paneCommand) => {
+    for (const paneContent of [firstLoginPrompt, legacyFirstLoginPrompt, ...managedFirstLoginPrompts]) {
+      const probe = assessNativeResumeProbe({ runtime: "codex", paneCommand, paneContent });
+      expect(probe.code).not.toBe("login_required");
+      expect(probe.status).not.toBe("resumed");
+    }
+  });
+
+  it.each([
+    "The guide says Sign in with ChatGPT or Provide your own API key.",
+    ...[firstLoginPrompt, legacyFirstLoginPrompt].flatMap(prompt => [
+      prompt.replace("> 1.", "  1."),
+      prompt.replace("  Press enter to continue", ""),
+      prompt.split("\n").map(line => `> ${line}`).join("\n"),
+      prompt.split("\n").map(line => `    ${line}`).join("\n"),
+      `\`\`\`text\n${prompt}\`\`\``,
+      `\`\`\`text\n${prompt}`,
+      `${prompt}\n› Explain this sign-in screen\n  gpt-5.4 default · /project`,
+      `${prompt}\nOpenAI Codex (v0.164.0)\n› Ask Codex to do anything`,
+      `${prompt}\n› New task\nPress enter to continue`,
+      `${prompt.replace("  Press enter to continue", "")}\n› New task\nPress enter to continue`,
+    ]),
+    legacyFirstLoginPrompt.replace("  or connect an API key for usage-based billing\n", ""),
+    legacyFirstLoginPrompt.replace("  3. Provide your own API key\n", ""),
+    legacyFirstLoginPrompt.replace("  3. Provide your own API key", "  3. Sign in with ChatGPT"),
+    apiKeyLoginPrompt.replace("  Press enter to save", ""),
+    `${apiKeyLoginPrompt}\n› New task\nPress enter to save\nPress esc to go back`,
+  ])("does not turn prose, an incomplete panel or dismissed history into a login gate", (paneContent) => {
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "codex", paneContent }).code)
+      .not.toBe("login_required");
+  });
+
+  it.each([
+    [currentTrustPrompt, "trust_gate"],
+    [currentUpdatePrompt, "update_gate"],
+  ])("keeps a newer native menu authoritative after a first-login picker", (panel, code) => {
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "codex", paneContent: `${firstLoginPrompt}\n${panel}` }).code)
+      .toBe(code);
+  });
+
+  it.each(["bash", "node"])("keeps an unverified first-login screen out of stale update automation under %s", (paneCommand) => {
+    const oldUpdate = "Update available!\n  1. Update now\n  2. Skip once\n  3. Skip until next version\n";
+    const paneContent = `${oldUpdate}\n${managedFirstLoginPrompts[2]}`;
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand, paneContent }))
+      .toMatchObject({ code: paneCommand === "bash" ? "returned_to_shell" : "awaiting_runtime" });
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand, paneContent, codexProcessVerified: true }))
+      .toMatchObject({ status: "attention_required", code: "login_required" });
+  });
+});
 
 describe("default-path consent", () => {
   it.each([CLAUDE_BYPASS_CONSENT, CLAUDE_BYPASS_CONSENT.replace("    No, exit\n  ❯ Yes, I accept", "  ❯ No, exit\n    Yes, I accept")])("recognizes the current consent menu", screen => {
@@ -47,11 +131,18 @@ describe("native resume probe", () => {
     it.each([
       ["Accessing workspace:\nYes, I trust this folder", "trust_gate"],
       ["new MCP servers found in .mcp.json\nSelect any you wish to enable\nEnter to confirm", "mcp_gate"],
-      ["Not logged in · Run /login", "login_required"],
+      ["● Not logged in · Please run /login\n❯\u00a0", "login_required"],
       ["How would you like to resume?\n❯ Resume from summary\n  Resume full session as-is", "claude_resume_selection_prompt"],
       ["No conversation found", "no_conversation_found"],
     ])("does not let identity proof waive prerequisites: %s", (panel, code) => {
       expect(assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "sh", paneContent: `${screen}\n${panel}`, claudeAutoIdentityVerified: true }).code).toBe(code);
+    });
+    it("lets identity proof decide when only the not-logged-in footer shows", () => {
+      const paneContent = `${screen}                                   Not logged in · Run /login\n`;
+      expect(assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "sh", paneContent }))
+        .toMatchObject({ status: "inconclusive", code: "claude_auto_identity_required" });
+      expect(assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "sh", paneContent, claudeAutoIdentityVerified: true }))
+        .toMatchObject({ status: "resumed", code: "active_runtime" });
     });
   });
   describe("Claude's exact resume identity can validate the visible composer", () => {
@@ -71,7 +162,7 @@ describe("native resume probe", () => {
     it.each([
       ["Accessing workspace:\nYes, I trust this folder", "inconclusive", "trust_gate"],
       ["new MCP servers found in .mcp.json\nSelect any you wish to enable\nEnter to confirm", "inconclusive", "mcp_gate"],
-      ["Not logged in · Run /login", "failed", "login_required"],
+      ["● Not logged in · Please run /login\n❯\u00a0", "failed", "login_required"],
       ["How would you like to resume?\n❯ Resume from summary\n  Resume full session as-is", "attention_required", "claude_resume_selection_prompt"],
       ["No conversation found", "failed", "no_conversation_found"],
     ])("keeps known blocking prompt authoritative despite resume identity proof: %s", (panel, status, code) => {
@@ -81,6 +172,14 @@ describe("native resume probe", () => {
         paneContent: `${screen}\n${panel}`,
         claudeResumeIdentityVerified: true,
       })).toMatchObject({ status, code });
+    });
+
+    it("lets resume identity decide when only the not-logged-in footer shows", () => {
+      const paneContent = `${screen}                                   Not logged in · Run /login\n`;
+      expect(assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "2.1.283", paneContent }))
+        .toMatchObject({ status: "inconclusive", code: "awaiting_runtime" });
+      expect(assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "2.1.283", paneContent, claudeResumeIdentityVerified: true }))
+        .toMatchObject({ status: "resumed", code: "verified_native_identity" });
     });
   });
   describe("issue116 headerless custom status lines", () => {
@@ -99,17 +198,102 @@ describe("native resume probe", () => {
         paneContent: `› Continue\n${footer}`,
       }).status).toBe("resumed");
     });
+    // george661's footer on closed #1764: Codex renders "{display name} {effort}{ tier}", so a GPT-6.1 footer has two
+    // or three words after the id once the header has scrolled off.
+    it.each([
+      "  GPT-6.1 Sol medium · /data/workspaces/proof-a · …",
+      "  Context 81% left · GPT-6.1 Luna xhigh · /project",
+      "  GPT-6.1 Sol medium Fast · /project",
+      "  GPT-6.1 Sol medium fast · /project",
+      "  GPT-6-Astra xhigh · /project",
+    ])("recognizes a model name with its effort label as a resumed conversation: %s", (footer) => {
+      expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "sh",
+        paneContent: `Restored conversation\n› Continue\n${footer}`,
+      })).toMatchObject({ status: "resumed", code: "active_runtime" });
+    });
+    // Short prose after a model id must not let a shell or log capture read as a ready Codex screen.
+    describe.each([false, true])("status prose that starts with a model name, process verified=%s", (codexProcessVerified) => {
+      it.each([
+        "  GPT-6.1 is not ready · retry later",
+        "  GPT-6.1 is default · see the docs",
+        "  GPT-6.1 Sol failed · retry later",
+        "  Notes · GPT-6.1 is unavailable · retry later",
+        "  GPT-6.1 Sol was picked for this run because it costs less · see the plan",
+        "  GPT-6.1 Sol medium plus more words · /project",
+        "  local-model-7b is not ready · retry later",
+      ])("is not read as a footer: %s", (line) => {
+        expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: codexProcessVerified ? "codex" : "sh",
+          paneContent: `› Continue\n${line}`, codexProcessVerified,
+        }).status).not.toBe("resumed");
+      });
+    });
+    it.each([
+      "  local-model-7b medium · /project",
+      "  anthropic/claude-3.5-sonnet · /project",
+      "  local-model-7b Coder high · /project",
+    ])("recognizes a versioned non-gpt model identifier after process verification: %s", (footer) => {
+      expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "sh",
+        paneContent: `› Continue\n${footer}`,
+        codexProcessVerified: true,
+      }).status).toBe("resumed");
+    });
+    it("recognizes the issue 1764 warning footer after process verification", () => {
+      const paneContent = [
+        "› ",
+        "  Ready · Context 13% used · anthropic/claude-3.5-sonnet         ⚠ 2 warnings · f2 to view",
+      ].join("\n");
+      expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "zsh", paneContent,
+        codexProcessVerified: true,
+      })).toMatchObject({ status: "resumed", code: "active_runtime" });
+    });
+    it("does not promote a verified Codex process while the captured screen is still a shell", () => {
+      const paneContent = [
+        "  project2 · main",
+        "› codex resume 019a136b-0000-7000-8000-000000000001",
+      ].join("\n");
+      expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "zsh", paneContent,
+        codexProcessVerified: true,
+      }).status).not.toBe("resumed");
+    });
     it.each([
       "› Continue",
       "› Continue\n  weekly 24% left · Context 81% left",
+      "› Continue\n  Context81 · /project",
       "› Continue\n  Notes · discussing GPT-8-Example medium · more text",
       "› Continue\n  Notes · gpt-like prose · more text",
       "› Continue\n  GPT-8-Example medium",
+      "› Continue\n  local-model medium · /project",
+      "› \n  Ready · Context 13% used · anthropic/claude-3.5-sonnet         ⚠ 2 warnings · f2 to view",
+      "  project2 · main\n› ",
+      "  project2 · main\n› codex resume 019a136b-0000-7000-8000-000000000001",
       reportedFooter,
       `model: loading\n› Continue\n${reportedFooter}`,
     ])("does not promote absent, vague or booting corroboration: %s", (paneContent) => {
       expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "codex", paneContent }).status)
         .toBe("inconclusive");
+    });
+    it("keeps a trust panel authoritative over a look-alike non-gpt footer", () => {
+      const paneContent = [
+        "Do you trust the contents of this directory?",
+        "› 1. Yes, continue",
+        "  2. No, quit",
+        "  Ready · Context 13% used · anthropic/claude-3.5-sonnet         ⚠ 2 warnings · f2 to view",
+      ].join("\n");
+      expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "zsh", paneContent,
+        codexProcessVerified: true,
+      })).toMatchObject({ status: "inconclusive", code: "trust_gate" });
+    });
+    it("accepts a verified custom footer after a legacy trust panel has been dismissed", () => {
+      const paneContent = [
+        "Do you trust the contents of this directory?",
+        "› 1. Yes, continue",
+        "  2. No, quit",
+        "› Continue",
+        "  Ready · Context 13% used · anthropic/claude-3.5-sonnet         ⚠ 2 warnings · f2 to view",
+      ].join("\n");
+      expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "zsh", paneContent,
+        codexProcessVerified: true,
+      })).toMatchObject({ status: "resumed", code: "active_runtime" });
     });
     it.each(["›", "»"])("keeps %s menus blocked with the custom footer", (prompt) => {
       for (const [panel, code] of [
@@ -205,18 +389,18 @@ describe("native resume probe", () => {
   it("builds a Claude resume command with the canonical session name when provided", () => {
     expect(
       buildNativeResumeCommand("claude-code", "abc-123", "dev-impl@demo-rig")
-    ).toBe("claude --resume 'abc-123' --name 'dev-impl@demo-rig'");
+    ).toBe("claude --permission-mode acceptEdits --resume 'abc-123' --name 'dev-impl@demo-rig'");
   });
 
-  it("builds a Codex no-profile resume with the explicit -s workspace-write floor flag", () => {
+  it("builds a Codex no-profile resume with the explicit -s workspace-write floor flag and operational launch arg", () => {
     expect(buildNativeResumeCommand("codex", "019d-token")).toBe(
-      "codex -s workspace-write resume '019d-token'"
+      "codex -s workspace-write '-c' 'check_for_update_on_startup=false' resume '019d-token'"
     );
   });
 
-  it("builds a Codex profile resume with -p flag", () => {
+  it("builds a Codex profile resume with -p flag and operational launch arg", () => {
     expect(buildNativeResumeCommand("codex", "019d-token", null, "my-profile")).toBe(
-      "codex -p 'my-profile' resume '019d-token'"
+      "codex -p 'my-profile' '-c' 'check_for_update_on_startup=false' resume '019d-token'"
     );
   });
 
@@ -288,7 +472,22 @@ describe("native resume probe", () => {
       status: "resumed",
       code: "active_runtime",
       detail: "Claude is the active foreground process in the probe pane.",
+      foregroundOnly: true,
     });
+  });
+
+  it("reads an auto-mode composer whose header scrolled out as Claude's drawn screen, not the process alone", () => {
+    const probe = assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "claude",
+      paneContent: `● Done.\n${"─".repeat(60)}\n❯ \n${"─".repeat(60)}\n  ⏵⏵ auto mode on (shift+tab to cycle)` });
+    expect(probe).toMatchObject({ status: "resumed", code: "active_runtime" });
+    expect(probe.foregroundOnly).toBeUndefined();
+  });
+
+  it("reads the trust dialog's heading, drawn before its options, as the trust gate, not the foreground process", () => {
+    const heading = "user@host:~$ ( . '/home/user/tmp/openrig-tmux-send-launch.txt' )\n\n" + "─".repeat(80)
+      + "\n Accessing workspace:\n\n /home/user";
+    expect(assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "claude", paneContent: heading }))
+      .toMatchObject({ status: "inconclusive", code: "trust_gate" });
   });
 
   it("classifies a Claude workspace trust prompt as blocked, not resumed", () => {
@@ -399,7 +598,7 @@ describe("native resume probe", () => {
     });
   });
 
-  it("classifies the Claude login-required screen as failed, not resumed", () => {
+  it("reads the persistent not-logged-in footer on a live Claude TUI as input readiness, not a login refusal", () => {
     expect(
       assessNativeResumeProbe({
         runtime: "claude-code",
@@ -416,10 +615,83 @@ describe("native resume probe", () => {
           "  ⏵⏵ accept edits on (shift+tab to cycle)                     ● high · /effort",
         ].join("\n"),
       })
-    ).toEqual({
-      status: "failed",
-      code: "login_required",
-      detail: "Claude is running but cannot continue until the user logs in.",
+    ).toMatchObject({ status: "resumed", code: "active_runtime" });
+  });
+
+  // #1405. The frame is a native Claude Code 2.1.296 capture: header, `❯` prompt row, `●` reply, input box, mode
+  // bar. The refusal strings are Claude's documented ones (code.claude.com/docs/en/errors); where Claude draws a
+  // refusal was not captured, so both a `●` reply row and a `⎿` result row are covered.
+  describe("a Claude login refusal counts only as the latest response", () => {
+    const native = fs.readFileSync(new URL("./fixtures/input-box/claude-code-2.1.296/after-enter-15s.J.txt", import.meta.url), "utf8").split("\n");
+    const head = native.slice(0, native.findIndex((line) => line.startsWith("❯ Reply with")));
+    const tail = native.slice(native.findIndex((line) => line.startsWith("✻ Cooked")) + 1);
+    const lastRule = tail.findLastIndex((line) => line.startsWith("────"));
+    const footerTail = [...tail.slice(0, lastRule + 1), "                                                    Not logged in · Run /login", ...tail.slice(lastRule + 1)];
+    const pane = (history: string[], footer = false) => [...head, ...history, ...(footer ? footerTail : tail)].join("\n");
+    const refusal = "Not logged in · Please run /login";
+
+    it.each([
+      ["the footer before any turn", pane([], true), "resumed"],
+      ["the footer after a completed turn", pane(["❯ Reply with OK.", "", "● OK", ""], true), "resumed"],
+      ["a current refusal as a reply row, with the footer", pane(["❯ hello", "", `● ${refusal}`, ""], true), "failed"],
+      ["a current refusal as a result row, without the footer", pane(["❯ hello", `  ⎿  ${refusal}`, ""]), "failed"],
+      ["a current expired-login refusal", pane(["❯ hello", "", "● Login expired · Please run /login", ""]), "failed"],
+      ["a refusal followed by a newer reply", pane(["❯ hello", "", `● ${refusal}`, "", "❯ again", "", "● OK", ""]), "resumed"],
+      ["a refusal followed by /login", pane(["❯ hello", "", `● ${refusal}`, "", "❯ /login", "  ⎿  Login successful", ""]), "resumed"],
+      ["a refusal quoted in a prompt", pane([`❯ What does "${refusal}" mean?`, "", "● It means Claude has no login of its own.", ""]), "resumed"],
+      ["a refusal on a prompt's own row while the turn runs", pane(["❯ Explain this message:", `  ${refusal}`, "", "✶ Thinking… (2s)", ""]), "resumed"],
+      ["a refusal quoted on its own row inside a reply", pane(["❯ hello", "", "● Claude shows this when it has no login:", "", `  ${refusal}`, "", "  Run /login to fix it.", ""]), "resumed"],
+      ["a refusal quoted inline in a reply", pane(["❯ hello", "", `● The message "${refusal}" means no login.`, ""]), "resumed"],
+    ])("%s", (_name, paneContent, status) => {
+      const result = assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "claude", paneContent });
+      expect(result.status).toBe(status);
+      if (status === "failed") expect(result.code).toBe("login_required");
+    });
+
+    // Only the three exact strings count. A real 401 reads ready for input, with or without the footer: no rule on
+    // this input tells it from a reply or tool output that starts with the same words.
+    it.each([
+      ["OAuth token revoked · Please run /login", false, "failed"],
+      ["OAuth token revoked · Please run /login", true, "failed"],
+      ["Please run /login · API Error: 401 OAuth token has expired", false, "resumed"],
+      ["Please run /login · API Error: 401 OAuth token has expired", true, "resumed"],
+      ["Please run /login · API Error: 401 Invalid authentication credentials", false, "resumed"],
+      ["The error Please run /login · API Error: 401 means the token was rejected.", false, "resumed"],
+    ])("reads the revoked refusal as current and a 401 as ready for input: %s (footer %s)", (reply, footer, status) => {
+      expect(assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "claude",
+        paneContent: pane(["❯ hello", "", `● ${reply}`, ""], footer) }).status).toBe(status);
+    });
+
+    it.each([
+      ["a refusal Claude wraps in a narrow pane", ["● Not logged in · Please run", "  /login"], "failed"],
+      ["a revoked refusal Claude wraps", ["● OAuth token revoked · Please", "  run /login"], "failed"],
+      ["a refusal with the right-aligned footer right below it", [`● ${refusal}`, "                    Not logged in · Run /login"], "failed"],
+    ])("joins Claude's own wrapped rows: %s", (_name, rows, status) => {
+      expect(assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "claude",
+        paneContent: pane(["❯ hello", "", ...rows, ""]) }).status).toBe(status);
+    });
+
+    // Review inputs (#1417): a submitted prompt with no input box drawn below it, quoted marker rows, and replies or
+    // tool output that start like a 401.
+    it.each([
+      ["F1-current-no-box", `Claude Code v2.1.296\n❯ hello\n● ${refusal}\nNot logged in · Run /login`, "failed"],
+      ["F1-recovered-no-box", `Claude Code v2.1.296\n❯ hello\n● ${refusal}\n❯ /login\n  ⎿ Login successful`, "resumed"],
+      ["F2-quoted-reply-marker", `Claude Code v2.1.296\n❯ Explain this log.\n● Here is the quoted log line:\n\n  ● ${refusal}\n\n  That is an example, not this turn failing.\n\n${"─".repeat(40)}\n❯ \n${"─".repeat(40)}\n  ⏵⏵ accept edits on (shift+tab to cycle)`, "resumed"],
+      ["R2-prefix-explanation", `Claude Code v2.1.296\n❯ Explain this output.\n● Please run /login · API Error: 401 is an example from the manual, not this request failing.\n\n${"─".repeat(40)}\n❯ \n${"─".repeat(40)}\n  ⏵⏵ accept edits on (shift+tab to cycle)`, "resumed"],
+      ["R2-prefix-multiline-tool", `Claude Code v2.1.296\n❯ Explain this output.\n● Bash(print recorded fixture)\n  ⎿  Please run /login · API Error: 401 Invalid authentication credentials\n     This is recorded fixture output; the request succeeded.\n\n${"─".repeat(40)}\n❯ \n${"─".repeat(40)}\n  ⏵⏵ accept edits on (shift+tab to cycle)`, "resumed"],
+      ["F2-quoted-prompt-marker", `Claude Code v2.1.296\n❯ Explain this log:\n  ● ${refusal}\n\n✶ Thinking… (2s)\n\n${"─".repeat(40)}\n❯ \n${"─".repeat(40)}\n  ⏵⏵ accept edits on (shift+tab to cycle)`, "resumed"],
+    ])("%s", (_name, paneContent, status) => {
+      const result = assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "claude", paneContent });
+      expect(result.status).toBe(status);
+      if (status === "failed") expect(result.code).toBe("login_required");
+    });
+
+    it("keeps the earlier native gates ahead of a current refusal", () => {
+      const refused = pane(["❯ hello", "", `● ${refusal}`, ""], true);
+      expect(assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "claude",
+        paneContent: `${refused}\nAccessing workspace:\nYes, I trust this folder` }).code).toBe("trust_gate");
+      expect(assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "claude",
+        paneContent: `No conversation found\n${refused}` }).code).toBe("no_conversation_found");
     });
   });
 
@@ -459,6 +731,102 @@ describe("native resume probe", () => {
       code: "trust_gate",
       detail: "Codex is waiting for workspace trust approval before the session can become interactive.",
     });
+  });
+
+  it.each(["codex", "node", "bash"])("recognizes the Codex 0.156.1 trust snapshot under %s", (paneCommand) => {
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand, paneContent: currentTrustPrompt }))
+      .toMatchObject({ status: "inconclusive", code: "trust_gate" });
+  });
+
+  it.each(["›", "»"])("keeps the current trust panel below an earlier %s composer and custom footer gated", (prompt) => {
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "node",
+      paneContent: `${prompt} Earlier conversation prompt\n  Context 81% left · GPT-6-Astra high\n${currentTrustPrompt}`,
+    })).toMatchObject({ status: "inconclusive", code: "trust_gate" });
+  });
+
+  it.each(["›", "»"])("accepts a headerless %s composer and custom footer after an old trust panel", (prompt) => {
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "node",
+      paneContent: `${currentTrustPrompt}\n${prompt} Continue\n  5h 71% left · GPT-6-Astra high · Context 81% left`,
+    })).toMatchObject({ status: "resumed", code: "active_runtime" });
+  });
+
+  it.each([
+    "  5h 71% left · GPT-6-Astra high · Context 81% left",
+    "  gpt-6-astra high · /work",
+    "  gpt-5.5 xhigh fast · Context 0% used · Fast on",
+  ])("does not treat an old panel before a later model footer as current: %s", (footer) => {
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "node",
+      paneContent: `› Earlier conversation prompt\n${currentTrustPrompt}\n${footer}`,
+    })).toMatchObject({ status: "resumed", code: "active_runtime" });
+  });
+
+  it.each(["", " ", "  ", "\t\t"])("preserves the whole-text default-footer match after blank lines with indentation %j", (indent) => {
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "node",
+      paneContent: `› Earlier conversation prompt\n${currentTrustPrompt}\n\n${indent}gpt-5.5 xhigh fast · Context 0% used · Fast on`,
+    })).toMatchObject({ status: "resumed", code: "active_runtime" });
+  });
+
+  it("does not keep trust pending after a later composer without readiness corroboration", () => {
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "node",
+      paneContent: `${currentTrustPrompt}\n› Continue`,
+    })).toMatchObject({ status: "inconclusive", code: "awaiting_runtime" });
+  });
+
+  it("keeps the latest panel current after an older panel was dismissed", () => {
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "node",
+      paneContent: `${currentTrustPrompt}\n› Continue\n  Context 81% left · GPT-6-Astra high\n${currentTrustPrompt}`,
+    })).toMatchObject({ status: "inconclusive", code: "trust_gate" });
+  });
+
+  it.each([
+    ["earlier custom footer", "› Earlier conversation prompt\n  Context 81% left · GPT-6-Astra high\n"],
+    ["no earlier readiness evidence", ""],
+  ])("retains a complete live trust panel before a trailing heading fragment: %s", (_label, before) => {
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "node",
+      paneContent: `${before}${currentTrustPrompt}\n  Trust this folder?`,
+    })).toMatchObject({ status: "inconclusive", code: "trust_gate" });
+  });
+
+  it.each([
+    ["default footer", "› Earlier conversation prompt\n  gpt-5.6-sol high · ~/work"],
+    ["Codex header", "OpenAI Codex (v0.156.1)\n› Earlier conversation prompt"],
+  ])("keeps a complete live trust panel ahead of earlier TUI evidence: %s", (_label, before) => {
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "node",
+      paneContent: `${before}\n${currentTrustPrompt}`,
+    })).toMatchObject({ status: "inconclusive", code: "trust_gate" });
+  });
+
+  it.each(["›", "»"])("keeps a stale panel dismissed after a %s composer, footer and trailing heading fragment", (prompt) => {
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "node",
+      paneContent: `${currentTrustPrompt}\n${prompt} Continue\n  Context 81% left · GPT-6-Astra high\n  Trust this folder?`,
+    })).toMatchObject({ status: "resumed", code: "active_runtime" });
+  });
+
+  it("recognizes the live trust panel when Quit is selected", () => {
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "node",
+      paneContent: currentTrustPrompt.replace("› 1. Trust and continue", "  1. Trust and continue").replace("  2. Quit", "› 2. Quit"),
+    })).toMatchObject({ status: "inconclusive", code: "trust_gate" });
+  });
+
+  it("preserves the legacy branch even with a later headerless composer and custom footer", () => {
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "node",
+      paneContent: "Do you trust the contents of this directory?\n› 1. Yes, continue\n  2. No\n› Continue\n  Context 81% left · GPT-6-Astra high",
+    })).toMatchObject({ status: "inconclusive", code: "trust_gate" });
+  });
+
+  it.each([
+    "Trust this folder?",
+    "› 1. Trust and continue\n  2. Quit",
+    'The guide asks "Trust this folder?" and offers Trust and continue.',
+  ])("does not classify incomplete or quoted current trust wording: %s", paneContent => {
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "codex", paneContent }).code)
+      .not.toBe("trust_gate");
+  });
+
+  it("accepts the current TUI after a dismissed current trust snapshot", () => {
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "node",
+      paneContent: `${currentTrustPrompt}\nOpenAI Codex (v0.156.1)\n› Ask Codex to do anything`,
+    })).toMatchObject({ status: "resumed", code: "active_runtime" });
   });
 
   it("classifies Codex as active when the current TUI appears below an old trust prompt in scrollback", () => {
@@ -556,6 +924,107 @@ describe("native resume probe", () => {
         ].join("\n"),
       }).code
     ).toBe("model_selection_gate");
+  });
+
+  it.each([
+    ["banner", [
+      "╭───────────────────────────────────────╮",
+      "│ >_ OpenAI Codex (v0.124.0)            │",
+      "╰───────────────────────────────────────╯",
+      "",
+      "› 1. Switch to gpt-5.1-codex-mini Optimized for codex. Cheaper,",
+      "  2. Switch to gpt-5.4-codex Stronger for complex tasks.",
+      "  3. Keep current model",
+      "",
+      "  gpt-5.4 default · ~/code/openrig",
+    ]],
+    ["structural", ["› 1. gpt-5.1-codex-mini", "  2. gpt-5.4-codex", "", "  gpt-5.4 default · ~/code/openrig"]],
+    ["» header", ["OpenAI Codex (v0.153.4)", "» 1. gpt-6-astra", "  2. gpt-6-sol", "  gpt-6-astra ultra · ~/Documents/openrig"]],
+  ])("keeps the %s Codex model chooser drawn high in a tall pane a gate", (_shape, rows) => {
+    const paneContent = `${rows.join("\n")}\n${Array<string>(45).fill("").join("\n")}`;
+
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "codex", paneContent }))
+      .toMatchObject({ status: "inconclusive", code: "model_selection_gate" });
+  });
+
+  // A chooser counts only while it's the last thing drawn. Chooser rows (or text quoting one) above a later composer
+  // are history, whether the pane reaches its bottom (the capture's final newline is its only blank) or is drawn high.
+  describe("a chooser above a later composer is history", () => {
+    const claudeResumed = ["Claude Code v2.1.310", "", "● Picked up where we left off.", "", "─".repeat(40), "❯ ", "─".repeat(40),
+      "  ⏵⏵ accept edits on (shift+tab to cycle)"].join("\n");
+    const codexResumed = ["╭────────────────────────────╮", "│ >_ OpenAI Codex (v0.164.0) │", "╰────────────────────────────╯", "",
+      "› Ask Codex to do anything", "", "  gpt-6-astra ultra · ~/code/openrig"].join("\n");
+    const shapes = { bottom: (pane: string) => `${pane}\n`, tall: (pane: string) => `${pane}\n${Array<string>(45).fill("").join("\n")}` };
+    const cases: Array<[string, "claude-code" | "codex", string]> = [
+      ["an old numbered Claude chooser", "claude-code", "Choose a conversation to resume:\n\n  1. project-foo (modified 2h ago)\n  2. project-bar (modified yesterday)\n\nEnter a number, or press q to cancel."],
+      ["an old › arrow Claude chooser", "claude-code", "Choose the conversation to resume:\n\n› 1. recent project\n  2. older project"],
+      ["an old two-choice Claude chooser", "claude-code", "How would you like to resume?\n\n❯ Resume from summary\n  Resume full session as-is"],
+      ["a reply quoting the whole Claude chooser", "claude-code", "● The chooser read:\nHow would you like to resume?\n❯ Resume from summary\n  Resume full session as-is"],
+      ["a reply naming the Claude chooser and ending in a list", "claude-code", "● Choose a conversation to resume only if asked. Next:\n  1. run the tests\n  2. push the branch"],
+      ["an old Codex model chooser", "codex", "› 1. gpt-5.1-codex-mini\n  2. gpt-5.4-codex\n\n  gpt-5.4 default · ~/code/openrig"],
+      ["a Codex answer listing two models", "codex", "• Two options:\n  1. gpt-6-astra for depth\n  2. gpt-6-sol for speed"],
+    ];
+    for (const [shape, wrap] of Object.entries(shapes)) {
+      it.each(cases)(`reads ${shape}: %s, then a resumed session, as resumed`, (_name, runtime, earlier) => {
+        const paneContent = wrap(`${earlier}\n\n${runtime === "codex" ? codexResumed : claudeResumed}`);
+        expect(assessNativeResumeProbe({ runtime, paneCommand: runtime === "codex" ? "codex" : "claude", paneContent }))
+          .toMatchObject({ status: "resumed", code: "active_runtime" });
+      });
+    }
+
+    it("reads an old heading far above a later numbered list and Claude's composer as resumed", () => {
+      const conversation = Array.from({ length: 35 }, (_, at) => `  line ${at} of the conversation`).join("\n");
+      const paneContent = `Choose a conversation to resume:\n${conversation}\n  1. run the tests\n  2. push the branch\n\n${claudeResumed}\n`;
+      expect(assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "claude", paneContent }))
+        .toMatchObject({ status: "resumed", code: "active_runtime" });
+    });
+
+    // A composer whose draft starts with "1." looks like a numbered option row; Claude's input frame (a rule above the
+    // ❯ row and another below) tells them apart. On a named session (OpenRig's seats) Claude 2.1.309 labels the top
+    // rule; these are its recorded 80-column rule rows (dev50-qa's #1955 native frame `b-question-cancel-observe`).
+    const plainRule = "─".repeat(80);
+    const labelledRule = `${"─".repeat(57)} probe-claude@r1955-b ─`;
+    const choosers = {
+      numbered: "Choose a conversation to resume:\n\n  1. project-foo (modified 2h ago)\n  2. project-bar (modified yesterday)",
+      "two-choice": "How would you like to resume?\n\n❯ Resume from summary\n  Resume full session as-is",
+    };
+    it.each(Object.entries(choosers).flatMap(([shape, earlier]) => [[shape, "plain", plainRule, earlier], [shape, "labelled", labelledRule, earlier]]))(
+      "reads an old %s chooser above a %s-frame composer holding a numbered draft as resumed", (_shape, _frame, topRule, earlier) => {
+        const draft = [topRule, "❯ 1. inspect the source", "  2. then fix it", plainRule, "  ⏵⏵ accept edits on (shift+tab to cycle)"].join("\n");
+        expect(assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "claude", paneContent: `${earlier}\n\n${draft}\n` }))
+          .toMatchObject({ status: "resumed", code: "active_runtime" });
+      });
+  });
+
+  // A live conversation list can outgrow the window, pushing its heading above the last 30 drawn rows.
+  describe("a live conversation list longer than the window", () => {
+    const list = (rows: number) => ["Choose a conversation to resume:", "",
+      ...Array.from({ length: rows }, (_, at) => `  ${at + 1}. project-${at + 1} (modified ${at + 1}h ago)`), "",
+      "Enter a number, or press q to cancel."].join("\n");
+    it.each([
+      ["bottom-reaching", `${list(40)}\n`],
+      ["drawn high", `${list(40)}\n${Array<string>(20).fill("").join("\n")}`],
+    ])("still reads as attention_required, %s", (_shape, paneContent) => {
+      expect(assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "claude", paneContent }))
+        .toMatchObject({ status: "attention_required", code: "claude_resume_selection_prompt" });
+    });
+
+    // A bare ❯ row and a mode footer under a live chooser (restore-orchestrator's headerless chooser screen) aren't Claude's
+    // framed input box, so the chooser stands.
+    it.each([
+      ["conversation list", "Choose a conversation to resume:\n  1. example"],
+      ["two-choice", "How would you like to resume?\n\n❯ Resume from summary\n  Resume full session as-is"],
+    ])("keeps a live %s with a bare ❯ row and a mode footer under it a chooser", (_shape, chooser) => {
+      const paneContent = `${chooser}\n❯ \n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n`;
+      expect(assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "claude", paneContent }))
+        .toMatchObject({ status: "attention_required", code: "claude_resume_selection_prompt" });
+    });
+
+    it("keeps a ❯ row that isn't inside Claude's input frame an option, not a composer", () => {
+      const paneContent = "Choose a conversation to resume:\n\n  1. project-foo\n  2. project-bar\n❯ 3. project-baz\n\nEnter a number, or press q to cancel.\n";
+      expect(assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "claude", paneContent }))
+        .toMatchObject({ status: "attention_required", code: "claude_resume_selection_prompt" });
+    });
   });
 
   it("classifies Codex as resumed when an old update banner remains in scrollback but the live TUI is present", () => {
@@ -744,6 +1213,18 @@ describe("native resume probe", () => {
       expect(result).toMatchObject({ status: "attention_required", code: "claude_resume_selection_prompt" });
     });
 
+    // A fresh `claude --resume` draws its chooser at the top of the pane; in a tall pane, blank rows fill the rest.
+    it.each([
+      ["numbered", "Claude Code v2.1.89\n\nChoose a conversation to resume:\n\n  1. project-foo (modified 2h ago)\n  2. project-bar (modified yesterday)\n\nEnter a number, or press q to cancel."],
+      ["› arrow", "Choose the conversation to resume:\n\n› 1. recent project\n  2. older project"],
+      ["two-choice resume-mode", "How would you like to resume?\n\n❯ Resume from summary\n  Resume full session as-is"],
+    ])("classifies the %s chooser drawn high in a tall pane as attention_required", (_shape, chooser) => {
+      const paneContent = `${chooser}\n${Array<string>(45).fill("").join("\n")}`;
+
+      expect(assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "claude", paneContent }))
+        .toMatchObject({ status: "attention_required", code: "claude_resume_selection_prompt" });
+    });
+
     it("does not classify a prose mention of only one current chooser option", () => {
       const result = assessNativeResumeProbe({
         runtime: "claude-code",
@@ -873,6 +1354,131 @@ describe("native resume probe", () => {
       expect(result.code).toBe("trust_gate");
     });
 
+    // A refusal counts only as the newest thing Codex printed, as Claude's login refusal counts only as its latest
+    // response. A resumed conversation replays its history, so an old refusal there isn't a current sign-in problem.
+    describe("only the current attempt's refusal counts", () => {
+      const header = "OpenAI Codex (v0.162.1)";
+      const composer = ["› Ask Codex to do anything", "  gpt-5.1 high · 100% context left · ~/project"];
+      const oldRefusal = "■ Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again.";
+      const probe = (paneCommand: string, lines: string[]) =>
+        assessNativeResumeProbe({ runtime: "codex", paneCommand, paneContent: lines.join("\n") });
+      const authRefusal = {
+        status: "attention_required",
+        code: "codex_auth_refusal",
+        detail: "Codex could not refresh the stored access token; an operator must sign in again before the session can resume.",
+      };
+
+      it("old refusals followed by later turns and a healthy composer read as the working conversation", () => {
+        expect(probe("codex", [header, oldRefusal, "› Please continue the task", "• Continued; the tests pass.", "", ...composer]))
+          .toMatchObject({ status: "resumed", code: "active_runtime" });
+        // An earlier launch's CLI refusal, then a launch that came up.
+        expect(probe("codex", ["$ codex resume 019d-token", "Error: Your access token could not be refreshed. Please log out and sign in again.",
+          "$ codex resume 019d-token", header, ...composer])).toMatchObject({ status: "resumed", code: "active_runtime" });
+      });
+
+      it("a working conversation that quotes the refusal stays working", () => {
+        expect(probe("codex", [header,
+          "› Why did my seat print \"Your access token could not be refreshed. Please log out and sign in again.\"?",
+          "• That message is from an earlier sign-in. It read:",
+          "  Your access token could not be refreshed. Please log out and sign in again.",
+          "```text",
+          "Your access token could not be refreshed. Please sign in again.",
+          "```",
+          ...composer])).toMatchObject({ status: "resumed", code: "active_runtime" });
+      });
+
+      it("a fresh refusal still asks for sign-in: the CLI's, before the shell prompt, and the TUI's, above the composer", () => {
+        expect(probe("zsh", ["$ codex resume 019d-token",
+          "Error: Your access token could not be refreshed because your refresh token has expired. Please log out and sign in again.",
+          "user@example.test ~/project %"])).toEqual(authRefusal);
+        expect(probe("codex", [header, "■ Your access token could not be refreshed. Please log out and sign in again.", "", ...composer]))
+          .toEqual(authRefusal);
+      });
+
+      it("old refusal text followed by a new model refusal reports what the pane shows without it", () => {
+        const modelRefusal = "■ The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account.";
+        const tui = ["› Run the check", modelRefusal, ...composer];
+        expect(probe("codex", [header, oldRefusal, ...tui])).toEqual(probe("codex", [header, ...tui]));
+        const shell = ["$ codex -m gpt-5.5 resume 019d-token",
+          "Error: unexpected status 400 Bad Request: The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account.",
+          "user@example.test ~/project %"];
+        const withOld = probe("zsh", ["Error: Your access token could not be refreshed. Please log out and sign in again.", ...shell]);
+        expect(withOld).toEqual(probe("zsh", shell));
+        expect(withOld.code).not.toBe("codex_auth_refusal");
+      });
+
+      it("an old refusal before a turn still running stays unknown", () => {
+        expect(probe("codex", [oldRefusal, "› Please retry", "• Working (3s • esc to interrupt)"]))
+          .toMatchObject({ status: "inconclusive", code: "awaiting_runtime" });
+      });
+
+      it("an input-shaped row isn't the composer without its footer, and a numbered option isn't one at all", () => {
+        // A prompt just submitted, drawn before any footer or reply.
+        const submitted = ["› Please retry"];
+        expect(probe("codex", [oldRefusal, ...submitted])).toEqual(probe("codex", submitted));
+        expect(probe("codex", [oldRefusal, ...submitted])).toMatchObject({ status: "inconclusive", code: "awaiting_runtime" });
+        // A model chooser's selected option starts with the same glyph.
+        const chooser = ["  Select a model", "› 1. gpt-5.1-codex-mini", "  2. gpt-5.1"];
+        expect(probe("codex", [oldRefusal, ...chooser])).toEqual(probe("codex", chooser));
+        expect(probe("codex", [oldRefusal, ...chooser]).code).toBe("model_selection_gate");
+      });
+
+      it("only a row that ends like a shell prompt may follow a refusal at the shell", () => {
+        const output = ["The model is unavailable"];
+        const withOld = probe("zsh", ["Error: Your access token could not be refreshed. Please log out and sign in again.", ...output]);
+        expect(withOld).toEqual(probe("zsh", output));
+        expect(withOld.code).toBe("returned_to_shell");
+      });
+
+      it("fences close only on their own kind and length, so a fresh refusal after one counts and a quote inside one doesn't", () => {
+        // A four-backtick block showing a three-backtick row, then a fresh refusal.
+        expect(probe("zsh", ["• Here's the snippet:", "````markdown", "```", "````",
+          "Error: Your access token could not be refreshed. Please sign in again."])).toEqual(authRefusal);
+        // A reply still drawing a tilde-fenced quote above the composer.
+        expect(probe("codex", [header, "• Codex printed this earlier:", "~~~text",
+          "Your access token could not be refreshed. Please sign in again.", "", ...composer]))
+          .toMatchObject({ status: "resumed", code: "active_runtime" });
+      });
+
+      it("a refusal whose closing period wraps alone onto the next row still asks for sign-in", () => {
+        // 120 characters through "again" at a 120-column pane: the shell wraps the period onto its own row.
+        const message = "Error: Your access token could not be refreshed because your refresh token has expired. Please log out and sign in again";
+        expect(message).toHaveLength(120);
+        expect(probe("zsh", ["$ codex resume 019d-token", message, ".", "user@example.test ~/project %"])).toEqual(authRefusal);
+        // A message that already ends in its period, then a newer "." row: that row is other output, as before.
+        expect(probe("zsh", ["$ codex resume 019d-token", `${message}.`, ".", "user@example.test ~/project %"]))
+          .toMatchObject({ code: "returned_to_shell" });
+      });
+
+      it("a block left open doesn't hide a fresh refusal Codex marks as its own, and still hides an unmarked quote", () => {
+        // A reply cut off inside its block, then the user's turn and a current refusal.
+        expect(probe("codex", [header, "• Here's the start of it:", "```text", "partial output", "› Continue",
+          "■ Your access token could not be refreshed. Please log out and sign in again.", "", ...composer])).toEqual(authRefusal);
+        // The probe's window starts below a block's opener, so its closer is the first marker it sees.
+        expect(probe("codex", ["```", "• That's the whole file.", "› Continue",
+          "■ Your access token could not be refreshed. Please log out and sign in again.", "", ...composer])).toEqual(authRefusal);
+        // The same closer, with the refusal straight after the reply and no turn between.
+        expect(probe("codex", ["```", "• That's the whole file.",
+          "■ Your access token could not be refreshed. Please log out and sign in again.", "", ...composer])).toEqual(authRefusal);
+        // A quote left open that shows a transcript's prompt row, then an unmarked refusal: still a quote.
+        expect(probe("codex", [header, "• Here's what the other session showed:", "```text", "› Continue",
+          "Your access token could not be refreshed. Please sign in again.", "", ...composer]))
+          .toMatchObject({ status: "resumed", code: "active_runtime" });
+      });
+
+      it("a refusal wrapped past three rows is read to its instruction, and stops at a boundary", () => {
+        expect(probe("zsh", ["$ codex resume 019d-token",
+          "Error: Your access token could not be refreshed because",
+          "you have since logged out or signed in",
+          "to another account. Please sign in ag",
+          "ain.",
+          "user@example.test ~/project %"])).toEqual(authRefusal);
+        // A blank row ends the message; a later row with the instruction doesn't complete it.
+        const later = ["Your access token could not be refreshed", "", "• Please sign in again to use the new plugins"];
+        expect(probe("codex", later)).not.toEqual(authRefusal);
+      });
+    });
+
     it("classifies the Codex hook review prompt as hook_trust_gate", () => {
       const result = assessNativeResumeProbe({
         runtime: "codex",
@@ -898,5 +1504,501 @@ describe("native resume probe", () => {
       expect(result.status).toBe("resumed");
       expect(result.code).toBe("active_runtime");
     });
+  });
+});
+
+// Claude Code 2.1.309's "Resume session" picker, from dev50-qa's native capture of a bare `claude --resume` in a 100×80
+// pane (release-0.7.2 evidence q2010-qa, DIRECT-UI-FIRST/LAST-FRAME.json). It is drawn at the top with 68 blank rows below.
+describe("Claude's Resume session picker", () => {
+  const picker = JSON.parse(fs.readFileSync(new URL("./fixtures/claude-resume-picker-2.1.309.json", import.meta.url), "utf8")) as Record<string, string>;
+  const native = picker.first100x80!;
+  const rows = native.trimEnd().split("\n");
+  // The real search box row sets the inner width; a changed row keeps the box's right edge.
+  const searchRow = rows.findIndex(row => row.includes("⌕"));
+  const boxRow = (text: string) => `  │ ${text.padEnd(rows[searchRow]!.length - 5)}│`;
+  const cards = rows.findIndex(row => row.includes("❯"));
+  const hint = rows.findIndex(row => row.includes("Ctrl+A to show all projects"));
+  const replaced = (from: number, to: number, ...next: string[]) => [...rows.slice(0, from), ...next, ...rows.slice(to)].join("\n");
+  const shapes: Array<[string, string]> = [
+    ["the native first frame, 100×80", native],
+    ["the native last frame, 100×80", picker.last100x80!],
+    ["the native frame replayed in a 100×24 pane", `${rows.join("\n")}\n${Array<string>(11).fill("").join("\n")}`],
+    ["a search for a name that matched nothing", replaced(searchRow, hint + 2, boxRow("⌕ probe-claude@elsewhere"), rows[searchRow + 1]!, "",
+      '    No sessions match "probe-claude@elsewhere".', "", "    Type to Search · Enter to select · Esc to clear")],
+    ["a long query wrapped inside the box", replaced(searchRow, searchRow + 1, boxRow(`⌕ ${"q".repeat(rows[searchRow]!.length - 7)}`), boxRow("  the rest of it"))],
+    ["a heading with its count", replaced(searchRow - 2, searchRow - 1, "  Resume session (2 of 9)")],
+    ["a project with no conversations", replaced(cards, cards + 2, "    No conversations found in this project.")],
+    // A card's title is the person's own text, and can read like Claude's header (dev50-qa's two probes).
+    ["a card titled with Claude's header words", native.replace("probe-claude@q2010-native", "Investigate Claude Code v2.1.309 startup")],
+    ["a card titled exactly like Claude's header", native.replace("probe-claude@q2010-native", "Claude Code v2.1.309")],
+  ];
+  it.each(shapes)("reads %s as waiting for a person", (_shape, paneContent) => {
+    expect(assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "claude", paneContent }))
+      .toMatchObject({ status: "attention_required", code: "claude_resume_selection_prompt" });
+  });
+
+  // #2010's rule: a picker counts only while it is the last thing drawn.
+  const plainRule = "─".repeat(100);
+  const labelledRule = `${"─".repeat(77)} probe-claude@q2010-native ─`;
+  const resumed = (topRule: string) => ["Claude Code v2.1.309", "", "● Picked up where we left off.", "", topRule, "❯ ", plainRule,
+    "  ⏵⏵ accept edits on (shift+tab to cycle)"].join("\n");
+  it.each([["plain", plainRule], ["labelled", labelledRule]])("reads an old picker above a resumed session (%s frame) as resumed", (_frame, rule) => {
+    const paneContent = `${rows.join("\n")}\n\n${resumed(rule)}\n${Array<string>(40).fill("").join("\n")}`;
+    expect(assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "claude", paneContent }))
+      .toMatchObject({ status: "resumed", code: "active_runtime" });
+  });
+  it("reads a reply quoting the picker above a live composer as resumed", () => {
+    const quoted = ["● The picker looked like this:", ...rows.slice(2, hint + 2).map(row => `  ${row}`), "", plainRule, "❯ ", plainRule,
+      "  ⏵⏵ accept edits on (shift+tab to cycle)"].join("\n");
+    expect(assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "claude", paneContent: quoted }))
+      .toMatchObject({ status: "resumed", code: "active_runtime" });
+  });
+  it("doesn't take a heading with no search box under it for the picker", () => {
+    const paneContent = ["● Tomorrow's plan:", "  Resume session", "  then rebase the branch.", "", plainRule, "❯ ", plainRule,
+      "  ⏵⏵ accept edits on (shift+tab to cycle)"].join("\n");
+    expect(assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "claude", paneContent }))
+      .toMatchObject({ status: "resumed", code: "active_runtime" });
+  });
+});
+
+// #2820 item 2: Claude Code's "gated grants" backstop (2.1.319+). It looks like the workspace trust prompt
+// ("Accessing workspace:", "Yes, I trust this folder"), but it also asks to approve the tool permissions the folder's
+// .claude/settings.json pre-approves, and its default choice declines them ("No, continue without these permissions")
+// or exits ("No, exit"). OpenRig must never answer it, not even with recovery.auto_drive_provider_prompts.
+describe("Claude gated grants backstop (#2820 item 2)", () => {
+  // A real capture: Claude Code 2.1.319 in a lab git repo (see claude-trust-git-root.test.ts).
+  const capture = JSON.parse(fs.readFileSync(new URL("./fixtures/claude-trust-git-root/trust-checks.json", import.meta.url), "utf8")) as { gatedGrantsScreen: string[] };
+  const screen = capture.gatedGrantsScreen.join("\n");
+  const probe = (paneContent: string) => assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "claude", paneContent });
+  const gate = { status: "attention_required", code: "claude_gated_grants_gate" };
+
+  it("the captured screen, focus on 'No, continue without these permissions', is its own gate, never trust_gate", () => {
+    expect(probe(screen)).toMatchObject(gate);
+    expect(probe(screen).detail).toContain("OpenRig does not approve or bypass this review. No input was sent.");
+  });
+
+  it("is the same gate with the focus moved to 'Yes, I trust this folder'", () => {
+    const yes = screen.replace("❯ No, continue without these permissions", "  No, continue without these permissions")
+      .replace("  Yes, I trust this folder", "❯ Yes, I trust this folder");
+    expect(probe(yes)).toMatchObject(gate);
+  });
+
+  it("is the same gate in the variant with nothing trusted yet, whose default choice is 'No, exit'", () => {
+    expect(probe(screen.replace("❯ No, continue without these permissions", "❯ No, exit"))).toMatchObject(gate);
+  });
+
+  // "Claude Code v" inside the dialog is not Claude's version header: the screen is not cut there.
+  it.each([
+    ["'No, exit'", "❯ No, exit"],
+    ["'No, continue without these permissions'", "❯ No, continue without these permissions"],
+  ])("is the same gate, focus on %s, with a pre-approved grant that reads 'Claude Code v'", (_focus, option) => {
+    const grant = screen.replace("❯ No, continue without these permissions", option)
+      .replace("Bash(git status:*)", "Bash(echo Claude Code v*)");
+    expect(grant).toContain("Bash(echo Claude Code v*)");
+    expect(probe(grant)).toMatchObject(gate);
+  });
+
+  it("is the same gate in the 'No, exit' variant with the warning scrolled out, by its 'These will apply without asking' block", () => {
+    const rows = screen.replace("❯ No, continue without these permissions", "❯ No, exit").split("\n");
+    const scrolled = rows.filter(row => !row.includes("This folder pre-approves")).join("\n");
+    expect(scrolled).not.toMatch(/pre-approves|No, continue without/);
+    expect(probe(scrolled)).toMatchObject(gate);
+  });
+
+  it("is the same gate when the git root is the home folder (the case item 1 deliberately does not seed)", () => {
+    expect(probe(screen.replace("<lab>/repo/cadeiras/rig/seat", "/home/agent"))).toMatchObject(gate);
+  });
+
+  it("is the same gate drawn with blank rows between its parts and a long permission list", () => {
+    const rows = capture.gatedGrantsScreen.flatMap(row => [row, ""]);
+    rows.splice(rows.findIndex(row => row.includes("Bash(ls:*)")) + 1, 0, ...Array.from({ length: 30 }, (_, n) => `   Bash(tool-${n}:*)`));
+    expect(probe(rows.join("\n"))).toMatchObject(gate);
+  });
+
+  it("a backstop still being drawn is not a trust prompt to drive: it waits for the next read", () => {
+    const partial = capture.gatedGrantsScreen.slice(0, capture.gatedGrantsScreen.findIndex(row => row.includes("Security guide")));
+    expect(probe(partial.join("\n"))).toMatchObject({ status: "inconclusive", code: "awaiting_runtime" });
+    const noFooter = capture.gatedGrantsScreen.slice(0, -1).join("\n");
+    expect(probe(noFooter)).toMatchObject({ status: "inconclusive", code: "awaiting_runtime" });
+  });
+
+  it("a backstop left in the scrollback above a session that started is neither this gate nor trust_gate", () => {
+    const later = [screen, "", " ▐▛███▜▌   Claude Code v2.1.319", "", "────────────────", "❯ ", "────────────────"].join("\n");
+    expect(probe(later).code).not.toBe("claude_gated_grants_gate");
+    expect(probe(later).code).not.toBe("trust_gate");
+  });
+
+  it("is the same gate in a 40-column pane, whose rows wrap and cut its marks (real capture), never trust_gate", () => {
+    const narrow = fs.readFileSync(new URL("./fixtures/claude-trust-git-root/backstop-40col-2.1.322.txt", import.meta.url), "utf8")
+      .split("\n").filter(row => !row.startsWith("# ")).join("\n");
+    expect(narrow).not.toMatch(/No, continue without these permissions/);
+    expect(probe(narrow)).toMatchObject(gate);
+    expect(claudeTrustPromptFocus(narrow)).toBe("unknown");
+  });
+
+  it("a 40-column backstop captured before its wrapped warning is complete waits, never resumed", () => {
+    const rows = fs.readFileSync(new URL("./fixtures/claude-trust-git-root/backstop-40col-2.1.322.txt", import.meta.url), "utf8")
+      .split("\n").filter(row => !row.startsWith("# "));
+    const partial = rows.slice(0, rows.findIndex(row => row.includes("⚠ This folder pre-approves")) + 1).join("\n");
+    expect(partial).not.toMatch(/tool permissions/);
+    expect(probe(partial)).toMatchObject({ status: "inconclusive", code: "awaiting_runtime" });
+  });
+
+  it("is the same gate in 40 columns when a long permission list scrolled the whole warning out", () => {
+    const rows = fs.readFileSync(new URL("./fixtures/claude-trust-git-root/backstop-40col-2.1.322.txt", import.meta.url), "utf8")
+      .split("\n").filter(row => !row.startsWith("# "));
+    const from = rows.findIndex(row => row.includes("⚠ This folder pre-approves"));
+    const to = rows.findIndex(row => row.includes("configuration."));
+    const scrolled = [...rows.slice(0, from), ...rows.slice(to + 1)].join("\n");
+    expect(scrolled).not.toMatch(/pre-approves/);
+    expect(probe(scrolled)).toMatchObject(gate);
+  });
+
+  it("is the same gate drawn with numbered options", () => {
+    const numbered = screen.replace("❯ No, continue without these permissions", "❯ 1. No, continue without these permissions")
+      .replace("  Yes, I trust this folder", "  2. Yes, I trust this folder");
+    expect(probe(numbered)).toMatchObject(gate);
+  });
+
+  it("a reply quoting the backstop's words above a fresh plain prompt does not hide that prompt", () => {
+    const plain = fs.readFileSync(new URL("./fixtures/claude-trust-git-root/plain-trust-2.1.322.txt", import.meta.url), "utf8")
+      .split("\n").filter(row => !row.startsWith("# ")).join("\n");
+    const earlier = ["⏺ It reads \"This folder pre-approves 2 tool permissions\" and \"No, continue without these permissions\".",
+      "", "────────────────", "❯ ", "────────────────", ""].join("\n");
+    expect(probe(earlier + plain)).toMatchObject({ status: "inconclusive", code: "trust_gate" });
+  });
+
+  it("a draft in Claude's input box that reads like the backstop's option is never the gate", () => {
+    const started = [" ▐▛███▜▌   Claude Code v2.1.322", "", "⏺ Done.", "", "────────────────────────────────",
+      "❯ No, continue without the tests", "────────────────────────────────", "  ⏵⏵ auto mode on (shift+tab to cycle)"].join("\n");
+    expect(probe(started)).toMatchObject({ status: "resumed" });
+  });
+
+  it("nor is that draft while the input frame's closing rule is not captured yet", () => {
+    const drawing = [" ▐▛███▜▌   Claude Code v2.1.322", "", "⏺ Done.", "", "────────────────────────────────",
+      "❯ No, continue without the tests"].join("\n");
+    expect(probe(drawing)).toMatchObject({ status: "resumed" });
+  });
+
+  // A draft's text never moves the cut: Claude draws its frame's rules from column 0 and a draft's continuation rows
+  // indented under the ❯, so a rule, a reply or a header pasted into a draft is the draft's, not Claude's.
+  const header = " ▐▛███▜▌   Claude Code v2.1.322";
+  const rule = "────────────────────────────────";
+  it.each([
+    ["a pasted rule", "  ────────"],
+    ["a pasted reply", "⏺ Earlier output"],
+    ["a pasted header", "  Claude Code v2.1.322"],
+  ])("a multi-line draft with %s above the backstop's words is never the gate", (_case, pasted) => {
+    const draft = ["❯ Review this example:", pasted, "  No, continue without the tests"];
+    const closed = [header, "", "⏺ Done.", "", rule, ...draft, rule, "  ⏵⏵ auto mode on (shift+tab to cycle)"].join("\n");
+    expect(probe(closed)).toMatchObject({ status: "resumed" });
+    const drawing = [header, "", "⏺ Done.", "", rule, ...draft].join("\n");
+    expect(probe(drawing)).toMatchObject({ status: "resumed" });
+  });
+
+  it("a draft that mentions a Claude Code version reads resumed, closed or still open (maintainer's case)", () => {
+    const draft = ["Claude Code v2.1.322", rule, "❯ Explain this Claude Code v2.1.322 message:", "  No, continue without the tests"];
+    expect(probe([...draft, rule, "  ⏵⏵ accept edits on (shift+tab to cycle)"].join("\n"))).toMatchObject({ status: "resumed" });
+    expect(probe(draft.join("\n"))).toMatchObject({ status: "resumed" });
+  });
+
+  it("a draft that starts with a pasted header is never the gate either", () => {
+    const started = [header, "", "⏺ Done.", "", rule, "❯ Claude Code v2.1.322 asks:", "  No, continue without the tests", rule].join("\n");
+    expect(probe(started)).toMatchObject({ status: "resumed" });
+  });
+
+  it("is the same gate below an old reply that quotes an input frame, with no input frame after it", () => {
+    // a quoted frame is indented like the reply: it is no frame of Claude's, so it never blanks the rows below it
+    const quoted = [header, "", "⏺ The screen looked like:", "  ────────", "  ❯ hi", "  ────────", "", "$ claude --resume x", ""].join("\n");
+    expect(probe(`${quoted}\n${capture.gatedGrantsScreen.join("\n")}`)).toMatchObject(gate);
+  });
+
+  it("is the same gate below an old session whose input frame holds a draft (N1)", () => {
+    const earlier = [header, "", "⏺ Done.", "", rule, "❯ Review this example:", "  ────────", "  more text", rule, ""].join("\n");
+    expect(probe(`${earlier}\n${screen}`)).toMatchObject(gate);
+  });
+
+  it("names the focused choice in the gate's detail", () => {
+    expect(probe(screen).detail).toContain("\"No, continue without these permissions\"");
+    const yes = screen.replace("❯ No, continue without these permissions", "  No, continue without these permissions")
+      .replace("  Yes, I trust this folder", "❯ Yes, I trust this folder");
+    expect(probe(yes).detail).toContain("\"Yes, I trust this folder\"");
+  });
+
+  it("the plain workspace trust prompt is still trust_gate (it stays auto-drivable)", () => {
+    const plain = ["Accessing workspace:", "/some/workspace", "", "Quick safety check: Is this a project you created or one you trust?",
+      "❯ 1. Yes, I trust this folder", "  2. No, exit"].join("\n");
+    expect(probe(plain)).toMatchObject({ status: "inconclusive", code: "trust_gate" });
+  });
+
+  it("the real plain prompt in a workspace whose path reads 'Claude Code v' is still trust_gate, never resumed", () => {
+    const plain = fs.readFileSync(new URL("./fixtures/claude-trust-git-root/plain-trust-2.1.322.txt", import.meta.url), "utf8")
+      .split("\n").filter(row => !row.startsWith("# ")).join("\n");
+    const path = plain.replace("<lab>/simples/repo/cadeiras/rig/seat", "/tmp/Claude Code v2/lab");
+    expect(path).toContain("/tmp/Claude Code v2/lab");
+    expect(probe(path)).toMatchObject({ status: "inconclusive", code: "trust_gate" });
+  });
+
+  it.each([
+    ["wrapped at a space", [" /home/agent/testes de", " Claude Code v2.1.322"]],
+    ["wrapped mid-word", [" /home/agent/labs/versoes-do-cli-claude/", " Claude Code v2.1.322 lab/seat"]],
+    ["after a dash", [" /home/agent/labs/old", " -Claude Code v2.1.322"]],
+    ["onto a row that starts with the box-rule glyph", [" /home/agent/labs/old", " ─Claude Code v2.1.322 lab"]],
+    ["onto a row that starts with a logo glyph", [" /home/agent/labs/old", " ▐Claude Code v2.1.322 lab"]],
+  ])("a workspace path with 'Claude Code v<x.y.z>' %s by a 40-column pane is still trust_gate", (_case, path) => {
+    const rows = fs.readFileSync(new URL("./fixtures/claude-trust-git-root/backstop-40col-2.1.322.txt", import.meta.url), "utf8")
+      .split("\n").filter(row => !row.startsWith("# "));
+    const from = rows.findIndex(row => row.includes("<lab>/backstop/rep"));
+    const warning = rows.findIndex(row => row.includes("⚠ This folder pre-approves"));
+    const note = rows.findIndex(row => row.includes("configuration."));
+    const plain = [...rows.slice(0, from), ...path, ...rows.slice(from + 2, warning), ...rows.slice(note + 1)].join("\n")
+      .replace(" ❯ No, continue without these", " ❯ No, exit");
+    expect(plain).not.toMatch(/pre-approves|without asking|No, continue/);
+    expect(probe(plain)).toMatchObject({ status: "inconclusive", code: "trust_gate" });
+  });
+
+  it.each([
+    ["'No, '", " No, folder/"],
+    ["'Yes, '", " Yes, folder/"],
+    ["the exact 'No, exit'", " No, exit"],
+    ["the exact 'Yes, I trust this folder'", " Yes, I trust this folder"],
+    ["the exact footer", " Enter to confirm · Esc to cancel"],
+  ])("a workspace path wrapped onto a row that reads %s before a header-like row is still trust_gate", (_case, row) => {
+    // A wrapped row that reads like an option or like the footer, even an exact one, is the dialog's text: the dialog
+    // ends at its last footer, below the path.
+    const plain = fs.readFileSync(new URL("./fixtures/claude-trust-git-root/plain-trust-2.1.322.txt", import.meta.url), "utf8")
+      .split("\n").filter(row => !row.startsWith("# ")).join("\n");
+    const wrapped = plain.replace("<lab>/simples/repo/cadeiras/rig/seat", ["/tmp/long", row, " ─Claude Code v2.1.322 lab"].join("\n"));
+    expect(wrapped).toContain(`${row}\n ─Claude Code v2.1.322 lab`);
+    expect(probe(wrapped)).toMatchObject({ status: "inconclusive", code: "trust_gate" });
+    const closed = [wrapped, "", " ▐▛███▛█▄╱✦  Claude Code v2.1.323", "", "────────────────", "❯ ", "────────────────"].join("\n");
+    expect(probe(closed).code).not.toBe("trust_gate");
+  });
+
+  it("a header-like row between the real options and the footer is the dialog's text: still trust_gate", () => {
+    const plain = fs.readFileSync(new URL("./fixtures/claude-trust-git-root/plain-trust-2.1.322.txt", import.meta.url), "utf8")
+      .split("\n").filter(row => !row.startsWith("# ")).join("\n");
+    const between = plain.replace("Enter to confirm · Esc to cancel", "─Claude Code v2.1.322 lab\n Enter to confirm · Esc to cancel");
+    expect(between).toContain("─Claude Code v2.1.322 lab\n Enter to confirm");
+    expect(probe(between)).toMatchObject({ status: "inconclusive", code: "trust_gate" });
+  });
+
+  it("Claude's version header drawn after the prompt still makes it history", () => {
+    const plain = fs.readFileSync(new URL("./fixtures/claude-trust-git-root/plain-trust-2.1.322.txt", import.meta.url), "utf8")
+      .split("\n").filter(row => !row.startsWith("# ")).join("\n").replace("<lab>/simples/repo/cadeiras/rig/seat", "/tmp/Claude Code v2/lab");
+    for (const header of [" ▐▛███▛█▄╱✦  Claude Code v2.1.323", " ▐▛███▜▌   Claude Code v2.1.322", "Claude Code v2.1.322"]) {
+      const later = [plain, "", header, "", "────────────────", "❯ ", "────────────────"].join("\n");
+      expect(probe(later).code).not.toBe("trust_gate");
+    }
+  });
+
+  it.each([
+    ["bare", "Claude Code v2.1.322"],
+    ["after the logo, as a live 2.1.323 pane draws it", " ▐▛███▛█▄╱✦  Claude Code v2.1.323"],
+    ["after the 2.1.322 logo", " ▐▛███▜▌   Claude Code v2.1.322"],
+    ["in a box border", "╭─── Claude Code v2.0.14 ───────────╮"],
+  ])("Claude's version header alone (%s) drawn after the prompt makes it history", (_form, header) => {
+    // no input frame after the header: the header alone has to end the dialog
+    const plain = fs.readFileSync(new URL("./fixtures/claude-trust-git-root/plain-trust-2.1.322.txt", import.meta.url), "utf8")
+      .split("\n").filter(row => !row.startsWith("# ")).join("\n");
+    expect(probe([plain, "", header].join("\n")).code).not.toBe("trust_gate");
+  });
+
+  it.each([
+    ["a grant", "   Bash(echo Claude Code v*)"],
+    ["a grant that a narrow pane wraps onto a row drawn like the header", " ─Claude Code v2.1.322 lab"],
+  ])("a backstop captured before its options, with %s reading 'Claude Code v', waits (partial), never resumed", (_case, row) => {
+    // the maintainer's case 1: captured right after the grant, before the note and the options, so no "Yes, I trust
+    // this folder" is drawn below the row and the warning above it is the backstop's only mark
+    const grants = capture.gatedGrantsScreen.map(line => line.includes("Bash(ls:*)") ? row : line);
+    const partial = grants.slice(0, grants.indexOf(row) + 1);
+    expect(partial.join("\n")).not.toMatch(/Yes, I trust this folder/);
+    const result = probe([...partial, "", "❯ "].join("\n"));
+    expect(result).toMatchObject({ status: "inconclusive", code: "awaiting_runtime" });
+  });
+
+  it("a dialog still being drawn whose text has a row equal to the footer above a header-like row is not closed by it", () => {
+    // A1b: the plain prompt with its options drawn and its real footer not yet; the path wraps onto the footer's words
+    const plain = fs.readFileSync(new URL("./fixtures/claude-trust-git-root/plain-trust-2.1.322.txt", import.meta.url), "utf8")
+      .split("\n").filter(row => !row.startsWith("# ")).join("\n");
+    const forged = plain.replace("<lab>/simples/repo/cadeiras/rig/seat",
+      ["/tmp/long", " Enter to confirm · Esc to cancel", " ─Claude Code v2.1.322 lab"].join("\n"));
+    const drawing = forged.replace(/\n\s*Enter to confirm · Esc to cancel\s*$/, "\n");
+    expect(drawing.match(/Enter to confirm/g)).toHaveLength(1);
+    expect(probe(drawing)).toMatchObject({ status: "inconclusive", code: "trust_gate" });
+    expect(probe(forged)).toMatchObject({ status: "inconclusive", code: "trust_gate" });
+    const closed = [forged, "", " ▐▛███▛█▄╱✦  Claude Code v2.1.323", "", "────────────────", "❯ ", "────────────────"].join("\n");
+    expect(probe(closed)).toMatchObject({ status: "resumed" });
+    // A1e: a backstop captured before its options, with a grant row equal to the footer above a header-like grant
+    const grants = capture.gatedGrantsScreen.flatMap(line => line.includes("Bash(ls:*)")
+      ? ["   Enter to confirm · Esc to cancel", " ─Claude Code v2.1.322 lab"] : [line]);
+    const partial = grants.slice(0, grants.indexOf(" ─Claude Code v2.1.322 lab") + 1);
+    expect(probe([...partial, "", "❯ "].join("\n"))).toMatchObject({ status: "inconclusive", code: "awaiting_runtime" });
+  });
+
+  it("a complete backstop whose grant reads 'Claude Code v', with Claude's real header drawn below it, is history (closed-dialog control)", () => {
+    const grants = capture.gatedGrantsScreen.map(line => line.includes("Bash(ls:*)") ? "   Bash(echo Claude Code v*)" : line);
+    expect(probe(grants.join("\n"))).toMatchObject(gate);
+    const closed = [...grants, "", " ▐▛███▛█▄╱✦  Claude Code v2.1.323", "", "────────────────", "❯ ", "────────────────"].join("\n");
+    expect(probe(closed).code).not.toBe("claude_gated_grants_gate");
+    expect(probe(closed).code).not.toBe("trust_gate");
+    expect(probe(closed).status).not.toBe("inconclusive");
+  });
+});
+
+describe("Claude's version header is read by its shape (#2820 follow-up, maintainer's review of 9c93238)", () => {
+  const probe = (paneContent: string) => assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "claude", paneContent });
+
+  it("a legacy 'Choose a conversation' list whose last option wraps a 'Claude Code v2.1.300' title still reads as the chooser", () => {
+    const chooser = ["Choose a conversation to resume:", "", "  1. project-foo (modified 2h ago)",
+      "  2. read the release notes for", "     Claude Code v2.1.300 upgrade notes", "", "Enter a number, or press q to cancel."].join("\n");
+    expect(probe(chooser)).toMatchObject({ status: "attention_required", code: "claude_resume_selection_prompt" });
+  });
+
+  it.each([
+    ["Claude's logo", "     ▐▛███▜▌   Claude Code v2.1.322 twice"],
+    ["a box rule", "     ─── Claude Code v2.0.14 ───"],
+    ["the welcome glyph", "     ✻ Claude Code v2.1.300 welcome"],
+  ])("a legacy chooser whose last option wraps a title that starts with %s, reading like the header, still reads as the chooser", (_case, wrapped) => {
+    const chooser = ["Choose a conversation to resume:", "", "  1. project-foo (modified 2h ago)",
+      "  2. why does my pane show", wrapped, "", "Enter a number, or press q to cancel."].join("\n");
+    expect(probe(chooser)).toMatchObject({ status: "attention_required", code: "claude_resume_selection_prompt" });
+  });
+
+  it("a legacy chooser whose last option wraps a 'Claude Code v2.1.300' title less indented than the title still reads as the chooser", () => {
+    // only the header's shape tells this row apart: it is not indented to the title's column
+    const chooser = ["Choose a conversation to resume:", "", "  1. project-foo (modified 2h ago)",
+      "  2. read the release notes for", "    Claude Code v2.1.300 upgrade notes", "", "Enter a number, or press q to cancel."].join("\n");
+    expect(probe(chooser)).toMatchObject({ status: "attention_required", code: "claude_resume_selection_prompt" });
+  });
+
+  it("a legacy chooser whose focused last option (❯) wraps a title that starts with Claude's logo still reads as the chooser", () => {
+    const chooser = ["Choose a conversation to resume:", "", "  1. project-foo", "  2. project-bar",
+      "❯ 3. why does my pane show", "     ▐▛███▜▌   Claude Code v2.1.322 twice", "", "Enter a number, or press q to cancel."].join("\n");
+    expect(probe(chooser)).toMatchObject({ status: "attention_required", code: "claude_resume_selection_prompt" });
+  });
+
+  it("the same list followed by Claude's real header is history", () => {
+    const chooser = ["Choose a conversation to resume:", "", "  1. project-foo (modified 2h ago)",
+      "  2. read the release notes for", "     Claude Code v2.1.300 upgrade notes", ""].join("\n");
+    expect(probe(`${chooser}\n ▐▛███▛█▄╱✦  Claude Code v2.1.323\n`).code).not.toBe("claude_resume_selection_prompt");
+  });
+});
+
+// #2820 item 2: the auto-drive presses a key on the trust prompt only for an allowlisted screen.
+describe("claudeTrustPromptFocus (#2820 item 2)", () => {
+  const plain = fs.readFileSync(new URL("./fixtures/claude-trust-git-root/plain-trust-2.1.322.txt", import.meta.url), "utf8")
+    .split("\n").filter(row => !row.startsWith("# ")).join("\n");
+  const backstop = (JSON.parse(fs.readFileSync(new URL("./fixtures/claude-trust-git-root/trust-checks.json", import.meta.url), "utf8")) as { gatedGrantsScreen: string[] }).gatedGrantsScreen.join("\n");
+
+  it("reads 'no' on the real 2.1.322 prompt, focused on 'No, exit'", () => {
+    expect(claudeTrustPromptFocus(plain)).toBe("no");
+  });
+  it("reads 'yes' once the focus is on 'Yes, I trust this folder'", () => {
+    expect(claudeTrustPromptFocus(plain.replace("❯ No, exit", "  No, exit").replace("  Yes, I trust this folder", "❯ Yes, I trust this folder"))).toBe("yes");
+  });
+  it("reads numbered prompts and the › cursor", () => {
+    expect(claudeTrustPromptFocus("Accessing workspace:\n/w\n❯ 1. Yes, I trust this folder\n  2. No, exit")).toBe("yes");
+    expect(claudeTrustPromptFocus("Accessing workspace:\n/w\n  1. Yes, I trust this folder\n› 2. No, exit")).toBe("no");
+  });
+  it("is 'unknown' without a cursor: the label cannot be checked", () => {
+    expect(claudeTrustPromptFocus("Accessing workspace:\n/w\n1. Yes, I trust this folder\n2. No, exit")).toBe("unknown");
+  });
+  it("is 'unknown' on the backstop's options, even with the focus moved to 'Yes'", () => {
+    expect(claudeTrustPromptFocus(backstop)).toBe("unknown");
+    expect(claudeTrustPromptFocus(backstop.replace("❯ No, continue without these permissions", "  No, continue without these permissions")
+      .replace("  Yes, I trust this folder", "❯ Yes, I trust this folder"))).toBe("unknown");
+  });
+  it("is 'unknown' on any other option set", () => {
+    expect(claudeTrustPromptFocus(plain.replace("  Yes, I trust this folder", "  Yes, I trust this folder\n  No, ask me later"))).toBe("unknown");
+  });
+});
+
+// #3843: a reused pane can still show an earlier launch's "No conversation found". A staged launch is run by one typed line
+// naming its script, which is unique to the launch, so only a report below the last place that whole line shows is this
+// launch's.
+describe("whose \"No conversation found\" a resume's pane shows (noConversationFoundOwner)", () => {
+  const name = "openrig-tmux-send-12345-0f0e0d0c-1111-4222-8333-444455556666.txt";
+  const typedLine = `( . '/tmp/${name}' )`;
+  const typed = `% ${typedLine}`;
+  const earlier = "No conversation found with session ID: old-1";
+  const ours = "No conversation found with session ID: abc-123";
+  const read = { typedLine, unread: false };
+
+  it("is this launch's only below the line typed to run the launch", () => {
+    expect(noConversationFoundOwner(`${typed}\n${ours}\n% `, read)).toEqual({ owner: "this" });
+    expect(noConversationFoundOwner(`${earlier}\n${typed}\n${ours}\n% `, read)).toEqual({ owner: "this" });
+  });
+
+  it("is an earlier launch's above that line, with what this launch has drawn below it", () => {
+    expect(noConversationFoundOwner(`${earlier}\n${typed}\nClaude Code v2.1.310\n❯ `, read))
+      .toEqual({ owner: "earlier", since: "Claude Code v2.1.310\n❯ " });
+    // The same text redrawn above the line, once or twice, is still the earlier launch's.
+    expect(noConversationFoundOwner(`${earlier}\n${earlier}\n${earlier}\n${typed}\n`, read)).toEqual({ owner: "earlier", since: "" });
+  });
+
+  it("is never this launch's while its shell hasn't read the launch, even below the line's echo", () => {
+    expect(noConversationFoundOwner(`${typed}\n${ours}`, { typedLine, unread: true })).toEqual({ owner: "earlier" });
+  });
+
+  it("can't be placed when the line isn't in view", () => {
+    expect(noConversationFoundOwner(`${ours}\n% `, read)).toEqual({ owner: "unknown" });
+    // Only the line's last row is left in the capture: its first rows scrolled out.
+    expect(noConversationFoundOwner(`0d0c-1111-4222-8333-444455556666.txt' )\n${ours}\n% `, read)).toEqual({ owner: "unknown" });
+  });
+
+  it("keeps any report as this launch's for a launch typed inline (nothing staged)", () => {
+    expect(noConversationFoundOwner(`${earlier}\n% `, { unread: false })).toEqual({ owner: "this" });
+  });
+
+  // review50-r2 (reviewer-tests.patch): the script's name in output is not the typed line.
+  it("doesn't move the line for a later message naming the script", () => {
+    expect(noConversationFoundOwner(`$ ${typedLine}\n${ours}\ndiagnostic: ${name} finished\n$ `, read)).toEqual({ owner: "this" });
+    // The shell's own error naming the script, as bash prints it, is output too.
+    expect(noConversationFoundOwner(`${earlier}\n$ ${typedLine}\nbash: /tmp/${name}: Permission denied\n$ `, read))
+      .toEqual({ owner: "earlier", since: `bash: /tmp/${name}: Permission denied\n$ ` });
+  });
+
+  it("takes no line from the script's name alone", () => {
+    expect(noConversationFoundOwner(`diagnostic: ${name}\n${ours}\n$ `, read)).toEqual({ owner: "unknown" });
+    expect(noConversationFoundOwner(`$ /bin/sh /tmp/${name}\n${ours}\n$ `, read)).toEqual({ owner: "unknown" });
+  });
+
+  it("matches the line split at every position inside the script's name", () => {
+    for (let cut = 1; cut < name.length; cut++) {
+      const wrapped = `$ ${typedLine}`.replace(name, name.slice(0, cut) + "\n" + name.slice(cut));
+      expect(noConversationFoundOwner(`${wrapped}\n${ours}`, read), String(cut)).toEqual({ owner: "this" });
+    }
+  });
+
+  it("matches the line split at one of its spaces, which the capture drops from the row's end", () => {
+    // capture-pane trims each row's trailing spaces, so a row that wraps at a space loses it.
+    expect(noConversationFoundOwner(`% (\n. '/tmp/${name}'\n)\n${ours}`, read)).toEqual({ owner: "this" });
+    expect(noConversationFoundOwner(`% ( .\n'/tmp/${name}' )\n${ours}`, read)).toEqual({ owner: "this" });
+  });
+
+  // Captured from real tmux 40 columns wide (a throwaway server): zsh still running its startup files when the launch was
+  // typed, so the terminal echoed it once, then zsh's line editor drew it again after its prompt. capture-pane -J rejoins
+  // only the first (the terminal wrapped it); zsh wraps its own line, so that one stays split, mid-name.
+  const narrow = [
+    "( . '/tmp/openrig-tmux-send-12345-0f0e0d",
+    "0c-1111-4222-8333-444455556666.txt' )",
+    "% ( . '/tmp/openrig-tmux-send-12345-0f0e",
+    "0d0c-1111-4222-8333-444455556666.txt' )",
+  ].join("\n");
+  it("finds the line when a narrow pane splits it across rows, and goes by the last place it shows", () => {
+    expect(noConversationFoundOwner(`${narrow}\nNo conversation found with session ID: a\nbc-123\n%`, read)).toEqual({ owner: "this" });
+    expect(noConversationFoundOwner(`${earlier}\n${narrow}\n%`, read)).toEqual({ owner: "earlier", since: "%" });
+    // Between the terminal's echo and the shell's own line is still above the line the shell read.
+    const [echo1, echo2, line1, line2] = narrow.split("\n");
+    expect(noConversationFoundOwner([echo1, echo2, earlier, line1, line2, "%"].join("\n"), read)).toEqual({ owner: "earlier", since: "%" });
+  });
+
+  it("finds the other typed forms: /bin/sh with a quoted path, and fish's", () => {
+    const sh = `/bin/sh '/tmp/launch '"'"'quoted'"'"'.sh'`;
+    expect(noConversationFoundOwner(`${earlier}\n$ ${sh}\n${ours}`, { typedLine: sh, unread: false })).toEqual({ owner: "this" });
+    const fish = `if eval 'OPENRIG_FISH_ASSIGNMENT_PROBE=1 /bin/sh -c :'; source '/tmp/${name}'; else; /bin/sh '/tmp/${name}'; end`;
+    expect(noConversationFoundOwner(`${earlier}\n> ${fish.slice(0, 50)}\n${fish.slice(50)}\n${ours}`, { typedLine: fish, unread: false }))
+      .toEqual({ owner: "this" });
   });
 });

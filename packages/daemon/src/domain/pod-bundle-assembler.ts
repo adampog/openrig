@@ -1,7 +1,7 @@
 import nodePath from "node:path";
 import { createHash } from "node:crypto";
 import { RigSpecCodec } from "./rigspec-codec.js";
-import { RigSpecSchema } from "./rigspec-schema.js";
+import { RigSpecSchema, poolAdvisories } from "./rigspec-schema.js";
 import { assertShippableSubstance, resolveAgentRef, type AgentResolverFsOps } from "./agent-resolver.js";
 import { serializePodBundleManifest, type PodBundleManifest, type PodBundleAgentEntry, type PodBundleAgentImportEntry, type BundleProvenance, type BundleCompatibility } from "./bundle-types.js";
 import type { RigSpec, StartupBlock } from "./types.js";
@@ -24,6 +24,8 @@ export interface PodAssembleOptions {
   outputDir: string;
   bundleName: string;
   bundleVersion: string;
+  /** Opt-in from bundle.services_enabled; omitted preserves the existing archive. */
+  servicesEnabled?: boolean;
   /**
    * Optional Item-1 provenance input. Caller fills the fields it knows
    * (sourceHost, authorSession, daemonVersion, cliVersion, sourceRigId,
@@ -106,6 +108,11 @@ export class PodBundleAssembler {
       }
     }
 
+    if (opts.servicesEnabled && rigSpec.services) {
+      const composeFile = rigSpec.services.composeFile;
+      this.collectRigFile(composeFile, opts.rigRoot, opts.outputDir, collectedFiles);
+    }
+
     // 2c. Rig startup files
     this.collectStartupFiles(rigSpec.startup, opts.rigRoot, opts.outputDir, collectedFiles);
 
@@ -117,6 +124,9 @@ export class PodBundleAssembler {
       for (const member of pod.members) {
         // Member startup files
         this.collectStartupFiles(member.startup, opts.rigRoot, opts.outputDir, collectedFiles);
+        // OPR.0.7.0.9 — a Claude member's own agent file, prompt file and plugin folders travel at their spec-relative paths,
+        // so an installed bundle's seat gets them. Declared means required: a missing one is refused here, not at install.
+        this.collectMemberAdditions(member, `${pod.id}.${member.id}`, opts.rigRoot, opts.outputDir, collectedFiles);
 
         // Terminal members are bundle-native sentinels, not vendored agents.
         if (member.agentRef === "builtin:terminal") {
@@ -216,7 +226,8 @@ export class PodBundleAssembler {
         createdAt: opts.provenance.createdAt ?? createdAt,
       };
     }
-    const warnings = [...unresolvedSkills];
+    // #3395: a malformed pool block is not carried (the rig.yaml is written from the normalized spec) and is listed here
+    const warnings = [...unresolvedSkills, ...poolAdvisories(raw)];
     if (warnings.length > 0) {
       // Reuse durable provenance notes so inspect and recovery see the same caveat.
       const warning = warnings.join("; ");
@@ -237,6 +248,28 @@ export class PodBundleAssembler {
     collectedFiles.push("bundle.yaml");
 
     return { manifest, collectedFiles, ...(warnings.length > 0 ? { warnings } : {}) };
+  }
+
+  private collectMemberAdditions(member: { agentFile?: string; appendSystemPromptFile?: string; pluginDirs?: string[] }, seat: string,
+    rigRoot: string, outputDir: string, collected: string[]): void {
+    const declared = (relPath: string, key: string): string => {
+      const absPath = nodePath.resolve(rigRoot, relPath);
+      if (!this.fs.exists(absPath)) throw new Error(`Declared ${key} not found for member ${seat}: ${relPath} (resolved to ${absPath}).`);
+      return absPath;
+    };
+    for (const [relPath, key] of [[member.agentFile, "agent_file"], [member.appendSystemPromptFile, "append_system_prompt_file"]] as const) {
+      if (!relPath) continue;
+      declared(relPath, key);
+      this.collectRigFile(relPath, rigRoot, outputDir, collected);
+    }
+    for (const relPath of member.pluginDirs ?? []) {
+      const realRoot = this.fs.realpath(nodePath.resolve(rigRoot));
+      const realDir = this.fs.realpath(declared(relPath, "plugin_dirs folder"));
+      if (realDir !== realRoot && !realDir.startsWith(nodePath.join(realRoot, nodePath.sep))) {
+        throw new Error(`"${relPath}" resolves outside the rig root through a symlink; copy the folder into the rig to bundle it`);
+      }
+      this.vendorDirectory(realDir, nodePath.join(outputDir, relPath), collected, relPath);
+    }
   }
 
   private collectRigFile(relPath: string, rigRoot: string, outputDir: string, collected: string[]): void {

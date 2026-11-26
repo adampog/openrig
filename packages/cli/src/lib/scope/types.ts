@@ -1,8 +1,7 @@
 // release-0.3.2 slice 12 — scope CLI primitive types.
 //
-// Aligned with the substrate convention at
-// `openrig-work/conventions/scope-and-versioning/README.md` (stage:
-// provisional, authored 2026-05-15). The CLI mints stable dot-IDs
+// Aligned with the scope-and-versioning convention (stage: provisional,
+// authored 2026-05-15). The CLI mints stable dot-IDs
 // into created mission/slice frontmatter per §1 of that convention.
 
 /** Scope tiers. v0 ships `mission` + `slice`; `project` and `sub-slice`
@@ -31,7 +30,10 @@ export interface MissionInfo {
   /** Minted dot-ID for this mission (read from frontmatter if present,
    *  otherwise inferred from the folder name pattern). */
   id: string | null;
+  /** Slices in flight (blocked included); delivered in place; and closed (closed/, or an exit in place). Each slice is
+   *  counted once, by the standing `slice ls --state` filters on. */
   activeSliceCount: number;
+  shippedSliceCount: number;
   closedSliceCount: number;
 }
 
@@ -88,12 +90,18 @@ export const MISSION_TEMPLATE_KINDS: ReadonlyArray<MissionTemplateKind> = [
   "release",
 ];
 
-export type CloseReason = "wontfix" | "deferred" | "superseded" | "stale";
-export const CLOSE_REASONS: ReadonlyArray<CloseReason> = [
+export type NonDeliveryCloseReason = "wontfix" | "deferred" | "superseded" | "stale";
+export const NON_DELIVERY_CLOSE_REASONS: ReadonlyArray<NonDeliveryCloseReason> = [
   "wontfix",
   "deferred",
   "superseded",
   "stale",
+];
+
+export type CloseReason = NonDeliveryCloseReason | "delivered";
+export const CLOSE_REASONS: ReadonlyArray<CloseReason> = [
+  ...NON_DELIVERY_CLOSE_REASONS,
+  "delivered",
 ];
 
 /** OPR.0.4.1.6 — the scope-and-versioning §2 epistemic-maturity `stage` enum

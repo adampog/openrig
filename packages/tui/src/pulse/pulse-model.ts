@@ -1,3 +1,4 @@
+import { DEFAULT_TIME_ZONE, displayClock } from "../time.js";
 import { isHumanSeatSessionRef } from "@openrig/daemon/attention";
 // PULSE view data model (5.2 Wave B). A reusable, view-local model so the pulse
 // row/section renderers (pulse/render-pulse.ts) can be shared — crash-cart rides
@@ -57,6 +58,7 @@ export interface PulseLane {
 }
 
 export interface PulseModel {
+  queueSampleNote?: string;
   exceptions: PulseExceptionSection[]; // EMPTY section omitted entirely (empty-strip-is-silence)
   lanes: [PulseLane, PulseLane, PulseLane]; // NOW, JUST FINISHED, UP NEXT
   footer: { active: number; parked: number; waitingYou: number; updatedAgo: string };
@@ -265,17 +267,6 @@ function parkedRows(
  * in the header) — never a silent truncation (see [[pagination-terminates-on-data-not-budgets]]). */
 const LANE_ROW_CAP = 5;
 
-/** Absolute UTC clock label for a JUST FINISHED transition time (e.g. "11:44").
- * UTC keeps it deterministic + TZ-independent; an unparseable stamp renders "". */
-function hhmm(iso: string | null | undefined): string {
-  if (!iso) return "";
-  const t = Date.parse(iso);
-  if (Number.isNaN(t)) return "";
-  const d = new Date(t);
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
-}
-
 /** The drill-in Action for a lane row keyed on a SEAT session. A seat resolvable
  * in the topology drills to that AGENT (the shipped agent drill — recovers the
  * full identity the compact lane label drops, parity with clicking the agent
@@ -315,17 +306,17 @@ function nowRows(seatActivity: SeatActivitySummary[], inProgress: QueueRead[], s
 }
 
 /** ✓ JUST FINISHED rows — recent terminal transitions newest-FINISHED-first.
- * The shipped /list read serves ts_created order, so we re-sort by tsUpdated
+ * The /list read picks the most recently updated rows; we sort them by tsUpdated
  * DESC (the finish time) and cap to a recent window (count == rendered — this is
  * inherently a WINDOW, not a total). Time = the transition's tsUpdated (HH:MM). */
-function finishedRows(recent: QueueRead[], cap: number, snap: FleetSnapshot): PulseLaneRow[] {
+function finishedRows(recent: QueueRead[], cap: number, snap: FleetSnapshot, timeZone: string): PulseLaneRow[] {
   return [...recent]
     .sort((a, b) => Date.parse(b.tsUpdated) - Date.parse(a.tsUpdated))
     .slice(0, cap)
     .map((q) => {
       const label = q.summary ?? bodyHead(q.body);
       // drill to the seat that FINISHED it (destinationSession → agent).
-      return { glyph: "✓", token: "ok" as Token, time: hhmm(q.tsUpdated), label, action: seatRowAction(snap, q.destinationSession, `${q.destinationSession} · ${label}`) };
+      return { glyph: "✓", token: "ok" as Token, time: displayClock(q.tsUpdated, timeZone), label, action: seatRowAction(snap, q.destinationSession, `${q.destinationSession} · ${label}`) };
     });
 }
 
@@ -357,7 +348,7 @@ function upNextLane(pending: QueueRead[], cap: number, snap: FleetSnapshot): Pul
  * derived FROM the built model so header numbers can never diverge from their
  * referent sets (label==referent). demoPulseModel is retained only as a static
  * renderer fixture (spatial-contract tests), no longer this builder's source. */
-export function buildPulseModel(snap: FleetSnapshot, nowMs: number = Date.now()): PulseModel {
+export function buildPulseModel(snap: FleetSnapshot, nowMs: number = Date.now(), timeZone = DEFAULT_TIME_ZONE): PulseModel {
   const exceptions: PulseExceptionSection[] = [];
 
   const needs = needsRows(snap.attention, nowMs);
@@ -369,14 +360,15 @@ export function buildPulseModel(snap: FleetSnapshot, nowMs: number = Date.now())
   // idle-duration derived at the renderer. Zero parked = silence (OMITTED), like
   // the other live joins — the incr-2 "read pending" placeholder is retired.
   const seatBySession = new Map(snap.seatActivity.map((s) => [s.session, s]));
-  const parked = parkedRows(snap.inProgress, seatBySession, nowMs);
+  const attentionIds = new Set(snap.attention.map(row => row.qitemId));
+  const parked = parkedRows(snap.inProgress.filter(row => !attentionIds.has(row.qitemId)), seatBySession, nowMs);
   if (parked.length > 0) exceptions.push({ glyph: "◌", token: "warn", label: "PARKED WITH BATON", rows: parked });
 
-  const blocked = blockedRows(snap.blocked, nowMs);
+  const blocked = blockedRows(snap.blocked.filter(row => !attentionIds.has(row.qitemId)), nowMs);
   if (blocked.length > 0) exceptions.push({ glyph: "⧗", token: PULSE_INFO_TOKEN, label: "BLOCKED ON AGENTS", rows: blocked });
 
   const now = nowRows(snap.seatActivity, snap.inProgress, snap);
-  const finished = finishedRows(snap.recentlyFinished, LANE_ROW_CAP, snap);
+  const finished = finishedRows(snap.recentlyFinished, LANE_ROW_CAP, snap, timeZone);
   const lanes: [PulseLane, PulseLane, PulseLane] = [
     { label: "NOW", count: now.length, rows: now },
     { label: "JUST FINISHED", count: finished.length, rows: finished },
@@ -391,5 +383,9 @@ export function buildPulseModel(snap: FleetSnapshot, nowMs: number = Date.now())
   const ago = ageLabel(snap.hydratedAt, nowMs);
   const footer = { active: now.length, parked: parkedCount, waitingYou, updatedAgo: ago ? `${ago} ago` : "—" };
 
-  return { exceptions, lanes, footer };
+  return { exceptions, lanes, footer,
+    ...(snap.queueCoverage === "pending" ? { queueSampleNote: "Queue lists pending: read after the rigs and seats." }
+      : snap.queueCoverage === "partial" || snap.queueCoverage === "unavailable"
+        ? { queueSampleNote: "Queue counts are samples; unlisted work is unknown." } : {}),
+  };
 }

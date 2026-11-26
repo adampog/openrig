@@ -3,10 +3,17 @@ import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
 import type { ExecFn } from "../adapters/tmux.js";
-import { runtimeProbeFailure } from "../adapters/preflight-exec.js";
+import { RIG_LOGIN_PATH_CHECK, runtimeProbeFailure, runtimeProbeTimeout } from "../adapters/preflight-exec.js";
 import { piVersionNotice } from "../adapters/pi-readiness.js";
 import type { LegacyRigSpec as RigSpec, PreflightResult, RigSpec as PodRigSpec, RigSpecPod, RigSpecPodMember } from "./types.js"; // TODO: AS-T08b — migrate to pod-aware RigSpec
-import { deriveSessionName, validateSessionName, validateSessionComponents, VIRTUAL_DOMAIN_TOKENS } from "./session-name.js";
+import { deriveCanonicalSessionName, deriveSessionName, tmuxRenamedSessionError, validateSessionName, validateSessionComponents, VIRTUAL_DOMAIN_TOKENS } from "./session-name.js";
+
+import { shellQuote } from "../adapters/shell-quote.js";
+import { mergeSeatEnv, type SeatEnv } from "./seat-env.js";
+import { withoutRuntimeHomes } from "./seat-runtime-home.js";
+import { isLaunchWrapperRuntime, unsupportedCommunityRunnerLaunchWrapperMessage } from "./launch-wrapper.js";
+import { resolveLaunchWrapperArgv, seatRigReachPaths } from "./seat-launch-environment.js";
+import { codexRigReach, codexRigReachWarning, type CodexMemberPermissions } from "./codex-member-permissions.js";
 
 const RUNTIME_COMMANDS: Record<string, string> = {
   "claude-code": "claude --version",
@@ -14,6 +21,10 @@ const RUNTIME_COMMANDS: Record<string, string> = {
   "pi": "pi --version",
   "omp": "omp --version",
 };
+
+export function unverifiedModelWarning(seat: string, model: string): string {
+  return `${seat}: configured model '${model}' is unverified. Launch checks do not establish model availability or account entitlement; no model call is made to verify it.`;
+}
 
 interface RigSpecPreflightDeps {
   rigRepo: RigRepository;
@@ -38,7 +49,7 @@ export class RigSpecPreflight {
     this.cmuxExec = deps.cmuxExec;
   }
 
-  async check(spec: RigSpec): Promise<PreflightResult> {
+  async check(spec: RigSpec, includeModelWarnings = true): Promise<PreflightResult> {
     const errors: string[] = [];
     const warnings: string[] = [];
 
@@ -47,6 +58,9 @@ export class RigSpecPreflight {
       const sessionName = deriveSessionName(spec.name, node.id);
       if (!validateSessionName(sessionName)) {
         errors.push(`Derived session name '${sessionName}' is invalid for node '${node.id}'`);
+      } else {
+        const renamed = tmuxRenamedSessionError(sessionName);
+        if (renamed) errors.push(`${node.id}: ${renamed}`);
       }
     }
 
@@ -68,7 +82,8 @@ export class RigSpecPreflight {
     // tmux session name collision
     for (const node of spec.nodes) {
       const sessionName = deriveSessionName(spec.name, node.id);
-      if (validateSessionName(sessionName)) {
+      // A name tmux would rename is already refused above, and probing it fails ("can't find pane").
+      if (validateSessionName(sessionName) && !tmuxRenamedSessionError(sessionName)) {
         const exists = await this.tmuxAdapter.hasSession(sessionName);
         if (exists) {
           errors.push(`tmux session '${sessionName}' already exists for node '${node.id}'`);
@@ -79,15 +94,16 @@ export class RigSpecPreflight {
     // cwd existence
     for (const node of spec.nodes) {
       if (node.cwd) {
-        if (!existsSync(node.cwd)) {
-          errors.push(`cwd '${node.cwd}' does not exist for node '${node.id}'`);
+        const cwd = resolveAuthoredCwd(node.cwd, null);
+        if (!existsSync(cwd)) {
+          errors.push(`cwd '${cwd}' does not exist for node '${node.id}'`);
         } else {
           try {
-            if (!statSync(node.cwd).isDirectory()) {
-              errors.push(`cwd '${node.cwd}' is not a directory for node '${node.id}'`);
+            if (!statSync(cwd).isDirectory()) {
+              errors.push(`cwd '${cwd}' is not a directory for node '${node.id}'`);
             }
           } catch {
-            errors.push(`cwd '${node.cwd}' is not accessible for node '${node.id}'`);
+            errors.push(`cwd '${cwd}' is not accessible for node '${node.id}'`);
           }
         }
       }
@@ -96,6 +112,7 @@ export class RigSpecPreflight {
     // Runtime availability
     const checkedRuntimes = new Set<string>();
     for (const node of spec.nodes) {
+      if (includeModelWarnings && node.model) warnings.push(unverifiedModelWarning(node.id, node.model));
       if (checkedRuntimes.has(node.runtime)) continue;
       checkedRuntimes.add(node.runtime);
 
@@ -106,9 +123,16 @@ export class RigSpecPreflight {
           if (node.runtime === "pi") warnings.push(piVersionNotice(output));
         } catch (err) {
           if (node.runtime === "pi") errors.push(...piAvailabilityFailure(err, warnings));
-          else errors.push(`Runtime '${node.runtime}' not available (${cmd} failed: ${runtimeProbeFailure(err)})`);
+          else errors.push(runtimeProbeTimeout(err) ?? `Runtime '${node.runtime}' not available (${cmd} failed: ${runtimeProbeFailure(err)})`);
         }
       }
+    }
+
+    for (const node of spec.nodes) {
+      if (node.runtime === "codex") warnRigReach(node.id, node.codexPermissions, node.cwd ? resolveAuthoredCwd(node.cwd, null) : undefined, warnings);
+    }
+    if (errors.length === 0) {
+      await warnRigLoginPath(spec.nodes.filter(node => node.runtime === "codex").map(node => ({ label: node.id, env: {} })), this.exec, warnings);
     }
 
     // cmux layout hints: warning if cmux unavailable and spec uses hints
@@ -132,11 +156,16 @@ export class RigSpecPreflight {
 // -- Rebooted rig preflight (AgentSpec reboot) --
 
 import { RigSpecCodec } from "./rigspec-codec.js";
-import { RigSpecSchema } from "./rigspec-schema.js";
-import { resolveAgentRef, type AgentResolverFsOps } from "./agent-resolver.js";
-import { resolveNodeConfig, type ResolutionContext } from "./profile-resolver.js";
-import { getOpenRigInstallCwdError, resolveLaunchCwd } from "./cwd-resolution.js";
+import { RigSpecSchema, poolAdvisories } from "./rigspec-schema.js";
+import { resolveAgentRef, type AgentResolverFsOps, agentSpecAdvisoryWarnings } from "./agent-resolver.js";
+import type { ResolutionContext, ResolutionResult } from "./profile-resolver.js";
+import { withNodeConfigResolver } from "./profile-resolution-worker.js";
+import { releaseScanCache } from "./skill-discovery.js";
+import { randomUUID } from "node:crypto";
+import { getOpenRigInstallCwdError, resolveAuthoredCwd, resolveLaunchCwd } from "./cwd-resolution.js";
 import nodePath from "node:path";
+import { loadCommunityHarnessPreset } from "./community-harness-presets.js";
+import { BUILT_IN_RUNTIMES } from "./built-in-runtimes.js";
 import { validateClaudeActivityHookDelivery, CLAUDE_ACTIVITY_HOOKS_RESOURCE_TYPE } from "./claude-activity-hooks.js";
 import {
   resolvePermissionPolicyAttachment,
@@ -146,7 +175,7 @@ import {
 
 // Slice 51-01 (OPR.0.5.1.1): `stub` is a first-class runtime (the deterministic node-script fake harness
 // through the real orchestrator) — admitted at the modern-pod preflight gate alongside the real runtimes.
-const SUPPORTED_RUNTIMES = new Set(["claude-code", "codex", "pi", "omp", "terminal", "stub"]);
+const SUPPORTED_RUNTIMES = BUILT_IN_RUNTIMES;
 
 // Default daemon-shipped asset paths for the managed Claude activity hooks — the SAME files the
 // ClaudeCodeAdapter is wired with in startup.ts (validation is the shared module either way).
@@ -155,6 +184,9 @@ const DEFAULT_ACTIVITY_RELAY_PATH = nodePath.resolve(import.meta.dirname, "../..
 const DEFAULT_CLAUDE_HOOKS_MANIFEST_PATH = nodePath.resolve(import.meta.dirname, "../../assets/plugins/openrig-core/hooks/claude.json");
 
 export interface RigPreflightInput {
+  includeModelWarnings?: boolean;
+  /** One-off launch environment, merged after the rig and member declarations. */
+  envOverride?: SeatEnv;
   rigSpecYaml: string;
   rigRoot: string;
   cwdOverride?: string;
@@ -167,6 +199,7 @@ export interface RigPreflightInput {
   externalQualifiedIds?: Iterable<string>;
   claudeActivityAssets?: { relayPath?: string; manifestPath?: string };
   inheritedPermissionPolicy?: PreflightSpecContext["inheritedPermissionPolicy"];
+  materializeOnly?: PreflightSpecContext["materializeOnly"];
 }
 
 /**
@@ -174,6 +207,8 @@ export interface RigPreflightInput {
  * already-parsed+validated spec. (YAML is only the input adapter at the front.)
  */
 export interface PreflightSpecContext {
+  includeModelWarnings?: boolean;
+  envOverride?: SeatEnv;
   rigRoot: string;
   cwdOverride?: string;
   fsOps: AgentResolverFsOps;
@@ -182,6 +217,9 @@ export interface PreflightSpecContext {
   systemSkills?: string[];
   systemWorldError?: string;
   rigNameOverride?: string;
+  /** True when no session is created after this preflight (materialize-only, `rig adopt`), so
+   *  a session name tmux would rename is not refused: no session is created under it. */
+  materializeOnly?: boolean;
   /** Effective persisted target-rig attachment for structured expansion.
    * Explicit member/fragment refs still win; this is the inherited fallback. */
   inheritedPermissionPolicy?: Pick<
@@ -205,9 +243,11 @@ export interface PreflightSpecContext {
  */
 export function permissionPolicyDiscoveryWarnings(
   rigSpec: PodRigSpec,
-  preflightCtx: Pick<PreflightSpecContext, "rigRoot" | "fsOps" | "inheritedPermissionPolicy">,
+  preflightCtx: Pick<PreflightSpecContext, "rigRoot" | "fsOps" | "inheritedPermissionPolicy" | "rigNameOverride">,
 ): string[] {
   const warnings: string[] = [];
+  // The rig these seats launch in: an append names its stored target, whatever the template is called.
+  const kernel = (preflightCtx.rigNameOverride ?? rigSpec.name) === "kernel";
   for (const pod of rigSpec.pods) {
     for (const member of pod.members) {
       const logicalId = `${pod.id}.${member.id}`;
@@ -219,6 +259,9 @@ export function permissionPolicyDiscoveryWarnings(
         : preflightCtx.inheritedPermissionPolicy;
       if (!attachment) {
         warnings.push(`${logicalId}: permission_policy absent; launch_posture=floor`);
+        // The absent line stays as ruled (5f37e40f); a separate line says what the seat launches with.
+        const teamDefault = absentPolicyTeamDefault(logicalId, member.runtime, kernel);
+        if (teamDefault) warnings.push(teamDefault);
         continue;
       }
       if (attachment.origin === "deliberate_none") {
@@ -228,10 +271,40 @@ export function permissionPolicyDiscoveryWarnings(
         warnings.push(`${logicalId}: permission_policy: none (deliberate choice — recorded); launch_posture=floor`);
         continue;
       }
-      warnings.push(`${logicalId}: permission_policy ref="${attachment.ref}" origin=${attachment.origin} launch_posture=${attachment.launchPosture}`);
+      warnings.push(`${logicalId}: permission_policy ref="${attachment.ref}" origin=${attachment.origin} launch_posture=${attachment.launchPosture}`
+        + configPolicyNote(attachment, member.runtime, kernel));
     }
   }
   return warnings;
+}
+
+/** A team Claude Code or Codex seat with no policy launches at the floor with the team default's allowances, which the
+ *  bare absent line doesn't say. The plan can't see a seat's own permission mode, Codex envelope or named Codex profile,
+ *  any of which replaces the default, so the line says that too. Kernel, Pi and terminal seats get no line. */
+function absentPolicyTeamDefault(logicalId: string, runtime: string, kernel: boolean): string | null {
+  if (kernel || (runtime !== "claude-code" && runtime !== "codex")) return null;
+  return `${logicalId}: no permission policy, so this seat launches at the floor with the team default's allowances,`
+    + " unless it has its own permission mode, Codex envelope or named Codex profile";
+}
+
+/** A config-surface policy (a built-in such as standard, open or locked, or a custom one) is recorded, but its rules
+ *  aren't applied at launch. So its line says what the seat launches with, rather than a bare floor that reads as the
+ *  policy taking effect: a team seat with standard or open keeps the team default's allowances (as with no policy),
+ *  and any other one launches without them. A seat's own native mode, Codex envelope or profile still decides first,
+ *  and the plan can't see those, so both branches say so. */
+function configPolicyNote(attachment: { ref: string; origin: string; surface?: string; launchPosture: string },
+  runtime: string, kernel: boolean): string {
+  const config = attachment.surface === "config" || (attachment.origin === "builtin" && attachment.surface === undefined);
+  // Pi and terminal seats have no permission rules or team default to describe.
+  if (!config || attachment.launchPosture !== "floor" || (runtime !== "claude-code" && runtime !== "codex")) return "";
+  const notApplied = `; ${attachment.ref} is recorded, but its rules aren't applied at launch`;
+  if (!kernel && (attachment.ref === "builtin:standard" || attachment.ref === "builtin:open")) {
+    return `${notApplied}: this seat launches at the floor with the team default's allowances, unless it has its own permission`
+      + " choice, rules or named Codex profile (the applying-a-permission-policy skill applies more per seat)";
+  }
+  return `${notApplied}: unless the seat has an explicit native permission mode, Codex envelope or named Codex profile, it`
+    + " launches at the floor without the team default's allowances until its rules are applied per seat (the"
+    + " applying-a-permission-policy skill)";
 }
 
 /**
@@ -247,8 +320,9 @@ export async function rigPreflight(input: RigPreflightInput & { exec?: (cmd: str
   // callers holding an already-parsed+validated spec (expand / add_member)
   // preflight it WITHOUT a YAML round-trip. Mirrors the materialize-core split.
   let rigSpec: PodRigSpec;
+  let raw: unknown;
   try {
-    const raw = RigSpecCodec.parse(input.rigSpecYaml);
+    raw = RigSpecCodec.parse(input.rigSpecYaml);
     const validation = RigSpecSchema.validate(raw, { externalQualifiedIds: input.externalQualifiedIds });
     if (!validation.valid) {
       return { ready: false, errors: validation.errors, warnings: [] };
@@ -258,16 +332,23 @@ export async function rigPreflight(input: RigPreflightInput & { exec?: (cmd: str
     return { ready: false, errors: [`Parse error: ${(err as Error).message}`], warnings: [] };
   }
 
-  return preflightValidatedSpec(rigSpec, {
+  // #3395: the pool advisories join the load warnings here, once; the structured core below and the
+  // instantiator's own preflight do not add them, so import and bootstrap plan/apply report each one once.
+  const result = await preflightValidatedSpec(rigSpec, {
+    includeModelWarnings: input.includeModelWarnings,
     rigRoot: input.rigRoot,
     cwdOverride: input.cwdOverride,
+    envOverride: input.envOverride,
     fsOps: input.fsOps,
     skillsRoot: input.skillsRoot,
     rigNameOverride: input.rigNameOverride,
     inheritedPermissionPolicy: input.inheritedPermissionPolicy,
+    materializeOnly: input.materializeOnly,
     exec: input.exec,
     claudeActivityAssets: input.claudeActivityAssets,
   });
+  const pool = poolAdvisories(raw);
+  return pool.length > 0 ? { ...result, warnings: [...result.warnings, ...pool] } : result;
 }
 
 /**
@@ -278,7 +359,22 @@ export async function rigPreflight(input: RigPreflightInput & { exec?: (cmd: str
  * with no YAML round-trip; rigPreflight(yaml) is the parse/normalize front over it.
  */
 export async function preflightValidatedSpec(rigSpec: PodRigSpec, preflightCtx: PreflightSpecContext): Promise<PreflightResult> {
+  // Members share raw skill scans of identical inputs within this preflight only (#1653). The worker's copy ends
+  // with the worker; the release covers the in-process fallback.
+  const scanScope = randomUUID();
+  try {
+    return await withNodeConfigResolver(resolve => preflightMembers(rigSpec, preflightCtx, context => resolve({ ...context, scanScope })));
+  } finally {
+    releaseScanCache(scanScope);
+  }
+}
+
+async function preflightMembers(
+  rigSpec: PodRigSpec, preflightCtx: PreflightSpecContext,
+  resolveNodeConfigAsync: (context: ResolutionContext) => Promise<ResolutionResult>,
+): Promise<PreflightResult> {
   const errors: string[] = [];
+  const loginTargets: Array<{ label: string; env: SeatEnv }> = [];
   // §6 reconciliation (PM ruling 2026-08-05): seed EMPTY so main's already-folded activity-hook /
   // collision warnings (pushed below during the checks) come FIRST; the incoming permission-policy
   // discovery warnings are APPENDED at the return. Rationale + semantic fence at the return site.
@@ -292,12 +388,15 @@ export async function preflightValidatedSpec(rigSpec: PodRigSpec, preflightCtx: 
       for (const err of nameErrors) {
         errors.push(`${pod.id}.${member.id}: ${err}`);
       }
+      const renamed = nameErrors.length === 0 && !preflightCtx.materializeOnly ? tmuxRenamedSessionError(deriveCanonicalSessionName(pod.id, member.id, effectiveRigName)) : null;
+      if (renamed) errors.push(`${pod.id}.${member.id}: ${renamed}`);
     }
   }
 
   // 3. For each pod member: resolve agent_ref + profile, check runtime, check cwd
   for (const pod of rigSpec.pods) {
     for (const member of pod.members) {
+      if (preflightCtx.includeModelWarnings !== false && member.model) warnings.push(unverifiedModelWarning(`${pod.id}.${member.id}`, member.model));
       // Terminal members: skip agent resolution and profile resolution
       if (member.agentRef === "builtin:terminal") {
         // Only validate runtime and cwd for terminal members
@@ -336,6 +435,9 @@ export async function preflightValidatedSpec(rigSpec: PodRigSpec, preflightCtx: 
         }
       }
 
+      // Agent spec advisories (non-blocking): the base spec's and each import's, one warning each.
+      warnings.push(...agentSpecAdvisoryWarnings(`${pod.id}.${member.id}`, resolveResult));
+
       // Resolve profile via resolveNodeConfig
       const ctx: ResolutionContext = {
         baseSpec: resolveResult.resolved,
@@ -351,13 +453,18 @@ export async function preflightValidatedSpec(rigSpec: PodRigSpec, preflightCtx: 
         pod,
         rig: rigSpec,
       };
-      const configResult = resolveNodeConfig(ctx);
+      const configResult = await resolveNodeConfigAsync(ctx);
       if (!configResult.ok) {
         for (const err of configResult.errors) {
           errors.push(`${pod.id}.${member.id}: ${err}`);
         }
         continue;
       }
+
+      const seatEnv = mergeSeatEnv(rigSpec.env, member.env, preflightCtx.envOverride && withoutRuntimeHomes(preflightCtx.envOverride));
+      if (member.runtime === "codex") loginTargets.push({ label: `${pod.id}.${member.id}`, env: seatEnv });
+      // No session follows a materialize-only preflight, so there's no launch to warn about.
+      if (member.runtime === "codex" && !preflightCtx.materializeOnly) warnRigReach(`${pod.id}.${member.id}`, member.codexPermissions, configResult.config.cwd, warnings, seatEnv);
 
       // Managed Claude activity-hook delivery preflight (NONFATAL): when a claude-code member
       // selects the claude_activity_hooks resource, verify the daemon can actually deliver
@@ -381,9 +488,14 @@ export async function preflightValidatedSpec(rigSpec: PodRigSpec, preflightCtx: 
         }
       }
 
-      // Check runtime
+      // Check runtime: a built-in, or a community harness whose preset is installed and usable.
       if (!SUPPORTED_RUNTIMES.has(member.runtime)) {
-        errors.push(`${pod.id}.${member.id}: unsupported runtime "${member.runtime}"`);
+        const app = loadCommunityHarnessPreset(member.runtime);
+        if (!app.ok) {
+          errors.push(`${pod.id}.${member.id}: unsupported runtime "${member.runtime}": ${app.kind === "missing" ? "it isn't built in, and " : ""}${app.message}`);
+        } else if (member.launchWrapper?.length && app.preset.runner && !app.preset.launchWrapper) {
+          errors.push(`${pod.id}.${member.id}: ${unsupportedCommunityRunnerLaunchWrapperMessage(member.runtime)}`);
+        }
       }
 
       // Check cwd (required, already validated by RigSpec schema, but double-check)
@@ -393,6 +505,13 @@ export async function preflightValidatedSpec(rigSpec: PodRigSpec, preflightCtx: 
       const cwdError = getOpenRigInstallCwdError(configResult.config.cwd, preflightCtx.cwdOverride);
       if (cwdError) {
         errors.push(`${pod.id}.${member.id}: ${cwdError}`);
+      }
+      if (isLaunchWrapperRuntime(member.runtime) && member.launchWrapper && member.launchWrapper.length > 0) {
+        try {
+          resolveLaunchWrapperArgv(member.launchWrapper, process.env.PATH ?? "", process.cwd());
+        } catch (err) {
+          errors.push(`${pod.id}.${member.id}: ${(err as Error).message}`);
+        }
       }
     }
   }
@@ -406,6 +525,7 @@ export async function preflightValidatedSpec(rigSpec: PodRigSpec, preflightCtx: 
     const piErrors = await verifyPiRuntimeAvailable(rigSpec, preflightCtx.exec, warnings);
     errors.push(...piErrors);
     errors.push(...await verifyOmpRuntimeAvailable(rigSpec, preflightCtx.exec));
+    if (errors.length === 0 && !preflightCtx.materializeOnly) await warnRigLoginPath(loginTargets, preflightCtx.exec, warnings);
   }
 
   // §6 RECONCILIATION — WARNING EMISSION ORDER (PM ruling 2026-08-05): ACTIVITY-HOOK-FIRST,
@@ -421,6 +541,38 @@ export async function preflightValidatedSpec(rigSpec: PodRigSpec, preflightCtx: 
   // higher-priority is a FINDING, not an ordering input — the pin freezes presentation, never semantics.
   warnings.push(...permissionPolicyDiscoveryWarnings(rigSpec, preflightCtx));
   return { ready: errors.length === 0, errors, warnings };
+}
+
+/** A Codex seat whose declared sandbox can't read what rig needs, or has network off, can't take its tasks; say so, and
+ *  launch as written. */
+function warnRigReach(label: string, permissions: CodexMemberPermissions | undefined, cwd: string | undefined, warnings: string[], env?: SeatEnv): void {
+  if (!permissions) return;
+  try {
+    const gap = codexRigReach(permissions, { ...seatRigReachPaths(env), cwd });
+    if (gap) warnings.push(codexRigReachWarning(label, gap));
+  } catch {
+    // Advisory only, as in the setter: a lookup that throws must not become a preflight error, nor read as covered.
+    warnings.push(`${label}: rig read coverage for this seat's codex_permissions could not be checked. The launch continues with the permissions as written; run rig whoami inside the seat to check.`);
+  }
+}
+
+/** A Codex login-shell lookup for each distinct declared seat environment, advisory only.
+ * No profile output or environment values are included in the warning. */
+async function warnRigLoginPath(targets: Array<{ label: string; env: SeatEnv }>, exec: ExecFn, warnings: string[]): Promise<void> {
+  const checks = new Map<string, string[]>();
+  for (const { label, env } of targets) {
+    const shell = env.SHELL || process.env.SHELL || "/bin/sh";
+    const assignments = Object.keys(env).sort().map(key => shellQuote(`${key}=${env[key]}`));
+    const command = `/usr/bin/env ${[...assignments, shellQuote(shell)].join(" ")}${RIG_LOGIN_PATH_CHECK}`;
+    const labels = checks.get(command) ?? [];
+    labels.push(label); checks.set(command, labels);
+  }
+  for (const [command, labels] of checks) {
+    try { await exec(command); }
+    catch {
+      warnings.push(`${labels.join(", ")}: login-shell PATH check could not confirm 'rig'; launch continues. For tarball/manual Node, put its bin directory on PATH in ~/.profile (or the login file your shell reads), then check: bash -lc 'command -v node rig'.`);
+    }
+  }
 }
 
 /**
@@ -447,6 +599,11 @@ export async function verifyPiRuntimeAvailable(
 }
 
 function piAvailabilityFailure(err: unknown, warnings: string[]): string[] {
+  const timedOut = runtimeProbeTimeout(err);
+  if (timedOut) {
+    warnings.push(timedOut);
+    return [];
+  }
   const detail = runtimeProbeFailure(err);
   if (detail === "ENOENT" || detail.includes("executable not found on PATH")) {
     warnings.push(`Pi was not found on the daemon's PATH ('pi --version': ${detail}). The pane's shell may have a different PATH; launch will check Pi there. If it also cannot find Pi, install @earendil-works/pi-coding-agent and check 'command -v pi' in that shell.`);
@@ -463,6 +620,8 @@ export async function verifyOmpRuntimeAvailable(rigSpec: PodRigSpec, exec: ExecF
     await exec(RUNTIME_COMMANDS["omp"]!);
     return [];
   } catch (err) {
+    const timedOut = runtimeProbeTimeout(err);
+    if (timedOut) return [timedOut];
     return [`Runtime "omp" not available ('omp --version' failed: ${runtimeProbeFailure(err)}). If OMP is not installed, install Oh My Pi and ensure 'omp' is on PATH.`];
   }
 }

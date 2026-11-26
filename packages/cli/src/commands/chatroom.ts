@@ -1,10 +1,36 @@
 import { Command } from "commander";
-import { DaemonClient, type DaemonResponse } from "../client.js";
+import { DaemonClient, DaemonConnectionError, DaemonTimeoutError, type DaemonResponse } from "../client.js";
+import { daemonFetch } from "../daemon-transport.js";
 import { readOpenRigEnv } from "../openrig-compat.js";
 import { getDaemonStatus, getDaemonUrl , daemonStatusGuard} from "../daemon-lifecycle.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
-import { execSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
+import { reportTmuxServerLimit, tmuxServerStartCommand } from "@openrig/daemon/tmux-server-start";
+import { shellWord } from "../cross-host-executor.js";
+
+/** tmux's arguments for the session that runs `rig chatroom watch`. The watcher goes to tmux as separate arguments, so
+ *  tmux runs it without a shell and the rig name arrives as one argument; `--` keeps a name that starts with `-` from
+ *  reading as an option. tmux reads the `-s` value as a format, where `##` is one `#` and a run of `#` before `[` is a
+ *  style it keeps as written, so every other `#` is doubled and the session is `chatroom@<rig>`. Some tmux versions
+ *  still change a session name (3.5a writes `_` for `:` and `.`, and escapes a backslash or a control character such
+ *  as a newline or tab), so `-P -F` prints the name tmux used. */
+export function chatroomWatchTmuxArgs(rig: string): string[] {
+  const session = `chatroom@${rig}`.replace(/#+(\[)?/g, (run, style?: string) => style ? run : run + run);
+  return ["new-session", "-d", "-P", "-F", "#{session_name}", "-s", tmuxArg(session),
+    "rig", "chatroom", "watch", "--", tmuxArg(rig)];
+}
+
+/** The printed attach line. The session gets tmux's final-`;` escape, then is quoted for a shell when it needs it, so a
+ *  pasted line attaches to that exact session; a name that needs neither prints as it is. */
+export function chatroomAttachHint(session: string): string {
+  return `Attach with: tmux attach -t ${shellWord(tmuxArg(session))}`;
+}
+
+/** tmux ends a command at an argument that ends in `;`, unless a `\` comes before it, so a final `;` gets that `\`. */
+function tmuxArg(value: string): string {
+  return value.endsWith(";") ? `${value.slice(0, -1)}\\;` : value;
+}
 
 interface RigSummary {
   id: string;
@@ -26,6 +52,16 @@ async function resolveRigId(client: DaemonClient, rigName: string): Promise<stri
   return matches[0]!.id;
 }
 
+// A poll that failed this way says nothing about the room: the daemon was slow to answer, refused the
+// connection, or dropped it while restarting. `chatroom wait` retries it on its usual cadence until its own
+// deadline. An HTTP error status or any other failure is real and ends the wait at once.
+const TRANSIENT_CONNECTION_CODES = new Set(["ECONNREFUSED", "ECONNRESET", "UND_ERR_SOCKET"]);
+
+function isTransientPollError(err: unknown): boolean {
+  if (err instanceof DaemonTimeoutError) return true;
+  return err instanceof DaemonConnectionError && err.causeCode !== undefined && TRANSIENT_CONNECTION_CODES.has(err.causeCode);
+}
+
 export function chatroomCommand(depsOverride?: StatusDeps): Command {
   const cmd = new Command("chatroom").description("Chat room for rig communication");
   const getDeps = (): StatusDeps => depsOverride ?? {
@@ -43,6 +79,7 @@ export function chatroomCommand(depsOverride?: StatusDeps): Command {
   // chatroom send <rig> "message" [--sender <name>]
   cmd
     .command("send")
+    .description("Post a message to a rig's chat room; the sender is this seat")
     .argument("<rig>", "Rig name")
     .argument("<message>", "Message to send")
     .option("--sender <name>", "(deprecated, ignored) the sender is derived from the seat env (X-OpenRig-Session); P21 made the chat route derive it from the transport header")
@@ -81,6 +118,7 @@ export function chatroomCommand(depsOverride?: StatusDeps): Command {
   // chatroom history <rig> [--topic <name>] [--limit N] [--json]
   cmd
     .command("history")
+    .description("Print a rig's chat messages and topic markers, with filters")
     .argument("<rig>", "Rig name")
     .option("--topic <name>", "Filter by topic")
     .option("--after <id>", "Messages after this message ID")
@@ -144,6 +182,7 @@ export function chatroomCommand(depsOverride?: StatusDeps): Command {
   // chatroom watch <rig> [--tmux]
   cmd
     .command("watch")
+    .description("Print a rig's chat messages as they arrive; --tmux runs it in its own tmux session")
     .argument("<rig>", "Rig name")
     .option("--tmux", "Run watch in a dedicated tmux session")
     .action(async (rig: string, opts: { tmux?: boolean }) => {
@@ -162,9 +201,14 @@ export function chatroomCommand(depsOverride?: StatusDeps): Command {
       if (opts.tmux) {
         const sessionName = `chatroom@${rig}`;
         try {
-          execSync(`tmux new-session -d -s ${JSON.stringify(sessionName)} "rig chatroom watch ${JSON.stringify(rig)}"`, { stdio: "ignore" });
-          console.log(`Started watch in tmux session: ${sessionName}`);
-          console.log(`Attach with: tmux attach -t ${sessionName}`);
+          // The name tmux used, which differs from sessionName when tmux changed it (a `.` in a rig name, for example).
+          const command = tmuxServerStartCommand("tmux", chatroomWatchTmuxArgs(rig));
+          const result = spawnSync(command.file, command.args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+          reportTmuxServerLimit(result.stderr);
+          if (result.error || result.status !== 0) throw result.error ?? new Error("tmux session creation failed");
+          const created = result.stdout.trim() || sessionName;
+          console.log(`Started watch in tmux session: ${created}`);
+          console.log(chatroomAttachHint(created));
         } catch {
           console.error(`Failed to create tmux session '${sessionName}'. It may already exist.`);
           process.exitCode = 1;
@@ -175,7 +219,8 @@ export function chatroomCommand(depsOverride?: StatusDeps): Command {
       // Direct SSE watch
       const url = `${client.baseUrl}/api/rigs/${encodeURIComponent(rigId)}/chat/watch`;
       try {
-        const res = await fetch(url, {
+        await client.assertLocalOwner();
+        const res = await daemonFetch(client.baseUrl)(url, {
           headers: { Accept: "text/event-stream" },
         });
 
@@ -224,6 +269,7 @@ export function chatroomCommand(depsOverride?: StatusDeps): Command {
   // chatroom topic <rig> <topic-name> [--body "text"]
   cmd
     .command("topic")
+    .description("Start a new topic in a rig's chat room")
     .argument("<rig>", "Rig name")
     .argument("<topic-name>", "Topic name")
     .option("--body <text>", "Optional body text")
@@ -259,6 +305,7 @@ export function chatroomCommand(depsOverride?: StatusDeps): Command {
   // chatroom wait <rig>
   cmd
     .command("wait")
+    .description("Wait for the next matching message in a rig's chat room; exits 1 when --timeout passes")
     .argument("<rig>", "Rig name")
     .option("--after <id>", "Only messages after this ID")
     .option("--topic <name>", "Filter by topic")
@@ -305,6 +352,8 @@ export function chatroomCommand(depsOverride?: StatusDeps): Command {
       if (opts.sender) filterParams.set("sender", opts.sender);
 
       const start = Date.now();
+      // The message of the last poll, when it failed transiently; null once a poll succeeds.
+      let lastPollError: string | null = null;
       while (true) {
         // Check timeout BEFORE polling
         if (Date.now() - start >= timeoutMs) break;
@@ -318,27 +367,31 @@ export function chatroomCommand(depsOverride?: StatusDeps): Command {
         // Keep the command's deadline through headers and body consumption.
         // The client's own request timeout still bounds an unresponsive daemon.
         const timer = setTimeout(() => controller.abort(), Math.min(remainingForRequest, 2_147_483_647));
-        let res: DaemonResponse<Array<Record<string, unknown>>>;
+        let res: DaemonResponse<Array<Record<string, unknown>>> | null = null;
         try {
           res = await client.get<Array<Record<string, unknown>>>(
             `/api/rigs/${encodeURIComponent(rigId)}/chat/history?${params}`,
             { signal: controller.signal },
           );
+          lastPollError = null;
         } catch (err) {
           if (controller.signal.aborted) break;
-          throw err;
+          if (!isTransientPollError(err)) throw err;
+          // Announce the first failure of a run, then keep polling quietly.
+          if (lastPollError === null) console.error(`A poll failed (${(err as Error).message}); retrying until the --timeout deadline.`);
+          lastPollError = (err as Error).message;
         } finally {
           clearTimeout(timer);
         }
         if (controller.signal.aborted || Date.now() - start >= timeoutMs) break;
 
-        if (res.status >= 400) {
+        if (res && res.status >= 400) {
           console.error((res.data as { error?: string })?.error ?? `Failed (HTTP ${res.status})`);
           process.exitCode = 1;
           return;
         }
 
-        if (res.data && res.data.length > 0) {
+        if (res?.data && res.data.length > 0) {
           if (opts.json) {
             console.log(JSON.stringify(res.data));
           } else {
@@ -356,12 +409,16 @@ export function chatroomCommand(depsOverride?: StatusDeps): Command {
       }
 
       console.error(`Timed out after ${opts.timeout} seconds — no new messages matching filters.`);
+      if (lastPollError !== null) {
+        console.error(`The last poll failed (${lastPollError}), so new messages may have arrived without being seen.`);
+      }
       process.exitCode = 1;
     });
 
   // chatroom clear <rig>
   cmd
     .command("clear")
+    .description("Delete every message in a rig's chat room")
     .argument("<rig>", "Rig name")
     .action(async (rig: string) => {
       const client = await getClient();

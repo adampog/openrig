@@ -33,14 +33,32 @@ export interface OutboundPostPayload {
   /** #96: an update posted into this earlier qitem's thread (subsystem-resolved). */
   replyTo?: string | null;
   humanQuestions?: import("../../human-questions.js").HumanQuestion[] | null;
+  /** Posted into a registered shared channel (0.7.3): its questions render as text, never buttons. */
+  sharedChannel?: boolean;
   summary?: string | null;
   body?: string | null;
   destinationSession?: string | null;
   sourceSession?: string | null;
   evidenceRef?: string | null;
+  /** The shared roots evidenceRef's writer may read, carried with the decision so a replay attaches only what the
+   *  writer could: a list limits the attachment to those roots; absent is a writer with no root grant (and every payload
+   *  recorded before this field), attached as before. */
+  evidenceRefRoots?: string[];
   /** F: the loudness discriminators (interim rule: escalations mention, all else quiet). */
   tier?: string | null;
   tags?: string[] | null;
+  /** #1013 — the row's state, so the renderer can tell a gate PARKED on a human
+   *  (state=blocked) from the same row while an agent seat owns it. */
+  state?: string | null;
+  /** Set by the gateway when it posts although it can't tell whether an earlier attempt landed: the post says it may
+   *  repeat, and an attempt record that can't be written doesn't stop it. Its quiet release, when one posts it later, sets
+   *  it again from the ask's row. Never part of a buffered decision. */
+  possibleRepeat?: boolean;
+  /** Set by the gateway when it posts an ask whose current state it couldn't check: the post says so. */
+  stateUnconfirmed?: boolean;
+  /** Set by the gateway when it posts although the person's quiet hours couldn't be read: the post says so. Decided at
+   *  each post from a fresh read, never part of a buffered decision. */
+  quietUnreadable?: boolean;
 }
 
 export interface OutboundDriverDeps {
@@ -98,11 +116,28 @@ export class SlackOutboundDriver {
       const dispatched: string[] = [];
       const refused: { qitemId: string; error: string }[] = [];
       for (const alert of fresh) {
-        const res = this.deps.dispatch(OUTBOUND_OP, alert.destinationSession ?? "(unknown)", toPayload(alert));
+        // Marked in flight BEFORE dispatching: the delivery layer can run synchronously inside dispatch and release the
+        // key (a deferred decision does), and that release must win over this mark, or the ask is never offered again.
+        const key = notificationKey(alert);
+        this.inflight.add(key);
+        let res: DispatchResult;
+        try {
+          res = this.deps.dispatch(OUTBOUND_OP, alert.destinationSession ?? "(unknown)", toPayload(alert));
+        } catch (error) {
+          // A throw after the decision was persisted leaves it pending in the durable buffer, and replay owns it: the key
+          // stays in flight, or the next sweep would make a second decision (a duplicate post). A throw before
+          // persistence left nothing durable: the key is cleared so the next sweep offers the ask again. The catch only
+          // ever clears, so a release the delivery layer already made still stands. Either way, the sweep goes on.
+          if (!this.pendingInBuffer(key)) this.inflight.delete(key);
+          const message = `dispatch threw: ${(error as Error).message}`;
+          refused.push({ qitemId: alert.qitemId, error: message });
+          this.deps.log?.(`outbound dispatch failed for ${alert.qitemId}: ${message}`);
+          continue;
+        }
         if (res.ok) {
-          this.inflight.add(notificationKey(alert));
           dispatched.push(alert.qitemId);
         } else {
+          this.inflight.delete(key);
           // Refused (e.g. delivery layer unconfigured → op unadvertised): honest, retried next
           // sweep — nothing durable was minted, so this is not a retained decision.
           refused.push({ qitemId: alert.qitemId, error: res.error });
@@ -117,9 +152,24 @@ export class SlackOutboundDriver {
     }
   }
 
-  /** The delivery layer marked a qitem seen (delivered) — release the in-memory guard. */
-  release(qitemId: string): void {
-    this.inflight.delete(qitemId);
+  /** Whether the durable buffer holds a pending decision for this key (the rule start() reseeds by). A buffer that can't
+   *  be read counts as pending: waiting for the restart reseed is better than a duplicate post. */
+  private pendingInBuffer(key: string): boolean {
+    try {
+      return new DispatchBuffer(this.deps.home).pendingStrict().some((d) => {
+        const payload = d.payload as OutboundPostPayload | undefined;
+        return (payload?.notificationKey ?? payload?.qitemId) === key;
+      });
+    } catch {
+      return true;
+    }
+  }
+
+  /** The delivery layer is done with an offer — release the in-memory guard. The guard is keyed by notification key
+   *  (`qitemId:transitionId` for a real alert); a caller that passes the bare qitem id releases nothing for such a key,
+   *  which is harmless when it has also marked the key seen (the sweep excludes seen keys) but not otherwise. */
+  release(key: string): void {
+    this.inflight.delete(key);
   }
 
   stop(): void {
@@ -128,7 +178,7 @@ export class SlackOutboundDriver {
   }
 }
 
-function toPayload(q: QueueItem): OutboundPostPayload {
+export function toPayload(q: QueueItem): OutboundPostPayload {
   return {
     qitemId: q.qitemId,
     notificationKey: q.notificationKey,
@@ -138,13 +188,16 @@ function toPayload(q: QueueItem): OutboundPostPayload {
     humanDetail: q.humanDetail,
     replyTo: q.replyTo,
     humanQuestions: q.humanQuestions,
+    ...(q.sharedChannel ? { sharedChannel: true } : {}),
     summary: q.summary,
     body: q.body,
     destinationSession: q.destinationSession,
     sourceSession: q.sourceSession,
     evidenceRef: q.evidenceRef,
+    ...(q.evidenceRefRoots ? { evidenceRefRoots: q.evidenceRefRoots } : {}),
     tier: q.tier,
     tags: q.tags,
+    state: q.state,
   };
 }
 

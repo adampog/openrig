@@ -1,7 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type Database from "better-sqlite3";
 import { createFullTestDb } from "./helpers/test-app.js";
-import { getNodeInventory, getNodeDetail, getNodeInventoryWithContext, getNodeDetailWithContext } from "../src/domain/node-inventory.js";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { RigRepository } from "../src/domain/rig-repository.js";
+import { getNodeInventory, getNodeInventoryForAllRigs, getNodeDetail, getNodeInventoryWithContext, getNodeDetailWithContext } from "../src/domain/node-inventory.js";
+import { setDaemonTmuxServer } from "../src/adapters/tmux-server.js";
 import type { RuntimeAdapter } from "../src/domain/runtime-adapter.js";
 import type { ContextUsage } from "../src/domain/types.js";
 import type { ContextUsageStore } from "../src/domain/context-usage-store.js";
@@ -92,6 +98,23 @@ describe("Node Inventory Projection", () => {
     db.close();
   });
 
+  it("projects only a configured Claude account label, preserving unknowns", () => {
+    seedPodAwareRig(db);
+    const read = () => getNodeInventory(db, "rig-1");
+    expect(read().find((n) => n.nodeId === "node-1")?.configuredAccount).toBe("login");
+    db.prepare("UPDATE nodes SET account_home = ? WHERE id = ?").run("/private/account-home", "node-1");
+    expect(read().find((n) => n.nodeId === "node-1")?.configuredAccount).toBeNull();
+    expect(JSON.stringify(read())).not.toContain("/private/account-home");
+    expect(read().find((n) => n.nodeId === "node-2")?.configuredAccount).toBeNull();
+    db.prepare("UPDATE nodes SET claude_token_ref = ? WHERE id = ?")
+      .run(JSON.stringify({ label: "team-1", tokenFile: "/private/token" }), "node-1");
+    expect(read().find((n) => n.nodeId === "node-1")?.configuredAccount).toBe("team-1");
+    expect(JSON.stringify(read())).not.toContain("/private/token");
+    expect(getNodeDetail(db, "rig-1", "dev.impl")?.configuredAccount).toBe("team-1");
+    db.prepare("UPDATE nodes SET claude_token_ref = ? WHERE id = ?").run("invalid", "node-1");
+    expect(read().find((n) => n.nodeId === "node-1")?.configuredAccount).toBeNull();
+  });
+
   // Test 1: Inventory includes all nodes for a pod-aware rig
   it("includes all nodes for a pod-aware rig", () => {
     seedPodAwareRig(db);
@@ -103,6 +126,33 @@ describe("Node Inventory Projection", () => {
     expect(entries.find((e) => e.logicalId === "dev.impl")?.nodeId).toBe("node-1");
     expect(entries.map((e) => e.logicalId).sort()).toEqual(["dev.impl", "infra.server"]);
     expect(entries.every((e) => e.podNamespace === "dev")).toBe(true);
+  });
+
+  it("#2940: reports keepAlive only for a seat that declares it, in the list and the detail", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig");
+    db.prepare("UPDATE nodes SET keep_alive = 1 WHERE id = ?").run("node-1");
+    const entries = getNodeInventory(db, "rig-1");
+    expect(entries.find((e) => e.nodeId === "node-1")?.keepAlive).toBe(true);
+    expect("keepAlive" in entries.find((e) => e.nodeId === "node-2")!).toBe(false);
+    expect(getNodeDetail(db, "rig-1", "dev.impl")?.keepAlive).toBe(true);
+  });
+
+  it("#2940: an exhausted keep_alive incident asks for attention only until the seat is stopped", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig", { id: "sess-fell", status: "detached" });
+    db.prepare("UPDATE nodes SET keep_alive = 1 WHERE id = ?").run("node-1");
+    db.prepare(`INSERT INTO node_keep_alive_budget (node_id, incident_id, fallen_session_id, attempts, last_error, exhausted_at)
+      VALUES ('node-1', 'incident-1', 'sess-fell', 2, 'no harness', '2026-11-17 00:00:00')`).run();
+    const entry = () => getNodeInventory(db, "rig-1").find((e) => e.nodeId === "node-1")!;
+    expect(entry()).toMatchObject({ lifecycleState: "attention_required", keepAliveIncident: { attempts: 2, exhausted: true } });
+
+    // The person stops the seat; the supervisor hasn't ended the incident yet (or never will: an archived rig).
+    db.prepare("UPDATE sessions SET status = 'exited', intentionally_stopped = 1 WHERE id = 'sess-fell'").run();
+    db.prepare("DELETE FROM bindings WHERE node_id = 'node-1'").run();
+    expect(entry().lifecycleState).not.toBe("attention_required");
+    expect(entry().intentionallyStopped).toBe(true);
+    expect("keepAliveIncident" in entry()).toBe(false);
   });
 
   // Test 2: Inventory includes correct canonical session names
@@ -138,6 +188,18 @@ describe("Node Inventory Projection", () => {
     expect(entry?.tmuxAttachCommand).toBe("tmux attach -t dev-impl@test-rig");
   });
 
+  it("tmuxAttachCommand names the daemon's tmux server when it isn't the default one", () => {
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig");
+    setDaemonTmuxServer(["-L", "person"]);
+    try {
+      const entry = getNodeInventory(db, "rig-1").find((e) => e.logicalId === "dev.impl");
+      expect(entry?.tmuxAttachCommand).toBe("tmux -L person attach -t dev-impl@test-rig");
+    } finally {
+      setDaemonTmuxServer([]);
+    }
+  });
+
   // Test 5: resumeCommand uses correct runtime syntax
   it("resumeCommand uses correct runtime syntax", () => {
     seedPodAwareRig(db);
@@ -148,7 +210,28 @@ describe("Node Inventory Projection", () => {
 
     const entries = getNodeInventory(db, "rig-1");
     const entry = entries.find((e) => e.logicalId === "dev.impl");
-    expect(entry?.resumeCommand).toBe("claude --resume 'abc-123-def'");
+    expect(entry?.resumeCommand).toBe("claude --permission-mode acceptEdits --resume 'abc-123-def'");
+  });
+
+  it.each([
+    ["none", "saved-history"], [null, "saved-history"],
+    ["none", undefined], [null, undefined],
+  ] as const)("served Claude recovery commands retain MCP choice %s with token %s", (selection, resumeToken) => {
+    seedPodAwareRig(db);
+    db.prepare("UPDATE nodes SET claude_mcp = ? WHERE id = 'node-1'").run(selection);
+    seedSession(db, "node-1", "dev-impl@test-rig", { resumeToken });
+    const entry = getNodeInventory(db, "rig-1").find(node => node.nodeId === "node-1")!;
+    const detail = getNodeDetail(db, "rig-1", "dev.impl")!;
+    const commands = [entry.resumeCommand, ...(detail.recoveryGuidance?.commands ?? [])]
+      .filter((command): command is string => command?.startsWith("claude ") === true);
+    expect(commands).toHaveLength(resumeToken ? 3 : 1);
+    for (const command of commands) {
+      const argv = execFileSync("/bin/sh", ["-c", `claude() { printf '%s\\n' "$@"; }; ${command}`], { encoding: "utf8" }).trim().split("\n");
+      expect(argv).toContain("--resume");
+      expect(argv.filter(arg => arg === "--strict-mcp-config")).toHaveLength(selection === "none" ? 1 : 0);
+      expect(argv.filter(arg => arg === "--mcp-config")).toHaveLength(selection === "none" ? 1 : 0);
+      if (selection === "none") expect(argv[argv.indexOf("--mcp-config") + 1]).toBe('{"mcpServers":{}}');
+    }
   });
 
   // Test 6: resumeCommand is null when no resume token
@@ -173,7 +256,7 @@ describe("Node Inventory Projection", () => {
     expect(entry?.recoveryGuidance).toBeNull();
     const detail = getNodeDetail(db, "rig-1", "dev.impl");
     expect(detail?.recoveryGuidance?.summary).toContain("native Claude resume");
-    expect(detail?.recoveryGuidance?.commands).toContain("claude --resume 'abc-123-def' --name 'dev-impl@test-rig'");
+    expect(detail?.recoveryGuidance?.commands).toContain("claude --permission-mode acceptEdits --resume 'abc-123-def' --name 'dev-impl@test-rig'");
     expect(detail?.recoveryGuidance?.commands).toContain("cd /project");
     expect(detail?.recoveryGuidance?.commands).toContain("claude --resume");
     expect(detail?.recoveryGuidance?.notes).toContain("Look for session name: dev-impl@test-rig");
@@ -192,9 +275,14 @@ describe("Node Inventory Projection", () => {
     expect(entry?.resumeCommand).toBeNull();
     expect(entry?.recoveryGuidance).toBeNull(); // relocated to detail
     const detail = getNodeDetail(db, "rig-2", "dev.qa");
-    expect(detail?.recoveryGuidance?.summary).toContain("codex -s workspace-write resume --last");
-    expect(detail?.recoveryGuidance?.summary).toContain("explicit -s workspace-write floor flag");
-    expect(detail?.recoveryGuidance?.commands).toEqual(["cd /workspace/app", "codex -s workspace-write resume --last"]);
+    expect(detail?.recoveryGuidance?.summary).toContain(
+      "codex -s workspace-write '-c' 'check_for_update_on_startup=false' resume --last"
+    );
+    expect(detail?.recoveryGuidance?.commands).toEqual([
+      "cd /workspace/app",
+      "codex -s workspace-write '-c' 'check_for_update_on_startup=false' resume --last",
+    ]);
+    expect(detail?.recoveryGuidance?.notes).toContain("flags from current settings");
     expect(detail?.recoveryGuidance?.notes).toContain("Use workspace and recent prompt text to identify the right conversation.");
     expect(detail?.recoveryGuidance?.notes).toContain("If the identity anchor was captured, the picker may include: dev-qa@test-rig");
   });
@@ -213,11 +301,13 @@ describe("Node Inventory Projection", () => {
     const entry = getNodeInventory(db, "rig-2").find((e) => e.logicalId === "platform.mac-admin");
 
     expect(entry?.codexConfigProfile).toBe("sysadmin");
-    expect(entry?.resumeCommand).toBe("codex -p 'sysadmin' resume 'sess-456'");
+    expect(entry?.resumeCommand).toBe("codex -p 'sysadmin' '-c' 'check_for_update_on_startup=false' resume 'sess-456'");
+    expect(entry?.resumeCommandLabel).toBe("flags from current settings");
     expect(entry?.recoveryGuidance).toBeNull(); // relocated to detail
     const detail = getNodeDetail(db, "rig-2", "platform.mac-admin");
     expect(detail?.codexConfigProfile).toBe("sysadmin");
-    expect(detail?.recoveryGuidance?.commands).toContain("codex -p 'sysadmin' resume 'sess-456'");
+    expect(detail?.recoveryGuidance?.commands).toContain("codex -p 'sysadmin' '-c' 'check_for_update_on_startup=false' resume 'sess-456'");
+    expect(detail?.recoveryGuidance?.notes).toContain("flags from current settings");
     expect(detail?.recoveryGuidance?.notes).toContain("Preserve Codex config profile: sysadmin");
   });
 
@@ -764,6 +854,230 @@ describe("Node Inventory Projection", () => {
       expect(entries.find((e) => e.logicalId === "dev.impl")?.restoreOutcome).toBe("failed");
     });
   });
+
+  // #116 — a ready fresh launch of the node's current occupant generation means
+  // a restore attempt that started before it describes the retired occupant.
+  describe("restore outcomes fenced by a ready current-generation fresh launch (#116)", () => {
+    beforeEach(() => {
+      seedPodAwareRig(db);
+      seedSession(db, "node-1", "dev-impl@test-rig", { id: "sess-fresh", status: "running" });
+      seedTenure(1, "gen-old", "initial");
+    });
+
+    function seedTenure(ordinal: number, generation: string, kind: string) {
+      db.prepare("INSERT INTO occupant_tenures (id, node_id, generation_ordinal, generation_uuid, kind) VALUES (?, ?, ?, ?, ?)")
+        .run(`tenure-${generation}`, "node-1", ordinal, generation, kind);
+    }
+
+    // Restore events are rig-scoped in production (node_id NULL).
+    function seedRigEvent(type: string, payload: Record<string, unknown>): number {
+      return Number(db.prepare("INSERT INTO events (rig_id, node_id, type, payload) VALUES (?, NULL, ?, ?)")
+        .run("rig-1", type, JSON.stringify({ ...payload, type, rigId: "rig-1" })).lastInsertRowid);
+    }
+
+    function startRestore(snapshotId: string): number {
+      return seedRigEvent("restore.started", { snapshotId, intendedRoster: [{ nodeId: "node-1", logicalId: "dev.impl" }] });
+    }
+
+    function completeRestore(snapshotId: string, status: string, type = "restore.completed") {
+      seedRigEvent(type, { snapshotId, result: { snapshotId, nodes: [{ nodeId: "node-1", logicalId: "dev.impl", status }], warnings: [] } });
+    }
+
+    function freshLaunch(generation: string, opts?: { status?: string; sessionId?: string; type?: string }) {
+      seedEvent(db, "rig-1", "node-1", opts?.type ?? "seat.fresh_launched", {
+        rigId: "rig-1", nodeId: "node-1", sessionId: opts?.sessionId ?? "sess-fresh",
+        newGeneration: generation, status: opts?.status ?? "ready",
+      });
+    }
+
+    function launchFreshOccupant(opts?: { status?: string }) {
+      seedTenure(2, "gen-new", "fresh");
+      freshLaunch("gen-new", opts);
+    }
+
+    function agent() {
+      return getNodeInventory(db, "rig-1").find((e) => e.logicalId === "dev.impl");
+    }
+
+    function eventCount(): number {
+      return (db.prepare("SELECT COUNT(*) AS n FROM events").get() as { n: number }).n;
+    }
+
+    it("a failed full restore followed by a ready fresh launch reads from the live session", () => {
+      startRestore("snap-1");
+      completeRestore("snap-1", "failed");
+      launchFreshOccupant();
+      db.prepare("UPDATE nodes SET continuity_outcome = 'fresh', occupant_lifecycle = 'active' WHERE id = 'node-1'").run();
+      const before = eventCount();
+
+      expect(agent()).toMatchObject({ restoreOutcome: "n-a", lifecycleState: "running", continuityOutcome: "fresh" });
+      expect(eventCount()).toBe(before);
+    });
+
+    it("the fleet inventory applies the same fence", () => {
+      startRestore("snap-1");
+      completeRestore("snap-1", "failed");
+      launchFreshOccupant();
+
+      const entry = getNodeInventoryForAllRigs(db).get("rig-1")?.find((e) => e.logicalId === "dev.impl");
+      expect(entry).toMatchObject({ restoreOutcome: "n-a", lifecycleState: "running" });
+    });
+
+    it("the same occupant keeps the failed outcome", () => {
+      startRestore("snap-1");
+      completeRestore("snap-1", "failed");
+
+      expect(agent()).toMatchObject({ restoreOutcome: "failed", lifecycleState: "attention_required" });
+    });
+
+    it("a restore attempt started after the fresh launch describes the new occupant", () => {
+      launchFreshOccupant();
+      startRestore("snap-2");
+      completeRestore("snap-2", "failed");
+
+      expect(agent()).toMatchObject({ restoreOutcome: "failed", lifecycleState: "attention_required" });
+    });
+
+    it("a fresh launch that needed attention leaves the failed outcome", () => {
+      startRestore("snap-1");
+      completeRestore("snap-1", "failed");
+      launchFreshOccupant({ status: "attention_required" });
+
+      expect(agent()).toMatchObject({ restoreOutcome: "failed", lifecycleState: "attention_required" });
+    });
+
+    it("a failed fresh launch leaves the failed outcome", () => {
+      startRestore("snap-1");
+      completeRestore("snap-1", "failed");
+      seedTenure(2, "gen-new", "fresh");
+      freshLaunch("gen-new", { type: "seat.fresh_launch_failed" });
+
+      expect(agent()).toMatchObject({ restoreOutcome: "failed", lifecycleState: "attention_required" });
+    });
+
+    it("a fresh launch of an earlier generation leaves the failed outcome", () => {
+      startRestore("snap-1");
+      completeRestore("snap-1", "failed");
+      launchFreshOccupant();
+      seedTenure(3, "gen-later", "handover");
+
+      expect(agent()).toMatchObject({ restoreOutcome: "failed", lifecycleState: "attention_required" });
+    });
+
+    it("contradictory fresh launches of the current generation leave the failed outcome", () => {
+      startRestore("snap-1");
+      completeRestore("snap-1", "failed");
+      launchFreshOccupant();
+      freshLaunch("gen-new", { sessionId: "sess-other" });
+
+      expect(agent()).toMatchObject({ restoreOutcome: "failed", lifecycleState: "attention_required" });
+    });
+
+    it("a full restore that completes after the fresh launch, for an attempt started before it, is fenced", () => {
+      startRestore("snap-1");
+      launchFreshOccupant();
+      completeRestore("snap-1", "failed");
+
+      expect(agent()).toMatchObject({ restoreOutcome: "n-a", lifecycleState: "running" });
+    });
+
+    it("a reconciliation of the old attempt cannot make the fresh occupant resumed", () => {
+      const attemptId = startRestore("snap-1");
+      completeRestore("snap-1", "failed");
+      launchFreshOccupant();
+      seedEvent(db, "rig-1", "node-1", "restore.outcome_reconciled", {
+        rigId: "rig-1", nodeId: "node-1", attemptId, from: "failed", to: "operator_recovered",
+        evidence: { tmux: true, fgProcess: "claude", resumeTokenUsed: true, paneState: "usable" },
+      });
+
+      // The continuity column is left unset so a derived resume would show.
+      expect(agent()).toMatchObject({ restoreOutcome: "n-a", continuityOutcome: null });
+    });
+
+    it("a subset completion before the fresh launch is fenced", () => {
+      completeRestore("snap-3", "failed", "restore.subset_completed");
+      launchFreshOccupant();
+
+      expect(agent()).toMatchObject({ restoreOutcome: "n-a", lifecycleState: "running" });
+    });
+
+    // A subset restore records no start, so a completion after the fresh launch
+    // may have started before or after it. It stays current, unresolved.
+    it("a subset completion after the fresh launch stays current", () => {
+      launchFreshOccupant();
+      completeRestore("snap-3", "failed", "restore.subset_completed");
+
+      expect(agent()).toMatchObject({ restoreOutcome: "failed", lifecycleState: "attention_required" });
+    });
+
+    // Every subset clear writes attemptId 0: it names no attempt and acknowledges the outcome it replaces.
+    function clearWithoutAttempt(from: string) {
+      seedEvent(db, "rig-1", "node-1", "restore.outcome_reconciled", {
+        rigId: "rig-1", nodeId: "node-1", attemptId: 0, from, to: "operator_recovered", evidence: { source: "operator_attestation" },
+      });
+    }
+
+    it("a zero-ID clear of a subset completed after the fresh launch reads operator_recovered", () => {
+      launchFreshOccupant();
+      completeRestore("snap-3", "failed", "restore.subset_completed");
+      clearWithoutAttempt("failed");
+
+      expect(agent()).toMatchObject({ restoreOutcome: "operator_recovered", lifecycleState: "running" });
+    });
+
+    it("a zero-ID clear of a subset completed before the fresh launch stays fenced", () => {
+      completeRestore("snap-3", "failed", "restore.subset_completed");
+      launchFreshOccupant();
+      clearWithoutAttempt("failed");
+
+      expect(agent()).toMatchObject({ restoreOutcome: "n-a" });
+    });
+
+    it("a zero-ID acknowledgment of a full attempt started after the fresh launch keeps that attempt current", () => {
+      launchFreshOccupant();
+      startRestore("snap-2");
+      completeRestore("snap-2", "attention_required");
+      clearWithoutAttempt("attention_required");
+
+      expect(agent()).toMatchObject({ restoreOutcome: "operator_recovered" });
+    });
+
+    // A completed handover, a discovered successor included, puts a new occupant in the seat: an earlier restore's resumed
+    // conversation isn't this occupant's, though the restore keeps its outcome.
+    function handOver() {
+      seedEvent(db, "rig-1", "node-1", "seat.handover_completed", {
+        rigId: "rig-1", nodeId: "node-1", logicalId: "dev.impl", previousOccupant: "dev-impl@test-rig",
+        currentOccupant: "dev-impl@test-rig", source: "discovered:disc-1",
+      });
+    }
+
+    it("a resumed restore is the current occupant's conversation", () => {
+      startRestore("snap-1");
+      completeRestore("snap-1", "resumed");
+
+      expect(agent()).toMatchObject({ restoreOutcome: "resumed", continuityOutcome: "resumed" });
+    });
+
+    it("a discovered successor after a resumed restore doesn't inherit its conversation", () => {
+      startRestore("snap-1");
+      completeRestore("snap-1", "resumed");
+      handOver();
+      const before = eventCount();
+
+      expect(agent()).toMatchObject({ restoreOutcome: "resumed", continuityOutcome: null });
+      expect(getNodeInventoryForAllRigs(db).get("rig-1")?.find((e) => e.logicalId === "dev.impl"))
+        .toMatchObject({ continuityOutcome: null });
+      expect(eventCount()).toBe(before);
+    });
+
+    it("a restore that resumes the successor after its handover is its conversation", () => {
+      handOver();
+      startRestore("snap-2");
+      completeRestore("snap-2", "resumed");
+
+      expect(agent()).toMatchObject({ continuityOutcome: "resumed" });
+    });
+  });
 });
 
 // OPR.0.4.0.26 — node-LIST payload source dedupe. The LIST drops the heavy
@@ -894,5 +1208,148 @@ describe("OPR.0.4.0.26 — node-list payload source dedupe", () => {
     // The full data remains retrievable on the single-node DETAIL path.
     expect(detailJson).toContain(HEAVY_BLOB_MARKER);
     expect(detailJson).toContain("Choose the full conversation option");
+  });
+});
+
+describe("node detail reports a guidance block's installed file only from evidence (#64)", () => {
+  let db: Database.Database;
+  let cwd: string;
+  const block = (id: string, marker = "OpenRig") => `<!-- BEGIN ${marker} MANAGED BLOCK: ${id} -->\nrole text\n<!-- END ${marker} MANAGED BLOCK: ${id} -->\n`;
+  const guidance = (target?: string, mergeStrategy = "managed_block") => ({
+    effectiveId: "role", category: "guidance", sourceSpec: "impl", sourcePath: "guidance/role.md", resourcePath: "guidance/role.md",
+    absolutePath: "/project/agents/impl/guidance/role.md", mergeStrategy, ...(target ? { target } : {}),
+  });
+  const installed = (runtime = "claude-code", entries: Array<Record<string, string>> = [guidance("AGENTS.md")]) => {
+    seedStartupContext(db, "node-1", { runtime, projectionEntries: entries });
+    return getNodeDetail(db, "rig-1", "dev.impl")!.installedResources;
+  };
+  beforeEach(() => {
+    db = createFullTestDb();
+    seedPodAwareRig(db);
+    seedSession(db, "node-1", "dev-impl@test-rig");
+    cwd = fs.mkdtempSync(path.join(os.tmpdir(), "inventory-guidance-"));
+    db.prepare("UPDATE nodes SET cwd = ? WHERE id = 'node-1'").run(cwd);
+  });
+  afterEach(() => { db.close(); fs.rmSync(cwd, { recursive: true, force: true }); });
+
+  it("reports the file the runtime merged into, not the spec's declared target, while that file holds the block", () => {
+    fs.writeFileSync(path.join(cwd, "CLAUDE.md"), `# Mine\n\n${block("role")}`);
+    expect(installed()).toEqual([{ id: "role", category: "guidance", targetPath: path.join(cwd, "CLAUDE.md"),
+      declaredTarget: "AGENTS.md", effectiveTarget: path.join(cwd, "CLAUDE.md") }]);
+  });
+
+  it("shows no installed path when the runtime's file lacks the block, even where the declared target holds one", () => {
+    fs.writeFileSync(path.join(cwd, "CLAUDE.md"), "# Mine\n");
+    fs.writeFileSync(path.join(cwd, "AGENTS.md"), block("role"));
+    expect(installed()).toEqual([{ id: "role", category: "guidance", targetPath: "",
+      declaredTarget: "AGENTS.md", effectiveTarget: path.join(cwd, "CLAUDE.md") }]);
+  });
+
+  it("follows the rig's Claude managed-blocks file, Codex's and Pi's AGENTS.md, and the older block markers", () => {
+    new RigRepository(db).setRigClaudeManagedBlockFile("rig-1", "CLAUDE.local.md");
+    fs.writeFileSync(path.join(cwd, "CLAUDE.local.md"), block("role", "RIGGED"));
+    expect(installed()[0]).toMatchObject({ targetPath: path.join(cwd, "CLAUDE.local.md"), effectiveTarget: path.join(cwd, "CLAUDE.local.md") });
+    db.prepare("DELETE FROM node_startup_context WHERE node_id = 'node-1'").run();
+    fs.writeFileSync(path.join(cwd, "AGENTS.md"), block("role"));
+    expect(installed("codex", [guidance("CLAUDE.md")])[0]).toMatchObject({ targetPath: path.join(cwd, "AGENTS.md"),
+      declaredTarget: "CLAUDE.md", effectiveTarget: path.join(cwd, "AGENTS.md") });
+    db.prepare("DELETE FROM node_startup_context WHERE node_id = 'node-1'").run();
+    expect(installed("pi", [guidance("CLAUDE.md")])[0]).toMatchObject({ targetPath: path.join(cwd, "AGENTS.md"),
+      declaredTarget: "CLAUDE.md", effectiveTarget: path.join(cwd, "AGENTS.md") });
+  });
+
+  it("follows a Pi seat's recorded guidance file in its agent folder, not the repository AGENTS.md (#875)", () => {
+    const agentFile = path.join(cwd, "pi-state", "dev-impl@test-rig", "agent", "AGENTS.md");
+    fs.mkdirSync(path.dirname(agentFile), { recursive: true });
+    fs.writeFileSync(agentFile, block("role"));
+    fs.writeFileSync(path.join(cwd, "AGENTS.md"), block("role")); // a stale repository copy isn't evidence for this seat
+    seedStartupContext(db, "node-1", { runtime: "pi", projectionEntries: [guidance("AGENTS.md")] });
+    db.prepare("UPDATE node_startup_context SET guidance_file = ? WHERE node_id = 'node-1'").run(agentFile);
+    expect(getNodeDetail(db, "rig-1", "dev.impl")!.installedResources[0]).toMatchObject({ targetPath: agentFile, effectiveTarget: agentFile });
+  });
+
+  it("claims nothing for a runtime with no known guidance file, a merge that writes nothing, or a half-written block", () => {
+    fs.writeFileSync(path.join(cwd, "AGENTS.md"), block("role"));
+    expect(installed("synth")[0]).toEqual({ id: "role", category: "guidance", targetPath: "", declaredTarget: "AGENTS.md" });
+    db.prepare("DELETE FROM node_startup_context WHERE node_id = 'node-1'").run();
+    fs.writeFileSync(path.join(cwd, "CLAUDE.md"), block("role"));
+    expect(installed("claude-code", [guidance(undefined, "append")])[0]).toMatchObject({ targetPath: "" });
+    db.prepare("DELETE FROM node_startup_context WHERE node_id = 'node-1'").run();
+    fs.writeFileSync(path.join(cwd, "CLAUDE.md"), "<!-- BEGIN OpenRig MANAGED BLOCK: role -->\nrole text\n");
+    expect(installed()[0]).toMatchObject({ targetPath: "" });
+  });
+
+  it.each(["OpenRig", "RIGGED"])("claims nothing for a reversed %s pair or an orphan END, which no writer produces", (marker) => {
+    const begin = `<!-- BEGIN ${marker} MANAGED BLOCK: role -->`, end = `<!-- END ${marker} MANAGED BLOCK: role -->`;
+    for (const text of [`${end}\n${begin}\npartial role text\n`, `# Mine\n${end}\n`]) {
+      db.prepare("DELETE FROM node_startup_context WHERE node_id = 'node-1'").run();
+      fs.writeFileSync(path.join(cwd, "CLAUDE.md"), text);
+      expect(installed()[0]).toEqual({ id: "role", category: "guidance", targetPath: "",
+        declaredTarget: "AGENTS.md", effectiveTarget: path.join(cwd, "CLAUDE.md") });
+    }
+  });
+
+  it("reads the runtime's file at the node's current cwd: a changed cwd whose file lacks the block shows no installed path", () => {
+    fs.writeFileSync(path.join(cwd, "CLAUDE.md"), block("role"));
+    const moved = fs.mkdtempSync(path.join(os.tmpdir(), "inventory-guidance-moved-"));
+    try {
+      db.prepare("UPDATE nodes SET cwd = ? WHERE id = 'node-1'").run(moved);
+      expect(installed()[0]).toEqual({ id: "role", category: "guidance", targetPath: "",
+        declaredTarget: "AGENTS.md", effectiveTarget: path.join(moved, "CLAUDE.md") });
+    } finally { fs.rmSync(moved, { recursive: true, force: true }); }
+  });
+});
+
+describe("Node inventory launchWrapper projection (#2328)", () => {
+  let db: Database.Database;
+  beforeEach(() => { db = createFullTestDb(); });
+  afterEach(() => { db.close(); });
+
+  it.each(["pi", "codex", "claude-code"])("projects %s launchWrapper in inventory and detail, omitting absent or cleared values", runtime => {
+    const repo = new RigRepository(db);
+    const rig = repo.createRig("wrapper-inv-rig");
+    const wrapped = repo.addNode(rig.id, "dev.pi-wrapped", {
+      runtime,
+      cwd: "/project",
+      launchWrapper: ["mtn", "sandbox", "exec", "--seat", "synthetic", "--"],
+    });
+    const unwrapped = repo.addNode(rig.id, "dev.codex-plain", {
+      runtime: "codex",
+      cwd: "/project",
+    });
+
+    const entries = getNodeInventory(db, rig.id);
+    const wrappedEntry = entries.find((e) => e.nodeId === wrapped.id)!;
+    const unwrappedEntry = entries.find((e) => e.nodeId === unwrapped.id)!;
+
+    expect(wrappedEntry.launchWrapper).toEqual(["mtn", "sandbox", "exec", "--seat", "synthetic", "--"]);
+    expect(unwrappedEntry.launchWrapper).toBeUndefined();
+    expect("launchWrapper" in unwrappedEntry).toBe(false);
+
+    const allRigsMap = getNodeInventoryForAllRigs(db);
+    expect(allRigsMap.get(rig.id)?.find((e) => e.nodeId === wrapped.id)?.launchWrapper).toEqual([
+      "mtn", "sandbox", "exec", "--seat", "synthetic", "--",
+    ]);
+    expect("launchWrapper" in (allRigsMap.get(rig.id)?.find((e) => e.nodeId === unwrapped.id) ?? {})).toBe(false);
+
+    const detail = getNodeDetail(db, rig.id, "dev.pi-wrapped");
+    expect(detail?.launchWrapper).toEqual(["mtn", "sandbox", "exec", "--seat", "synthetic", "--"]);
+
+    repo.setNodeLaunchWrapper(wrapped.id, []);
+    const clearedEntry = getNodeInventory(db, rig.id).find((e) => e.nodeId === wrapped.id)!;
+    expect(clearedEntry.launchWrapper).toBeUndefined();
+    expect("launchWrapper" in clearedEntry).toBe(false);
+  });
+
+  it.each(["pi", "codex", "claude-code"])("fails closed when stored %s launch_wrapper is malformed or attached to an unsupported runtime", runtime => {
+    const repo = new RigRepository(db);
+    const rig = repo.createRig("bad-wrapper-inv-rig");
+    const node = repo.addNode(rig.id, "dev.codex", { runtime, cwd: "/project" });
+    db.prepare("UPDATE nodes SET launch_wrapper = ? WHERE id = ?").run("[]", node.id);
+    expect(() => getNodeInventory(db, rig.id)).toThrow(/launch_wrapper/);
+
+    db.prepare("UPDATE nodes SET runtime = 'terminal', launch_wrapper = ? WHERE id = ?")
+      .run('["mtn","--"]', node.id);
+    expect(() => getNodeInventory(db, rig.id)).toThrow(/pi|codex/i);
   });
 });

@@ -2,12 +2,16 @@ import { readdirSync, realpathSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { QueueRepository } from "./queue-repository.js";
+import { CONTINUATION_MARKER } from "./queue-transition-log.js";
+import { CLOSE_PREFIX, DELIVERED_PREFIX, FAILED_PREFIX, HELD_PREFIX, REFUSED_PREFIX, RESERVE_PREFIX } from "./policies/parked-owner-consumer.js";
 import type { HealthCheckpointSource } from "./health-checkpoints.js";
 import type { OperatingPostureService } from "./rig-mode/operating-posture.js";
 import { readHealthArtifact, healthSelectedContext } from "./health-context.js";
 import { validateMissionComposition } from "./lifecycle-manifest.js";
 import { healthHash, type HealthPolicyStore } from "./health-policy.js";
 import type { HealthDetectorObservation, HealthObservationSource, HealthSourceCoverage } from "./health-detectors.js";
+import { isOpenRigSender } from "../lib/pane-envelope.js";
+import { runSyncSite } from "./sync-site-wrap.js";
 import { adaptQueueTransitionEvidence, boundHealthEvidence, deriveHealthSourceFreshness, healthEpisodeId, type HealthScope, type PassiveCeremony, type CeremonyProgressAssessment } from "./health-projection.js";
 
 const detector = "process.ceremony-amplification";
@@ -15,6 +19,63 @@ const familyLimit = 200;
 const excluded = (tags: string[] | null | undefined) => tags?.some((t) => t === "health-diagnosis" || t === "health-human") ?? false;
 const one = (values: string[]) => { const unique = [...new Set(values)]; return unique.length === 1 ? unique[0] : undefined; };
 const tagged = (tags: string[], prefix: string) => tags.filter((t) => t.startsWith(prefix)).map((t) => t.slice(prefix.length));
+
+/** Notes the daemon writes about its own queue bookkeeping, matched by prefix (an owner's note that
+ * merely quotes one still counts). `auto-unparked:` and `blocker custody moved ` are recorded under
+ * the seat that closed the blocker (queue-repository.ts), so the actor does not reveal them; park and
+ * parked-owner wakes (queue-repository.ts, policies/parked-owner-consumer.ts) are excluded under any actor. */
+const DAEMON_BOOKKEEPING_NOTE_PREFIXES = ["auto-unparked:", "blocker custody moved ", "park wake ", "parked-owner "] as const;
+
+/** The daemon's own actors: `*@system` (watchdog, queue, stuck-sweep, wake-ladder, claim, ...), the
+ * bare `system` that releases or transfers claims when a seat's occupant changes (queue-repository.ts),
+ * and OpenRig's own sender (`isOpenRigSender`): the exact `daemon@kernel` (wake escalations, stream intake,
+ * the Slack gateway, quiet-release, delivery-deferral, ...) and every `system:*` actor (queue fallback
+ * routing, compaction restore notices, health, ...). Other kernel seats (`human@kernel`,
+ * `advisor-lead@kernel`) are seats and still count. */
+const isSystemActor = (actor: string) => actor === "system" || actor.endsWith("@system") || isOpenRigSender(actor);
+
+/** #2762: a coordination transition is one a seat decided; system actors and daemon bookkeeping notes are not. */
+function isCoordinationTransition(t: { actorSession: string; transitionNote: string | null }): boolean {
+  if (isSystemActor(t.actorSession)) return false;
+  const note = t.transitionNote;
+  return !note || !DAEMON_BOOKKEEPING_NOTE_PREFIXES.some((prefix) => note.startsWith(prefix));
+}
+
+/** Wake notes the daemon writes on a parked row while the owner's wait is unchanged. The parked-owner
+ * "episode closed" note is bookkeeping but not a wake: the wait ended, so a park after it is a new one. */
+const WAKE_NOTE_PREFIXES = ["park wake ", RESERVE_PREFIX, DELIVERED_PREFIX, REFUSED_PREFIX, FAILED_PREFIX, HELD_PREFIX] as const;
+
+/**
+ * The transitions seats decided, in transition order. An owner's note-only blocked -> blocked
+ * acknowledgement is not one of them when it directly follows a wake note on that row and repeats
+ * the actor, blocker (closure target) and note of the owner's last park: nothing changed,
+ * so nothing was decided. A state change, a new blocker or continuation, or an acknowledgement
+ * with no earlier owner park in the window still counts.
+ */
+function coordinationTransitions<T extends { qitemId: string; state: string; actorSession: string; transitionNote: string | null; closureTarget: string | null }>(window: T[]): T[] {
+  const counted: T[] = [];
+  const lastPark = new Map<string, { note: string; target: string | null; actor: string }>();
+  const previous = new Map<string, T>();
+  for (const t of window) {
+    const prev = previous.get(t.qitemId);
+    previous.set(t.qitemId, t);
+    // A state change or a closed parked-owner episode ends the remembered park even when the row is
+    // bookkeeping and never counts: the next park is a new one, not an acknowledgement of the old wait.
+    if (t.state !== "blocked" || t.transitionNote?.startsWith(CLOSE_PREFIX)) lastPark.delete(t.qitemId);
+    if (!isCoordinationTransition(t)) continue;
+    const park = lastPark.get(t.qitemId);
+    if (t.state !== "blocked" || !t.transitionNote?.startsWith(CONTINUATION_MARKER)) lastPark.delete(t.qitemId);
+    else {
+      const acknowledgesWake = park !== undefined && park.actor === t.actorSession && park.note === t.transitionNote && park.target !== null && park.target === t.closureTarget
+        && prev?.state === "blocked" && prev.transitionNote !== null
+        && WAKE_NOTE_PREFIXES.some((prefix) => prev.transitionNote!.startsWith(prefix));
+      lastPark.set(t.qitemId, { note: t.transitionNote, target: t.closureTarget, actor: t.actorSession });
+      if (acknowledgesWake) continue;
+    }
+    counted.push(t);
+  }
+  return counted;
+}
 
 /** A read-only question generator. Proof files, closures and acceptance receipts
  * are material for the diagnosing agent, never an automatic outcome counter. */
@@ -26,13 +87,18 @@ export class PassiveCeremonySource implements HealthObservationSource {
     private readonly posture?: { reader: OperatingPostureService; instanceId: string }) {}
 
   private lastCoverage: HealthSourceCoverage | undefined;
+  /** This evaluation's lineage-tagged rows by tag, read once on first use (closedBoundaries). */
+  private lineageRows: Map<string, string[]> | undefined;
   coverage(): HealthSourceCoverage[] { return this.lastCoverage ? [this.lastCoverage] : []; }
 
   read(): HealthDetectorObservation[] {
     this.lastCoverage = undefined;
+    this.lineageRows = undefined;
     const now = this.now(); const p = this.policy.read().policy;
     const start = new Date(Date.parse(now) - p.observationWindowSeconds * 1000).toISOString();
-    const touched = this.queue.db.prepare("SELECT qitem_id AS id, COUNT(*) AS n FROM queue_transitions WHERE ts >= ? AND ts <= ? GROUP BY qitem_id ORDER BY qitem_id LIMIT 2001").all(start, now) as Array<{ id: string; n: number }>;
+    // Retention moves old transitions to the archive and the deep read counts those too, so discovery and screening
+    // read both: each qitem once, with its live and archived in-window transitions summed.
+    const touched = this.discoverTouched(start, now);
     if (touched.length > 2000) throw new Error("health_passive_queue_window_truncated");
     type Member = { qitemId: string; handedOffFrom: string | null; tags: string[] };
     const roots = new Map<string, Member>();
@@ -65,16 +131,20 @@ export class PassiveCeremonySource implements HealthObservationSource {
         if (!row) throw new Error("health_passive_lineage_parent_unavailable");
       }
     }
-    // Past the limit, evaluate the busiest families instead of none. A family qualifies
-    // by its transition count, so ranking by transitions in the window (then lineage ID,
-    // for a stable order) keeps every family that could qualify unless more than the
-    // limit do. The rest are reported as omitted: unevaluated, never healthy.
-    const selectedFamilies = new Set([...roots.keys()]
-      .sort((a, b) => activity.get(b)! - activity.get(a)! || (a < b ? -1 : a > b ? 1 : 0))
-      .slice(0, familyLimit));
+    // A family qualifies on counted transitions, and the raw count in the window bounds the counted ones. A family
+    // below the ceremony threshold on raw traffic therefore cannot qualify: it is classified without any per-family
+    // read and is evaluated, not omitted. The limit bounds only the deep evaluation of families that can qualify.
+    // Past it the busiest are evaluated (raw count, then lineage ID) and the rest are reported as omitted:
+    // unevaluated, never healthy.
+    const threshold = p.thresholds.ceremonyTransitions;
+    const candidates = [...roots.keys()].filter((id) => activity.get(id)! >= threshold)
+      .sort((a, b) => activity.get(b)! - activity.get(a)! || (a < b ? -1 : a > b ? 1 : 0));
+    const selectedFamilies = new Set(candidates.slice(0, familyLimit));
+    const screened = roots.size - candidates.length;
     this.lastCoverage = { source: "passive-ceremony", evaluatedAt: now, unit: "handoff families", limit: familyLimit,
-      total: roots.size, evaluated: selectedFamilies.size, omitted: roots.size - selectedFamilies.size, partial: roots.size > familyLimit,
-      order: "most queue transitions in the observation window, then lineage ID" };
+      total: roots.size, evaluated: screened + selectedFamilies.size, omitted: candidates.length - selectedFamilies.size,
+      partial: candidates.length > familyLimit, screened, deepCandidates: candidates.length,
+      order: `limit applies to deep evaluation of families that can qualify (at least ${threshold} queue transitions in the observation window), most transitions first, then lineage ID; families below the ceremony threshold are classified without reads and count as evaluated` };
     // An explicit legacy source already owns this lineage; never route it twice.
     const explicit = new Set(this.checkpoints?.entries().map((x) => x.checkpoint.lineageQitemId) ?? []);
     const observations: HealthDetectorObservation[] = [];
@@ -85,14 +155,16 @@ export class PassiveCeremonySource implements HealthObservationSource {
       // Its parent joins give the complete family without rescanning dormant work.
       const ids = [...members.get(lineageId)!];
       if (ids.length > 1000) throw new Error("health_passive_family_member_limit");
-      const transitions: ReturnType<QueueRepository["listTransitions"]> = [];
+      const window: ReturnType<QueueRepository["listTransitions"]> = [];
       for (const id of ids) {
-        transitions.push(...this.queue.transitionLog.listForQitemWindow(id, start, now, 10001 - transitions.length));
-        if (transitions.length > 10000) throw new Error("health_passive_transition_window_truncated");
+        window.push(...this.queue.transitionLog.listForQitemWindow(id, start, now, 10001 - window.length));
+        if (window.length > 10000) throw new Error("health_passive_transition_window_truncated");
       }
-      transitions.sort((a, b) => a.transitionId - b.transitionId);
+      window.sort((a, b) => a.transitionId - b.transitionId);
+      // Count, segment and report only what seats decided (#2762); the raw window still names the family.
+      const transitions = coordinationTransitions(window);
       if (transitions.length < p.thresholds.ceremonyTransitions) continue;
-      const rows = [...new Set(transitions.map((t) => t.qitemId))].map((id) => get(id)!);
+      const rows = [...new Set(window.map((t) => t.qitemId))].map((id) => get(id)!);
       const tags = rows.flatMap((r) => r.tags ?? []);
       let missionId = one(tagged(tags, "mission:"));
       // Normal work linkage is explicit tags. Untagged work has no invented mission.
@@ -117,25 +189,44 @@ export class PassiveCeremonySource implements HealthObservationSource {
         const sliceId = one(slices);
         scope = sliceId ? { type: "slice", projectId, missionId, sliceId } : { type: "mission", projectId, missionId };
       }
-      const first = this.queue.db.prepare("SELECT ts FROM queue_transitions WHERE qitem_id = ? ORDER BY transition_id LIMIT 1").get(lineageId) as { ts: string } | undefined;
+      // Live and archived history: retention may archive the root of a family that is still active.
+      const first = this.queue.transitionLog.firstAfter([lineageId], 0);
       if (!first) throw new Error("health_passive_episode_start_unavailable");
       const boundaries = this.closedBoundaries(lineageId);
       const cuts = boundaries.map((b) => b.transitionId);
-      const segments: typeof transitions[] = [];
+      let familyIds: string[] | null | undefined;   // null: the family is over the member limit
+      // Each closed segment keeps the end of the disposition that closed it: a disposition recorded
+      // before #2762 may cut at a transition that no longer counts, so its id is not the segment's last.
+      const segments: Array<{ segment: typeof transitions; endedAt?: string }> = [];
       let remaining = transitions;
-      for (const cut of cuts) {
-        const part = remaining.filter((t) => t.transitionId <= cut);
-        if (part.length) segments.push(part);
-        remaining = remaining.filter((t) => t.transitionId > cut);
+      for (const boundary of boundaries) {
+        const part = remaining.filter((t) => t.transitionId <= boundary.transitionId);
+        if (part.length) segments.push({ segment: part, endedAt: boundary.endedAt });
+        remaining = remaining.filter((t) => t.transitionId > boundary.transitionId);
       }
-      if (remaining.length) segments.push(remaining);
-      for (const segment of segments) {
+      if (remaining.length) segments.push({ segment: remaining });
+      for (const { segment, endedAt } of segments) {
         if (segment.length < p.thresholds.ceremonyTransitions) continue;
         const segmentFirst = segment[0]!;
-        const resumed = cuts.some((cut) => cut < segmentFirst.transitionId);
-        const episodeStartedAt = resumed ? segmentFirst.ts : first.ts;
-        const episodeKey = resumed ? `${lineageId}:${segmentFirst.transitionId}` : lineageId;
-        const measuredEnd = boundaries.find((b) => b.transitionId === segment.at(-1)!.transitionId)?.endedAt ?? now;
+        // A resumed episode is named by the first raw transition after its cut, not the first counted one,
+        // so a change to what counts never renames an open episode or orphans its diagnosis. The opener is read
+        // from the full history, as closedBoundaries reads the cuts: it is often an older, non-counting transition
+        // that leaves the rolling window first, and the window then would name the episode anew (#3192 review). The
+        // full history is the live and the archived transitions, as for the cuts: retention may archive the opener.
+        const cut = cuts.filter((c) => c < segmentFirst.transitionId).at(-1);
+        if (cut !== undefined && familyIds === undefined) {
+          try { familyIds = this.familyOf(lineageId); } catch (error) {
+            // Only this family falls back to the members active in the window (at most 1000, checked above); the
+            // other families are still read.
+            if ((error as Error).message !== "health_passive_family_member_limit") throw error;
+            familyIds = null;
+          }
+        }
+        const opener = cut === undefined ? undefined
+          : this.queue.transitionLog.firstAfter(familyIds ?? ids, cut) ?? segmentFirst;
+        const episodeStartedAt = opener?.ts ?? first.ts;
+        const episodeKey = opener ? `${lineageId}:${opener.transitionId}` : lineageId;
+        const measuredEnd = endedAt ?? now;
         const scopeKey = healthHash({ scope, workspace });
         if (!contexts.has(scopeKey)) contexts.set(scopeKey, scope.type === "mission" || scope.type === "slice"
           ? this.context(scope, workspace, missionRoot)
@@ -156,6 +247,7 @@ export class PassiveCeremonySource implements HealthObservationSource {
         if (resolved?.posture === "unknown") missingFacts.push("scope identity unresolved: " + resolved.reason);
         if (Date.parse(episodeStartedAt) < Date.parse(start)) missingFacts.push("lineage begins before retained observation window; full interval unavailable");
         if (new Set(slices).size > 1) missingFacts.push("handoff family crosses slice identities; product boundary unresolved");
+        if (cut !== undefined && familyIds === null) missingFacts.push("handoff family exceeds 1000 members; the resumed episode is named by its first transition after the cut among the members active in the observation window, so an opener on a dormant member is not read and the episode may be renamed");
         if (receipt && receipt.result.basis !== basis) missingFacts.push("normal evidence changed since the attributed assessment; reassess the current basis");
         if (receipt?.evidenceChanged) missingFacts.push("assessment evidence changed or became unavailable");
         const assessment = receipt ? { result: receipt.result, actor: receipt.actor, at: receipt.at, transitionId: receipt.transitionId, identityProvenance: receipt.identityProvenance } : undefined;
@@ -166,17 +258,46 @@ export class PassiveCeremonySource implements HealthObservationSource {
           productStateChanges: null, boundedAuthority: false, reviewReturns: 0, candidateChanges: 0, newRiskClasses: 0, ceremony,
           sourceDescription: `Passively read ${rows.length} declared handoff members. Normal evidence paths and workflow closure receipts are starting points, not proof counts or acceptance judgments. This source performs no writes or agent calls.`,
           source: boundHealthEvidence(segment.map(adaptQueueTransitionEvidence), { source: "mixed", startedAt: start > episodeStartedAt ? start : episodeStartedAt, endedAt: measuredEnd, limit: 10000, retentionSeconds: p.observationWindowSeconds },
-            deriveHealthSourceFreshness({ evaluatedAt: now, newestSourceAt: latest, maxAgeSeconds: p.freshnessSeconds, available: true })) });
+            // Freshness is the successful read of the queue, not the lineage's last activity: `lastObservedAt` carries
+            // activity and the detector gates confirmation and wake on it. Activity dated after the read stays contradictory.
+            deriveHealthSourceFreshness({ evaluatedAt: now, newestSourceAt: now, maxAgeSeconds: p.freshnessSeconds, available: true, contradictory: Date.parse(latest) > Date.parse(now) })) });
       }
     }
     return observations;
   }
 
+  /** Every qitem with a transition in the window, live or archived, with its combined count. At most 2001 rows. */
+  private discoverTouched(start: string, end: string): Array<{ id: string; n: number }> {
+    const hasArchive = !!this.queue.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'queue_transitions_archive'").get();
+    // A side with more than 2000 distinct qitems already exceeds the combined limit, so each side stops at 2001.
+    const side = (table: string) => `SELECT qitem_id, COUNT(*) AS n FROM ${table} WHERE ts >= ? AND ts <= ? GROUP BY qitem_id ORDER BY qitem_id LIMIT 2001`;
+    if (!hasArchive) return this.queue.db.prepare(side("queue_transitions").replace("qitem_id,", "qitem_id AS id,").replace("ORDER BY qitem_id", "ORDER BY id")).all(start, end) as Array<{ id: string; n: number }>;
+    return this.queue.db.prepare(`SELECT qitem_id AS id, SUM(n) AS n FROM (SELECT qitem_id, n FROM (${side("queue_transitions")}) UNION ALL SELECT qitem_id, n FROM (${side("queue_transitions_archive")}))
+      GROUP BY qitem_id ORDER BY qitem_id LIMIT 2001`).all(start, end, start, end) as Array<{ id: string; n: number }>;
+  }
+
+  /** The whole handoff family under a root, dormant members included (the window only knows the touched ones), down
+   * handed_off_from as discovery walks it up: a diagnosis or human row is not a member, and nothing under it is. */
+  private familyOf(lineageId: string): string[] {
+    const children = this.queue.db.prepare("SELECT qitem_id AS id, tags FROM queue_items WHERE handed_off_from = ?");
+    const ids = [lineageId]; const seen = new Set(ids);
+    for (let i = 0; i < ids.length; i++) {
+      for (const child of children.all(ids[i]) as Array<{ id: string; tags: string | null }>) {
+        if (seen.has(child.id) || excluded(JSON.parse(child.tags ?? "[]") as string[])) continue;
+        seen.add(child.id); ids.push(child.id);
+        if (ids.length > 1000) throw new Error("health_passive_family_member_limit");
+      }
+    }
+    return ids;
+  }
+
   private closedBoundaries(lineageId: string): Array<{ transitionId: number; endedAt: string }> {
-    const rows = this.queue.list({ tag: `health-lineage:${lineageId}`, limit: 201 });
-    if (rows.length > 200) throw new Error("health_passive_episode_history_truncated");
-    return rows.flatMap((row) => {
-      const transitions = this.queue.listTransitions(row.qitemId);
+    // One read per evaluation finds every lineage-tagged row: a tag lookup per family was a whole-queue scan each time.
+    this.lineageRows ??= this.readLineageRows();
+    const ids = this.lineageRows.get(`health-lineage:${lineageId}`) ?? [];
+    if (ids.length > 200) throw new Error("health_passive_episode_history_truncated");
+    return ids.flatMap((qitemId) => {
+      const transitions = this.queue.listTransitions(qitemId);
       if (transitions.length > 1000) throw new Error("health_passive_diagnosis_history_truncated");
       for (const t of [...transitions].reverse()) {
         try {
@@ -188,6 +309,24 @@ export class PassiveCeremonySource implements HealthObservationSource {
       }
       return [];
     }).sort((a, b) => a.transitionId - b.transitionId);
+  }
+
+  /** Every `health-lineage:<id>` tag's rows, exact tag match, ids only (all closedBoundaries uses). */
+  private readLineageRows(): Map<string, string[]> {
+    const rows = runSyncSite("health.lineage_rows", () => this.queue.db.prepare("SELECT qitem_id AS id, tags FROM queue_items WHERE tags LIKE '%health-lineage:%'")
+      .all() as Array<{ id: string; tags: string | null }>);
+    const index = new Map<string, string[]>();
+    for (const row of rows) {
+      let tags: unknown;
+      try { tags = JSON.parse(row.tags ?? "[]"); } catch { continue; }
+      if (!Array.isArray(tags)) continue;
+      for (const tag of new Set(tags)) {
+        if (typeof tag !== "string" || !tag.startsWith("health-lineage:")) continue;
+        const ids = index.get(tag) ?? [];
+        ids.push(row.id); index.set(tag, ids);
+      }
+    }
+    return index;
   }
 
   private assessment(id: string, workspace = this.workspace): (NonNullable<PassiveCeremony["assessment"]> & { evidenceChanged: boolean }) | undefined {

@@ -7,6 +7,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { randomUUID } = require("node:crypto");
 
 const outputTarget = process.argv[2];
 const providerUsageTarget = process.argv[3];
@@ -44,6 +45,8 @@ process.stdin.on("end", () => {
       session_name: raw.session_name ?? null,
       occupant_generation: process.env.OPENRIG_OCCUPANT_GENERATION || process.env.RIGGED_OCCUPANT_GENERATION || null,
       transcript_path: raw.transcript_path ?? null,
+      // Claude's own client-side cost estimate for this session (cumulative; not an invoice).
+      cost: raw.cost && typeof raw.cost.total_cost_usd === "number" ? { total_cost_usd: raw.cost.total_cost_usd } : null,
       sampled_at: new Date().toISOString(),
     };
 
@@ -112,11 +115,20 @@ function unixSecondsToIso(value) {
 }
 
 function writeJsonAtomic(outputPath, value) {
-  const tmpPath = outputPath + ".tmp";
+  const tmpPath = outputPath + ".tmp-" + randomUUID();
   const dir = path.dirname(outputPath);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
-  fs.writeFileSync(tmpPath, JSON.stringify(value), "utf-8");
-  fs.renameSync(tmpPath, outputPath);
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(value), "utf-8");
+    fs.renameSync(tmpPath, outputPath);
+  } catch (error) {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      // Keep the original write or rename error.
+    }
+    throw error;
+  }
 }

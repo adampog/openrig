@@ -1,12 +1,15 @@
+import { ActivityGrantStore } from "../src/domain/activity-grants.js";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type Database from "better-sqlite3";
 import { createFullTestDb } from "./helpers/test-app.js";
 import { DiscoveryRepository } from "../src/domain/discovery-repository.js";
 import { SuccessorSessionLauncher } from "../src/domain/successor-session-launcher.js";
+import { resolveGuardTarget } from "../src/domain/seat-delivery-guard.js";
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
 import type { RuntimeAdapter } from "../src/domain/runtime-adapter.js";
 import type { TmuxOptionDefaultsApplier } from "../src/domain/tmux-option-defaults.js";
 import type { SettingsStore } from "../src/domain/user-settings/settings-store.js";
+import { claudePane, codexPane, type Pane } from "./fixtures/runtime-exit-pane.js";
 
 describe("SuccessorSessionLauncher", () => {
   let db: Database.Database;
@@ -54,7 +57,7 @@ describe("SuccessorSessionLauncher", () => {
     return new SuccessorSessionLauncher(tmux, discoveryRepo, {
       sessionEnv: { OPENRIG_HOME: "/home", HOME: "/daemon-home", CODEX_HOME: "/daemon-codex" },
       newId: () => "01ABCDEFG",
-      runtimeAdapters: { codex: fakeAdapter("codex") },
+      runtimeAdapters: { codex: fakeAdapter("codex"), "claude-code": fakeAdapter("claude-code") },
       readinessTimeoutMs: 50,
       sleep: async () => {},
       exitPollMs: 1,
@@ -62,6 +65,156 @@ describe("SuccessorSessionLauncher", () => {
       tmuxOptionDefaults,
     });
   }
+
+  it("uses the seat identity for guarded cutover when a detached binding shares the pane", async () => {
+    db.exec(`INSERT INTO rigs (id,name) VALUES ('rig-1','rig');
+      INSERT INTO nodes (id,rig_id,logical_id,runtime) VALUES ('live','rig-1','dev.live','codex'), ('old','rig-1','dev.old','codex');
+      INSERT INTO bindings (id,node_id,tmux_session,tmux_pane) VALUES ('b1','live','dev-live@rig','%7'), ('b2','old','dev-old@rig','%7');
+      INSERT INTO sessions (id,node_id,session_name,status) VALUES ('s1','live','dev-live@rig','running'), ('s2','old','dev-old@rig','detached');`);
+    expect(resolveGuardTarget(db, "%7")).toBeNull();
+    expect(resolveGuardTarget(db, "live")).toMatchObject({ nodeId: "live", pane: "%7" });
+    const resolveWrite = (target: string) => resolveGuardTarget(db, target)?.nodeId === "live"
+      ? { ok: true } : { ok: false, code: "guard_target_unknown", message: "ambiguous target" };
+    signalPaneProcess.mockImplementation(async (target: string) => resolveWrite(target));
+    respawnPane.mockImplementation(async (target: string) => resolveWrite(target));
+    isPaneDead.mockResolvedValueOnce(false).mockResolvedValueOnce(false).mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false).mockResolvedValueOnce(false).mockResolvedValueOnce(false).mockResolvedValue(true);
+    const tmux = { deliveryGuard: { maybeTarget: (name: string) => resolveGuardTarget(db, name) }, createSession, listPanes, killSession, respawnPane, setRemainOnExit,
+      signalPaneProcess, isPaneDead, getDefaultShell, getPaneCommand } as unknown as TmuxAdapter;
+    const subject = new SuccessorSessionLauncher(tmux, discoveryRepo, { newId: () => "01ABCDEFG",
+      runtimeAdapters: { codex: fakeAdapter("codex") }, sleep: async () => {}, exitPollMs: 1, exitTimeoutMs: 5 });
+    const result = await subject.createSuccessor({ node: { id: "live", runtime: "codex", cwd: "/w" }, departingSessionName: "dev-live@rig" });
+    expect(result.ok).toBe(true);
+    expect(signalPaneProcess).toHaveBeenCalledWith("live", "TERM");
+    expect(signalPaneProcess).toHaveBeenCalledWith("live", "KILL");
+    expect(respawnPane).toHaveBeenCalledWith("live", "/bin/zsh", expect.anything());
+    expect(isPaneDead).toHaveBeenCalledWith("%7");
+    expect(db.prepare("SELECT node_id, tmux_session, tmux_pane FROM bindings WHERE id = ?").get("b2"))
+      .toEqual({ node_id: "old", tmux_session: "dev-old@rig", tmux_pane: "%7" });
+    expect(db.prepare("SELECT node_id, session_name, status FROM sessions WHERE id = ?").get("s2"))
+      .toEqual({ node_id: "old", session_name: "dev-old@rig", status: "detached" });
+  });
+
+  it("does not cut over when the selected pane disagrees with the managed binding", async () => {
+    const tmux = { deliveryGuard: { maybeTarget: () => ({ session: "dev-live@rig", pane: "%8" }) }, listPanes,
+      respawnPane, setRemainOnExit, signalPaneProcess, isPaneDead, getDefaultShell, getPaneCommand } as unknown as TmuxAdapter;
+    const subject = new SuccessorSessionLauncher(tmux, discoveryRepo, { runtimeAdapters: { codex: fakeAdapter("codex") } });
+    const result = await subject.createSuccessor({ node: { id: "live", runtime: "codex", cwd: "/w" }, departingSessionName: "dev-live@rig" });
+    expect(result).toMatchObject({ ok: false, code: "pane_unresolved", replacementStarted: false });
+    expect(setRemainOnExit).not.toHaveBeenCalled();
+    expect(signalPaneProcess).not.toHaveBeenCalled();
+    expect(respawnPane).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("leaves the predecessor untouched when launch preflight refuses or throws (throws: %s)", async throws => {
+    const preflightLaunch = vi.fn(async () => {
+      if (throws) throw new Error("preflight unavailable");
+      return { ok: false as const, error: "policy conflicts with the successor" };
+    });
+    const runtime = { ...fakeAdapter("codex"), preflightLaunch };
+    const tmux = { listPanes, killSession, respawnPane, setRemainOnExit, signalPaneProcess, isPaneDead,
+      getDefaultShell, getPaneCommand } as unknown as TmuxAdapter;
+    const guarded = new SuccessorSessionLauncher(tmux, discoveryRepo, { runtimeAdapters: { codex: runtime } });
+    const onReplacementStarted = vi.fn();
+    const result = await guarded.createSuccessor({ node: { id: "node-1", runtime: "codex", cwd: "/w" },
+      departingSessionName: "dev-impl@rig", onReplacementStarted });
+    expect(result).toMatchObject({ ok: false, code: "successor_preflight_failed", replacementStarted: false });
+    expect(signalPaneProcess).not.toHaveBeenCalled();
+    expect(setRemainOnExit).not.toHaveBeenCalled();
+    expect(respawnPane).not.toHaveBeenCalled();
+    expect(killSession).not.toHaveBeenCalled();
+    expect(launchHarness).not.toHaveBeenCalled();
+    expect(onReplacementStarted).not.toHaveBeenCalled();
+  });
+
+  it("preflights the same binding it launches and retains an inconclusive-policy warning", async () => {
+    const preflightLaunch = vi.fn(async () => ({ ok: true as const, warnings: ["policy not verified: native read timed out"] }));
+    const runtime = { ...fakeAdapter("codex"), preflightLaunch };
+    const tmux = { listPanes, killSession, respawnPane, setRemainOnExit, signalPaneProcess, isPaneDead,
+      getDefaultShell, getPaneCommand } as unknown as TmuxAdapter;
+    const guarded = new SuccessorSessionLauncher(tmux, discoveryRepo, { runtimeAdapters: { codex: runtime } });
+    signalPaneProcess.mockImplementation(async () => {
+      expect(preflightLaunch).toHaveBeenCalledTimes(1);
+      return { ok: true };
+    });
+    const result = await guarded.createSuccessor({ node: { id: "node-1", runtime: "codex", cwd: "/w",
+      codexPermissions: { approval: "never", filesystem: { ":minimal": "read" } } },
+      departingSessionName: "dev-impl@rig", occupantGeneration: "successor-generation" });
+    expect(result).toMatchObject({ ok: true, warnings: ["policy not verified: native read timed out"] });
+    expect(preflightLaunch.mock.calls[0]?.[0]).toBe(launchHarness.mock.calls[0]?.[0]);
+  });
+
+  it("revokes the staged attempt if its separate readiness probe fails", async () => {
+    db.prepare("INSERT INTO rigs (id,name) VALUES ('rig-bound','bound')").run();
+    db.prepare("INSERT INTO nodes (id,rig_id,logical_id,runtime) VALUES ('node-1','rig-bound','dev.impl','codex')").run();
+    const grants = new ActivityGrantStore(db);
+    const issue = (runId: string) => grants.issue({ nodeId: "node-1", generation: "reserved", issuedBy: "launch",
+      run: { runId, binding: { runtime: "pi", runner: 0, pane: "%7", panePid: 101 } } });
+    const first = issue("staged"), unrelated = issue("other-staged");
+    launchHarness.mockResolvedValue({ ok: true, activityGrantId: first.grantId });
+    checkReady.mockRejectedValue(new Error("probe unavailable"));
+    expect(await launcher().createSuccessor({ node: { id: "node-1", runtime: "codex", cwd: "/w" },
+      departingSessionName: "dev-impl@rig" })).toMatchObject({ ok: false, code: "successor_readiness_failed" });
+    expect(grants.standing(first.grantId)).toBe("revoked");
+    expect(grants.standing(unrelated.grantId)).toBe("pending");
+  });
+
+  it("carries its exact issuance to abandoned cutover cleanup without revoking another pending run", async () => {
+    db.prepare("INSERT INTO rigs (id,name) VALUES ('rig-bound','bound')").run();
+    db.prepare("INSERT INTO nodes (id,rig_id,logical_id,runtime) VALUES ('node-1','rig-bound','dev.impl','codex')").run();
+    const grants = new ActivityGrantStore(db);
+    const issue = (runId: string) => grants.issue({ nodeId: "node-1", generation: "reserved", issuedBy: "launch",
+      run: { runId, binding: { runtime: "pi", runner: 0, pane: "%7", panePid: 101 } } });
+    const first = issue("ready-staged"), unrelated = issue("other-staged");
+    launchHarness.mockResolvedValue({ ok: true, activityGrantId: first.grantId });
+    const subject = launcher();
+    const result = await subject.createSuccessor({ node: { id: "node-1", runtime: "codex", cwd: "/w" }, departingSessionName: "dev-impl@rig" });
+    expect(result).toMatchObject({ ok: true, activityGrantId: first.grantId });
+    if (!result.ok) throw new Error("successor did not start");
+    await subject.cleanup(result.tmuxSession, result.discoveredId, result.activityGrantId);
+    expect(grants.standing(first.grantId)).toBe("revoked");
+    expect(grants.standing(unrelated.grantId)).toBe("pending");
+  });
+
+  it("the successor's respawned pane gets the seat's declared env, and the declared names are recorded", async () => {
+    const res = await launcher().createSuccessor({
+      node: { id: "node-1", runtime: "codex", cwd: "/w", seatEnv: { MODE: "fast", REGION: "eu" } },
+      departingSessionName: "dev-impl@rig",
+    });
+    expect(res.ok).toBe(true);
+    const opts = respawnPane.mock.calls[0]![2];
+    expect(opts.env).toMatchObject({ MODE: "fast", REGION: "eu", OPENRIG_SEAT_ENV_KEYS: "MODE,REGION", OPENRIG_NODE_ID: "node-1" });
+  });
+
+  it.each(["codex", "claude-code"])("a selected %s plugin keeps its interpreter on handover", async runtime => {
+    const res = await launcher().createSuccessor({
+      node: { id: "node-1", runtime, cwd: "/w", seatProjectDir: "/w" }, departingSessionName: "dev-impl@rig",
+    });
+    expect(res.ok).toBe(true);
+    expect(respawnPane.mock.calls[0]![2].env).toMatchObject({ OPENRIG_NODE: process.execPath });
+  });
+
+  it("a seat that declares no env gets no env keys variable", async () => {
+    await launcher().createSuccessor({ node: { id: "node-1", runtime: "codex", cwd: "/w" }, departingSessionName: "dev-impl@rig" });
+    expect(respawnPane.mock.calls[0]![2].env).not.toHaveProperty("OPENRIG_SEAT_ENV_KEYS");
+  });
+
+  it("never reads or writes the departing session's environment: a handover that works on main works here, whatever tmux does to those calls", async () => {
+    const refused = async () => { throw new Error("tmux environment calls are not part of a handover"); };
+    const tmux = {
+      listPanes, respawnPane, setRemainOnExit, signalPaneProcess, isPaneDead, getDefaultShell, getPaneCommand,
+      getSessionEnv: refused, setSessionEnv: refused, unsetSessionEnv: refused,
+    } as unknown as TmuxAdapter;
+    for (const seatEnv of [undefined, { MODE: "fast" }]) {
+      respawnPane.mockClear();
+      const plain = new SuccessorSessionLauncher(tmux, discoveryRepo, {
+        runtimeAdapters: { codex: fakeAdapter("codex") }, readinessTimeoutMs: 50, sleep: async () => {}, exitPollMs: 1, exitTimeoutMs: 5,
+      });
+      const res = await plain.createSuccessor({ node: { id: "node-1", runtime: "codex", cwd: "/w", ...(seatEnv ? { seatEnv } : {}) }, departingSessionName: "dev-impl@rig" });
+      expect(res.ok).toBe(true);
+      expect(respawnPane).toHaveBeenCalledTimes(1);
+    }
+  });
 
   it("MONEY PROOF (0.5.2-07): the successor's launch binding carries the SPEC-pinned model, not the runtime default", async () => {
     // Boot cheap → hand over → the successor LAUNCH must carry the spec's model. The adapter emits
@@ -215,6 +368,125 @@ describe("SuccessorSessionLauncher", () => {
     expect(launchHarness).toHaveBeenCalledTimes(1);
   });
 
+  describe("#3901: the retiree exits through its own shutdown before its pane is retired", () => {
+    function cutover(pane: Pane): SuccessorSessionLauncher {
+      pane.session = "dev-impl@rig";
+      listPanes.mockResolvedValue([{ id: "%1", index: 0, cwd: "/w", width: 80, height: 24, active: true }]);
+      const measured = pane.tmux();
+      const tmux = { ...measured, createSession, listPanes, killSession, getDefaultShell, getPaneCommand,
+        respawnPane: vi.fn(async (...args: unknown[]) => { pane.effects.push("respawn"); return respawnPane(...args); }) } as unknown as TmuxAdapter;
+      return new SuccessorSessionLauncher(tmux, discoveryRepo, { newId: () => "01ABCDEFG",
+        runtimeAdapters: { codex: fakeAdapter("codex"), "claude-code": fakeAdapter("claude-code") },
+        readinessTimeoutMs: 50, sleep: async () => {}, exitPollMs: 1, exitTimeoutMs: 5, listProcesses: pane.list });
+    }
+
+    it("a Claude Code retiree in a shell-backed pane gets TERM itself (not its shell) and is reported graceful", async () => {
+      const pane = claudePane();
+      const res = await cutover(pane).createSuccessor({ node: { id: "node-1", runtime: "claude-code", cwd: "/w" }, departingSessionName: "dev-impl@rig" });
+      expect(res).toMatchObject({ ok: true, retireeExit: "graceful", retireeExitDetail: expect.stringMatching(/^Claude Code exited on TERM in /) });
+      // The shell, left at its prompt, is ended only after Claude Code has exited; the respawn needs the pane dead.
+      expect(pane.effects).toEqual(["remain-on-exit", "TERM 200", "root HUP", "respawn"]);
+    });
+
+    it("a Codex retiree at an empty input box exits through /exit and is reported graceful", async () => {
+      const pane = codexPane();
+      const res = await cutover(pane).createSuccessor({ node: { id: "node-1", runtime: "codex", cwd: "/w" }, departingSessionName: "dev-impl@rig" });
+      expect(res).toMatchObject({ ok: true, retireeExit: "graceful", retireeExitDetail: expect.stringMatching(/^Codex exited through \/exit in /) });
+      expect(pane.effects).toEqual(["remain-on-exit", "type /exit (keys)", "keys Enter", "root HUP", "respawn"]);
+    });
+
+    it("an unresponsive retiree is killed at the end of the window and reported forced, before the respawn", async () => {
+      const pane = claudePane();
+      pane.runtimeIgnores.add("TERM");
+      const res = await cutover(pane).createSuccessor({ node: { id: "node-1", runtime: "claude-code", cwd: "/w" }, departingSessionName: "dev-impl@rig" });
+      expect(res).toMatchObject({ ok: true, retireeExit: "forced", retireeExitDetail: "Claude Code didn't exit within 0.0 s of TERM and was killed." });
+      expect(pane.effects).toEqual(["remain-on-exit", "TERM 200", "KILL 200", "root HUP", "respawn"]);
+    });
+
+    // X-F5: a check that can't be made never fails a handover. Only an agent seen running after its KILL does.
+    it("a retiree whose exit can't be checked after TERM (the process table unreadable) is stopped at the pane, reported forced, and the handover goes on", async () => {
+      const pane = claudePane();
+      const rows = pane.list.getMockImplementation()!;
+      pane.list.mockImplementation(async () => { if (pane.effects.includes("TERM 200")) throw new Error("table unreadable"); return rows(); });
+      const res = await cutover(pane).createSuccessor({ node: { id: "node-1", runtime: "claude-code", cwd: "/w" }, departingSessionName: "dev-impl@rig" });
+      expect(res).toMatchObject({ ok: true, retireeExit: "forced", retireeExitDetail: expect.stringMatching(/^Claude Code was sent TERM, but its exit couldn't be checked/) });
+      expect(pane.effects).toEqual(["remain-on-exit", "TERM 200", "refused KILL 200", "root TERM", "root KILL", "respawn"]);
+    });
+
+    it("a retiree seen still running after its KILL fails the handover before the respawn", async () => {
+      const pane = claudePane();
+      pane.runtimeIgnores.add("TERM");
+      pane.runtimeIgnores.add("KILL");
+      const res = await cutover(pane).createSuccessor({ node: { id: "node-1", runtime: "claude-code", cwd: "/w" }, departingSessionName: "dev-impl@rig" });
+      expect(res).toMatchObject({ ok: false, code: "retiree_not_terminated", replacementStarted: false });
+      expect(pane.effects).not.toContain("respawn");
+    });
+
+    // X-F4: the pane's terminal is read as the pane is resolved, and every cutover effect is held to it.
+    it("a pane that is another server's by the time of the retiree's TERM is left alone, and the handover stops before the respawn", async () => {
+      const pane = claudePane();
+      pane.beforeRuntimeEffect = () => { pane.server = { pid: "4001", start: "1764061290" }; };
+      const res = await cutover(pane).createSuccessor({ node: { id: "node-1", runtime: "claude-code", cwd: "/w" }, departingSessionName: "dev-impl@rig" });
+      expect(res).toMatchObject({ ok: false, code: "guard_target_changed", step: "create_successor", replacementStarted: false });
+      expect(pane.effects).toEqual(["remain-on-exit", "refused TERM 200"]);
+    });
+
+    it("a pane no longer in the departing session when it is resolved gets no cutover at all", async () => {
+      const pane = claudePane();
+      const launcher = cutover(pane);
+      pane.session = "someone-else";
+      const res = await launcher.createSuccessor({ node: { id: "node-1", runtime: "claude-code", cwd: "/w" }, departingSessionName: "dev-impl@rig" });
+      expect(res).toMatchObject({ ok: false, code: "pane_unresolved", step: "resolve_pane", replacementStarted: false });
+      expect(pane.effects).toEqual([]);
+    });
+  });
+
+  it("#3253: a handover chooses its path before the retiree is signalled, and a limit never stops it after that", async () => {
+    const order: string[] = [];
+    const notice = { state: "not_applied", kind: "unsupported", reason: "not Linux", retryable: false, requested: { tasksMax: 256 } };
+    const seatProcessLimitsRecoveryPlan = vi.fn(async (nodeId: string) => { order.push("plan"); return nodeId === "n" ? notice : null; });
+    const signal = vi.fn(async (...a: unknown[]) => { order.push("signal"); return (signalPaneProcess as any)(...a); });
+    // the respawn goes ahead without the limit, with the warning (the adapter's recovery mode), never a refusal
+    const respawn = vi.fn(async (...a: unknown[]) => ({ ...(await (respawnPane as any)(...a)), processLimits: notice,
+      warnings: ["process_limits requested, not applied: …"] }));
+    const tmux = { createSession, listPanes, killSession, respawnPane: respawn, setRemainOnExit, signalPaneProcess: signal, isPaneDead,
+      getDefaultShell, getPaneCommand, seatProcessLimitsRecoveryPlan } as unknown as TmuxAdapter;
+    const l = new SuccessorSessionLauncher(tmux, discoveryRepo, {
+      sessionEnv: { OPENRIG_HOME: "/home" }, newId: () => "01ABCDEFG", runtimeAdapters: { codex: fakeAdapter("codex") },
+      readinessTimeoutMs: 50, sleep: async () => {}, exitPollMs: 1, exitTimeoutMs: 5,
+    });
+    const res = await l.createSuccessor({ node: { id: "n", runtime: "codex", cwd: "/w" }, departingSessionName: "a@r" });
+    expect(res).toMatchObject({ ok: true, processLimits: notice });  // the structured warning reaches the caller
+    expect(order[0]).toBe("plan");
+    expect(respawn).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.objectContaining({ processLimitsMode: "recovery" }));
+  });
+
+  it("#3253: readiness failure after a respawn without the limit forwards the notice", async () => {
+    const notice = { state: "not_applied", kind: "unverified", reason: "the user manager timed out", retryable: true, requested: { tasksMax: 256 } };
+    respawnPane.mockResolvedValue({ ok: true, processLimits: notice });
+    checkReady.mockResolvedValue({ ready: false, reason: "harness not interactive" });
+    const res = await launcher().createSuccessor({ node: { id: "n", runtime: "codex", cwd: "/w" }, departingSessionName: "a@r" });
+    expect(res).toMatchObject({ ok: false, step: "start_agent", successorLaunched: true, processLimits: notice });
+  });
+
+  it("#3253: the staged successor (provider switch) is created in recovery mode and carries the notice, also when it fails", async () => {
+    const notice = { state: "not_applied", kind: "unverified", reason: "the user manager timed out", retryable: true, requested: { tasksMax: 256 } };
+    const line = "process_limits requested, not applied: the user manager timed out";
+    createSession.mockResolvedValue({ ok: true, processLimits: notice, warnings: [line] });
+    const stage = () => launcher().stageSuccessor({ node: { id: "n", runtime: "codex", cwd: "/w" }, canonicalSession: "a@r",
+      stagingSession: "openrig-switch-1", occupantGeneration: "gen-1", onPaneCreated: () => {}, staged: { prepare: async () => [] } });
+    const res = await stage();
+    expect(createSession).toHaveBeenCalledWith("openrig-switch-1", "/w", expect.anything(), { processLimitsMode: "recovery" });
+    expect(res).toMatchObject({ ok: true, processLimits: notice });
+    expect((res as { notes?: string[] }).notes).toContain(line);
+
+    checkReady.mockResolvedValue({ ready: false, reason: "harness not interactive" });
+    expect(await stage()).toMatchObject({ ok: false, processLimits: notice });
+    // a step after the create that throws keeps it too
+    listPanes.mockRejectedValueOnce(new Error("lost server"));
+    expect(await stage()).toMatchObject({ ok: false, code: "successor_launch_failed", processLimits: notice });
+  });
+
   it("retiree NEVER exits (survives TERM and KILL) → structured retiree_not_terminated, NO respawn (never clobber a live retiree)", async () => {
     isPaneDead.mockResolvedValue(false); // never becomes dead
     const res = await launcher().createSuccessor({ node: { id: "n", runtime: "codex", cwd: "/w" }, departingSessionName: "a@r" });
@@ -280,6 +552,8 @@ describe("SuccessorSessionLauncher", () => {
 
     expect(res).toMatchObject({ ok: false, step: "start_agent", code: "successor_launch_failed" });
     expect((res as { message: string }).message).toContain("codex binary not found");
+    // #2985: the launch itself failed, so no successor was sent into the pane.
+    expect(res).not.toHaveProperty("successorLaunched");
     // The preserved seat's session is NEVER killed on unwind (retiree state stays recoverable).
     expect(killSession).not.toHaveBeenCalled();
     // No discovery candidate was committed for a failed successor.
@@ -290,6 +564,8 @@ describe("SuccessorSessionLauncher", () => {
     checkReady.mockResolvedValue({ ready: false, reason: "harness not interactive" });
     const res = await launcher().createSuccessor({ node: { id: "n", runtime: "codex", cwd: "/w" }, departingSessionName: "a@r" });
     expect(res).toMatchObject({ ok: false, step: "start_agent", code: "successor_not_ready" });
+    // #2985: the harness launch was sent and only readiness failed: the successor may still come up in this pane.
+    expect(res).toMatchObject({ replacementStarted: true, successorLaunched: true, tmuxPane: "%7" });
     expect(killSession).not.toHaveBeenCalled();
     expect(discoveryRepo.listDiscovered()).toHaveLength(0);
   });
@@ -311,6 +587,22 @@ describe("SuccessorSessionLauncher", () => {
         sleep: async (ms) => { vi.setSystemTime(Date.now() + ms); },
       });
     }
+
+    it("OPR.0.7.0.9 (K2): the seat's launch additions reach the successor's launch, fresh and fork", async () => {
+      checkReady.mockImplementation(async () => ({ ready: true }));
+      const launchAdditions = { agent: "openrig:reviewer", appendSystemPromptFile: "/seat/additions/system-prompt.md", pluginDirs: [],
+        pluginChannels: ["plugin:example-channel@example"] }; // #2044: a seat's plugin channels travel with the rest
+      for (const forkSource of [undefined, { kind: "native_id" as const, value: "parent-1" }]) {
+        launchHarness.mockClear();
+        const res = await timedLauncher().createSuccessor({
+          node: { id: "n", runtime: "codex", cwd: "/w", launchAdditions }, departingSessionName: "a@r", ...(forkSource ? { forkSource } : {}),
+        });
+        expect(res.ok).toBe(true);
+        const [binding, opts] = launchHarness.mock.calls[0]! as [{ launchAdditions?: unknown }, { forkSource?: unknown }];
+        expect(binding.launchAdditions).toEqual(launchAdditions);
+        expect(opts.forkSource).toEqual(forkSource);
+      }
+    });
 
     it("uses the configured window for successor readiness", async () => {
       checkReady.mockImplementation(async () => ({ ready: Date.now() >= 40_000 }));
@@ -407,28 +699,65 @@ describe("SuccessorSessionLauncher", () => {
     checkReady.mockRejectedValue(new Error("tmux socket closed"));
     const res = await launcher().createSuccessor({ node: { id: "n", runtime: "codex", cwd: "/w" }, departingSessionName: "a@r" });
     expect(res).toMatchObject({ ok: false, step: "start_agent", code: "successor_readiness_failed" });
+    // #2985: the launch was sent before the probe threw, so the successor may still be in the pane.
+    expect(res).toMatchObject({ replacementStarted: true, successorLaunched: true, tmuxPane: "%7" });
     expect((res as { message: string }).message).toContain("tmux socket closed");
     expect(checkReady).toHaveBeenCalledTimes(1);
     expect(killSession).not.toHaveBeenCalled();
     expect(discoveryRepo.listDiscovered()).toHaveLength(0);
   });
 
+  it("#3044: a readiness failure keeps what the launch applied, for the recovery to commit with the successor", async () => {
+    const appliedLaunch = { axis: "permission", value: "auto", source: "launch" };
+    launchHarness.mockResolvedValue({ ok: true, resumeToken: "t", resumeType: "claude_id", appliedLaunch });
+    checkReady.mockRejectedValueOnce(new Error("tmux socket closed"));
+    const threw = await launcher().createSuccessor({ node: { id: "n", runtime: "codex", cwd: "/w" }, departingSessionName: "a@r" });
+    expect(threw).toMatchObject({ ok: false, step: "start_agent", successorLaunched: true, appliedLaunch });
+  });
+
   it("readiness reports attention_required (auth/trust gate) → structured failure, preserved seat NOT killed", async () => {
     checkReady.mockResolvedValue({ ready: false, code: "trust_gate", reason: "trust prompt" });
     const res = await launcher().createSuccessor({ node: { id: "n", runtime: "codex", cwd: "/w" }, departingSessionName: "a@r" });
     expect(res).toMatchObject({ ok: false, step: "start_agent", code: "successor_attention_required" });
+    expect(res).toMatchObject({ replacementStarted: true, successorLaunched: true, tmuxPane: "%7" });
     expect(checkReady).toHaveBeenCalledTimes(1);
     expect(killSession).not.toHaveBeenCalled();
     expect(discoveryRepo.listDiscovered()).toHaveLength(0);
   });
 
-  it("no runtime adapter for the seat's runtime → structured failure, preserved seat NOT killed", async () => {
+  // 0.7.24: with no adapter the launch was refused only after the retiree had ended. It is known before, so it's refused there.
+  it.each(["codex", "synth", null])("no runtime adapter for the seat's runtime (%s) → refused before the retiree is touched", async runtime => {
     const tmux = { createSession, listPanes, killSession, respawnPane, setRemainOnExit, signalPaneProcess, isPaneDead, getDefaultShell, getPaneCommand } as unknown as TmuxAdapter;
     const noAdapter = new SuccessorSessionLauncher(tmux, discoveryRepo, { newId: () => "01ABCDEFG", runtimeAdapters: {}, exitPollMs: 1, exitTimeoutMs: 5 });
-    const res = await noAdapter.createSuccessor({ node: { id: "n", runtime: "codex", cwd: "/w" }, departingSessionName: "a@r" });
-    expect(res).toMatchObject({ ok: false, step: "start_agent", code: "successor_runtime_unsupported" });
+    const onReplacementStarted = vi.fn();
+    const res = await noAdapter.createSuccessor({ node: { id: "n", runtime, cwd: "/w" }, departingSessionName: "a@r", onReplacementStarted });
+    expect(res).toMatchObject({ ok: false, step: "create_successor", code: "successor_runtime_unsupported", replacementStarted: false });
+    expect(setRemainOnExit).not.toHaveBeenCalled();
+    expect(signalPaneProcess).not.toHaveBeenCalled();
+    expect(respawnPane).not.toHaveBeenCalled();
+    expect(onReplacementStarted).not.toHaveBeenCalled();
     expect(killSession).not.toHaveBeenCalled();
     expect(discoveryRepo.listDiscovered()).toHaveLength(0);
+  });
+
+  // 0.7.24: a community harness's adapter is made anew at each lookup, so the launch must use the one its preflight passed.
+  it("launches with exactly the adapter it preflighted, and returns the launch's conversation provenance", async () => {
+    const made: Array<{ preflightLaunch: ReturnType<typeof vi.fn>; launchHarness: ReturnType<typeof vi.fn> }> = [];
+    const runtimeAdapters = {} as Record<string, RuntimeAdapter>;
+    Object.defineProperty(runtimeAdapters, "synth", { enumerable: true, get: () => {
+      const made1 = { runtime: "synth", checkReady, preflightLaunch: vi.fn(async () => ({ ok: true as const })),
+        launchHarness: vi.fn(async () => ({ ok: true, resumeToken: "chat-1", resumeType: "community:synth", resumeProvenance: "launcher" })) };
+      made.push(made1);
+      return made1 as unknown as RuntimeAdapter;
+    } });
+    const tmux = { listPanes, killSession, respawnPane, setRemainOnExit, signalPaneProcess, isPaneDead, getDefaultShell, getPaneCommand } as unknown as TmuxAdapter;
+    const subject = new SuccessorSessionLauncher(tmux, discoveryRepo, { runtimeAdapters, readinessTimeoutMs: 50, sleep: async () => {}, exitPollMs: 1, exitTimeoutMs: 5 });
+    const result = await subject.createSuccessor({ node: { id: "node-1", runtime: "synth", cwd: "/w" }, departingSessionName: "dev-impl@rig" });
+    expect(result).toMatchObject({ ok: true, resumeToken: "chat-1", resumeType: "community:synth", resumeProvenance: "launcher" });
+    const preflighted = made.filter(adapter => adapter.preflightLaunch.mock.calls.length > 0);
+    expect(preflighted).toHaveLength(1);
+    expect(preflighted[0]!.launchHarness).toHaveBeenCalledTimes(1);
+    expect(made.flatMap(adapter => adapter.launchHarness.mock.calls)).toHaveLength(1);
   });
 
   it("respawn-pane failure → structured create_successor failure (no kill, no candidate)", async () => {
@@ -574,6 +903,35 @@ describe("SuccessorSessionLauncher", () => {
       expect(res.ok).toBe(true);
       const [, command] = respawnPane.mock.calls[0]!;
       expect(command).toBe("/bin/sh");
+    });
+  });
+
+  describe("launch_wrapper forwarding", () => {
+    it.each(["codex", "claude-code"])("forwards %s node.launchWrapper on binding for createSuccessor and stageSuccessor", async runtime => {
+      const created = await launcher().createSuccessor({
+        node: { id: "node-1", runtime, cwd: "/w", launchWrapper: ["rtk", "--succ"] },
+        departingSessionName: "dev-impl@rig",
+      });
+      expect(created.ok).toBe(true);
+      expect(launchHarness.mock.calls[0]?.[0]).toMatchObject({
+        nodeId: "node-1",
+        launchWrapper: ["rtk", "--succ"],
+      });
+
+      launchHarness.mockClear();
+      const staged = await launcher().stageSuccessor({
+        node: { id: "node-1", runtime, cwd: "/w", launchWrapper: ["rtk", "--staged"] },
+        canonicalSession: "dev-impl@rig",
+        stagingSession: "openrig-switch-1",
+        occupantGeneration: "gen-1",
+        onPaneCreated: () => {},
+        staged: { prepare: async () => [] },
+      });
+      expect(staged.ok).toBe(true);
+      expect(launchHarness.mock.calls[0]?.[0]).toMatchObject({
+        nodeId: "node-1",
+        launchWrapper: ["rtk", "--staged"],
+      });
     });
   });
 });

@@ -5,6 +5,7 @@
 // colors — the ⧗ info accent uses the RESOLVED D4 info token, see PULSE_INFO_TOKEN).
 import type { Token } from "../theme.js";
 import type { Action } from "../types.js";
+import { columnIndex, columns } from "../visual-layout.js";
 import type { PulseModel, PulseExceptionSection, PulseLane, PulseLaneRow } from "./pulse-model.js";
 
 interface Seg { text: string; token?: Token; bold?: boolean; bg?: Token; inverse?: boolean }
@@ -61,10 +62,6 @@ const COL = [30, 26] as const; // NOW, JUST FINISHED CONTENT widths; UP NEXT tak
 // spaces; the rule row lays it as continuous dashes — same stride (COL[i] + 3).
 const LANE_GUTTER = "   ";
 
-function padEnd(s: string, w: number): string {
-  return s.length >= w ? s.slice(0, w) : s + " ".repeat(w - s.length);
-}
-
 /** The `── NOW (n) ──… JUST FINISHED (n) ──… UP NEXT (n) ──` rule row (dim). */
 export function renderLaneRule(lanes: [PulseLane, PulseLane, PulseLane]): Line {
   const seg = (label: string, count: number, w: number): string => {
@@ -78,22 +75,23 @@ export function renderLaneRule(lanes: [PulseLane, PulseLane, PulseLane]): Line {
 }
 
 function laneCell(row: PulseLaneRow | undefined, w: number): Seg[] {
-  if (!row) return [{ text: padEnd("", w) }];
+  if (!row) return [{ text: " ".repeat(w) }];
   const glyph = `${row.glyph} `;
   const time = row.time ? `${row.time} ` : "";
   // TRUNCATE the (variable) label to the cell budget so a long REAL label never
   // overflows and shoves the next column out of alignment — the mock's fixed
   // three-lane columns are a render contract. A cut is signalled with a trailing
   // "…" (honest truncation, not a silent drop); the full value stays on drill-in.
-  const avail = Math.max(0, w - glyph.length - time.length);
+  const prefixWidth = columns(glyph) + columns(time);
+  const avail = Math.max(0, w - prefixWidth);
   let label = row.label;
-  if (label.length > avail) label = avail > 0 ? label.slice(0, avail - 1) + "…" : "";
+  if (columns(label) > avail) label = avail > 0 ? label.slice(0, columnIndex(label, avail - 1)) + "…" : "";
   const segs: Seg[] = [{ text: glyph, token: row.token }];
   if (row.time) segs.push({ text: time, token: "dim" });
   segs.push({ text: label, token: row.time ? undefined : row.token === "ok" ? "dim" : row.token });
   // pad the cell to its CONTENT width (plain trailing spaces); the inter-column
   // gutter is added by renderLanes so it is guaranteed even when body === w.
-  const pad = w - glyph.length - time.length - label.length;
+  const pad = w - prefixWidth - columns(label);
   if (pad > 0) segs.push({ text: " ".repeat(pad) });
   // SELECTION is PER-CELL (incr-4): a selected lane row accent-bgs only ITS cell,
   // never the whole zipped terminal row (which spans all three lanes) — so the
@@ -149,7 +147,7 @@ export interface PulseLaneTarget {
 export function pulseLaneTargets(model: PulseModel): PulseLaneTarget[] {
   const exceptionLines = model.exceptions.reduce((n, s) => n + renderExceptionSection(s).length, 0);
   // renderPulseView layout: [tabStrip, blank] + exceptions + [blank, laneRule] + laneRows + footer
-  const laneStart = 2 + exceptionLines + 2;
+  const laneStart = 2 + (model.queueSampleNote ? 1 : 0) + exceptionLines + 2;
   const g = LANE_GUTTER.length;
   const starts = [0, COL[0] + g, COL[0] + g + COL[1] + g]; // text col where each lane's cell begins
   const widths = [COL[0], COL[1], UP_NEXT_WIDTH];
@@ -170,6 +168,7 @@ export function renderPulseFooter(f: PulseModel["footer"]): Line {
 /** The whole PULSE view (increment 1: static from demoPulseModel). REUSABLE parts above. */
 export function renderPulseView(model: PulseModel): Line[] {
   const out: Line[] = [renderPulseTabStrip(), { text: "" }];
+  if (model.queueSampleNote) out.push(line([{ text: model.queueSampleNote, token: "dim" }]));
   // EMPTY section is omitted entirely by the model (empty-strip-is-silence); we
   // render exactly the sections present.
   for (const section of model.exceptions) out.push(...renderExceptionSection(section));

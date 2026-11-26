@@ -10,6 +10,7 @@ import { migrate } from "../src/db/migrate.js";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
+import { runStuckSweep } from "../src/domain/queue-stuck-sweep.js";
 import { SLACK_SECTION_CAP, SLACK_TEXT_CAP, splitForSlack, escapeSlackText } from "../src/domain/gateway/slack/message.js";
 import { MAX_HUMAN_MESSAGE_PARTS, subsystemSlackDeliver } from "../src/domain/gateway/slack/slack-delivery.js";
 import { SeenStore } from "../src/domain/gateway/slack/state-store.js";
@@ -21,7 +22,7 @@ import type { OutboundDecision } from "../src/domain/gateway/protocol.js";
 import type { FetchImpl } from "../src/domain/gateway/slack/slack-api.js";
 
 const registry = { ok: true as const, entities: [{ entityId: "human-founder", class: "human" as const, displayName: "Founder", address: "human-founder@external", connectorBindings: [{ kind: "slack" as const, connectorRef: "primary", secretsRef: "env:SLACK_BOT_TOKEN", role: "primary" as const, handle: "UFOUNDER" }], prefs: { deliveryClass: "A" as const } }] };
-const request = { sourceSession: "author@rig", destinationSession: "human-founder@external", summary: "Approve the rollout plan?", evidenceRef: "/private/retained-proof.md", nudge: false };
+const request = { humanAlert: true, sourceSession: "author@rig", destinationSession: "human-founder@external", summary: "Approve the rollout plan?", evidenceRef: "/private/retained-proof.md", nudge: false };
 const reply = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
 const unescape = (s: string) => s.replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&amp;", "&");
 const NOTE = "\n\nThe rest of this brief follows in this thread.";
@@ -69,7 +70,7 @@ describe("long human asks (#897)", () => {
     expect(posts.slice(1).some((p) => p.blocks.some((b) => b.type === "actions"))).toBe(false);
     posts.slice(1).forEach((p, i) => expect(p.text).toContain(`Continued (${i + 2} of ${posts.length})`));
     // Joined back, the parts are the whole brief.
-    const bodies = posts.map((p) => unescape(p.blocks[1]!.text!.text));
+    const bodies = posts.map((p) => unescape(p.blocks[2]!.text!.text));
     expect(bodies[0]!.endsWith(NOTE)).toBe(true);
     expect([bodies[0]!.slice(0, -NOTE.length), ...bodies.slice(1)].join("")).toBe(longBody);
     expect(onPosted).toHaveBeenCalledOnce();
@@ -91,9 +92,9 @@ describe("long human asks (#897)", () => {
     expect(await deliver(decision("detail", { body: "Approve or hold?", humanDetail: detail }))).toEqual({ ok: true });
     expect(posts.length).toBeGreaterThan(2);
     // The brief fits, so the primary keeps the usual note.
-    expect(unescape(posts[0]!.blocks[1]!.text!.text)).toBe("Approve or hold?\n\nSupplemental detail follows in this thread.");
+    expect(unescape(posts[0]!.blocks[2]!.text!.text)).toBe("Approve or hold?\n\nSupplemental detail follows in this thread.");
     expect(posts[1]!.text).toContain(`Supplemental detail (1 of ${posts.length - 1})`);
-    const pieces = posts.slice(1).map((p) => unescape(p.blocks[1]!.text!.text)).join("");
+    const pieces = posts.slice(1).map((p) => unescape(p.blocks[2]!.text!.text)).join("");
     expect(pieces).toBe(detail.trimEnd());
   });
 
@@ -135,7 +136,7 @@ describe("long human asks (#897)", () => {
     mention = "U0123456789";
     expect(await subsystemSlackDeliver(opts)(ask)).toEqual({ ok: true });
     // Joined back in posting order, the parts are the whole brief: nothing lost, nothing repeated.
-    const bodies = posted.map((p) => unescape(p.blocks[1]!.text!.text));
+    const bodies = posted.map((p) => unescape(p.blocks[2]!.text!.text));
     expect(bodies[0]!.endsWith(NOTE)).toBe(true);
     expect([bodies[0]!.slice(0, -NOTE.length), ...bodies.slice(1)].join("")).toBe(longBody);
   });
@@ -179,7 +180,7 @@ describe("long human asks (#897)", () => {
     mention = after;
     expect(await subsystemSlackDeliver(opts)(ask)).toEqual({ ok: true });
     // Joined back in posting order, what posted is the whole brief once, as one message or as a split.
-    const bodies = posted.map((p) => unescape(p.blocks[1]!.text!.text));
+    const bodies = posted.map((p) => unescape(p.blocks[2]!.text!.text));
     const first = bodies[0]!.endsWith(NOTE) ? bodies[0]!.slice(0, -NOTE.length) : bodies[0]!;
     expect([first, ...bodies.slice(1)].join("")).toBe(body);
   });
@@ -205,7 +206,7 @@ describe("long human asks (#897)", () => {
     expect(await subsystemSlackDeliver(opts)(ask)).toEqual({ ok: true });
     expect(posted).toHaveLength(1);
     expect(posted[0]!.text).not.toContain("<@U0123456789>");
-    expect(unescape(posted[0]!.blocks[1]!.text!.text)).toBe(body);
+    expect(unescape(posted[0]!.blocks[2]!.text!.text)).toBe(body);
   });
 
   /** An ask from no seat, which is signed with the configured sender label, at the longest brief that fits
@@ -239,7 +240,7 @@ describe("long human asks (#897)", () => {
     expect((await subsystemSlackDeliver({ ...base, sourceLabel: "fixture" })(ask(body))).ok).toBe(false);
     // The label grows by more than ten characters before the retry.
     expect(await subsystemSlackDeliver({ ...base, sourceLabel: "fixture-0123456789" })(ask(body))).toEqual({ ok: true });
-    const bodies = posted.map((p) => unescape(p.blocks[1]!.text!.text));
+    const bodies = posted.map((p) => unescape(p.blocks[2]!.text!.text));
     expect(bodies.length).toBeGreaterThan(1);
     expect(bodies[0]!.endsWith(NOTE)).toBe(true);
     expect([bodies[0]!.slice(0, -NOTE.length), ...bodies.slice(1)].join("")).toBe(body);
@@ -437,7 +438,7 @@ describe("long human asks (#897)", () => {
     expect(posted).toHaveLength(1);
     expect(await subsystemSlackDeliver({ ...base, sourceLabel: "fixture-0123456789" })(ask)).toEqual({ ok: true });
     // Joined back in posting order, the parts are the whole brief: nothing lost, nothing repeated.
-    const bodies = posted.map((p) => unescape(p.blocks[1]!.text!.text));
+    const bodies = posted.map((p) => unescape(p.blocks[2]!.text!.text));
     expect(bodies).toHaveLength(2);
     expect(bodies[0]!.endsWith(NOTE)).toBe(true);
     expect([bodies[0]!.slice(0, -NOTE.length), ...bodies.slice(1)].join("")).toBe(brief);
@@ -503,9 +504,35 @@ describe("long human asks (#897)", () => {
       expect(notice.body).toMatch(/maximum 20/);
       expect(repo.list({ destinationSession: "author@rig" }).filter((q) => q.qitemId.endsWith("-undeliverable"))).toHaveLength(1);
       expect(fetchImpl.mock.calls.filter(([url]) => url.endsWith("chat.postMessage"))).toHaveLength(0);
+      const swept = await runStuckSweep({ db, queueRepo: repo, resolveOrchestrator: () => null,
+        unclaimedAgeMinutes: 60, isRegisteredHost: () => false });
+      expect(swept.outcome).not.toBe("failed");
+      expect(swept.findings).toContainEqual(expect.objectContaining({ qitemId: item.qitemId,
+        findingQitemId: notice.qitemId, action: "refreshed" }));
+      expect(repo.list({ destinationSession: request.sourceSession }).filter((q) => q.tags.includes("stuck-sweep-finding"))).toHaveLength(0);
     } finally {
       wire.stop();
       db.close();
     }
+  });
+
+  it("#1013 — a parked workflow gate's supplemental detail posts in full; only the agent packet is replaced", async () => {
+    const posts: Post[] = [];
+    const deliver = subsystemSlackDeliver({ ...stores("gate-detail"), botToken: "synthetic", channel: "C", sourceLabel: "fixture", fetchImpl: recorder(posts) });
+    expect(await deliver(decision("gate-detail", {
+      summary: "Approve the plan at https://example.invalid/plan.md",
+      body: "### Workflow gate: mission@1 step plan_signoff\n\nWorkflow instance: 01M4EXAMPLE\nContinuation: rig workflow project --instance 01M4EXAMPLE",
+      state: "blocked",
+      tags: ["workflow", "gate"],
+      humanDetail: "Please sign off by Friday; the signed plan is retained at /srv/rig/plan.md.",
+    }))).toEqual({ ok: true });
+    const primary = posts[0]!;
+    const detail = posts.find((p) => p.text.includes("Supplemental detail"))!;
+    // The primary renders the gate's question (plus its local-path Evidence line), never the packet.
+    expect(primary.text).toContain("*Approve the plan at https://example.invalid/plan.md*");
+    expect(JSON.stringify(primary.blocks)).not.toContain("Workflow instance:");
+    // The supplemental thread reply keeps its full body — the gate check must not eat it.
+    expect(detail.thread_ts).toBeTruthy();
+    expect(unescape(detail.blocks[2]!.text!.text)).toContain("Please sign off by Friday");
   });
 });

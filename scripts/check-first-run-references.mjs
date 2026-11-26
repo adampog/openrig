@@ -25,9 +25,12 @@ export const SCOPE = [
   { file: `${RIGS}/launch/factory/guidance/lead-first-move.md`, team: "factory" },
   { file: `${RIGS}/launch/factory/guidance/advisor-role.md`, team: "factory" },
   { file: "docs/reference/getting-started.md" },
+  { file: "docs/reference/quickstart.md" },
   { file: "packages/cli/src/commands/setup.ts", function: "goldenPathNextSteps" },
   { file: "packages/daemon/assets/onboarding/01-world-and-purpose.md" },
   { file: "packages/daemon/assets/onboarding/02-self-and-competent-action.md" },
+  // The installer procedure moved out of onboarding 02 into the rigs skill's reference (issue #3228); its commands stay checked.
+  { file: "packages/daemon/assets/skills/rigs/references/installing-for-someone.md" },
 ];
 
 // Not a builtin alias or an existence assertion. External bundles need their own
@@ -179,7 +182,7 @@ export async function loadAuthorities(root) {
   if (!entries.length) throw new Error(`empty builtin rig library: ${RIGS}`);
   const skills = new Map();
   for (const dir of SKILL_ROOTS) {
-    for (const file of walk(path.join(root, dir)).filter((p) => p.endsWith("/SKILL.md"))) {
+    for (const file of walk(path.join(root, dir)).filter((p) => path.basename(p) === "SKILL.md")) {
       skills.set(path.basename(path.dirname(file)), path.relative(root, file));
     }
   }

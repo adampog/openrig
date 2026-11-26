@@ -5,6 +5,8 @@
 //   gateway-routable  → the gateway subsystem owns delivery (the queue row is
 //                       its input; its ledger is the delivery record; tmux is
 //                       never consulted — it can never hold these addresses)
+//   hosted            → a hosted member (an outside tool on the team) whose
+//                       authored roster entry declares a trigger: the wake rings it
 //   unroutable        → an honest structured teaching refusal; tmux is never
 //                       consulted for an address it can never hold
 //
@@ -29,13 +31,21 @@
 //      (canonical-form aliases like human-founder@kernel — the live 4-row
 //      specimen class) is gateway-routable: a PANELLESS virtual identity whose
 //      delivery rides the gateway, exactly like its @external address.
-//   4. Anything else is unroutable, with teaching that names BOTH checks.
+//   4. A hosted member whose roster entry declares a trigger is hosted. One with no
+//      trigger stays unroutable, so its person is told; its teaching says it picks up its
+//      work when its person asks it to or on a schedule they set, not to fix the address.
+//   5. An address OpenRig issued to a person's own conversation (#3964's issued return route) stays unroutable: nothing
+//      pushes work to it. Its teaching says the work waits for the conversation's own read, as a hosted member's does.
+//   6. Anything else is unroutable, with teaching that names BOTH checks.
 import { parseSessionName } from "../session-name.js";
+import { describeCheckIn, type MemberCheckIn } from "../connection-contract.js";
+import type { RosterWake } from "../rosters.js";
 import { resolveRegisteredHumanAddress, type HumanFragment } from "./human-registry.js";
 
 export type DestinationClass =
   | { class: "pane-bound" }
   | { class: "gateway-routable"; resolvedHuman: string | null; via: "external-address" | "registry-alias" }
+  | { class: "hosted"; wake: RosterWake }
   | { class: "unroutable"; teaching: string };
 
 export interface ClassifyDeps {
@@ -44,6 +54,21 @@ export interface ClassifyDeps {
   entities: readonly HumanFragment[] | null;
   /** Does this daemon have an explicit terminal transport for the destination? */
   hasTerminalTransport: (destination: string) => boolean;
+  /** The trigger a hosted member's roster entry declares, when it declares one. */
+  hostedWake?: (destination: string) => RosterWake | null;
+  /** Whether a roster lists the destination as a hosted member, trigger or not. */
+  isHostedMember?: (destination: string) => boolean;
+  /** The existing roster/inbox check-in reading used by the team view. */
+  hostedCheckIn?: (destination: string) => MemberCheckIn;
+  /** Whether OpenRig issued this address to a person's own conversation (return-route.ts). */
+  isIssuedConversation?: (destination: string) => boolean;
+}
+
+/** Whether a recorded wake result says no transport could take the wake: an address nothing holds (`unroutable:`), or a
+ *  hosted member with no wake trigger or a conversation address OpenRig issued, whose work waits until it reads its queue
+ *  (`awaiting-pickup:`). Every reader of a recorded no-route result reads both the same way. */
+export function recordsNoWakeRoute(recorded: string | null | undefined): boolean {
+  return !!recorded && (recorded.startsWith("unroutable:") || recorded.startsWith("awaiting-pickup:"));
 }
 
 export function classifyDestination(destination: string, deps: ClassifyDeps): DestinationClass {
@@ -58,6 +83,32 @@ export function classifyDestination(destination: string, deps: ClassifyDeps): De
   const aliasResolved = deps.entities ? resolveRegisteredHumanAddress(destination, deps.entities) : null;
   if (aliasResolved) {
     return { class: "gateway-routable", resolvedHuman: aliasResolved, via: "registry-alias" };
+  }
+  const wake = deps.hostedWake?.(destination) ?? null;
+  if (wake) return { class: "hosted", wake };
+  if (deps.isHostedMember?.(destination)) {
+    // The member reads this teaching too: the address is right, and it isn't a person to register. A requester's
+    // assistant repeats it, so it says the work waits, not that it can't be delivered.
+    const checkIn = deps.hostedCheckIn?.(destination);
+    if (checkIn && (checkIn.expectedMinutes !== null || checkIn.onRequest)) {
+      const cadence = checkIn.status === "checking-in"
+        ? `has been checking in about every ${checkIn.expectedMinutes} min`
+        : `reports ${describeCheckIn(checkIn)}`;
+      return { class: "unroutable", teaching: `awaiting-pickup: '${destination}' is a hosted member that ${cadence}. ` +
+        "No wake is sent; this request waits in its queue for its next inbox read." };
+    }
+    return {
+      class: "unroutable",
+      teaching: `awaiting-pickup: '${destination}' is a hosted member with no wake trigger, so no wake is sent. The work waits ` +
+        `in its queue until the member reads it: when its person asks it to, on a schedule they set, or through a local seat connected to it.`,
+    };
+  }
+  if (deps.isIssuedConversation?.(destination)) {
+    // The seat that sent the work reads this, and repeats it to the person: the address is right, and OpenRig can't see the
+    // conversation's reads, so it says the work waits there, never that it was delivered or that it can't be.
+    return { class: "unroutable", teaching: `awaiting-pickup: '${destination}' is an address OpenRig issued to a person's own conversation ` +
+      "(Claude Code or Codex, not a seat), so no wake is sent. The work waits there until that conversation reads it, through the " +
+      "openrig plugin's hooks or its own check; its claim is the only sign it was picked up." };
   }
   return {
     class: "unroutable",

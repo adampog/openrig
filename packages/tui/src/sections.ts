@@ -17,6 +17,11 @@ export const SECTION_REGISTRY: readonly SectionDef[] = [
     sourceRead: "GET /api/scopes/projects + project-scoped scopes, execution and slice projections",
     drillShape: "project>mission>execution-row>slice/source",
   },
+  {
+    name: "fleet",
+    sourceRead: "GET /api/scopes/fleet (existing scopes counts read per host) + /api/scopes/slice via the read-through for a fleet slice's detail",
+    drillShape: "host>mission>slice",
+  },
   { name: "terminals", sourceRead: "GET /api/terminal/views?detail=1 + /api/terminal/preview (passive)", drillShape: "saved/derived>view>page" },
   {
     name: "needs",
@@ -26,7 +31,10 @@ export const SECTION_REGISTRY: readonly SectionDef[] = [
   { name: "system", sourceRead: "GET /api/health (canonical instance findings)", drillShape: "health/configuration/connections" },
   { name: "config", sourceRead: "GET /healthz + /api/config?view=browser + /api/gateway/connections (passive)", drillShape: "category>setting" },
   { name: "connections", sourceRead: "GET /healthz + /api/gateway/connections (passive projection)", drillShape: "instance>human/routes>work" },
+  { name: "usage", sourceRead: "GET /api/provider/status (memory-only read; never the refresh) + /api/config?view=browser only when usage is absent", drillShape: "provider>allowance>window; seats" },
+  { name: "usage-hosts", sourceRead: "GET /api/provider/usage/hosts (memory-only reads here and on each registered host; never the refresh)", drillShape: "hosts; allowance>host>window; seats per host" },
+  { name: "cost", sourceRead: "GET /api/telemetry/usage/cost (the daemon's stored usage samples; starts no lookup)", drillShape: "seats" },
 ];
 
 /** Display grouping only; compatible configuration/connection coordinates remain. */
-export const SYSTEM_SECTIONS = ["system", "config", "connections"];
+export const SYSTEM_SECTIONS = ["system", "config", "connections", "usage", "usage-hosts", "cost"];

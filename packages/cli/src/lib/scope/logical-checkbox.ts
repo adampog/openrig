@@ -36,6 +36,13 @@ export interface LogicalCheckboxItem {
 
 const CHECKBOX_LINE = /^(\s*)-?\s*\[(\s|x|X)\]\s+(.+)$/;
 
+// Markdown tabs advance to the next four-column stop.
+function columns(prefix: string): number {
+  let column = 0;
+  for (const char of prefix) column += char === "\t" ? 4 - column % 4 : 1;
+  return column;
+}
+
 /** Parse an authored checkbox block into logical items.
  *
  *  Continuation eligibility (pinned by test): a line is a continuation of the
@@ -44,9 +51,11 @@ const CHECKBOX_LINE = /^(\s*)-?\s*\[(\s|x|X)\]\s+(.+)$/;
  *  blank line, or same/shallower prose terminates the item. */
 export function parseLogicalCheckboxes(block: string | null): LogicalCheckboxItem[] {
   if (!block) return [];
-  const lines = block.split("\n");
+  const lines = block.split(/\r?\n/);
   const out: LogicalCheckboxItem[] = [];
-  let current: { checked: boolean; parts: string[]; indent: number; sourceLine: number } | null = null;
+  let comment = false;
+  let fence: { marker: string; length: number } | null = null;
+  let current: { checked: boolean; parts: string[]; indent: number; contentColumn: number; sourceLine: number } | null = null;
 
   const flush = () => {
     if (!current) return;
@@ -56,6 +65,26 @@ export function parseLogicalCheckboxes(block: string | null): LogicalCheckboxIte
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
+    const opener = !fence && !comment && /^([ \t]*)<!--/.exec(line);
+    const column = opener ? columns(opener[1]!) : -1;
+    const inList = current && column >= current.contentColumn && column < current.contentColumn + 4;
+    if (comment || (opener && (column < 4 || inList))) {
+      if (opener && current && opener[1]!.length <= current.indent) flush();
+      comment = !line.includes("-->");
+      continue;
+    }
+    // Fenced examples do not declare proof items or shift evidence indexes.
+    const marker = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (fence) {
+      if (marker && marker[1]![0] === fence.marker && marker[1]!.length >= fence.length
+        && /^[ \t]*$/.test(marker[2]!)) fence = null;
+      continue;
+    }
+    if (marker && (marker[1]![0] !== "`" || !marker[2]!.includes("`"))) {
+      flush();
+      fence = { marker: marker[1]![0]!, length: marker[1]!.length };
+      continue;
+    }
     const m = line.match(CHECKBOX_LINE);
     if (m) {
       flush();
@@ -63,6 +92,7 @@ export function parseLogicalCheckboxes(block: string | null): LogicalCheckboxIte
         checked: m[2]!.toLowerCase() === "x",
         parts: [m[3]!.trim()],
         indent: m[1]!.length,
+        contentColumn: columns(line.slice(0, line.indexOf("["))),
         sourceLine: i + 1,
       };
       continue;

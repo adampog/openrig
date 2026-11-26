@@ -7,7 +7,7 @@ import { dirname, join, resolve } from "node:path";
 
 const GENERATOR = resolve("packages/daemon/scripts/gen-control-plane-json.mjs");
 const MIRROR = resolve("scripts/mirror-skills.mjs");
-const NAMES = ["product-public-skills", "internal-tokens", "skill-edge-layout"];
+const NAMES = ["product-public-skills", "skill-edge-layout"];
 
 test("regeneration preserves product policy bytes in place and when exporting", () => {
   withFixture(({ root, policyBytes }) => {
@@ -35,12 +35,14 @@ test("legacy YAML inputs refuse with product pointers before changing policy fil
     for (const name of NAMES) {
       assert.deepEqual(readFileSync(join(root, "scripts", `${name}.generated.json`)), policyBytes[name]);
     }
-    for (const [index, flag] of ["membership", "denylist", "layout"].entries()) {
+    // The leak guard's term lists left the repository: a denylist override points at their local file instead.
+    for (const [flag, named] of [["membership", "product-public-skills.generated.json"], ["denylist", "OPENRIG_LEAK_GUARD_RULES"],
+      ["layout", "skill-edge-layout.generated.json"]]) {
       const single = run(GENERATOR, root, [
         "--repo-root", root, "--output", join(root, "scripts"), `--${flag}`, legacy[flag],
       ]);
       assert.notEqual(single.status, 0);
-      assert.ok(single.stderr.includes(`${NAMES[index]}.generated.json`), single.stderr);
+      assert.ok(single.stderr.includes(named), single.stderr);
       for (const name of NAMES) {
         assert.deepEqual(readFileSync(join(root, "scripts", `${name}.generated.json`)), policyBytes[name]);
       }
@@ -48,13 +50,13 @@ test("legacy YAML inputs refuse with product pointers before changing policy fil
   });
 });
 
-test("authoring apply uses product policy despite conflicting legacy YAML environment", () => {
+test("authoring apply uses product policy and in-repo sources despite legacy YAML and external canon environment", () => {
   withFixture(({ root, legacy, policyBytes }) => {
     const script = join(root, "packages/daemon/scripts/gen-control-plane-json.mjs");
     mkdirSync(dirname(script), { recursive: true });
     // Forward the real invocation: a symlink would defeat the generator's main-module check.
     write(script, `import { spawnSync } from "node:child_process";\nconst r = spawnSync(process.execPath, [${JSON.stringify(GENERATOR)}, ...process.argv.slice(2)], { stdio: "inherit" });\nprocess.exitCode = r.status ?? 1;\n`);
-    write(join(root, "canon/alpha/SKILL.md"), "# Alpha from authoring source\n");
+    write(join(root, "canon/alpha/SKILL.md"), "# Alpha from an outside canon\n");
     const result = run(MIRROR, root, [], {
       OPENRIG_SKILL_CANON_ROOT: join(root, "canon"),
       OPENRIG_PRODUCT_PUBLIC_SKILLS_YAML: legacy.membership,
@@ -62,10 +64,27 @@ test("authoring apply uses product policy despite conflicting legacy YAML enviro
       OPENRIG_SKILL_EDGE_LAYOUT_YAML: legacy.layout,
     });
     assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /OPENRIG_SKILL_CANON_ROOT is ignored/);
     for (const name of NAMES) {
       assert.deepEqual(readFileSync(join(root, "scripts", `${name}.generated.json`)), policyBytes[name]);
     }
-    assert.equal(readFileSync(join(root, "plugin/alpha/SKILL.md"), "utf8"), "# Alpha from authoring source\n");
+    assert.equal(readFileSync(join(root, "plugin/alpha/SKILL.md"), "utf8"), "# Original alpha\n");
+  });
+});
+
+test("authoring apply regenerates from in-repo sources with no external authoring variables", () => {
+  withFixture(({ root }) => {
+    const script = join(root, "packages/daemon/scripts/gen-control-plane-json.mjs");
+    mkdirSync(dirname(script), { recursive: true });
+    write(script, `import { spawnSync } from "node:child_process";\nconst r = spawnSync(process.execPath, [${JSON.stringify(GENERATOR)}, ...process.argv.slice(2)], { stdio: "inherit" });\nprocess.exitCode = r.status ?? 1;\n`);
+    const env = { ...process.env };
+    delete env.OPENRIG_SKILL_CANON_ROOT;
+    const result = spawnSync(process.execPath, [MIRROR], { cwd: root, encoding: "utf8", env });
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stderr, /OPENRIG_SKILL_CANON_ROOT/);
+    assert.equal(readFileSync(join(root, "plugin/alpha/SKILL.md"), "utf8"), "# Original alpha\n");
+    const check = spawnSync(process.execPath, [MIRROR, "--check"], { cwd: root, encoding: "utf8", env });
+    assert.equal(check.status, 0, check.stderr);
   });
 });
 
@@ -88,7 +107,7 @@ function withFixture(check) {
   };
   const layout = { version: 0, edges, skills: { alpha: { edges: ["plugin"], category: null } } };
   const policyBytes = {};
-  for (const [i, data] of [membership, rules, layout].entries()) {
+  for (const [i, data] of [membership, layout].entries()) {
     // Deliberately nonstandard formatting must survive a refresh byte for byte.
     policyBytes[NAMES[i]] = Buffer.from(JSON.stringify(data, null, 4) + "\n\n");
     write(join(root, "scripts", `${NAMES[i]}.generated.json`), policyBytes[NAMES[i]]);

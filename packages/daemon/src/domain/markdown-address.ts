@@ -103,13 +103,25 @@ interface HeaderScan {
   unterminatedFenceLine: number | null;
 }
 
-/** Scan for real headers, skipping fenced code blocks (``` or ~~~, any info string;
+/** Scan for real headers, skipping HTML comment blocks and fenced code blocks (``` or ~~~, any info string;
  *  a fence closes only on the same marker at the same or greater length). */
 function scanHeaders(lines: string[]): HeaderScan {
   const hits: HeaderHit[] = [];
   let fence: { marker: string; length: number; line: number } | null = null;
+  let comment = false;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
+    // HTML comment blocks end on the line containing --> (or at EOF). Their
+    // headings and fences are literal content, just as comment markers inside
+    // a fenced code block are literal content. Keep the original span bytes.
+    if (comment) {
+      if (line.includes("-->")) comment = false;
+      continue;
+    }
+    if (!fence && /^ {0,3}<!--/.test(line)) {
+      comment = !line.includes("-->");
+      continue;
+    }
     const fenceMatch = line.match(/^\s{0,3}(`{3,}|~{3,})/);
     if (fenceMatch) {
       const marker = fenceMatch[1]![0]!;
@@ -127,10 +139,27 @@ function scanHeaders(lines: string[]): HeaderScan {
     }
     if (fence) continue;
     // Empty ATX headings still end spans and change the parent scope.
-    const header = line.match(/^ {0,3}(#{1,6})(?:\s+(.*\S))?\s*$/);
-    if (header) hits.push({ level: header[1]!.length, title: header[2] ?? "", line: i });
+    const header = atxHeading(line);
+    if (header) hits.push({ ...header, line: i });
   }
   return { hits, unterminatedFenceLine: fence?.line ?? null };
+}
+
+const LINE_BREAK_IN_TITLE = /[\r\u2028\u2029]/;
+
+/** An ATX heading's level and title, or null: up to three spaces, one to six `#`, then whitespace or the line's end; the
+ *  title is the rest, trimmed, and holds no line break (`# a\rb` isn't a heading, `# a\r` is "a"). A linear scan: the
+ *  regex it replaces, `/^ {0,3}(#{1,6})(?:\s+(.*\S))?\s*$/`, backtracked polynomially on a long whitespace run. */
+function atxHeading(line: string): { level: number; title: string } | null {
+  let start = 0;
+  while (start < 3 && line[start] === " ") start++;
+  let level = 0;
+  while (line[start + level] === "#") level++;
+  if (level < 1 || level > 6) return null;
+  const rest = line.slice(start + level);
+  if (rest !== "" && !/^\s/.test(rest)) return null;
+  const title = rest.trim();
+  return LINE_BREAK_IN_TITLE.test(title) ? null : { level, title };
 }
 
 /** Parse the addressable H2/H3 section tree of a markdown text.
@@ -141,6 +170,16 @@ function scanHeaders(lines: string[]): HeaderScan {
 export function parseMarkdownSections(text: string): MarkdownSection[] {
   const lines = text.split("\n");
   const { hits: headers } = scanHeaders(lines);
+  // Resolve all section ends in one backwards pass. Copying the remaining
+  // header array for every section makes even sibling-only documents quadratic.
+  const fullEnds: number[] = [];
+  const following: HeaderHit[] = [];
+  for (let idx = headers.length - 1; idx >= 0; idx--) {
+    const header = headers[idx]!;
+    while (following.length && following[following.length - 1]!.level > header.level) following.pop();
+    fullEnds[idx] = following[following.length - 1]?.line ?? lines.length;
+    following.push(header);
+  }
   const sections: MarkdownSection[] = [];
   let currentH2: string | null = null;
   for (let idx = 0; idx < headers.length; idx++) {
@@ -157,7 +196,7 @@ export function parseMarkdownSections(text: string): MarkdownSection[] {
     // instead of being silently promoted to top-level addresses.
     const headerPath = h.level === 2 ? [slug] : currentH2 !== null ? [currentH2, slug] : [slug];
     // FULL span: to the next header with level <= this one (same-or-higher).
-    const fullEnd = headers.slice(idx + 1).find((n) => n.level <= h.level)?.line ?? lines.length;
+    const fullEnd = fullEnds[idx]!;
     // OWN text: to the next header of ANY level.
     const ownEnd = headers[idx + 1]?.line ?? lines.length;
     sections.push({

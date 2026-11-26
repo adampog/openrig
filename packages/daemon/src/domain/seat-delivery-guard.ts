@@ -1,5 +1,9 @@
+import { inputReadDiagnostic, type InputReadDiagnostic } from "./input-read-diagnostic.js";
+import { hasOtherSeatHistory, isStoppedSeatPredecessor, resolveCurrentSessionAddress } from "./session-registry.js";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
+import { COMPOSER_COLLAPSED_PASTE_PATTERN, composerPasteUncertainty, composerContainsOwnedText, ownCollapsedPaste, type ComposerInput, type ComposerOwnership } from "./composer-prompts.js";
 
 /** A binding is captured before waiting. Never rebind an old operation to a new occupant. */
 export interface GuardTarget {
@@ -12,12 +16,23 @@ export interface GuardTarget {
 interface Lease {
   target: GuardTarget;
   active: boolean;
-  origin: "automatic" | "human";
+  serialOwner?: Lease;
+  origin: "automatic" | "human" | "custody";
   lifecycle?: boolean;
+  freshLifecyclePane?: string;
+  config?: TypingGuardConfig;
+  humanEpoch: number;
+  inputFrame?: string;
+  /** `pastedAt`: when notePasted saw the paste go in (epoch ms). */
+  staged?: { text: string; collapsedPaste: string | null; pastedAt?: number };
+  /** #2429: the delivery's own check found the paste this guard left unsubmitted, then the adapter submitted it. */
+  ownLeftover?: "recognized" | "submitted";
+  /** A lifecycle lease at queue-only: each write is checked as draft-aware, without draft-aware's lifecycle refusal. */
+  queueOnlyLifecycle?: boolean;
 }
 
 export class DeliveryGuardError extends Error {
-  constructor(readonly code: string, message: string) { super(message); }
+  constructor(readonly code: string, message: string, readonly inputReadFailure?: InputReadDiagnostic) { super(message); }
 
   // Hono's error protocol also preserves this typed refusal on lifecycle routes.
   getResponse(): Response {
@@ -30,6 +45,101 @@ export interface GuardPreference {
   desired: boolean;
   effective: boolean;
   pending: boolean;
+  desiredMode: TypingGuardMode;
+  effectiveMode: TypingGuardMode;
+  /** The interruption level, where one is set (or a terminal member's default); absent means the mode alone decides. */
+  desiredLevel?: InterruptionLevel;
+  effectiveLevel?: InterruptionLevel;
+}
+
+export const TYPING_GUARD_MODES = ["off", "draft-aware", "hold"] as const;
+export type TypingGuardMode = (typeof TYPING_GUARD_MODES)[number];
+/** The middle interruption levels, and a terminal member's default. `off` is always interrupt and `hold` is full quiet;
+ *  these sit between, deciding by the input's source and urgency. `queue-only` is for a seat a person types in: deliberate
+ *  sends type draft-aware, and OpenRig's own notices never type (#3076). */
+export const INTERRUPTION_LEVELS = ["openrig-urgent", "urgent-only", "sends-only", "queue-only"] as const;
+export type InterruptionLevel = (typeof INTERRUPTION_LEVELS)[number];
+export interface TypingGuardSettings { mode: TypingGuardMode; level?: InterruptionLevel }
+export interface TypingGuardConfig extends TypingGuardSettings { revision: string }
+const DEFAULT_GUARD: TypingGuardConfig = { mode: "off", revision: "legacy-off" };
+/** How long the guard waits before reading again an input it couldn't read right after its own paste or Enter (#2429). */
+const OWN_INPUT_REREAD_MS = 300;
+/** How long the guard keeps re-reading its own paste before refusing the Enter: the life of the `paste again to expand`
+ *  hint that replaces Claude's mode bar after a large paste (Claude Code's own timer clears it 8 s later). A notice the
+ *  reader doesn't know beside the hint leaves the input unreadable until then (#2429). */
+const OWN_PASTE_REREAD_LIMIT_MS = 8000;
+/** Right before an automatic paste, the empty input is read once more after this wait: a draft typed (or redrawn by the
+ *  agent's TUI) since the first read is seen before the paste, not after it, where nothing is removed (#2447, #3076). */
+const PASTE_SETTLE_MS = 300;
+/** Recent activity at a writable tmux client of the seat (keys, but also other client input; session-wide, not proof of
+ *  typing in this pane) holds the paste: a later attempt can deliver once it reads quiet and the input empty. tmux
+ *  reports client activity in whole seconds, so this is three of them (#3076). */
+const INPUT_QUIET_MS = 3000;
+/** tmux's client_activity is in whole seconds; the activity may have come up to this much after the second it reports. */
+const CLIENT_ACTIVITY_PRECISION_MS = 999;
+/** A terminal member with nothing set holds OpenRig's own notices and takes deliberate sends. */
+const TERMINAL_DEFAULT: TypingGuardConfig = { mode: "off", level: "sends-only", revision: "terminal-default" };
+/** The actor a guard change records when its request carries no seat identity, as from an ordinary terminal (#2350).
+ *  An explicit value, never a seat name: nothing derives an identity in its place. */
+export const UNATTRIBUTED_GUARD_ACTOR = "unattributed (no seat identity)";
+
+/** What automatic input is, for the level: OpenRig's own (a watchdog, a scheduler wake, a notice) or anyone else's. */
+export interface AdmissionInput { source: "openrig" | "agent"; urgent: boolean; override?: boolean }
+
+/** Whether a level lets this input type. Every other input at the seat is held, never refused or lost. */
+export function levelAdmits(level: InterruptionLevel, input: AdmissionInput): boolean {
+  // queue-only decides before urgency: OpenRig's own notice never types there, urgent ones included (no hidden urgent
+  // bypass). It is held with its urgency, or reaches the seat as a queue row (#3076).
+  if (level === "queue-only") return input.source === "agent";
+  if (input.urgent) return true;
+  if (level === "openrig-urgent") return input.source === "openrig";
+  if (level === "sends-only") return input.source === "agent";
+  return false;
+}
+
+export function parseTypingGuardSettings(value: unknown): TypingGuardSettings {
+  const input = typeof value === "boolean" ? { mode: value ? "hold" : "off" } : value;
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new DeliveryGuardError("invalid_typing_guard", "Supply an enabled boolean or a typing-guard mode.");
+  const config = input as Record<string, unknown>;
+  // A level is set as a mode name and stored with the coarse mode older daemons understand: `hold` for the middle
+  // levels (an older daemon holds everything there, never typing what the level would hold), `off` for sends-only.
+  if ((INTERRUPTION_LEVELS as readonly unknown[]).includes(config.mode)) {
+    const level = config.mode as InterruptionLevel;
+    return { mode: level === "sends-only" ? "off" : "hold", level };
+  }
+  if (!(TYPING_GUARD_MODES as readonly unknown[]).includes(config.mode)) {
+    throw new DeliveryGuardError("invalid_typing_guard", "mode must be off, draft-aware, openrig-urgent, urgent-only, sends-only, queue-only or hold.");
+  }
+  if (config.holdSeconds !== undefined || config.maxAttempts !== undefined) throw new DeliveryGuardError("invalid_typing_guard", "Draft-aware sends return their result immediately; retry settings are not supported.");
+  return { mode: config.mode as TypingGuardMode };
+}
+
+function storedGuard(raw: string | null | undefined, enabled: number): TypingGuardConfig {
+  if (!raw) return { ...DEFAULT_GUARD, mode: enabled ? "hold" : "off", revision: enabled ? "legacy-hold" : "legacy-off" };
+  const value = JSON.parse(raw) as Record<string, unknown>;
+  const settings = parseTypingGuardSettings({ mode: value.mode });
+  if (typeof value.revision !== "string" || !value.revision) throw new DeliveryGuardError("invalid_typing_guard", "Stored guard configuration has no revision.");
+  const level = (INTERRUPTION_LEVELS as readonly unknown[]).includes(value.level) ? value.level as InterruptionLevel : undefined;
+  return { ...settings, ...(level ? { level } : {}), revision: value.revision };
+}
+
+/** Whether this configuration holds the input. With a level, a classified input is decided by the level; an input with
+ *  no classification (lifecycle work, a direct adapter write) is held only where the coarse mode holds. Lifecycle work
+ *  isn't held at queue-only: that level is about how OpenRig's notices reach a seat a person types in, so managed
+ *  compaction, its restore and recovery go ahead there, with the draft-aware check on each write but without
+ *  draft-aware's refusal of an active seat (#3076). Its stored coarse mode stays hold, so a daemon without the level
+ *  still refuses them. */
+function holds(config: TypingGuardConfig, input?: AdmissionInput, lifecycle = false): boolean {
+  if (config.level && input) return !levelAdmits(config.level, input);
+  if (lifecycle && config.level === "queue-only") return false;
+  return config.mode === "hold";
+}
+
+/** Whether a seat's guard preference refuses a writing lifecycle operation: the same rule lifecycle() applies, for a
+ *  preflight that reads the preference without taking a lease. */
+export function preferenceHoldsLifecycle(preference: Pick<GuardPreference, "desired" | "effective" | "desiredLevel" | "effectiveLevel"> | undefined): boolean {
+  if (!preference) return false;
+  return (preference.desired && preference.desiredLevel !== "queue-only") || (preference.effective && preference.effectiveLevel !== "queue-only");
 }
 
 /** One serialization domain for preference activation, delivery and writing lifecycle.
@@ -40,26 +150,92 @@ export class SeatDeliveryGuard {
   private readonly tails = new Map<string, Promise<void>>();
   private readonly scope = new AsyncLocalStorage<Map<string, Lease>>();
   private readonly humanLeases = new Set<Lease>();
+  private readonly humanEpochs = new Map<string, number>();
+  /** A paste this guard kept from being submitted because it couldn't read the input, per node (#2429). */
+  private readonly leftovers = new Map<string, { target: GuardTarget; humanEpoch: number; text: string; collapsedPaste: string | null }>();
+  private inspectInput?: (target: GuardTarget, owned?: ComposerOwnership) => Promise<ComposerInput | null>;
+  /** When a writable tmux client of the seat last had activity (epoch ms, whole seconds); null when no writable client
+   *  is attached; a rejection when that can't be known. */
+  private inputActivity?: (target: GuardTarget) => Promise<number | null>;
+  private inputAbsent?: (target: GuardTarget) => Promise<boolean>;
+  private readonly hasModeConfig: boolean;
 
   constructor(
     readonly db: Database.Database,
     private readonly resolve: (target: string) => GuardTarget | null,
-  ) {}
+    private readonly sleep: (ms: number) => Promise<void> = ms => new Promise(resolve => setTimeout(resolve, ms)),
+  ) {
+    this.hasModeConfig = (db.prepare("PRAGMA table_info(seat_delivery_guards)").all() as Array<{ name: string }>).some(c => c.name === "desired_config");
+  }
+
+  attachInputInspection(inspect: (target: GuardTarget, owned?: ComposerOwnership) => Promise<ComposerInput | null>, absent: (target: GuardTarget) => Promise<boolean>,
+    activity?: (target: GuardTarget) => Promise<number | null>): void {
+    this.inspectInput = inspect;
+    this.inputAbsent = absent;
+    this.inputActivity = activity;
+  }
 
   /** Startup-only, before exposing routes or starting writers. A stopped operation cannot
    * retain an in-memory lease. Persisted desired protection applies at the new boundary. */
   recoverActivation(): void {
     this.db.transaction(() => {
+      if (this.hasModeConfig) {
+        // Old daemons append an audit row even for a same-value 1 -> 1 write.
+        // That newer boolean decision supersedes a previously saved mode.
+        this.db.prepare(`UPDATE seat_delivery_guards AS g SET desired_config=NULL,effective_config=NULL
+          WHERE desired_config IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM seat_delivery_guard_changes c WHERE c.id=(SELECT max(id) FROM seat_delivery_guard_changes WHERE node_id=g.node_id)
+              AND c.desired_config=g.desired_config AND c.requested_at=g.changed_at)`).run();
+        this.db.prepare(`UPDATE seat_delivery_guards SET desired=CASE WHEN json_extract(desired_config,'$.mode')='off' THEN 0 ELSE 1 END
+          WHERE desired_config IS NOT NULL`).run();
+      }
       this.db.prepare("UPDATE seat_delivery_guards SET effective = desired WHERE effective != desired").run();
       this.db.prepare("UPDATE seat_delivery_guard_changes SET effective_at = ? WHERE effective_at IS NULL")
         .run(new Date().toISOString());
+      if (this.hasModeConfig) {
+        this.db.prepare("UPDATE seat_delivery_guards SET effective_config=desired_config WHERE desired_config IS NOT NULL").run();
+      }
     })();
   }
 
   preference(nodeId: string): GuardPreference {
-    const row = this.db.prepare("SELECT desired, effective FROM seat_delivery_guards WHERE node_id = ?")
-      .get(nodeId) as { desired: number; effective: number } | undefined;
-    return { nodeId, desired: !!row?.desired, effective: !!row?.effective, pending: row !== undefined && row.desired !== row.effective };
+    const { desired, effective } = this.configuration(nodeId);
+    return { nodeId, desired: desired.mode === "hold", effective: effective.mode === "hold", pending: desired.revision !== effective.revision,
+      desiredMode: desired.mode, effectiveMode: effective.mode,
+      ...(desired.level ? { desiredLevel: desired.level } : {}), ...(effective.level ? { effectiveLevel: effective.level } : {}) };
+  }
+
+  /** Whether the seat is at the queue-only level, desired or effective: OpenRig's own reminders reach it as queue rows or
+   *  notes on its rows, never typed (#3076). */
+  queueOnly(nodeId: string): boolean {
+    const { desired, effective } = this.configuration(nodeId);
+    return desired.level === "queue-only" || effective.level === "queue-only";
+  }
+
+  /** Whether the seat's configuration would hold this input now (desired or effective, as the operation decides). */
+  holdsInput(nodeId: string, input: AdmissionInput): boolean {
+    const config = this.configuration(nodeId);
+    return holds(config.desired, input) || holds(config.effective, input);
+  }
+
+  private terminalMember(nodeId: string): boolean {
+    try {
+      return (this.db.prepare("SELECT runtime FROM nodes WHERE id=?").get(nodeId) as { runtime?: string | null } | undefined)?.runtime === "terminal";
+    } catch { return false; }
+  }
+
+  configuration(nodeId: string): { desired: TypingGuardConfig; effective: TypingGuardConfig } {
+    const row = this.db.prepare("SELECT * FROM seat_delivery_guards WHERE node_id=?").get(nodeId) as
+      { desired: number; effective: number; changed_at: string; desired_config?: string | null; effective_config?: string | null } | undefined;
+    if (row?.desired_config && this.hasModeConfig) {
+      const latest = this.db.prepare("SELECT desired_config,requested_at FROM seat_delivery_guard_changes WHERE node_id=? ORDER BY id DESC LIMIT 1").get(nodeId) as
+        { desired_config: string | null; requested_at: string } | undefined;
+      if (latest?.desired_config !== row.desired_config || latest.requested_at !== row.changed_at) {
+        return { desired: storedGuard(null, row.desired), effective: storedGuard(null, row.effective) };
+      }
+    }
+    if (!row && this.hasModeConfig && this.terminalMember(nodeId)) return { desired: TERMINAL_DEFAULT, effective: TERMINAL_DEFAULT };
+    return { desired: storedGuard(row?.desired_config, row?.desired ?? 0), effective: storedGuard(row?.effective_config, row?.effective ?? 0) };
   }
 
   maybeTarget(name: string): GuardTarget | null { return this.resolve(name); }
@@ -74,6 +250,12 @@ export class SeatDeliveryGuard {
     return a.nodeId === b.nodeId && a.session === b.session && a.occupant === b.occupant && a.pane === b.pane;
   }
 
+  /** Runs `fn` under the seat's delivery lease, after every send already waiting for it: the same owner typed sends take,
+   *  with no admission of its own. The hook bridge's poll claims messages under it (#3270). */
+  exclusive<T>(nodeId: string, fn: () => T | Promise<T>): Promise<T> {
+    return this.serial(nodeId, async () => fn());
+  }
+
   private async serial<T>(nodeId: string, fn: () => Promise<T>): Promise<T> {
     const before = this.tails.get(nodeId) ?? Promise.resolve();
     let release!: () => void;
@@ -85,22 +267,43 @@ export class SeatDeliveryGuard {
     finally { release(); if (this.tails.get(nodeId) === tail) this.tails.delete(nodeId); }
   }
 
-  async set(nodeId: string, enabled: boolean, actor: string, reason: string, timeoutMs = 2000): Promise<GuardPreference> {
-    if (!actor.trim() || !reason.trim()) throw new DeliveryGuardError("guard_reason_required", "Actor and reason are required.");
+  /** `actor` is the requesting seat, or null for a request without a seat identity: that change applies the same way and
+   *  the preference and its audit row record UNATTRIBUTED_GUARD_ACTOR. */
+  async set(nodeId: string, value: unknown, actor: string | null, reason: string, timeoutMs = 2000): Promise<GuardPreference> {
+    const recordedActor = actor ?? UNATTRIBUTED_GUARD_ACTOR;
+    if (!recordedActor.trim() || !reason.trim()) throw new DeliveryGuardError("guard_reason_required", "Actor and reason are required.");
     const at = new Date().toISOString();
-    const change = this.db.transaction(() => {
-      const old = this.preference(nodeId);
-      this.db.prepare(`INSERT INTO seat_delivery_guards(node_id, desired, effective, actor, reason, changed_at)
-        VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(node_id) DO UPDATE SET
-        desired=excluded.desired, actor=excluded.actor, reason=excluded.reason, changed_at=excluded.changed_at`)
-        .run(nodeId, Number(enabled), Number(old.effective), actor, reason, at);
-      return this.db.prepare(`INSERT INTO seat_delivery_guard_changes(node_id, desired, previous_desired, previous_effective, actor, reason, requested_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)`).run(nodeId, Number(enabled), Number(old.desired), Number(old.effective), actor, reason, at).lastInsertRowid;
+    const { change, desired } = this.db.transaction(() => {
+      const old = this.configuration(nodeId);
+      const settings = parseTypingGuardSettings(value);
+      if (!this.hasModeConfig && (settings.mode === "draft-aware" || settings.level)) throw new DeliveryGuardError("typing_guard_unavailable", "Draft-aware and level configuration require the mode schema.");
+      const unchanged = settings.mode === old.desired.mode && settings.level === old.desired.level;
+      const desired = { ...settings, revision: unchanged ? old.desired.revision : randomUUID() };
+      // The legacy bits deliberately fail safe to hold when a daemon without modes opens this DB.
+      const args = [nodeId, Number(desired.mode !== "off"), Number(old.effective.mode !== "off"), recordedActor, reason, at];
+      if (this.hasModeConfig) {
+        this.db.prepare(`INSERT INTO seat_delivery_guards(node_id,desired,effective,actor,reason,changed_at,desired_config,effective_config)
+          VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET desired=excluded.desired,actor=excluded.actor,
+          reason=excluded.reason,changed_at=excluded.changed_at,desired_config=excluded.desired_config`)
+          .run(...args, JSON.stringify(desired), JSON.stringify(old.effective));
+      } else {
+        this.db.prepare(`INSERT INTO seat_delivery_guards(node_id,desired,effective,actor,reason,changed_at)
+          VALUES (?,?,?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET desired=excluded.desired,actor=excluded.actor,
+          reason=excluded.reason,changed_at=excluded.changed_at`).run(...args);
+      }
+      const audit = [nodeId, Number(desired.mode !== "off"), Number(old.desired.mode !== "off"), Number(old.effective.mode !== "off"), recordedActor, reason, at];
+      const change = this.hasModeConfig
+        ? this.db.prepare(`INSERT INTO seat_delivery_guard_changes(node_id,desired,previous_desired,previous_effective,actor,reason,requested_at,desired_config)
+            VALUES (?,?,?,?,?,?,?,?)`).run(...audit, JSON.stringify(desired)).lastInsertRowid
+        : this.db.prepare(`INSERT INTO seat_delivery_guard_changes(node_id,desired,previous_desired,previous_effective,actor,reason,requested_at)
+            VALUES (?,?,?,?,?,?,?)`).run(...audit).lastInsertRowid;
+      return { change, desired };
     })();
     const activation = this.serial(nodeId, async () => {
       this.db.transaction(() => {
         // Later requests are serialized too. Apply each accepted transition, in order.
-        this.db.prepare("UPDATE seat_delivery_guards SET effective = ? WHERE node_id = ?").run(Number(enabled), nodeId);
+        this.db.prepare("UPDATE seat_delivery_guards SET effective = ? WHERE node_id = ?").run(Number(desired.mode !== "off"), nodeId);
+        if (this.hasModeConfig) this.db.prepare("UPDATE seat_delivery_guards SET effective_config=? WHERE node_id=?").run(JSON.stringify(desired), nodeId);
         this.db.prepare("UPDATE seat_delivery_guard_changes SET effective_at = ? WHERE id = ?")
           .run(new Date().toISOString(), change);
       })();
@@ -114,22 +317,41 @@ export class SeatDeliveryGuard {
 
   /** fn must include lifecycle preflight, effects and last write. Retention callbacks
    * execute under this same lease, before any pane capture/paste/submit branch. */
-  async operation<T>(name: string, fn: () => Promise<T>, held?: (target: GuardTarget) => Promise<T>): Promise<T> {
+  operation<T>(name: string, fn: () => Promise<T>, held?: (target: GuardTarget) => Promise<T>, input?: AdmissionInput): Promise<T> {
+    return this.leased(name, fn, held, input, false);
+  }
+
+  /** `lifecycle`: the lease is lifecycle()'s own, for a writing lifecycle operation. */
+  private async leased<T>(name: string, fn: () => Promise<T>, held: ((target: GuardTarget) => Promise<T>) | undefined,
+    input: AdmissionInput | undefined, lifecycle: boolean): Promise<T> {
     const bound = this.target(name);
     const inherited = this.scope.getStore()?.get(bound.nodeId);
     if (inherited?.active && inherited.target.nodeId === bound.nodeId) {
-      this.assertCurrent(name, inherited);
+      this.checkInput(name);
       return fn();
     }
     return this.serial(bound.nodeId, async () => {
       const current = this.target(name);
       if (!this.same(bound, current)) throw new DeliveryGuardError("guard_target_changed", "Input target changed while waiting; no input written.");
-      const pref = this.preference(bound.nodeId);
-      if (pref.effective || pref.desired) {
+      const config = this.configuration(bound.nodeId);
+      if (!input?.override && (holds(config.desired, input, lifecycle) || holds(config.effective, input, lifecycle))) {
         if (held) return held(bound);
-        throw new DeliveryGuardError("typing_guard_enabled", "Automatic input is paused for this seat. Disable its typing guard explicitly before this writing operation.");
+        throw new DeliveryGuardError("typing_guard_enabled", "Automatic input is paused for this seat. Select off or draft-aware mode explicitly before this writing operation.");
       }
-      const lease: Lease = { target: bound, active: true, origin: "automatic" };
+      // Input a middle level lets through still never types over a person's draft: it's delivered as draft-aware.
+      const draftAwareLevel = (level?: InterruptionLevel) => level === "openrig-urgent" || level === "urgent-only" || level === "queue-only";
+      const admittedByLevel = !!input && (draftAwareLevel(config.desired.level) || draftAwareLevel(config.effective.level));
+      // Lifecycle work queue-only lets through writes as draft-aware too: compaction, its restore and recovery never
+      // type over a person's draft there; only draft-aware's refusal of an active seat is left out (lifecycle()). A
+      // draft-aware side (desired or effective, while a change is pending) keeps that refusal.
+      const queueOnlyLifecycle = lifecycle && !input && (config.desired.level === "queue-only" || config.effective.level === "queue-only")
+        && config.desired.mode !== "draft-aware" && config.effective.mode !== "draft-aware";
+      const lease: Lease = { target: bound, active: true, origin: "automatic", humanEpoch: this.humanEpochs.get(bound.nodeId) ?? 0,
+        // Explicit interaction keeps serialization/binding checks; its own last-paste reader replaces automatic draft retention.
+        config: input?.override ? DEFAULT_GUARD : admittedByLevel || queueOnlyLifecycle ? { mode: "draft-aware", revision: config.desired.revision }
+          : config.desired.mode === "draft-aware" ? config.desired : config.effective,
+        ...(queueOnlyLifecycle ? { queueOnlyLifecycle: true } : {}) };
+      lease.serialOwner = lease;
       try { return await this.scope.run(new Map([...(this.scope.getStore() ?? []), [lease.target.nodeId, lease]]), fn); }
       finally { lease.active = false; }
     });
@@ -142,20 +364,108 @@ export class SeatDeliveryGuard {
     return true;
   }
 
-  /** Multi-seat restore takes leases in stable order before any rig mutation.
-   * Nested per-seat launch joins these leases; it must not reacquire them. */
-  async lifecycle<T>(nodeIds: string[], fn: () => Promise<T>): Promise<T> {
-    const ids = [...new Set(nodeIds)].sort();
+  /** Custody cleanup can join a writing lifecycle lease without granting input permission. */
+  ownsCustody(nodeId: string): boolean {
+    const lease = this.scope.getStore()?.get(nodeId);
+    if (!lease?.active || (lease.origin !== "custody" && !lease.lifecycle)) return false;
+    this.assertCurrent(nodeId, lease);
+    return true;
+  }
+
+  /** Serialize metadata/custody cleanup even when typing is paused. Capture every
+   * target before waiting, then validate all of them before the first effect. */
+  async custody<T>(nodeIds: string[], fn: () => Promise<T>, onTargetChanged?: (nodeId: string, error: DeliveryGuardError) => void): Promise<T> {
+    const targets = [...new Set(nodeIds)].sort().map(id => this.target(id));
+    const excluded = new Set<string>();
+    const validate = (target: GuardTarget, inherited?: Lease): boolean => {
+      if (excluded.has(target.nodeId)) return false;
+      try {
+        if (inherited) this.assertCurrent(target.nodeId, inherited);
+        if (!this.same(target, this.target(target.nodeId))) {
+          throw new DeliveryGuardError("guard_target_changed", "Custody target changed while waiting; no cleanup performed for this seat.");
+        }
+        return true;
+      } catch (error) {
+        if (!onTargetChanged || !(error instanceof DeliveryGuardError)) throw error;
+        excluded.add(target.nodeId);
+        onTargetChanged(target.nodeId, error);
+        return false;
+      }
+    };
     const acquire = async (index: number): Promise<T> => {
-      const id = ids[index]; if (!id) return fn();
-      if (this.ownsLifecycle(id)) return acquire(index + 1);
-      return this.operation(id, async () => {
-        const lease = this.scope.getStore()!.get(id)!;
-        lease.lifecycle = true;
-        return acquire(index + 1);
+      const target = targets[index];
+      if (!target) { for (const captured of targets) validate(captured); return fn(); }
+      const inherited = this.scope.getStore()?.get(target.nodeId);
+      const run = async () => {
+        const lease: Lease = { target, active: true, origin: "custody", humanEpoch: this.humanEpochs.get(target.nodeId) ?? 0 };
+        lease.serialOwner = inherited?.active && inherited.serialOwner?.active ? inherited.serialOwner : lease;
+        try {
+          return await this.scope.run(new Map([...(this.scope.getStore() ?? []), [target.nodeId, lease]]), () => acquire(index + 1));
+        } finally { lease.active = false; }
+      };
+      if (inherited?.active && inherited.serialOwner?.active) {
+        if (!validate(target, inherited)) return acquire(index + 1);
+        return inherited.origin === "custody" || inherited.lifecycle ? acquire(index + 1) : run();
+      }
+      return this.serial(target.nodeId, async () => {
+        if (!validate(target)) return acquire(index + 1);
+        return run();
       });
     };
     return acquire(0);
+  }
+
+  /** Multi-seat restore takes leases in stable order before any rig mutation.
+   * Nested per-seat launch joins these leases; it must not reacquire them.
+   * `custodyIds` are seats the operation only records (metadata, never input): they get a custody lease in the same sorted
+   * pass, so a paused or draft-aware seat isn't refused and its mode, draft and binding stay as they are.
+   * `draftChecked`: managed compaction's writes (preparation, /compact, restore) go to a live seat through draft-aware's
+   * own write checks, so a draft-aware seat isn't refused for being active; a draft or an unreadable input still holds each
+   * write. Launch, snapshot restore and runtime switch don't pass it and keep the refusal. */
+  async lifecycle<T>(nodeIds: string[], fn: () => Promise<T>, custodyIds: readonly string[] = [],
+    { draftChecked = false }: { draftChecked?: boolean } = {}): Promise<T> {
+    const writing = new Set(nodeIds);
+    const ids = [...new Set([...nodeIds, ...custodyIds])].sort();
+    const acquire = async (index: number): Promise<T> => {
+      const id = ids[index]; if (!id) return fn();
+      if (!writing.has(id)) return this.custodyInPass(id, () => acquire(index + 1));
+      if (this.ownsLifecycle(id)) return acquire(index + 1);
+      return this.leased(id, async () => {
+        const lease = this.scope.getStore()!.get(id)!;
+        if (lease.config?.mode === "draft-aware" && !lease.queueOnlyLifecycle && !draftChecked) {
+          // Only a positively absent input may receive fresh startup/resume writes.
+          // An active protected seat requires an explicit guard mode change first.
+          const absent = !lease.target.pane || await this.inputAbsent?.(lease.target) === true;
+          this.assertCurrent(id, lease);
+          if (!absent) throw new DeliveryGuardError("draft_aware_lifecycle", "This active seat uses draft-aware delivery. Select off mode before a writing lifecycle operation; held messages are not replayed.");
+        }
+        lease.lifecycle = true;
+        return acquire(index + 1);
+      }, undefined, undefined, true);
+    };
+    return acquire(0);
+  }
+
+  /** One custody lease taken inside lifecycle's sorted pass. Its target is read when the pass reaches this seat, as
+   *  lifecycle's own leases are, not up front the way custody() reads every target before waiting. A target that changed
+   *  while waiting on this seat refuses the whole operation before any effect, as a lifecycle lease's would. */
+  private async custodyInPass<T>(id: string, next: () => Promise<T>): Promise<T> {
+    if (this.ownsCustody(id)) return next();
+    const target = this.target(id);
+    const inherited = this.scope.getStore()?.get(id);
+    const run = async () => {
+      const lease: Lease = { target, active: true, origin: "custody", humanEpoch: this.humanEpochs.get(id) ?? 0 };
+      lease.serialOwner = inherited?.active && inherited.serialOwner?.active ? inherited.serialOwner : lease;
+      try { return await this.scope.run(new Map([...(this.scope.getStore() ?? []), [id, lease]]), next); }
+      finally { lease.active = false; }
+    };
+    const current = () => {
+      if (!this.same(target, this.target(id))) {
+        throw new DeliveryGuardError("guard_target_changed", "Custody target changed while waiting; no cleanup performed for this seat.");
+      }
+    };
+    if (inherited?.active && inherited.serialOwner?.active) { this.assertCurrent(id, inherited); current(); return run(); }
+    return this.serial(id, async () => { current(); return run(); });
   }
 
   /** Called only after an intentional lifecycle binding change, under its lease.
@@ -164,6 +474,21 @@ export class SeatDeliveryGuard {
     const lease = this.scope.getStore()?.get(nodeId);
     if (!lease?.active || !lease.lifecycle) throw new DeliveryGuardError("guard_lease_required", "Binding changes require the complete lifecycle lease.");
     lease.target = this.target(nodeId);
+    delete lease.staged;
+    delete lease.inputFrame;
+  }
+
+  /** Only a successful adapter creation/respawn may exempt its new shell from composer checks. */
+  noteFreshLifecyclePane(nodeId: string, pane: string): void {
+    const lease = this.scope.getStore()?.get(nodeId);
+    if (!lease?.active || !lease.lifecycle) throw new DeliveryGuardError("guard_lease_required", "A fresh pane requires its creation lifecycle lease.");
+    this.assertCurrent(nodeId, lease);
+    lease.freshLifecyclePane = pane;
+  }
+
+  private ownsFreshInput(lease: Lease): boolean {
+    return !!lease.lifecycle && !!lease.freshLifecyclePane
+      && (lease.target.pane === null || lease.target.pane === lease.freshLifecyclePane);
   }
 
   private assertCurrent(name: string, lease: Lease): void {
@@ -178,6 +503,184 @@ export class SeatDeliveryGuard {
     const lease = this.scope.getStore()?.get(target.nodeId);
     if (!lease) throw new DeliveryGuardError("guard_lease_required", "Input requires an active operation lease.");
     this.assertCurrent(name, lease);
+    if (lease.origin === "custody") {
+      throw new DeliveryGuardError("guard_lease_required", "Custody cleanup does not authorize input or writing lifecycle operations.");
+    }
+    if (lease.origin === "automatic" && !this.ownsFreshInput(lease) && lease.config?.mode === "draft-aware"
+      && lease.humanEpoch !== (this.humanEpochs.get(target.nodeId) ?? 0)) {
+      throw new DeliveryGuardError("draft_input_changed", "Human input arrived during this delivery. No further automatic input was written.");
+    }
+  }
+
+  needsInputCheck(name: string): boolean {
+    const target = this.maybeTarget(name);
+    if (!target) return false; // Proven private probes have no managed-seat policy.
+    const lease = this.scope.getStore()?.get(target.nodeId);
+    return !!lease?.active && lease.origin === "automatic" && !this.ownsFreshInput(lease) && lease.config?.mode === "draft-aware";
+  }
+
+  /** Called at the paste/key boundary after file and buffer preparation. A paste this guard left unsubmitted (#2429) can
+   * be submitted ahead of a delivery: its own check passes `"recognize"` to find it, and then the adapter, before the
+   * paste, passes the delivery's other checks and the Enter, which run in that order. */
+  async beforeInput(name: string, submit = false, pasteText?: string,
+    leftover?: "recognize" | { checks: () => Promise<void>; enter: () => Promise<boolean> }): Promise<void> {
+    if (!this.needsInputCheck(name)) return;
+    const target = this.target(name);
+    const lease = this.scope.getStore()!.get(target.nodeId)!;
+    const read = async () => {
+      const owned = submit && lease.staged && lease.inputFrame ? { text: lease.staged.text, frame: lease.inputFrame } : undefined;
+      const observed = await this.inspectInput?.(target, owned).catch(() => null) ?? null;
+      this.checkInput(name);
+      return observed;
+    };
+    const unknown = (reading: ComposerInput | null) => new DeliveryGuardError("draft_input_unknown", "The current input cannot be read. Automatic delivery is held.", inputReadDiagnostic("draft-aware", reading));
+    let input = await read();
+    // Claude may still be redrawing this lease's own paste, or showing its paste hint: bounded re-reads before refusing
+    // its Enter. Each read checks this lease again, so input from a person through OpenRig still ends the wait.
+    let rereads = 0;
+    for (let waited = 0; submit && lease.staged && (!input || input.state === "unknown") && waited < OWN_PASTE_REREAD_LIMIT_MS; waited += OWN_INPUT_REREAD_MS) {
+      await this.sleep(OWN_INPUT_REREAD_MS); input = await read(); rereads++;
+    }
+    if (!input || input.state === "unknown") {
+      // No Enter was sent, so the paste stays there unsubmitted, and the next delivery may recognize it as OpenRig's.
+      if (submit && lease.staged) this.leftovers.set(target.nodeId, { target: lease.target, humanEpoch: lease.humanEpoch, ...lease.staged });
+      throw unknown(input);
+    }
+    if (leftover === "recognize" && !submit && this.ownsLeftover(target, input)) { lease.ownLeftover = "recognized"; return; }
+    if (typeof leftover === "object" && lease.ownLeftover === "recognized") {
+      if (!this.ownsLeftover(target, input)) this.leftovers.delete(target.nodeId);
+      else {
+        // The delivery's own checks come first; one that refuses leaves the record for the next delivery. Then the input
+        // is read again, since the checks can wait, and the Enter goes only on the same paste.
+        await leftover.checks();
+        const still = await read();
+        const owned = !!still && this.ownsLeftover(target, still);
+        if (!owned) this.leftovers.delete(target.nodeId);
+        // `enter` repeats the synchronous checks before its key; one that refuses throws here and keeps the record.
+        const entered = owned && await leftover.enter();
+        if (owned) this.leftovers.delete(target.nodeId);
+        if (entered) {
+          lease.ownLeftover = "submitted";
+          await this.sleep(OWN_INPUT_REREAD_MS);
+          const after = await read();
+          if (!after || after.state === "unknown") throw unknown(after);
+          input = after;
+        }
+      }
+    }
+    if (submit) {
+      // The TUI may render the collapsed label only after notePasted's read.
+      // If no label was recorded, recognize it in this same lease and original composer. A label without a line count
+      // (`[Pasted text #K]`, a single-line paste) says only its paste ID, and a person may have replaced our paste with
+      // their own single line by then: that one counts as ours only when notePasted recorded it (#2429).
+      const late = lease.staged && !lease.staged.collapsedPaste && !!lease.inputFrame
+        && lease.inputFrame === input.frame && ownCollapsedPaste(input, lease.staged.text);
+      const label = late ? COMPOSER_COLLAPSED_PASTE_PATTERN.exec(late) : null;
+      const collapsed = !!late && !(label && label[1] === undefined);
+      // Past the first re-read, a late counted label could be a person's own paste of the same line count, typed at the
+      // terminal where no OpenRig input shows it. It's ours only if no writable client was active since our paste;
+      // otherwise the paste stays, recorded as a leftover, with no Enter.
+      if (collapsed && rereads > 1 && await this.clientActiveSince(target, lease.staged!.pastedAt)) {
+        this.leftovers.set(target.nodeId, { target: lease.target, humanEpoch: lease.humanEpoch, ...lease.staged! });
+        throw new DeliveryGuardError("draft_input_unknown", "OpenRig couldn't confirm the collapsed paste is still its own: a terminal client was active since it was pasted. Automatic delivery is held.",
+          inputReadDiagnostic("draft-aware", input, "client_activity_since_paste"));
+      }
+      const owned = lease.staged && (composerContainsOwnedText(input, lease.staged.text)
+        || !!collapsed || !!lease.staged.collapsedPaste && input.cursorAtEnd && input.collapsedPaste === lease.staged.collapsedPaste);
+      if (!owned) throw new DeliveryGuardError("draft_input_changed", "The input no longer contains only this delivery's staged text. Enter was not sent.");
+    } else if (input.state !== "empty") {
+      throw new DeliveryGuardError("draft_input_busy", "The seat has an unsubmitted input. Automatic delivery is held.");
+    } else {
+      // Right before the paste (the adapter's check passes the text): the read above is a snapshot, and a draft typed
+      // after it would get the paste appended and then lose the Enter, with the paste left in the person's input (#3076).
+      if (pasteText !== undefined) input = await this.quietBeforePaste(target, read, unknown);
+      const uncertainty = pasteText === undefined ? null : composerPasteUncertainty(input, pasteText);
+      if (uncertainty) {
+        const message = uncertainty === "controls"
+          ? "OpenRig couldn't confirm the layout of tabs or control characters. Send the message without them; nothing was pasted."
+          : uncertainty === "long"
+            ? "OpenRig couldn't confirm ownership of Codex's collapsed long paste. Send a shorter message; nothing was pasted. Turning this seat's typing guard off explicitly disables draft protection."
+            : "OpenRig couldn't confirm the complete message would stay visible in this Codex viewport. Open a larger terminal or shorten the message, then retry this request; nothing was pasted.";
+        throw new DeliveryGuardError("draft_input_unknown", message, inputReadDiagnostic("draft-aware", input, `paste_${uncertainty}`));
+      }
+      lease.inputFrame = input.frame;
+    }
+  }
+
+  /** No recent writable-client activity before a short wait, the input still empty when read again after it, and still
+   *  no recent activity after that read. A time tmux can't report holds the paste, as an unreadable input does. The
+   *  read it returns is the one the paste goes on. Typing after this final check and before the paste can still leave
+   *  the notice beside the person's draft. In the tested append-mode schedule the Enter is then refused and nothing is
+   *  submitted or deleted; that isn't a guarantee for every interleaving (#3076). */
+  private async quietBeforePaste(target: GuardTarget, read: () => Promise<ComposerInput | null>,
+    unknown: (reading: ComposerInput | null) => DeliveryGuardError): Promise<ComposerInput> {
+    const quiet = async () => {
+      if (!this.inputActivity) return;
+      const last = await this.inputActivity(target).then(at => ({ at }), () => null);
+      // Its own diagnostic: a caller keeps the last one it was given, which would otherwise be an earlier refusal's.
+      if (!last) throw new DeliveryGuardError("draft_input_unknown", "OpenRig couldn't read the recent activity of the seat's terminal clients. Automatic delivery is held; nothing was pasted.",
+        inputReadDiagnostic("draft-aware", null, "client_activity_unavailable"));
+      // tmux reports whole seconds: activity at N.999 s reads as N, so the quiet window counts from the end of that second.
+      if (last.at !== null && Date.now() - (last.at + CLIENT_ACTIVITY_PRECISION_MS) < INPUT_QUIET_MS) {
+        throw new DeliveryGuardError("draft_input_busy", "A writable client of this seat had recent activity. Automatic delivery is held; nothing was pasted.");
+      }
+    };
+    await quiet();
+    await this.sleep(PASTE_SETTLE_MS);
+    const again = await read();
+    if (!again || again.state === "unknown") throw unknown(again);
+    if (again.state !== "empty") throw new DeliveryGuardError("draft_input_busy", "The input changed just before the paste. Automatic delivery is held; nothing was pasted.");
+    await quiet();
+    return again;
+  }
+
+  /** Whether a writable client of the seat was active since `since` (epoch ms). tmux reports whole seconds, so activity
+   *  in that second counts, and so does a time tmux can't report or a paste time that wasn't seen. With no activity
+   *  reader, as before a paste, there's nothing to check. */
+  private async clientActiveSince(target: GuardTarget, since: number | undefined): Promise<boolean> {
+    if (!this.inputActivity) return false;
+    if (since === undefined) return true;
+    const last = await this.inputActivity(target).then(at => ({ at }), () => null);
+    return !last || (last.at !== null && last.at + CLIENT_ACTIVITY_PRECISION_MS >= since);
+  }
+
+  /** A leftover paste is OpenRig's only while it's exactly there: the same occupant, no person's input through OpenRig
+   * since, and its text or the label recorded for it. A label first seen later proves nothing (#1871). */
+  private ownsLeftover(target: GuardTarget, input: ComposerInput): boolean {
+    const left = this.leftovers.get(target.nodeId);
+    return !!left && this.same(left.target, target) && left.humanEpoch === (this.humanEpochs.get(target.nodeId) ?? 0)
+      && (composerContainsOwnedText(input, left.text) || !!left.collapsedPaste && input.cursorAtEnd && input.collapsedPaste === left.collapsedPaste);
+  }
+
+  /** Whether this delivery submitted a paste the guard had left unsubmitted, so its result can say so. */
+  submittedOwnLeftover(name: string): boolean {
+    const target = this.maybeTarget(name);
+    return !!target && this.scope.getStore()?.get(target.nodeId)?.ownLeftover === "submitted";
+  }
+
+  expectStagedInput(name: string, text: string): void {
+    if (!this.needsInputCheck(name)) return;
+    const target = this.target(name);
+    this.scope.getStore()!.get(target.nodeId)!.staged = { text, collapsedPaste: null };
+  }
+
+  async notePasted(name: string, text: string): Promise<void> {
+    try {
+      if (!this.needsInputCheck(name)) return;
+      const target = this.target(name);
+      const lease = this.scope.getStore()!.get(target.nodeId)!;
+      lease.staged = { text, collapsedPaste: null, pastedAt: Date.now() };
+      const input = await this.inspectInput?.(target, lease.inputFrame ? { text, frame: lease.inputFrame } : undefined).catch(() => null) ?? null;
+      if (input) lease.staged.collapsedPaste = ownCollapsedPaste(input, text);
+    } catch { /* Observation cannot turn a completed paste into a claimed no-write failure. */ }
+  }
+
+  noteSubmitted(name: string): void {
+    try {
+      const target = this.maybeTarget(name);
+      const lease = target && this.scope.getStore()?.get(target.nodeId);
+      if (lease) lease.staged = undefined;
+    } catch { /* Enter already succeeded. */ }
   }
 
   /** Reconciliation is a synchronous DB transaction, not a nested input operation.
@@ -190,8 +693,8 @@ export class SeatDeliveryGuard {
     if (this.tails.has(expected.nodeId) || [...this.humanLeases].some(l => l.active && l.target.nodeId === expected.nodeId)) {
       throw new DeliveryGuardError("guard_operation_in_progress", "Seat operation in progress; reconciliation did not change custody. Retry after it finishes.");
     }
-    const pref = this.preference(expected.nodeId);
-    if (pref.desired || pref.effective) {
+    const config = this.configuration(expected.nodeId);
+    if (config.desired.mode !== "off" || config.effective.mode !== "off") {
       throw new DeliveryGuardError("typing_guard_enabled", "Reconciliation cannot replace the occupant while typing protection is enabled.");
     }
     return commit();
@@ -200,14 +703,17 @@ export class SeatDeliveryGuard {
   async input<T>(name: string, fn: () => Promise<T>): Promise<T> {
     const target = this.target(name);
     const lease = this.scope.getStore()?.get(target.nodeId);
-    if (lease?.active) { this.assertCurrent(name, lease); return fn(); }
+    if (lease?.active) { this.checkInput(name); return fn(); }
     return this.operation(name, fn);
   }
 
   /** Internal broker path only; never an option accepted by the send HTTP route. */
   async humanInput<T>(name: string, fn: () => Promise<T>): Promise<T> {
     const target = this.target(name);
-    const lease: Lease = { target, active: true, origin: "human" };
+    const humanEpoch = (this.humanEpochs.get(target.nodeId) ?? 0) + 1;
+    this.humanEpochs.set(target.nodeId, humanEpoch);
+    const inherited = this.scope.getStore()?.get(target.nodeId);
+    const lease: Lease = { target, active: true, serialOwner: inherited?.active ? inherited.serialOwner : undefined, origin: "human", humanEpoch };
     this.humanLeases.add(lease);
     try { return await this.scope.run(new Map([...(this.scope.getStore() ?? []), [lease.target.nodeId, lease]]), fn); }
     finally { lease.active = false; this.humanLeases.delete(lease); }
@@ -224,14 +730,38 @@ export function resolveGuardTarget(db: Database.Database, name: string): GuardTa
       coalesce(b.tmux_session, replace(n.logical_id,'.','-') || '@' || r.name) AS session,
       b.tmux_pane AS pane,
       (SELECT generation_uuid FROM occupant_tenures t WHERE t.node_id=n.id ORDER BY generation_ordinal DESC LIMIT 1) AS occupant,
+      b.tmux_session AS physicalName, n.logical_id AS logicalId, r.name AS rigName,
+      (SELECT status FROM sessions WHERE node_id=n.id ORDER BY id DESC LIMIT 1) AS latestStatus,
       r.archived_at AS archivedAt
     FROM nodes n JOIN rigs r ON r.id=n.rig_id LEFT JOIN bindings b ON b.node_id=n.id
     WHERE n.id=? OR b.tmux_session=? OR b.tmux_pane=? OR n.logical_id=?
-      OR (b.tmux_session IS NULL AND replace(n.logical_id,'.','-') || '@' || r.name=?)`)
-    .all(name, name, name, name, name) as Array<GuardTarget & { archivedAt: string | null }>;
-  const unarchived = rows.filter((row) => row.archivedAt === null);
-  const pool = unarchived.length > 0 ? unarchived : rows;
-  if (pool.length !== 1) return null;
-  const { archivedAt: _archivedAt, ...target } = pool[0]!;
+      OR (replace(n.logical_id,'.','-') || '@' || r.name=?
+        AND (b.tmux_session IS NULL OR b.tmux_session=(SELECT session_name FROM sessions WHERE node_id=n.id ORDER BY id DESC LIMIT 1))
+      )`)
+    .all(name, name, name, name, name) as Array<GuardTarget & { archivedAt: string | null; physicalName: string | null; logicalId: string; rigName: string; latestStatus: string | null }>;
+  const eligible = rows.filter(row => row.nodeId === name || row.physicalName === name || row.pane === name || row.logicalId === name
+    || !hasOtherSeatHistory(db, name, row.nodeId));
+  // A stopped same-seat predecessor may retain the exact physical spelling.
+  // Omit only a proven same-seat predecessor. Unrelated/mismatched bindings
+  // still compete, including owners without a current matching session row.
+  // Explicit node/pane lookup and saved-history access remain separate.
+  const current = name.includes("@") ? resolveCurrentSessionAddress(db, name) : null;
+  const named = current ? eligible.filter(row => row.nodeId === current.nodeId || !isStoppedSeatPredecessor(row, current)) : eligible;
+  const unarchived = named.filter((row) => row.archivedAt === null);
+  const active = unarchived.length > 0 ? unarchived : named;
+  const exact = active.filter(row => row.physicalName === name);
+  const pool = exact.length ? exact : active;
+  // An exact physical spelling cannot displace the routed logical recipient.
+  if (pool.length !== 1 || (current && pool[0]!.nodeId !== current.nodeId)) return null;
+  const { archivedAt: _archivedAt, physicalName: _physicalName, logicalId: _logicalId, rigName: _rigName, latestStatus: _latestStatus, ...target } = pool[0]!;
   return target;
+}
+
+/** An external-CLI seat's newest occupant generation by its external session name, which resolveGuardTarget's address
+ *  rules don't match: the one unarchived external_cli binding with that name, else null (none or several). */
+export function resolveExternalCliOccupant(db: Database.Database, name: string): string | null {
+  const rows = db.prepare(`SELECT (SELECT generation_uuid FROM occupant_tenures t WHERE t.node_id=b.node_id ORDER BY generation_ordinal DESC LIMIT 1) AS occupant
+    FROM bindings b JOIN nodes n ON n.id=b.node_id JOIN rigs r ON r.id=n.rig_id
+    WHERE b.attachment_type='external_cli' AND b.external_session_name=? AND r.archived_at IS NULL`).all(name) as Array<{ occupant: string | null }>;
+  return rows.length === 1 ? rows[0]!.occupant : null;
 }

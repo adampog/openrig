@@ -1,0 +1,97 @@
+import { afterEach, describe, expect, it } from "vitest";
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { loadCommunityHarnessPreset } from "../src/domain/community-harness-presets.js";
+import { newLaunchAttempt, readLaunchResult } from "../src/domain/community-harness-launch-result.js";
+
+// The documented Cursor example, run against a stand-in `cursor-agent` (no Cursor, no model): its record is one OpenRig reads.
+const EXAMPLE = resolve(__dirname, "../../../docs/reference/community-harness-examples/cursor");
+const dirs: string[] = [];
+afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+
+// Where Cursor keeps a chat's store: <config folder>/chats/<md5 of the physical working directory>/<chat id>/store.db.
+function addChat(configDir: string, cwd: string, id: string) {
+  const chat = join(configDir, "chats", createHash("md5").update(realpathSync(cwd)).digest("hex"), id);
+  mkdirSync(chat, { recursive: true });
+  writeFileSync(join(chat, "store.db"), "");
+}
+
+// `setup` prepares the seat's folder and returns the launch's extra variables.
+function run(setup: (dir: string) => Record<string, string> = () => ({})) {
+  const dir = mkdtempSync(join(tmpdir(), "cursor-example-")); dirs.push(dir);
+  const fake = join(dir, "cursor-agent");
+  // create-chat prints an id and keeps running, as Cursor's does; any other call records its arguments and exits.
+  const observe = `legacy=false; [ "\${OPENRIG_ACTIVITY_HOOK_TOKEN-}" != legacy-hook ] || legacy=true
+printf '%s|%s|%s|%s|%s|%s|%s|%s\\n' "\${OPENRIG_RUN_ID+x}" "\${OPENRIG_ACTIVITY_HOOK_TOKEN+x}" "$legacy" "$OPENRIG_NODE_ID" "\${OPENRIG_SESSION_NAME-}" "\${OPENRIG_URL-}" "\${OPENRIG_OCCUPANT_GENERATION-}" "\${ANTHROPIC_API_KEY-}" >> "${dir}/native-env"`;
+  writeFileSync(fake, `#!/bin/sh\n${observe}\nif [ "$1" = create-chat ]; then echo chat-abc; exec sleep 30; fi\necho "$@ CFG=$CURSOR_CONFIG_DIR" > "${dir}/started"\nprintf '%s\\0' "$@" > "${dir}/args"\n`);
+  chmodSync(fake, 0o755);
+  const env = setup(dir);
+  const root = join(dir, "results");
+  const attempt = newLaunchAttempt("dev-cursor@r", root);
+  const exit = spawnSync(join(EXAMPLE, "openrig-cursor-launch"), [], { cwd: dir, env: { PATH: process.env["PATH"]!, OPENRIG_CURSOR_AGENT: fake,
+    OPENRIG_HOME: join(dir, "home"), OPENRIG_NODE_ID: "node-1", OPENRIG_LAUNCH_RESULT: attempt.file, OPENRIG_LAUNCH_ATTEMPT: attempt.attempt, ...env },
+    timeout: 20_000 });
+  const started = join(dir, "started");
+  return { args: existsSync(join(dir, "args")) ? readFileSync(join(dir, "args"), "utf8").split("\0").slice(0, -1) : [], exit: exit.status, stderr: exit.stderr?.toString(), read: readLaunchResult(attempt, "cursor", root), started: existsSync(started) ? readFileSync(started, "utf8") : null, dir,
+    childEnv: existsSync(join(dir, "native-env")) ? readFileSync(join(dir, "native-env"), "utf8").trim().split("\n") : [] };
+}
+
+describe("the documented Cursor launcher and preset", () => {
+  it.each([false, true])("keeps private run authority out of both Cursor children, bound=%s", bound => {
+    const result = run(() => ({ ...(bound ? { OPENRIG_RUN_ID: "actual-run" } : {}), OPENRIG_ACTIVITY_HOOK_TOKEN: bound ? "scoped-fixture-secret" : "legacy-hook",
+      OPENRIG_SESSION_NAME: "cursor@rig", OPENRIG_URL: "http://fixture.test", OPENRIG_OCCUPANT_GENERATION: "generation", ANTHROPIC_API_KEY: "fixture-provider" }));
+    expect(result.exit).toBe(0);
+    expect(result.childEnv).toEqual(Array(2).fill(`${bound ? "||false" : "|x|true"}|node-1|cursor@rig|http://fixture.test|generation|fixture-provider`));
+    expect(JSON.stringify(result)).not.toContain("scoped-fixture-secret");
+    expect(JSON.stringify(result)).not.toContain("actual-run");
+  });
+  it("reports the chat create-chat made, then reopens it in the seat's own Cursor config folder", () => {
+    const { read, started, dir } = run();
+    expect(read).toEqual({ ok: true, nativeRef: "chat-abc", producer: "openrig-cursor-launch 2" });
+    expect(started?.trim()).toBe(`--resume chat-abc --trust CFG=${join(dir, "home", "state", "cursor", "node-1")}`);
+  });
+
+  it("passes a multiline first input as one positional prompt", () => {
+    const text = "identity\n'quoted' $literal\n";
+    const { args } = run(dir => {
+      const file = join(dir, "first.txt"); writeFileSync(file, text, { mode: 0o600 });
+      return { OPENRIG_FIRST_INPUT: file };
+    });
+    expect(args).toEqual(["--resume", "chat-abc", "--trust", text]);
+  });
+
+  it("reopens a chat Cursor holds in an already-set config folder, and reports that id", () => {
+    const { read, started, dir } = run(dir => {
+      addChat(join(dir, "own-config"), dir, "chat-777");
+      return { CURSOR_CONFIG_DIR: join(dir, "own-config"), OPENRIG_RESUME_REF: "chat-777" };
+    });
+    expect(read).toMatchObject({ ok: true, nativeRef: "chat-777" });
+    expect(started?.trim()).toBe(`--resume chat-777 --trust CFG=${join(dir, "own-config")}`);
+  });
+
+  it("reports a chat Cursor doesn't hold as missing, and starts nothing", () => {
+    const { exit, read, started } = run(dir => {
+      addChat(join(dir, "home", "state", "cursor", "node-1"), dir, "chat-other");
+      return { OPENRIG_RESUME_REF: "chat-gone" };
+    });
+    expect(read).toMatchObject({ ok: false, missing: true });
+    expect(started).toBeNull();
+    expect(exit).not.toBe(0);
+  });
+
+  it("gives a new chat the seat's model, and a resumed chat none", () => {
+    expect(run(() => ({ OPENRIG_MODEL: "auto" })).args).toEqual(["--resume", "chat-abc", "--trust", "--model", "auto"]);
+    const resumed = run(dir => {
+      addChat(join(dir, "home", "state", "cursor", "node-1"), dir, "chat-777");
+      return { OPENRIG_MODEL: "auto", OPENRIG_RESUME_REF: "chat-777" };
+    });
+    expect(resumed.args).toEqual(["--resume", "chat-777", "--trust"]);
+  });
+
+  it("declares conversation reporting, resume and first input without an assisted check, and takes the seat's model", () => {
+    expect(loadCommunityHarnessPreset("cursor", EXAMPLE)).toMatchObject({ ok: true, preset: { command: "openrig-cursor-launch", launchResult: true, resume: true, firstInput: true, startupAssisted: false, passesModel: true } });
+  });
+});

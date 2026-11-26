@@ -1,3 +1,8 @@
+import { DeliveryGuardError } from "../domain/seat-delivery-guard.js";
+import type { Context } from "hono";
+import { expectedConversation, resolveExpectedConversation, type ExpectedConversation } from "../domain/expected-conversation.js";
+import { unknownModelObservation, type CurrentModelReader } from "../domain/model-divergence/current-model-reader.js";
+import { RemoteControlObservationStore } from "../domain/remote-control-observations.js";
 import { inventoryCaptureOptions, type ShadowCapture } from "../domain/shadow-capture.js";
 import { Hono } from "hono";
 import { observeInventoryHandler } from "../domain/request-phase-observer.js";
@@ -19,6 +24,7 @@ import {
   getNodeDetail,
   getNodeInventoryWithContext,
   getNodeDetailWithContext,
+  deriveCanonicalFromEntry,
 } from "../domain/node-inventory.js";
 import type { ContextUsageStore } from "../domain/context-usage-store.js";
 import type { RigLifecycleService } from "../domain/rig-lifecycle-service.js";
@@ -26,6 +32,7 @@ import type { SessionTransport } from "../domain/session-transport.js";
 import type { PreviewRateLimiter } from "../domain/preview/preview-rate-limiter.js";
 import type { ClaimService } from "../domain/claim-service.js";
 import type { PodRigInstantiator } from "../domain/rigspec-instantiator.js";
+import type { SnapshotCapture } from "../domain/snapshot-capture.js";
 import { convergeOp } from "../domain/topology-converge.js";
 import type { RestoreOrchestrator } from "../domain/restore-orchestrator.js";
 import { launchStatusIsRunning } from "../domain/restore-orchestrator.js";
@@ -36,17 +43,38 @@ import { validateResumeToken } from "../domain/resume-token-validation.js";
 import type { PermissionDriftReader } from "../domain/permission-drift-observer.js";
 import { ProcessCensus } from "../domain/process-census.js";
 import { CodexThreadIdResolver } from "../domain/codex-thread-id.js";
+import { effectiveRuntimeHome } from "../domain/seat-runtime-home.js";
 import { resolveLiveCodexThreadId } from "../domain/model-divergence/current-generation-record.js";
 import { SeatIdentityStore } from "../domain/seat-identity-store.js";
 import { parseSqliteUtcMs } from "../domain/sqlite-time.js";
+import { runSyncSiteWhenSlow } from "../domain/sync-site-wrap.js";
 
 const generationCensus = new ProcessCensus({ freshnessMs: 0 }); // coalesce concurrent receipts; recheck each later read
-const generationThreadIds = new CodexThreadIdResolver({ codexHome: process.env.CODEX_HOME || undefined });
+const generationThreadIds = new CodexThreadIdResolver();
+
+/** The node inventory's synchronous steps run one at a time, each after a turn of the event loop. They're SQLite work
+ *  that can't yield, so concurrent requests ran their whole builds back to back and a read queued behind a burst (a
+ *  /healthz, a queue read) waited for all of them; now it waits for one step. Steps that await I/O run outside.
+ *  A step that takes the slow threshold or more is named `site` in the slow-operation log. That's its own synchronous
+ *  time, measured once its turn comes: not the wait for the turn, and not the settling of a promise it returns. */
+let inventoryTurn: Promise<void> = Promise.resolve();
+async function inventoryStep<T>(site: string, work: () => T): Promise<Awaited<T>> {
+  const previous = inventoryTurn;
+  let release = () => {};
+  inventoryTurn = new Promise<void>((resolve) => { release = () => resolve(); });
+  try {
+    await previous;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    return await runSyncSiteWhenSlow(site, work);
+  } finally {
+    release();
+  }
+}
 
 function terminalAuthGuard(): MiddlewareHandler {
   return async (c, next) => {
     const token = (c.get("terminalBearerToken" as never) as string | null | undefined) ?? null;
-    const mw = authBearerTokenMiddleware({ expectedToken: token });
+    const mw = authBearerTokenMiddleware({ expectedToken: token, diagnosticContext: "terminal" });
     return mw(c, next);
   };
 }
@@ -71,9 +99,37 @@ function getDeps(c: { get: (key: string) => unknown }) {
   };
 }
 
+/** A seat a launch names: its logical or node id, as before, or else a session name, matched against this rig's
+ *  inventory by the name each seat records (an adopted seat's raw tmux name) or derives, never by converting the string.
+ *  The ref is compared as given and, when it has no `@`, also as `ref@<rig>`. One seat is the seat. More than one, or
+ *  none, names the rig's candidate seats with their session names. */
+function resolveLaunchSeat(db: Parameters<typeof getNodeInventory>[0], rigId: string, rig: { rig: { name: string }; nodes: Array<{ id: string; logicalId: string }> }, ref: string):
+  { ok: true; logicalId: string }
+  | { ok: false; code: "node_not_found"; error: string }
+  | { ok: false; code: "seat_ambiguous"; error: string; candidates: Array<{ logicalId: string; sessionName: string | null }> } {
+  const direct = rig.nodes.find((node) => node.logicalId === ref || node.id === ref);
+  if (direct) return { ok: true, logicalId: direct.logicalId };
+  const inventory = getNodeInventory(db, rigId);
+  const wanted = new Set(ref.includes("@") ? [ref] : [ref, `${ref}@${rig.rig.name}`]);
+  const named = (name: string | null | undefined) => name != null && wanted.has(name);
+  const sessionName = (entry: (typeof inventory)[number]) => entry.canonicalSessionName ?? deriveCanonicalFromEntry(entry);
+  const matches = [...new Map(inventory
+    .filter((entry) => named(entry.canonicalSessionName) || named(deriveCanonicalFromEntry(entry)))
+    .map((entry) => [entry.logicalId, entry])).values()];
+  if (matches.length === 1) return { ok: true, logicalId: matches[0]!.logicalId };
+  const listed = (entries: typeof inventory) => entries.map((entry) => `${entry.logicalId} (${sessionName(entry) ?? "no session name"})`).join(", ");
+  return matches.length > 1
+    ? {
+      ok: false, code: "seat_ambiguous",
+      error: `"${ref}" matches more than one seat in rig "${rig.rig.name}": ${listed(matches)}. Name one by its logical id.`,
+      candidates: matches.map((entry) => ({ logicalId: entry.logicalId, sessionName: sessionName(entry) ?? null })),
+    }
+    : { ok: false, code: "node_not_found", error: `Node "${ref}" not found in rig "${rig.rig.name}"${inventory.length > 0 ? `. Its seats: ${listed(inventory)}` : ""}.` };
+}
+
 function narrowLaunchErrorStatus(code: string | undefined): 404 | 409 | 500 {
   if (code === "rig_not_found" || code === "no_matching_nodes" || code === "snapshot_not_found" || code === "snapshot_wrong_rig" || code === "no_usable_snapshot") return 404;
-  if (code === "snapshot_unusable") return 409;
+  if (code === "snapshot_unusable" || code === "selection_changed") return 409;
   return 500;
 }
 
@@ -103,7 +159,8 @@ sessionsRoutes.get("/", (c) => {
 nodesRoutes.get("/", observeInventoryHandler, async (c) => {
   const rigId = c.req.param("rigId")!;
   const deps = getDeps(c);
-  const rig = deps.rigRepo.getRig(rigId);
+  // Only existence is needed here; the inventory below builds the response.
+  const rig = deps.rigRepo.db.prepare("SELECT 1 FROM rigs WHERE id = ?").get(rigId);
   if (!rig) return c.json({ error: `Rig "${rigId}" not found. List rigs with: rig ps` }, 404);
 
   const refresh = c.req.query("refresh") === "true";
@@ -124,9 +181,9 @@ nodesRoutes.get("/", observeInventoryHandler, async (c) => {
 
   const contextUsageStore = c.get("contextUsageStore" as never) as ContextUsageStore | undefined;
   const transcriptStore = c.get("transcriptStore" as never) as TranscriptStore | undefined;
-  const inventory = contextUsageStore
+  const inventory = await inventoryStep("nodes.inventory.build", () => contextUsageStore
     ? getNodeInventoryWithContext(deps.rigRepo.db, rigId, contextUsageStore, transcriptStore)
-    : getNodeInventory(deps.rigRepo.db, rigId);
+    : getNodeInventory(deps.rigRepo.db, rigId));
   // Slice 15 — enrich with the two new orthogonal primitives. Order is
   // independent (each enrichment reads its own source), so the chain
   // composes cleanly with attachAgentActivity. The non-inference
@@ -136,7 +193,8 @@ nodesRoutes.get("/", observeInventoryHandler, async (c) => {
   // capture). Opt into the per-node fallback with ?full=true / ?refresh=true — the
   // latter already implies a fresh sweep above.
   const full = c.req.query("full") === "true" || refresh;
-  const withActivity = await attachAgentActivity(inventory, {
+  // The default path reads no pane, so it is one more synchronous step; a full read awaits pane captures, outside.
+  const attachActivity = () => attachAgentActivity(inventory, {
     ...inventoryCaptureOptions(deps.rigRepo.db, deps.shadowCapture),
     tmuxAdapter: deps.tmuxAdapter,
     activityStore: deps.agentActivityStore,
@@ -157,10 +215,12 @@ nodesRoutes.get("/", observeInventoryHandler, async (c) => {
     seatActivity: deps.seatActivityService,
     captureFallback: full,
   });
-  const withTerminalAndWork = attachTerminalActivityAndWork(withActivity, {
+  const withActivity = full ? await attachActivity() : await inventoryStep("nodes.inventory.activity_sync", attachActivity);
+  const withTerminalAndWork = await inventoryStep("nodes.inventory.terminal_work", () => attachTerminalActivityAndWork(withActivity, {
     db: deps.rigRepo.db,
     seatActivity: deps.seatActivityService,
-  });
+    agentActivity: deps.agentActivityStore,
+  }));
   // Slice 13 fix 2 — HOST ATTRIBUTION AT THE SOURCE. A daemon only inventories its own seats, so
   // every row it serves lives on THIS host; stamping the boot-reconciled self-id here means a
   // merged multi-host roster stays attributable row-by-row (a roster missing a host is legible as
@@ -168,7 +228,24 @@ nodesRoutes.get("/", observeInventoryHandler, async (c) => {
   // always present, so "not yet known" is a value, never an absence a consumer can misread.
   // selfHostId ONLY — never host.name (display-only; the DP4 conflation healthz already refuses).
   const hostSelfId = getSelfHostId();
-  return c.json(withTerminalAndWork.map((n) => ({ ...n, hostSelfId })));
+  const modelReader = c.get("currentModelReader" as never) as CurrentModelReader | undefined;
+  const observations = modelReader ? await modelReader.observeInventory(withTerminalAndWork) : null;
+  // #3513: the Remote Control session the seat's own hooks last reported, for its current occupant and conversation;
+  // null when none applies. An observation with its time ("last seen"), not proof of a live connection.
+  const remoteControlStore = new RemoteControlObservationStore(deps.rigRepo.db);
+  const remoteControlOf = (nodeId: string) => {
+    try {
+      return remoteControlStore.current({ nodeId,
+        isCurrentOccupant: (generation) => deps.sessionRegistry.isOccupantContinuedByAdoption(nodeId, generation) });
+    } catch {
+      return null;
+    }
+  };
+  const nodes = withTerminalAndWork.map((n, i) => ({ ...n, hostSelfId,
+    modelObservation: observations?.[i] ?? unknownModelObservation("observer-unavailable"),
+    remoteControl: remoteControlOf(n.nodeId),
+  }));
+  return c.json(nodes);
 });
 
 // GET /api/rigs/:rigId/nodes/:logicalId — node detail
@@ -189,8 +266,12 @@ nodesRoutes.get("/:logicalId", async (c) => {
   const [detailWithTerminalAndWork] = attachTerminalActivityAndWork(detailWithActivity ? [detailWithActivity] : [detail], {
     db: deps.rigRepo.db,
     seatActivity: deps.seatActivityService,
+    agentActivity: deps.agentActivityStore,
   });
   Object.assign(detail, {
+    needsAttention: detailWithTerminalAndWork?.needsAttention,
+    arbitratedNeedsInput: detailWithTerminalAndWork?.arbitratedNeedsInput,
+    needsInputEvidence: detailWithTerminalAndWork?.needsInputEvidence,
     agentActivity: detailWithTerminalAndWork?.agentActivity,
     terminalActive: detailWithTerminalAndWork?.terminalActive,
     // ARCH RULING 3a947fb1: serve the raw lastActivityAt fact on node-detail too
@@ -255,10 +336,9 @@ nodesRoutes.post("/:logicalId/launch", async (c) => {
     return c.json({ ok: false, code: "rig_not_found", error: `Rig "${rigId}" not found` }, 404);
   }
 
-  const node = rig.nodes.find((entry) => entry.logicalId === logicalId || entry.id === logicalId);
-  if (!node) {
-    return c.json({ ok: false, code: "node_not_found", error: `Node "${logicalId}" not found in rig "${rigId}"` }, 404);
-  }
+  const seat = resolveLaunchSeat(rigRepo.db, rigId, rig, logicalId);
+  if (!seat.ok) return c.json({ ok: false, code: seat.code, error: seat.error }, seat.code === "seat_ambiguous" ? 409 : 404);
+  const node = rig.nodes.find((entry) => entry.logicalId === seat.logicalId)!;
 
   const body = await c.req.json().catch(() => ({})) as { snapshotId?: string; retryStartupFrom?: { member?: Record<string, unknown>; rigRoot?: string } };
   if (body.retryStartupFrom !== undefined) {
@@ -269,10 +349,19 @@ nodesRoutes.post("/:logicalId/launch", async (c) => {
     const instantiator = c.get("podInstantiator" as never) as PodRigInstantiator | undefined;
     if (!instantiator) return c.json({ ok: false, code: "internal_error", message: "Pod instantiator unavailable" }, 500);
     const result = await instantiator.retryFirstStart(rigId, node.id, retry.member, retry.rigRoot);
-    return c.json(result, result.ok ? 201 : result.code === "failed" ? 500 : 409);
+    return c.json(result, result.ok ? 201 : processLimitsStatus(result.code) ?? (result.code === "failed" ? 500 : 409));
   }
 
-  if (node.podId) {
+  if (node.podId || body.snapshotId !== undefined) {
+    if (body.snapshotId === undefined) {
+      const instantiator = c.get("podInstantiator" as never) as PodRigInstantiator | undefined;
+      const firstStart = await instantiator?.launchFirstMaterializedNode(rigId, node.id);
+      if (firstStart) {
+        if (firstStart.ok) (c.get("snapshotCapture" as never) as SnapshotCapture | undefined)?.captureSnapshot(rigId, "auto-rehydrate");
+        return c.json(firstStart, firstStart.ok ? 201
+          : processLimitsStatus(firstStart.code) ?? (firstStart.code === "target_liveness_unknown" ? 503 : 409));
+      }
+    }
     const { restoreOrchestrator } = getDeps(c);
     if (!restoreOrchestrator) {
       return c.json({ ok: false, code: "internal_error", error: "Restore orchestrator not available" }, 500);
@@ -307,18 +396,28 @@ nodesRoutes.post("/:logicalId/launch", async (c) => {
     return c.json(result);
   }
 
-  const result = await nodeLauncher.launchNode(rigId, logicalId);
+  const result = await nodeLauncher.launchNode(rigId, node.logicalId);
 
   if (!result.ok) {
     const status = result.code === "node_not_found" ? 404
       : result.code === "already_bound" ? 409
       : result.code === "invalid_session_name" ? 400
+      // #3253: a seat whose process limit can't be applied; only an unverified check may pass on retry.
+      : result.code === "process_limits_unverified" ? 409
+      : /^process_limits_/.test(result.code) ? 422
       : 500;
     return c.json(result, status);
   }
 
   return c.json(result, 201);
 });
+
+/** #3253: the HTTP status of a launch refused for the seat's process limit, as the legacy launch maps it (only an
+ *  unverified check may pass on retry: 409; the rest are 422); undefined for any other code. */
+function processLimitsStatus(code: string | undefined): 409 | 422 | undefined {
+  if (code === "process_limits_unverified") return 409;
+  return code !== undefined && /^process_limits_/.test(code) ? 422 : undefined;
+}
 
 // POST /api/rigs/:rigId/nodes/launch-subset — multi-target managed subset launch
 nodesRoutes.post("/launch-subset", async (c) => {
@@ -327,15 +426,33 @@ nodesRoutes.post("/launch-subset", async (c) => {
   if (!restoreOrchestrator) {
     return c.json({ ok: false, code: "internal_error", error: "Restore orchestrator not available" }, 500);
   }
-  const body = await c.req.json().catch(() => ({})) as { seats?: string[]; holdReason?: string; snapshotId?: string; plan?: boolean };
+  const body = await c.req.json().catch(() => ({})) as { seats?: string[]; holdReason?: string; snapshotId?: string; plan?: boolean; nonTargetMode?: "unchanged" | "detach_and_hold" };
   if (!Array.isArray(body.seats) || body.seats.length === 0) {
     return c.json({ ok: false, code: "invalid_request", error: "Request body must include a non-empty 'seats' array of logical IDs" }, 400);
   }
+  // Each seat may be named by its session name too. A name more than one seat answers to isn't launched: it's reported in
+  // `ambiguousSeats` with its candidates, beside `unmatchedIds`, and the other seats go ahead. One that matches nothing is
+  // passed on as given, and the launch reports it unmatched as before.
+  const rig = getDeps(c).rigRepo.getRig(rigId);
+  const seats: string[] = [];
+  const ambiguousSeats: Array<{ seat: string; candidates: Array<{ logicalId: string; sessionName: string | null }>; message: string }> = [];
+  for (const ref of body.seats) {
+    const seat = rig && typeof ref === "string" ? resolveLaunchSeat(getDeps(c).rigRepo.db, rigId, rig, ref) : null;
+    if (seat && !seat.ok && seat.code === "seat_ambiguous") {
+      ambiguousSeats.push({ seat: ref, candidates: seat.candidates, message: seat.error });
+      continue;
+    }
+    seats.push(seat?.ok ? seat.logicalId : ref);
+  }
+  const ambiguity = ambiguousSeats.length > 0 ? { ambiguousSeats } : {};
+  if (seats.length === 0) {
+    return c.json({ ok: false, code: "seat_ambiguous", error: "Each seat named matches more than one seat, so there is nothing to launch.", ...ambiguity }, 409);
+  }
   const result = body.plan === true
-    ? restoreOrchestrator.planNodeSubset(rigId, body.seats, { holdReason: body.holdReason, snapshotId: body.snapshotId })
-    : await restoreOrchestrator.launchNodeSubset(rigId, body.seats, { holdReason: body.holdReason, snapshotId: body.snapshotId, ...(await resumeLaunchOpts(c)) });
+    ? restoreOrchestrator.planNodeSubset(rigId, seats, { holdReason: body.holdReason, snapshotId: body.snapshotId, nonTargetMode: body.nonTargetMode })
+    : await restoreOrchestrator.launchNodeSubset(rigId, seats, { holdReason: body.holdReason, snapshotId: body.snapshotId, ...(await resumeLaunchOpts(c)) });
   if (!result.ok) {
-    return c.json(result, narrowLaunchErrorStatus(result.code));
+    return c.json({ ...result, ...ambiguity }, narrowLaunchErrorStatus(result.code));
   }
   // OPR.0.4.3.20 FR-7 — a target that landed awaiting-decision / attention_required /
   // failed is NOT launched (no running session). Success requires at least one running
@@ -345,7 +462,7 @@ nodesRoutes.post("/launch-subset", async (c) => {
   const nonRunning = launchedEntries.filter((n) => !launchStatusIsRunning(n.status));
   const running = launchedEntries.filter((n) => launchStatusIsRunning(n.status));
   const status = nonRunning.length > 0 ? 409 : running.length > 0 ? 201 : 200;
-  return c.json({ ...result, ok: nonRunning.length === 0 && result.ok }, status);
+  return c.json({ ...result, ...ambiguity, ok: nonRunning.length === 0 && result.ok }, status);
 });
 
 // GET /api/rigs/:rigId/nodes/:logicalId/preview?lines=N
@@ -577,6 +694,35 @@ sessionAdminRoutes.post("/:sessionName/reconcile", terminalAuthGuard(), async (c
   return c.json(outcome, 200);
 });
 
+// Deliberately separate from /reconcile: old daemons must return 404, never adopt.
+sessionAdminRoutes.post("/:sessionName/repair-missing-pane", terminalAuthGuard(), async (c) => {
+  const body: unknown = await c.req.json().catch(() => null);
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return c.json({ error: "Supply a JSON object with optional rigId and logicalId." }, 400);
+  }
+  const input = body as Record<string, unknown>;
+  for (const key of ["rigId", "logicalId"]) {
+    if (input[key] !== undefined && (typeof input[key] !== "string" || !(input[key] as string).trim())) {
+      return c.json({ error: `${key} must be a non-empty string.` }, 400);
+    }
+  }
+  const rigId = input.rigId as string | undefined, logicalId = input.logicalId as string | undefined;
+  if (!!rigId !== !!logicalId) return c.json({ error: "rigId and logicalId must be provided together (or both omitted)." }, 400);
+  const claimService = c.get("claimService" as never) as ClaimService | undefined;
+  const instantiator = c.get("podInstantiator" as never) as PodRigInstantiator | undefined;
+  if (!claimService || !instantiator) return c.json({ error: "Missing-pane repair is unavailable on this daemon." }, 503);
+  const result = await convergeOp({ instantiator, claimService }, rigId ?? "", {
+    kind: "reconcile_session", sessionName: c.req.param("sessionName")!, rigId, logicalId, repairMissingPane: true,
+  }, ".");
+  if (result.kind !== "reconcile_session" || !result.supported) return c.json({ error: "Unexpected repair result." }, 500);
+  const outcome = result.outcome;
+  if (outcome.ok) return c.json(outcome, 200);
+  if (outcome.code === "tmux_unavailable") return c.json(outcome, 503);
+  if (outcome.code === "repair_timed_out") return c.json(outcome, 504);
+  if (outcome.code === "reconcile_error") return c.json(outcome, 500);
+  return c.json(outcome, 409);
+});
+
 // POST /api/sessions/:sessionName/clear-attention — OPR.0.3.4.10.
 sessionAdminRoutes.post("/:sessionName/clear-attention", terminalAuthGuard(), async (c) => {
   const sessionName = c.req.param("sessionName")!;
@@ -665,7 +811,7 @@ sessionAdminRoutes.post("/:sessionRef/unclaim", terminalAuthGuard(), async (c) =
 
   const result = await rigLifecycleService.unclaimSession(sessionRef);
   if (!result.ok) {
-    const status = result.code === "session_ambiguous" ? 409 : 404;
+    const status = result.code === "session_not_found" ? 404 : 409;
     return c.json(result, status);
   }
 
@@ -681,11 +827,17 @@ sessionAdminRoutes.post("/:sessionRef/unclaim", terminalAuthGuard(), async (c) =
 // impossible, never receive an empty success.
 // Round-2 (r2 HIGH-2): raw conversation bytes with no transcript redaction — a TERMINAL-CLASS
 // surface behind the same bearer gate as its neighbors (401/401/200; null-token loopback passes).
-sessionAdminRoutes.get("/:sessionName/generation-record", terminalAuthGuard(), async (c) => {
+const generationRecord = async (c: Context) => {
   const sessionName = c.req.param("sessionName")!;
+  let expected: ExpectedConversation | undefined;
+  if (c.req.path.endsWith("/generation-record-expected")) {
+    try { expected = expectedConversation({ nodeId: c.req.query("expectedNodeId"), sessionName,
+      runtime: c.req.query("expectedRuntime"), nativeId: c.req.query("expectedNativeId") }); }
+    catch (error) { return c.json({ error: "invalid_expected_identity", message: (error as Error).message }, 400); }
+  }
   const store = c.get("contextUsageStore" as never) as ContextUsageStore | undefined;
   if (!store) {
-    return c.json({ error: "unsupported_runtime", message: "No context-usage store on this daemon; the seat's generation record cannot be resolved." }, 409);
+    return c.json({ error: expected ? "expected_identity_unavailable" : "unsupported_runtime", message: "No context-usage store on this daemon; the seat's generation record cannot be resolved." }, 409);
   }
   const { sessionRegistry: registry, tmuxAdapter } = getDeps(c);
   const context = registry?.findResumeContextByName(sessionName);
@@ -693,7 +845,12 @@ sessionAdminRoutes.get("/:sessionName/generation-record", terminalAuthGuard(), a
   const runtime = context?.runtime ?? "claude-code";
   let transcriptPath: string | null;
   let sessionId: string | null;
-  if (runtime === "codex") {
+  let original: Awaited<ReturnType<typeof resolveExpectedConversation>> | undefined;
+  if (expected) {
+    try { original = await resolveExpectedConversation(expected, registry, tmuxAdapter, store);
+      sessionId = original.identity.nativeId; transcriptPath = original.path;
+    } catch (error) { return c.json({ error: error instanceof DeliveryGuardError ? error.code : "expected_identity_unavailable", message: (error as Error).message }, 409); }
+  } else if (runtime === "codex") {
     const binding = registry.getBindingForNode(context!.nodeId);
     const identity = new SeatIdentityStore(registry.db).getForNode(context!.nodeId);
     if (!occupant || !binding?.tmuxPane || binding.tmuxSession !== sessionName
@@ -704,18 +861,40 @@ sessionAdminRoutes.get("/:sessionName/generation-record", terminalAuthGuard(), a
     }
     try {
       const pid = await tmuxAdapter?.getPanePid?.(binding.tmuxPane);
-      if (!pid || pid !== identity.evidence.observedPid) {
+      // A shell or launcher can be the pane root; legacy verdicts only recorded one PID.
+      const verifiedPanePid = identity.evidence.observedPanePid ?? identity.evidence.observedPid;
+      if (!pid || pid !== verifiedPanePid) {
         return c.json({ error: "record_identity_unverified", message: `The bound pane for '${sessionName}' no longer matches its verified occupant.` }, 409);
       }
+      // Match the expected-identity reader: select this seat's home, then carry the
+      // positive PID/start-time lookup's home into the transcript lookup as well.
+      const codexHome = effectiveRuntimeHome(registry.db, context!.nodeId, "codex", process.env.CODEX_HOME || undefined);
+      const threads = codexHome ? new CodexThreadIdResolver({ codexHome }) : generationThreadIds;
+      let verifiedNativeThreadId: string | undefined, verifiedHome: string | undefined;
+      const homes = new Set<string>();
       const live = await resolveLiveCodexThreadId(binding.tmuxPane, {
         getPanePid: async () => pid,
-        listProcesses: () => generationCensus.list(),
-        readThreadIdByPid: (nativePid, startedAt) => startedAt
-          ? generationThreadIds.resolve(nativePid, startedAt) : undefined,
+        listProcesses: (opts) => generationCensus.list(opts),
+        readThreadIdByPid: async (nativePid, startedAt) => {
+          if (!startedAt) return undefined;
+          const read = await threads.resolveWithHome(nativePid, startedAt, nativePid === identity.evidence.observedPid);
+          if (read.thread && read.codexHome) homes.add(read.codexHome);
+          if (nativePid === identity.evidence.observedPid) { verifiedNativeThreadId = read.thread; verifiedHome = read.codexHome; }
+          return read.thread;
+        },
       });
       if (!live.ok) return c.json({ error: "record_identity_unverified", message: live.reason }, 409);
       sessionId = live.id;
-      transcriptPath = store.readCodexTranscriptPath(sessionId);
+      // Dual-PID verdicts must name the process whose thread was selected; legacy verdicts only identify the root. A different
+      // conversation under a surviving wrapper isn't a binding change, so it says what it is.
+      if (identity.evidence.observedPanePid != null && verifiedNativeThreadId !== sessionId) {
+        return c.json({ error: "record_identity_unverified", message: `The Codex conversation in the pane for '${sessionName}' isn't the one its verified process owned, so no generation record is served.` }, 409);
+      }
+      const recordHome = verifiedHome ?? (homes.size === 1 ? [...homes][0] : undefined);
+      if (!recordHome) {
+        return c.json({ error: "record_identity_unverified", message: `The current native process's record home for '${sessionName}' could not be established.` }, 409);
+      }
+      transcriptPath = store.readCodexTranscriptPath(sessionId, recordHome);
       if (registry.currentOccupantTenure(context!.nodeId)?.generationUuid !== occupant.generationUuid
         || registry.getBindingForNode(context!.nodeId)?.tmuxPane !== binding.tmuxPane
         || await tmuxAdapter.getPanePid?.(binding.tmuxPane) !== pid) {
@@ -741,39 +920,54 @@ sessionAdminRoutes.get("/:sessionName/generation-record", terminalAuthGuard(), a
   // Cap the served suffix — the caller polls; a runaway record must not become a runaway response.
   const MAX_SUFFIX_BYTES = 8 * 1024 * 1024;
   try {
-    const fd = fs.openSync(transcriptPath, "r");
+    if (expected) { original = await resolveExpectedConversation(expected, registry, tmuxAdapter, store); transcriptPath = original.path; }
+    const fd = fs.openSync(original?.path ?? transcriptPath, "r");
     try {
       const stat = fs.fstatSync(fd);
       if (!stat.isFile()) throw new Error("record is not a regular file");
       const totalBytes = stat.size;
       // Identity and bytes come from the same open file. Appends preserve this identity;
       // replacing a rollout at the same path changes it, even if its native id is unchanged.
-      const generationId = JSON.stringify([occupant?.generationUuid ?? null, sessionId, transcriptPath, stat.dev, stat.ino, stat.birthtimeMs]);
-      if (runtime === "codex") {
-        let header = "";
-        for (let offset = 0; offset < Math.min(totalBytes, MAX_SUFFIX_BYTES) && !header.includes("\n");) {
+      const generationId = JSON.stringify([original?.generation ?? occupant?.generationUuid ?? null, sessionId, transcriptPath, stat.dev, stat.ino, stat.birthtimeMs]);
+      if (runtime === "codex" || expected) {
+        // Native records are append-only. Identify the opened file at its first identity-bearing line,
+        // rather than parsing megabytes of old conversation again on every suffix poll.
+        let pending = "", nativeId: string | undefined;
+        for (let offset = 0; offset < Math.min(totalBytes, MAX_SUFFIX_BYTES) && nativeId === undefined;) {
           const chunk = Buffer.alloc(Math.min(64 * 1024, totalBytes - offset, MAX_SUFFIX_BYTES - offset));
           const n = fs.readSync(fd, chunk, 0, chunk.length, offset);
           if (!n) break;
-          header += chunk.subarray(0, n).toString("utf8");
-          offset += n;
+          pending += chunk.subarray(0, n).toString("utf8"); offset += n;
+          for (let newline = pending.indexOf("\n"); newline >= 0; newline = pending.indexOf("\n")) {
+            const line = pending.slice(0, newline); pending = pending.slice(newline + 1);
+            let row;
+            try { row = JSON.parse(line); } catch { /* explicit no-answer below */ }
+            if (runtime === "codex") {
+              nativeId = row?.type === "session_meta" && typeof row.payload?.id === "string" ? row.payload.id : "";
+              break;
+            }
+            if (typeof row?.sessionId === "string") { nativeId = row.sessionId; break; }
+          }
         }
-        let meta;
-        try { meta = JSON.parse(header.slice(0, header.indexOf("\n"))); } catch { /* explicit no-answer below */ }
-        if (meta?.type !== "session_meta" || meta.payload?.id !== sessionId) {
-          return c.json({ error: "record_identity_mismatch", message: `The rollout header does not identify current thread '${sessionId}'.` }, 409);
+        if (nativeId !== sessionId) {
+          return c.json({ error: expected ? "expected_identity_mismatch" : "record_identity_mismatch",
+            message: "The opened record does not identify the selected native conversation." }, 409);
         }
       }
-      if (sinceRaw === undefined) return c.json({ generationId, sessionId, runtime, totalBytes });
+      original?.assertCurrent();
+      const receipt = expected ? { checkedIdentity: expected, identityContract: 1 as const } : {};
+      if (sinceRaw === undefined) return c.json({ generationId, sessionId, runtime, totalBytes, ...receipt });
       if (since > totalBytes) return c.json({ error: "record_truncated", message: "Generation record shrank below the requested byte boundary." }, 409);
       const length = Math.min(totalBytes - since, MAX_SUFFIX_BYTES);
       const buf = Buffer.alloc(length);
       const read = fs.readSync(fd, buf, 0, length, since);
-      return c.json({ generationId, sessionId, runtime, totalBytes, suffix: buf.subarray(0, read).toString("utf8"), truncated: totalBytes - since > read });
+      return c.json({ generationId, sessionId, runtime, totalBytes, ...receipt, suffix: buf.subarray(0, read).toString("utf8"), truncated: totalBytes - since > read });
     } finally {
       fs.closeSync(fd);
     }
   } catch (err) {
-    return c.json({ error: "record_unreadable", message: `Generation record for '${sessionName}' is unreadable: ${(err as Error).message}` }, 409);
+    return c.json({ error: expected ? err instanceof DeliveryGuardError ? err.code : "expected_identity_unavailable" : "record_unreadable", message: `Generation record for '${sessionName}' is unreadable: ${(err as Error).message}` }, 409);
   }
-});
+};
+sessionAdminRoutes.get("/:sessionName/generation-record", terminalAuthGuard(), generationRecord);
+sessionAdminRoutes.get("/:sessionName/generation-record-expected", terminalAuthGuard(), generationRecord);

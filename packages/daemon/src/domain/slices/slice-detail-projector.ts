@@ -24,6 +24,7 @@ import * as path from "node:path";
 import type Database from "better-sqlite3";
 import type { SliceIndexer, SliceRecord, SliceProofPacket } from "./slice-indexer.js";
 import type { WorkflowSpecCache } from "../workflow-spec-cache.js";
+import type { WorkflowSpec } from "../workflow-types.js";
 import { sessionRigOf } from "../session-name.js";
 import {
   findSliceWorkflowBinding,
@@ -54,6 +55,7 @@ import {
   type PhaseDefinition,
   type CurrentStepPayload,
 } from "../workflow/slice-workflow-projection.js";
+import { sliceWhole } from "../text-cut.js";
 
 export interface StoryEvent {
   ts: string;
@@ -236,7 +238,7 @@ export class SliceDetailProjector {
     const bindingResult = findSliceWorkflowBinding(this.db, slice.qitemIds);
     const binding = bindingResult.primary;
     const spec = binding && this.workflowSpecCache
-      ? this.tryGetSpec(binding.workflowName, binding.workflowVersion)
+      ? this.tryGetSpec(binding.instanceId, binding.workflowName, binding.workflowVersion)
       : null;
     const trailQitemToStep = binding ? this.buildTrailQitemToStepMap(binding.instanceId) : new Map<string, string>();
 
@@ -287,10 +289,19 @@ export class SliceDetailProjector {
 
   // --- v1 helpers ---
 
-  private tryGetSpec(name: string, version: string) {
+  /** The rig the instance is bound to, so `member@{rig}` targets show the seat the packet went to. */
+  /** The steps the run actually runs: the spec it started with (#2607) and its bound rig, when its row has them. */
+  private tryGetSpec(instanceId: string, name: string, version: string) {
     if (!this.workflowSpecCache) return null;
     try {
-      const row = this.workflowSpecCache.getByNameVersion(name, version);
+      const instance = this.db.prepare(`SELECT * FROM workflow_instances WHERE instance_id = ?`)
+        .get(instanceId) as { bound_rig?: string | null; spec_source_path?: string | null; spec_json?: string | null } | undefined;
+      const row = this.workflowSpecCache.getForInstance({
+        workflowName: name, workflowVersion: version, boundRig: instance?.bound_rig ?? null,
+        startedSpec: instance?.spec_json && instance.spec_source_path
+          ? { sourcePath: instance.spec_source_path, spec: JSON.parse(instance.spec_json) as WorkflowSpec }
+          : null,
+      });
       return row?.spec ?? null;
     } catch {
       return null;
@@ -876,7 +887,7 @@ export class SliceDetailProjector {
 
 function truncate(s: string, n: number): string {
   if (s.length <= n) return s;
-  return `${s.slice(0, n)}…`;
+  return `${sliceWhole(s, n)}…`;
 }
 
 function sessionRigKey(session: string): string {

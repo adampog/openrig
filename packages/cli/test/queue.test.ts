@@ -1,10 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { CommanderError } from "commander";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { PassThrough } from "node:stream";
 import type { QueueDeps } from "../src/commands/queue.js";
-import { resolveQueueBody, previewBody, waitForDeliveryOutcome } from "../src/commands/queue.js";
+import { resolveQueueBody, previewBody, previewCutMarker, waitForDeliveryOutcome } from "../src/commands/queue.js";
 import { createProgram } from "../src/index.js";
 
 /**
@@ -28,7 +29,10 @@ vi.mock("../src/daemon-lifecycle.js", async () => {
 interface StubResponse {
   status: number;
   data: unknown;
+  headers?: Headers;
 }
+
+const STUB_SENDER = "stub@rig";
 
 function makeDeps(opts?: {
   routes?: Record<string, StubResponse | StubResponse[]>;
@@ -40,10 +44,37 @@ function makeDeps(opts?: {
     deps: {
       lifecycleDeps: {} as QueueDeps["lifecycleDeps"],
       clientFactory: () => ({
+        // The sender this stub stamps; the transitions it synthesizes record it as their actor, as the daemon does.
+        senderIdentity: async () => ({ session: STUB_SENDER, originUnknown: false }),
         get: vi.fn(async (path: string) => {
           calls.push({ method: "GET", path });
           const route = routes[`GET ${path}`];
-          return (Array.isArray(route) ? route.shift() : route) ?? { status: 200, data: {} };
+          if (route) return Array.isArray(route) ? route.shift() : route;
+          const transitionMatch = /^\/api\/queue\/([^/]+)\/transitions$/.exec(path);
+          if (transitionMatch) {
+            const qitemId = decodeURIComponent(transitionMatch[1]!);
+            const update = [...calls].reverse().find((call) => call.method === "POST"
+              && call.path === `/api/queue/${encodeURIComponent(qitemId)}/update`);
+            const transitionNote = update?.body && typeof update.body === "object"
+              ? (update.body as { transitionNote?: unknown }).transitionNote
+              : undefined;
+            return { status: 200, data: [
+              { transitionId: 1, transitionNote: null, actorSession: STUB_SENDER },
+              ...(typeof transitionNote === "string" ? [{ transitionId: 2, transitionNote, actorSession: STUB_SENDER }] : []),
+            ] };
+          }
+          const match = /^\/api\/queue\/([^/]+)$/.exec(path);
+          if (match) {
+            const qitemId = decodeURIComponent(match[1]!);
+            const update = [...calls].reverse().find((call) => call.method === "POST"
+              && call.path === `/api/queue/${encodeURIComponent(qitemId)}/update`);
+            if (update?.body && typeof update.body === "object") {
+              const body = Object.fromEntries(Object.entries(update.body as Record<string, unknown>)
+                .filter(([key, value]) => value !== undefined && !["transitionNote", "actorSession", "reopen"].includes(key)));
+              return { status: 200, data: { qitemId, ...body } };
+            }
+          }
+          return { status: 200, data: {} };
         }),
         getText: vi.fn(async (path: string) => {
           calls.push({ method: "GET", path });
@@ -82,6 +113,7 @@ describe("rig queue CLI", () => {
     // AMBIENT OPENRIG_SESSION_NAME (which masked the env-less break in a managed runner). Per-test stubs
     // that need a specific seat override this.
     vi.stubEnv("OPENRIG_SESSION_NAME", "seat@rig");
+    vi.stubEnv("TMUX_PANE", "");
     logs = [];
     errors = [];
     vi.spyOn(console, "log").mockImplementation((...args) => logs.push(args.join(" ")));
@@ -164,6 +196,24 @@ describe("rig queue CLI", () => {
     expect(process.exitCode).toBe(1);
     expect(calls).toEqual([]);
     expect(errors.join("\n")).toContain("--source is required");
+  });
+
+  it("verbs whose actor is the seat's identity name OPENRIG_SESSION_NAME outside a managed seat, never their ignored flag", async () => {
+    vi.stubEnv("OPENRIG_SESSION_NAME", "");
+    vi.stubEnv("RIGGED_SESSION_NAME", "");
+    for (const [flag, argv] of [["actor", ["update", "q1", "--note", "x", "--actor", "me@rig"]], ["from", ["handoff", "q1", "--to", "bob@rig", "--body", "next"]],
+      ["destination", ["claim", "q1"]]] as const) {
+      errors.length = 0;
+      process.exitCode = undefined;
+      const { deps, calls } = makeDeps();
+      await createProgram({ queueDeps: deps }).parseAsync(["node", "rig", "queue", ...argv]);
+      expect(process.exitCode, argv[0]).toBe(1);
+      expect(calls, argv[0]).toEqual([]);
+      const text = errors.join("\n");
+      expect(text, argv[0]).toContain("OPENRIG_SESSION_NAME is not set");
+      expect(text, argv[0]).toContain(`--${flag} is ignored`);
+      expect(text, argv[0]).not.toContain("is required when OPENRIG_SESSION_NAME is not set");
+    }
   });
 
   it("create preserves the legacy managed source env without forwarding an explicit body claim", async () => {
@@ -341,6 +391,8 @@ describe("rig queue CLI", () => {
       qitemId: id,
       persisted: true,
       delivery: {
+        receiptSource: "gateway",
+        destinationKind: "human",
         outcome: "posted",
         connectorAccepted: true,
         humanReadership: "unknown",
@@ -371,6 +423,8 @@ describe("rig queue CLI", () => {
       qitemId: id,
       persisted: true,
       delivery: {
+        receiptSource: "gateway",
+        destinationKind: "human",
         outcome: "still-pending",
         connectorAccepted: null,
         humanReadership: "unknown",
@@ -398,27 +452,388 @@ describe("rig queue CLI", () => {
       ]);
       expect(JSON.parse(logs.at(-1)!)).toMatchObject({
         persisted: true,
-        delivery: { outcome, connectorAccepted: false, humanReadership: "unknown", detail: `${outcome} detail` },
+        delivery: { receiptSource: "gateway", destinationKind: "human", outcome, connectorAccepted: false, humanReadership: "unknown", detail: `${outcome} detail` },
       });
       expect(calls.filter((call) => call.method === "POST" && call.path === "/api/queue/create")).toHaveLength(1);
     },
   );
 
   it("delivery verification preserves an HTTP refusal as indeterminate", async () => {
-    const result = await waitForDeliveryOutcome({ get: async <T>() => ({ status: 503, data: { error: "projection unavailable" } as T }) }, "qitem-human-http");
+    const result = await waitForDeliveryOutcome(
+      { get: async <T>() => ({ status: 503, data: { error: "projection unavailable" } as T }) },
+      "qitem-human-http",
+      {},
+      { destinationSession: "founder@external" },
+    );
     expect(result).toMatchObject({ outcome: "indeterminate", connectorAccepted: null, humanReadership: "unknown" });
     expect(result.detail).toContain("HTTP 503");
+  });
+
+  // An ask placed on Steering without an alert owes no Slack post: verification says so at once, never "still pending".
+  it("create --alert sends humanAlert; delivery verification reports an unalerted ask at once, without waiting for a post", async () => {
+    const { deps, calls } = makeDeps();
+    await createProgram({ queueDeps: deps }).parseAsync(["node", "rig", "queue", "create", "--destination", "human-founder@external", "--body", "Approve the rollback now?", "--alert", "--json"]);
+    expect(calls.find((c) => c.path === "/api/queue/create")?.body).toMatchObject({ humanAlert: true });
+    const quiet = makeDeps();
+    await createProgram({ queueDeps: quiet.deps }).parseAsync(["node", "rig", "queue", "create", "--destination", "human-founder@external", "--body", "Which name?", "--json"]);
+    expect(quiet.calls.find((c) => c.path === "/api/queue/create")?.body).not.toHaveProperty("humanAlert");
+    const handoff = makeDeps();
+    await createProgram({ queueDeps: handoff.deps }).parseAsync(["node", "rig", "queue", "handoff", "qitem-src", "--to", "human-founder@external", "--body", "Approve now?", "--alert", "--json"]);
+    expect(handoff.calls.find((c) => c.path === "/api/queue/qitem-src/handoff")?.body).toMatchObject({ humanAlert: true });
+    const complete = makeDeps();
+    await createProgram({ queueDeps: complete.deps }).parseAsync(["node", "rig", "queue", "handoff-and-complete", "qitem-src", "--to", "human-founder@external", "--body", "Approve now?", "--alert", "--json"]);
+    expect(complete.calls.find((c) => c.path === "/api/queue/qitem-src/handoff-and-complete")?.body).toMatchObject({ humanAlert: true });
+    let reads = 0;
+    const result = await waitForDeliveryOutcome(
+      { get: async <T>() => { reads += 1; return { status: 200, data: { destinationSession: "human-founder@external", lastNudgeResult: "gateway-owned:slack", ownerNotificationLevel: "RECORD", deliveryOutcome: null } as T }; } },
+      "qitem-steering",
+      { timeoutMs: 60_000, sleep: async () => { throw new Error("waited for a post that isn't owed"); } },
+      { destinationSession: "human-founder@external" },
+    );
+    expect(result).toMatchObject({ receiptSource: "gateway", outcome: "not-alerted", connectorAccepted: null, nextAction: null });
+    expect(result.detail).toMatch(/^created without --alert, and the person's Slack subscription is urgent-only/);
+    expect(reads).toBe(1);
   });
 
   it("delivery verification reports an unreadable receipt as indeterminate, not rejected", async () => {
     const result = await waitForDeliveryOutcome(
       { get: async () => { throw new Error("daemon read timed out"); } } as never,
       "qitem-human-indeterminate",
+      {},
+      { destinationSession: "founder@external" },
     );
     expect(result).toMatchObject({
       outcome: "indeterminate",
       connectorAccepted: null,
       humanReadership: "unknown",
+    });
+  });
+
+  // A terminal (pane-bound) destination's receipt is the row's wake result (lastNudgeResult) and
+  // its pickup is the claim; a registered person with a pane may also get a gateway receipt (see
+  // the nested describe). Keep persistence, terminal receipt, claim, Slack and human readership
+  // apart, and never call a saved row failed.
+  describe("--verify for a terminal destination", () => {
+    const ROW = { qitemId: "qitem-t", state: "pending", claimedAt: null, lastNudgeResult: null, deliveryOutcome: null, pickup: { state: "unclaimed" } };
+    // Each poll reads the next row; the last row repeats. The caller's array is not mutated.
+    function rowsClient(rows: Array<Record<string, unknown>>) {
+      let reads = 0;
+      return {
+        get reads() { return reads; },
+        get: async <T>() => {
+          const row = rows[Math.min(reads, rows.length - 1)]!;
+          reads += 1;
+          return { status: 200, data: { ...ROW, ...row } as T };
+        },
+      };
+    }
+    function boundedDeps(timeoutMs = 10) {
+      let now = 0;
+      return { timeoutMs, intervalMs: 1, sleep: async (ms: number) => { now += ms; }, now: () => now };
+    }
+    const verify = (rows: Array<Record<string, unknown>>, target: { destinationSession?: string; nudge?: boolean } = { destinationSession: "bob@rig" }) => {
+      const client = rowsClient(rows);
+      return waitForDeliveryOutcome(client, "qitem-t", boundedDeps(), target).then((result) => ({ result, reads: client.reads }));
+    };
+
+    it("smoke-test case through create: settles on the first delivered-ack-pending read, not a failed handoff", async () => {
+      const id = "qitem-agent-verify";
+      const rows = [
+        {},
+        { lastNudgeResult: "delivered-ack-pending" },
+        { lastNudgeResult: "delivered-ack-pending", state: "in-progress", claimedAt: "2026-10-08T10:00:10.000Z", pickup: { state: "working" } },
+      ];
+      const { deps, calls } = makeDeps({
+        routes: {
+          "POST /api/queue/create": { status: 201, data: { qitemId: id, state: "pending", destinationSession: "bob@rig" } },
+          [`GET /api/queue/${id}`]: rows.map((row) => ({ status: 200, data: { ...ROW, qitemId: id, ...row } })),
+        },
+      });
+      deps.deliveryVerify = boundedDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "create", "--destination", "bob@rig", "--body", "Review this", "--summary", "Review", "--verify", "--json"]);
+      const out = JSON.parse(logs.at(-1)!) as { persisted: boolean; delivery: Record<string, unknown> };
+      expect(out.persisted).toBe(true);
+      expect(out.delivery).toEqual({
+        receiptSource: "terminal",
+        destinationKind: "agent",
+        outcome: "delivered-ack-pending",
+        wakeResult: "delivered-ack-pending",
+        claim: { observed: false, claimedAt: null, pickup: "unclaimed" },
+        detail: "The qitem is saved. Terminal receipt unconfirmed (delivered-ack-pending): the wake was sent, but its render could not be confirmed. No claim observed yet. This is not a failed handoff.",
+        nextAction: `rig queue show ${id} --json`,
+      });
+      expect(process.exitCode).toBeUndefined();
+      expect(calls.filter((call) => call.method === "POST")).toHaveLength(1);
+      // The wait ends on the first recorded wake result; the later claim is not awaited.
+      expect(calls.filter((call) => call.method === "GET" && call.path === `/api/queue/${id}`)).toHaveLength(2);
+    });
+
+    it("persisted row with an unconfirmed receipt and no claim: saved, unconfirmed, not a failed handoff, at once", async () => {
+      const { result, reads } = await verify([{ lastNudgeResult: "delivered-ack-pending" }]);
+      expect(reads).toBe(1);
+      expect(result).toMatchObject({ receiptSource: "terminal", destinationKind: "agent", outcome: "delivered-ack-pending", claim: { observed: false, claimedAt: null, pickup: "unclaimed" }, nextAction: "rig queue show qitem-t --json" });
+      expect(result).not.toHaveProperty("humanReadership");
+      expect(result).not.toHaveProperty("connectorAccepted");
+      expect(result.detail).toBe("The qitem is saved. Terminal receipt unconfirmed (delivered-ack-pending): the wake was sent, but its render could not be confirmed. No claim observed yet. This is not a failed handoff.");
+    });
+
+    it("an existing claim is reported with the first wake result", async () => {
+      const { result, reads } = await verify([{ lastNudgeResult: "delivered-ack-pending", state: "in-progress", claimedAt: "2026-10-08T10:00:10.000Z", pickup: { state: "working" } }]);
+      expect(reads).toBe(1);
+      expect(result).toMatchObject({ outcome: "delivered-ack-pending", claim: { observed: true, claimedAt: "2026-10-08T10:00:10.000Z", pickup: "working" }, nextAction: null });
+      expect(result.detail).toContain("A claim shows the seat took the item; it does not prove the body was read.");
+      expect(result.detail).not.toContain("not a failed handoff");
+    });
+
+    it("a verified wake is distinct from delivered-ack-pending and settles the wait", async () => {
+      const { result, reads } = await verify([{}, { lastNudgeResult: "verified" }, { lastNudgeResult: "verified", claimedAt: "x" }]);
+      expect(result).toMatchObject({ outcome: "verified", wakeResult: "verified", claim: { observed: false } });
+      expect(result.detail).not.toContain("not a failed handoff");
+      expect(reads).toBe(2);
+    });
+
+    it.each([
+      "failed:tmux reports no session",
+      "unroutable: 'revieweer@rig' has no terminal transport on this daemon and names no registered human",
+    ])("a %s wake is a failed wake on a saved row, reported at once", async (wakeResult) => {
+      const { result, reads } = await verify([{ lastNudgeResult: wakeResult }]);
+      expect(result).toMatchObject({ outcome: "failed", wakeResult });
+      expect(result.detail).toMatch(/^The qitem is saved\. The wake failed/);
+      expect(result.detail).not.toContain("not a failed handoff");
+      expect(reads).toBe(1);
+    });
+
+    it("a hosted member's waiting work keeps the failed outcome, and its receipt says no wake is sent", async () => {
+      const wakeResult = "awaiting-pickup: 'helper@hub' is a hosted member with no wake trigger, so no wake is sent.";
+      const { result, reads } = await verify([{ lastNudgeResult: wakeResult }]);
+      expect(result).toMatchObject({ outcome: "failed", wakeResult });
+      expect(result.detail).toMatch(/^The qitem is saved\. No wake is sent \(awaiting-pickup: /);
+      expect(result.detail).toContain("): the work waits in the member's queue until it reads it.");
+      expect(result.detail).not.toContain("The wake failed");
+      expect(reads).toBe(1);
+    });
+
+    it("keeps a recent hosted member's stated cadence visible in the sender receipt", async () => {
+      const wakeResult = "awaiting-pickup: 'helper@hub' is a hosted member that has been checking in about every 1 min. No wake is sent; this request waits in its queue for its next inbox read.";
+      const { result, reads } = await verify([{ lastNudgeResult: wakeResult }]);
+      expect(result).toMatchObject({ outcome: "failed", wakeResult });
+      expect(result.detail).toContain("has been checking in about every 1 min");
+      expect(result.detail).toContain("No wake is sent");
+      expect(result.detail).not.toContain("The wake failed");
+      expect(reads).toBe(1);
+    });
+
+    it("a claimed row's unconfirmed wake reads claimed, not indeterminate, and is never verified", async () => {
+      const { result, reads } = await verify([{ lastNudgeResult: "claimed", state: "in-progress", claimedAt: "2026-10-11T20:00:00.000Z", pickup: { state: "working" } }]);
+      expect(reads).toBe(1);
+      expect(result).toMatchObject({ outcome: "claimed", wakeResult: "claimed", claim: { observed: true, claimedAt: "2026-10-11T20:00:00.000Z", pickup: "working" }, nextAction: null });
+      expect(result.detail).toContain("Terminal receipt unconfirmed, but the seat has claimed the item (claimed).");
+      expect(result.detail).toContain("it does not prove the body was read");
+    });
+
+    it("an unrecognised wake result is indeterminate and never labelled not-failed", async () => {
+      const { result } = await verify([{ lastNudgeResult: "refused:new-prefix" }]);
+      expect(result).toMatchObject({ outcome: "indeterminate", wakeResult: "refused:new-prefix" });
+      expect(result.detail).not.toContain("not a failed handoff");
+    });
+
+    it("an indeterminate:* wake is reported unconfirmed at once", async () => {
+      const { result, reads } = await verify([{ lastNudgeResult: "indeterminate:timeout" }]);
+      expect(reads).toBe(1);
+      expect(result).toMatchObject({ outcome: "indeterminate", nextAction: "rig queue show qitem-t --json" });
+      expect(result.detail).toContain("Terminal receipt unconfirmed (indeterminate:timeout)");
+      expect(result.detail).toContain("This is not a failed handoff.");
+    });
+
+    it("a retained wake is reported at once, points at the held message and does not promise a retry", async () => {
+      const { result, reads } = await verify([{ lastNudgeResult: "retained:typing_guard" }]);
+      expect(reads).toBe(1);
+      expect(result).toMatchObject({ outcome: "retained", nextAction: "rig seat held-messages bob@rig" });
+      expect(result.detail).toContain("nothing was typed into the pane");
+      expect(result.detail).toContain("not retried automatically");
+      expect(result.detail).not.toMatch(/ladder retries/);
+    });
+
+    it("a draft-aware held wake says it's tried again on the seat's next idle report, within the cap (#48)", async () => {
+      const { result } = await verify([{ lastNudgeResult: "retained:draft_aware" }]);
+      expect(result).toMatchObject({ outcome: "retained", nextAction: "rig seat held-messages bob@rig" });
+      expect(result.detail).toContain("tried again when the seat next reports idle while it's still in draft-aware mode");
+      expect(result.detail).not.toContain("not retried automatically");
+    });
+
+    it("only a missing wake result waits, up to the bound, then stays still-pending", async () => {
+      const { result, reads } = await verify([{}]);
+      expect(reads).toBeGreaterThan(1);
+      expect(result).toMatchObject({ outcome: "still-pending", wakeResult: null, claim: { observed: false } });
+      expect(result.detail).toContain("No terminal receipt was recorded within 10ms.");
+    });
+
+    it("a claim before any wake result ends the wait without a null duration", async () => {
+      const { result } = await verify([{ state: "in-progress", claimedAt: "2026-10-08T10:00:02.000Z" }]);
+      expect(result).toMatchObject({ outcome: "still-pending", claim: { observed: true }, nextAction: null });
+      expect(result.detail).toContain("No terminal receipt was recorded before the claim.");
+      expect(result.detail).not.toContain("null");
+    });
+
+    it("--no-nudge through create: one read, no wake requested, no claim that nobody was notified", async () => {
+      const id = "qitem-cold";
+      const { deps, calls } = makeDeps({
+        routes: {
+          "POST /api/queue/create": { status: 201, data: { qitemId: id, state: "pending" } },
+          [`GET /api/queue/${id}`]: { status: 200, data: { ...ROW, qitemId: id } },
+        },
+      });
+      deps.deliveryVerify = boundedDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "create", "--destination", "bob@rig", "--body", "cold", "--summary", "Cold", "--no-nudge", "--verify", "--json"]);
+      expect((calls.find((c) => c.path === "/api/queue/create")!.body as { nudge: boolean }).nudge).toBe(false);
+      const out = JSON.parse(logs.at(-1)!) as { delivery: Record<string, unknown> };
+      expect(out.delivery).toMatchObject({ receiptSource: "terminal", outcome: "not-requested", claim: { observed: false } });
+      expect(out.delivery.detail).toBe("The qitem is saved. No terminal wake was requested (--no-nudge). No claim observed yet. This is not a failed handoff.");
+      expect(calls.filter((call) => call.method === "GET" && call.path === `/api/queue/${id}`)).toHaveLength(1);
+    });
+
+    it("--no-nudge to a registered person's alias keeps the bounded gateway wait (daemon destinationClass)", async () => {
+      const { result, reads } = await verify([{ destinationClass: "gateway-routable" }], { destinationSession: "mike@kernel", nudge: false });
+      expect(result).toMatchObject({ receiptSource: "gateway", destinationKind: "human", outcome: "still-pending", connectorAccepted: null, humanReadership: "unknown" });
+      expect(reads).toBeGreaterThan(1);
+    });
+
+    it("--no-nudge to a registered person's alias settles on the gateway receipt", async () => {
+      const { result } = await verify([{ destinationClass: "gateway-routable" }, { destinationClass: "gateway-routable", deliveryOutcome: "posted" }], { destinationSession: "mike@kernel", nudge: false });
+      expect(result).toMatchObject({ receiptSource: "gateway", outcome: "posted", connectorAccepted: true });
+    });
+
+    it("--no-nudge to a seat the daemon classes pane-bound reads once as not-requested", async () => {
+      const { result, reads } = await verify([{ destinationClass: "pane-bound" }], { destinationSession: "bob@rig", nudge: false });
+      expect(result).toMatchObject({ receiptSource: "terminal", destinationKind: "agent", outcome: "not-requested" });
+      expect(reads).toBe(1);
+    });
+
+    it("the daemon's pane-bound class for a human seat wins over the address pattern", async () => {
+      const { result, reads } = await verify([{ destinationClass: "pane-bound" }], { destinationSession: "human-founder@kernel", nudge: false });
+      expect(result).toMatchObject({ receiptSource: "terminal", destinationKind: "human", outcome: "not-requested", humanReadership: "unknown" });
+      expect(reads).toBe(1);
+    });
+
+    // A registered person who is also a seat with its own pane: the gateway may post the row to
+    // Slack too (the row's owner notification level is what its selector keys on), so --verify
+    // keeps a bounded wait for that receipt and reports both sides separately.
+    describe("a pane-bound registered person (owner notification level set)", () => {
+      const PANE_PERSON = { destinationClass: "pane-bound", ownerNotificationLevel: "ALERT" };
+      const target = { destinationSession: "dev-a@rig1" };
+
+      it("waits for the Slack receipt after the terminal receipt and reports both", async () => {
+        const { result, reads } = await verify([
+          PANE_PERSON,
+          { ...PANE_PERSON, lastNudgeResult: "verified" },
+          { ...PANE_PERSON, lastNudgeResult: "verified", deliveryOutcome: "posted" },
+        ], target);
+        expect(reads).toBe(3);
+        expect(result).toMatchObject({
+          receiptSource: "terminal", destinationKind: "human", humanReadership: "unknown",
+          outcome: "verified", wakeResult: "verified",
+          gateway: { outcome: "posted", connectorAccepted: true },
+        });
+        expect(result.detail).toContain("Slack receipt: posted.");
+      });
+
+      it("keeps the bounded wait when Slack has not posted, without failing the terminal side", async () => {
+        const { result, reads } = await verify([{ ...PANE_PERSON, lastNudgeResult: "verified" }], target);
+        expect(reads).toBeGreaterThan(1);
+        expect(result).toMatchObject({ outcome: "verified", gateway: { outcome: "still-pending", connectorAccepted: null }, nextAction: "rig queue show qitem-t --json" });
+        expect(result.detail).toContain("No Slack receipt within 10ms.");
+      });
+
+      it("reports a Slack transport failure on its own side", async () => {
+        const { result } = await verify([{ ...PANE_PERSON, lastNudgeResult: "delivered-ack-pending", deliveryOutcome: "transport-failed", deliveryFailureDetail: "slack 500" }], target);
+        expect(result).toMatchObject({ outcome: "delivered-ack-pending", gateway: { outcome: "transport-failed", connectorAccepted: false, detail: "slack 500" } });
+        expect(result.detail).not.toContain("not a failed handoff");
+      });
+
+      it("with --no-nudge, reports no terminal wake and still waits for Slack", async () => {
+        const { result } = await verify([PANE_PERSON, { ...PANE_PERSON, deliveryOutcome: "posted" }], { ...target, nudge: false });
+        expect(result).toMatchObject({ outcome: "not-requested", gateway: { outcome: "posted", connectorAccepted: true } });
+      });
+
+      it("a pane-bound seat with no owner notification level is unchanged: no Slack side, settles at once", async () => {
+        const { result, reads } = await verify([{ destinationClass: "pane-bound", ownerNotificationLevel: null, lastNudgeResult: "verified" }], target);
+        expect(reads).toBe(1);
+        expect(result).toMatchObject({ receiptSource: "terminal", destinationKind: "agent", outcome: "verified" });
+        expect(result).not.toHaveProperty("gateway");
+        expect(result).not.toHaveProperty("humanReadership");
+      });
+
+      it("a Slack receipt that lands before the wake result keeps waiting on the terminal side", async () => {
+        const { result, reads } = await verify([
+          { ...PANE_PERSON, deliveryOutcome: "posted" },
+          { ...PANE_PERSON, deliveryOutcome: "posted", lastNudgeResult: "delivered-ack-pending" },
+        ], target);
+        expect(reads).toBe(2);
+        expect(result).toMatchObject({ outcome: "delivered-ack-pending", gateway: { outcome: "posted" } });
+      });
+
+      it("a claim with Slack still pending keeps the bounded Slack wait", async () => {
+        const { result, reads } = await verify([{ ...PANE_PERSON, state: "in-progress", claimedAt: "2026-10-08T10:00:02.000Z" }], target);
+        expect(reads).toBeGreaterThan(1);
+        expect(result).toMatchObject({ claim: { observed: true }, gateway: { outcome: "still-pending" }, nextAction: "rig queue show qitem-t --json" });
+      });
+
+      it("a recorded terminal wake still wins over a gateway-routable class read later (#1029 order)", async () => {
+        const { result, reads } = await verify([{ destinationClass: "gateway-routable", ownerNotificationLevel: "ALERT", lastNudgeResult: "verified", deliveryOutcome: "posted" }], target);
+        expect(reads).toBe(1);
+        expect(result).toMatchObject({ receiptSource: "terminal", outcome: "verified", wakeResult: "verified", gateway: { outcome: "posted" } });
+      });
+
+      it("an older daemon's posted receipt beside a terminal wake reports both sides", async () => {
+        const { result } = await verify([{ lastNudgeResult: "verified", deliveryOutcome: "posted" }], target);
+        expect(result).toMatchObject({ receiptSource: "terminal", destinationKind: "human", outcome: "verified", gateway: { outcome: "posted" } });
+      });
+    });
+
+    it("--no-nudge to a human-seat address on a daemon without destinationClass keeps the bounded gateway wait", async () => {
+      const { result, reads } = await verify([{}], { destinationSession: "human-founder@kernel", nudge: false });
+      expect(result).toMatchObject({ receiptSource: "gateway", destinationKind: "human", outcome: "still-pending", humanReadership: "unknown" });
+      expect(reads).toBeGreaterThan(1);
+    });
+
+    it("an idempotent --id retry verifies the existing row by that id, with one POST", async () => {
+      const id = "qitem-agent-retry";
+      const { deps, calls } = makeDeps({
+        routes: {
+          "POST /api/queue/create": { status: 201, data: { qitemId: id, state: "in-progress" } },
+          [`GET /api/queue/${id}`]: { status: 200, data: { ...ROW, qitemId: id, lastNudgeResult: "verified", state: "in-progress", claimedAt: "2026-10-08T10:00:10.000Z" } },
+        },
+      });
+      deps.deliveryVerify = boundedDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "create", "--destination", "bob@rig", "--body", "b", "--summary", "s", "--id", id, "--verify", "--json"]);
+      expect((calls.find((c) => c.path === "/api/queue/create")!.body as { qitemId: string }).qitemId).toBe(id);
+      expect(JSON.parse(logs.at(-1)!).delivery).toMatchObject({ outcome: "verified", claim: { observed: true } });
+      expect(calls.filter((call) => call.method === "POST")).toHaveLength(1);
+    });
+
+    it("a registry alias (<entityId>@<rig>) moves to the gateway receipt once gateway-owned lands", async () => {
+      const { result } = await verify([{}, { lastNudgeResult: "gateway-owned: 'mike@kernel' is a virtual paneless human destination" }, { lastNudgeResult: "gateway-owned: x", deliveryOutcome: "posted" }], { destinationSession: "mike@kernel" });
+      expect(result).toMatchObject({ receiptSource: "gateway", destinationKind: "human", outcome: "posted", connectorAccepted: true, humanReadership: "unknown" });
+    });
+
+    it("a human seat with a real pane reports its terminal receipt and keeps human readership unknown", async () => {
+      const { result, reads } = await verify([{}, { lastNudgeResult: "verified" }], { destinationSession: "human-founder@kernel" });
+      expect(result).toMatchObject({ receiptSource: "terminal", destinationKind: "human", outcome: "verified", humanReadership: "unknown" });
+      expect(result.detail).not.toContain("connector");
+      expect(reads).toBe(2);
+    });
+
+    it("an unreadable receipt for a terminal destination is indeterminate with no readership claim", async () => {
+      const result = await waitForDeliveryOutcome({ get: async () => { throw new Error("daemon read timed out"); } } as never, "qitem-t", boundedDeps(), { destinationSession: "bob@rig" });
+      expect(result).toMatchObject({ receiptSource: "terminal", destinationKind: "agent", outcome: "indeterminate", wakeResult: null, claim: { observed: false }, nextAction: "rig queue show qitem-t --json" });
+      expect(result.detail).toContain("daemon read timed out");
+      expect(result).not.toHaveProperty("humanReadership");
     });
   });
 
@@ -805,8 +1220,8 @@ describe("rig queue CLI", () => {
           status: 400,
           data: {
             error: "missing_closure_reason",
-            message: "state=done requires closure_reason; valid values: handed_off_to, blocked_on, denied, canceled, no-follow-on, escalation",
-            validReasons: ["handed_off_to", "blocked_on", "denied", "canceled", "no-follow-on", "escalation"],
+            message: "state=done requires closure_reason; valid values: handed_off_to, denied, canceled, no-follow-on, escalation, superseded",
+            validReasons: ["handed_off_to", "denied", "canceled", "no-follow-on", "escalation", "superseded"],
           },
         },
       },
@@ -846,6 +1261,48 @@ describe("rig queue CLI", () => {
       evidenceRef: undefined,
       transitionNote: "audit bytes",
     });
+    expect(calls.some((c) => c.method === "GET" && c.path === "/api/queue/qitem-note")).toBe(true);
+  });
+
+  it("update reports success only after canonical read-back matches the requested state", async () => {
+    const row = { qitemId: "qitem-verified", state: "in-progress", summary: "working" };
+    const { deps, calls } = makeDeps({ routes: {
+      "POST /api/queue/qitem-verified/update": { status: 200, data: { qitemId: "qitem-verified", state: "in-progress" } },
+      "GET /api/queue/qitem-verified": { status: 200, data: row },
+    } });
+    await createProgram({ queueDeps: deps }).parseAsync([
+      "node", "rig", "queue", "update", "qitem-verified", "--state", "in-progress", "--summary", "working", "--json",
+    ]);
+    expect(calls.map((call) => `${call.method} ${call.path}`)).toEqual([
+      "POST /api/queue/qitem-verified/update",
+      "GET /api/queue/qitem-verified",
+    ]);
+    expect(JSON.parse(logs.at(-1)!)).toMatchObject(row);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("update fails closed when canonical read-back does not contain the requested state", async () => {
+    const { deps } = makeDeps({ routes: {
+      "POST /api/queue/qitem-mismatch/update": { status: 200, data: { qitemId: "qitem-mismatch", state: "in-progress" } },
+      "GET /api/queue/qitem-mismatch": { status: 200, data: { qitemId: "qitem-mismatch", state: "pending" } },
+    } });
+    await createProgram({ queueDeps: deps }).parseAsync([
+      "node", "rig", "queue", "update", "qitem-mismatch", "--state", "in-progress", "--json",
+    ]);
+    expect(process.exitCode).toBe(1);
+    expect(JSON.parse(errors.at(-1)!)).toMatchObject({ error: "queue_update_readback_failed" });
+    expect(logs).toEqual([]);
+  });
+
+  it("update forwards an explicitly accepted closure deadline without a state change", async () => {
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync(["node", "rig", "queue", "update", "qitem-estimate", "--closure-required-at", "2026-11-04T10:00:00.000Z", "--note", "Coordinator accepted the revised estimate", "--json"]);
+    expect(calls.find(c => c.path === "/api/queue/qitem-estimate/update")?.body).toMatchObject({
+      closureRequiredAt: "2026-11-04T10:00:00.000Z", transitionNote: "Coordinator accepted the revised estimate",
+    });
+    expect(calls.find(c => c.path === "/api/queue/qitem-estimate/update")?.body).toHaveProperty("state", undefined);
   });
 
   it("update forwards explicit reopen acknowledgment", async () => {
@@ -883,6 +1340,30 @@ describe("rig queue CLI", () => {
       state: "blocked",
       blockedOn: "external:cooldown",
       transitionNote: "continuation: resume after the cooldown",
+      wakeAfterSeconds: 90,
+    });
+  });
+
+  it.each([
+    { label: "note only", flags: ["--note", "checked the source"], expected: "checked the source" },
+    { label: "note and continuation", flags: ["--note", "checked the source", "--continuation", "resume the review"], expected: "continuation: resume the review\n\nchecked the source" },
+    { label: "multiline note and continuation", flags: ["--note", "checked the source\nkept the evidence", "--continuation", "resume the review"], expected: "continuation: resume the review\n\nchecked the source\nkept the evidence" },
+    { label: "empty continuation", flags: ["--note", "checked the source", "--continuation", ""], expected: "checked the source" },
+    { label: "whitespace-only continuation with note", flags: ["--note", "checked the source", "--continuation", " \t\n "], expected: "checked the source" },
+    { label: "whitespace-only continuation without note", flags: ["--continuation", " \t\n "], expected: "parked on external:cooldown" },
+    { label: "neither flag", flags: [], expected: "parked on external:cooldown" },
+  ])("block preserves the audit note: $label", async ({ flags, expected }) => {
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync([
+      "node", "rig", "queue", "block", "qitem-park",
+      "--on", "external:cooldown", "--wake-after", "90s", ...flags, "--json",
+    ]);
+    expect(calls.find((c) => c.path === "/api/queue/qitem-park/update")?.body).toMatchObject({
+      state: "blocked",
+      blockedOn: "external:cooldown",
+      transitionNote: expected,
       wakeAfterSeconds: 90,
     });
   });
@@ -965,6 +1446,56 @@ describe("rig queue CLI", () => {
     expect(call).toBeDefined();
     expect(call!.path).toContain("session=bob%40rig");
     expect(call!.path).toContain("recentLimit=10");
+  });
+
+  // The refocus hook passes --held-work on its one lookup; every other whoami asks for nothing more.
+  it("whoami asks for held and pending work (held=1) only with --held-work", async () => {
+    const pathFor = async (extra: string[]) => {
+      const { deps, calls } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "whoami", "--session", "bob@rig", "--json", ...extra]);
+      return calls.find((c) => c.method === "GET" && c.path.startsWith("/api/queue/whoami"))!.path;
+    };
+    expect(await pathFor([])).toBe("/api/queue/whoami?session=bob%40rig&recentLimit=25");
+    expect(await pathFor(["--held-work"])).toBe("/api/queue/whoami?session=bob%40rig&recentLimit=25&held=1");
+    expect(await pathFor(["--work-candidates", "--held-work"])).toBe("/api/queue/whoami?session=bob%40rig&recentLimit=25&candidates=1&held=1");
+  });
+
+  it("plain whoami ends with one line per candidate to choose from; --json adds nothing", async () => {
+    const data = {
+      session: "bob@rig",
+      currentWork: null,
+      currentWorkBasis: "2 distinct typed work nodes — refusing to guess",
+      currentWorkChoice: {
+        instruction: "OpenRig did not choose your current work. Choose the candidate your actual work belongs to.",
+        candidates: [
+          { qitemId: "q-1", projects: ["alpha"], mission: "release", slice: "01-work", workNodePath: "/m/release/slices/01-work", unresolved: null },
+          { qitemId: "q-2", projects: [], mission: "missing", slice: "01-work", workNodePath: null, unresolved: "mission missing resolves to 0 directories on this host" },
+        ],
+        unknown: [{ qitemId: "q-3", summary: null, reason: "no mission tag and no handoff ancestry" }],
+      },
+    };
+    const run = async (json: boolean) => {
+      const { deps } = makeDeps({ routes: { "GET /api/queue/whoami?session=bob%40rig&recentLimit=25": { status: 200, data } } });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      logs.length = 0; errors.length = 0;
+      await program.parseAsync(["node", "rig", "queue", "whoami", "--session", "bob@rig", ...(json ? ["--json"] : [])]);
+      return [...logs];
+    };
+    // #1806: plain stdout is the answer alone and parses as JSON; the choice lines are on stderr.
+    const plain = await run(false);
+    expect(JSON.parse(plain.join("\n"))).toEqual(data);
+    expect(errors.slice(-4)).toEqual([
+      "OpenRig did not choose your current work. Choose the candidate your actual work belongs to.",
+      "  1. project alpha · mission release · slice 01-work · /m/release/slices/01-work · from row q-1",
+      "  2. no project tag · mission missing · slice 01-work · no folder found (mission missing resolves to 0 directories on this host) · from row q-2",
+      "  - row q-3: work not named (no mission tag and no handoff ancestry)",
+    ]);
+    const json = await run(true);
+    expect(json).toHaveLength(1);
+    expect(JSON.parse(json[0]!)).toEqual(data);
   });
 
   it("whoami defaults the session from OPENRIG_SESSION_NAME when --session is omitted", async () => {
@@ -1216,6 +1747,151 @@ describe("rig queue CLI", () => {
     expect(call!.path).not.toContain("rig=");
   });
 
+  it("issue2728 list sends repeated exact tags and canonical mission/slice aliases once", async () => {
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync([
+      "node", "rig", "queue", "list", "--all", "--all-rigs",
+      "--tag", "review", "--tag", "publish", "--tag", "mission:launch",
+      "--mission", "launch", "--slice", "docs", "--tag", "comma,separated", "--json",
+    ]);
+    const call = calls.find((candidate) => candidate.method === "GET" && candidate.path.startsWith("/api/queue/list"));
+    expect(call).toBeDefined();
+    const params = new URLSearchParams(call!.path.split("?")[1]);
+    expect(params.getAll("tag")).toEqual(["review", "publish", "mission:launch", "slice:docs", "comma,separated"]);
+    expect(params.get("limit")).toBe("100");
+  });
+
+  it("issue2728 refuses a blank tag before contacting the daemon", async () => {
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync(["node", "rig", "queue", "list", "--tag", " ", "--json"]);
+    expect(calls).toHaveLength(0);
+    expect(process.exitCode).toBe(1);
+    expect(logs.join("\n")).toContain('"error":"tag_invalid"');
+    expect(logs.join("\n")).toContain("tag filters cannot be blank");
+  });
+
+  it("issue2728 clears captured list tags after blank refusal when reusing the same command", async () => {
+    const { deps, calls } = makeDeps({
+      routes: {
+        "GET /api/queue/list?tag=fresh&limit=100": { status: 200, data: [] },
+      },
+    });
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+
+    await program.parseAsync([
+      "node", "rig", "queue", "list", "--all", "--all-rigs", "--full", "--tag", "stale", "--tag", " ", "--json",
+    ]);
+    expect(calls).toHaveLength(0);
+    expect(process.exitCode).toBe(1);
+
+    process.exitCode = undefined;
+    await program.parseAsync([
+      "node", "rig", "queue", "list", "--all", "--all-rigs", "--full", "--tag", "fresh", "--json",
+    ]);
+
+    const call = calls.find((candidate) => candidate.method === "GET" && candidate.path.startsWith("/api/queue/list"));
+    expect(call).toBeDefined();
+    const params = new URLSearchParams(call!.path.split("?")[1]);
+    expect(params.getAll("tag")).toEqual(["fresh"]);
+  });
+
+  it.each([
+    {
+      after: "an invalid option argument",
+      abortedArgs: ["node", "rig", "queue", "list", "--tag", "stale", "--limit", "0"],
+      exitCode: "commander.invalidArgument",
+      nextArgs: ["node", "rig", "queue", "list", "--all", "--all-rigs", "--json"],
+      expectedTags: [],
+    },
+    {
+      after: "help following tag and mission collection",
+      abortedArgs: ["node", "rig", "queue", "list", "--tag", "stale", "--mission", "old", "--help"],
+      exitCode: "commander.helpDisplayed",
+      nextArgs: ["node", "rig", "queue", "list", "--all", "--all-rigs", "--slice", "fresh", "--json"],
+      expectedTags: ["slice:fresh"],
+    },
+  ])("issue2728 clears list tags after $after when reusing the same command", async ({ abortedArgs, exitCode, nextArgs, expectedTags }) => {
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    program.commands.find((command) => command.name() === "queue")!.commands.find((command) => command.name() === "list")!.exitOverride();
+    program.configureOutput({ writeOut: () => {}, writeErr: () => {} });
+
+    let abortedWith: unknown;
+    try {
+      await program.parseAsync(abortedArgs);
+    } catch (error) {
+      abortedWith = error;
+    }
+    expect(abortedWith).toBeInstanceOf(CommanderError);
+    expect((abortedWith as CommanderError).code).toBe(exitCode);
+    expect(calls).toHaveLength(0);
+
+    await program.parseAsync(nextArgs);
+
+    const call = calls.find((candidate) => candidate.method === "GET" && candidate.path.startsWith("/api/queue/list"));
+    expect(call).toBeDefined();
+    const params = new URLSearchParams(call!.path.split("?")[1]);
+    expect(params.getAll("tag")).toEqual(expectedTags);
+    expect(params.has("tag")).toBe(expectedTags.length > 0);
+  });
+
+  it("issue2728 does not print rows when a daemon returns a row missing a requested tag", async () => {
+    const { deps, calls } = makeDeps({
+      routes: {
+        "GET /api/queue/list?tag=review&limit=100": {
+          status: 200,
+          data: [{ qitemId: "qitem-unfiltered", tags: ["other"] }],
+        },
+      },
+    });
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync(["node", "rig", "queue", "list", "--all", "--all-rigs", "--full", "--tag", "review", "--json"]);
+    expect(calls).toHaveLength(1);
+    expect(process.exitCode).toBe(1);
+    expect(logs.join("\n")).toContain("filter_unsupported");
+    expect(logs.join("\n")).not.toContain("qitem-unfiltered");
+  });
+
+  it("list says on stderr when the daemon cut the page, and leaves stdout as it was (#3572)", async () => {
+    const rows = [{ qitemId: "qitem-newest" }, { qitemId: "qitem-next" }];
+    // The notice names the limit the daemon says it applied, not the one asked for.
+    const page = (truncated: string) => new Headers({ "X-OpenRig-Limit": "7", "X-OpenRig-Truncated": truncated });
+    const { deps } = makeDeps({
+      routes: {
+        "GET /api/queue/list?limit=2": [
+          { status: 200, data: rows, headers: page("1") },
+          { status: 200, data: rows, headers: page("1") },
+          { status: 200, data: rows, headers: page("0") },
+          { status: 200, data: rows },
+        ],
+      },
+    });
+    const run = async (...extra: string[]) => {
+      logs.length = 0; errors.length = 0;
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "list", "--full", "--all", "--all-rigs", "--limit", "2", ...extra]);
+      return { stdout: [...logs], stderr: [...errors] };
+    };
+    const notice = "this page stops at --limit 7 and more rows match; pass a larger --limit to see the rest";
+
+    // Cut, in JSON and in the default output: the rows unchanged on stdout, one line on stderr naming the limit.
+    expect(await run("--json")).toEqual({ stdout: [JSON.stringify(rows)], stderr: [notice] });
+    expect(await run()).toEqual({ stdout: [JSON.stringify(rows, null, 2)], stderr: [notice] });
+    // Exactly the limit matched: nothing on stderr.
+    expect(await run("--json")).toEqual({ stdout: [JSON.stringify(rows)], stderr: [] });
+    // A daemon that doesn't send the marker: nothing on stderr either.
+    expect(await run("--json")).toEqual({ stdout: [JSON.stringify(rows)], stderr: [] });
+    expect(process.exitCode).toBeUndefined();
+  });
+
   it("list -a includes history (no activeOnly param)", async () => {
     const saved = process.env.OPENRIG_SESSION_NAME;
     process.env.OPENRIG_SESSION_NAME = "dev1@my-rig";
@@ -1457,11 +2133,13 @@ describe("rig queue CLI", () => {
       const printed = JSON.parse(logs[0]);
       expect(printed.bodyTruncated).toBe(true);
       expect(printed.bodyBytes).toBe(1000);
-      expect(Array.from(printed.body).length).toBe(512);
-      // marker line on its OWN line, with the honest total byte size
-      expect(logs.join("\n")).toContain("bounded preview — complete body is 1000 bytes; full record");
-      expect(logs.join("\n")).toContain("rig queue show 'qitem-1' --full --json");
-      expect(logs.join("\n")).not.toMatch(/\btruncated\b/i);
+      // Keep the first 512 code points, then mark the cut inside the body.
+      expect(printed.body).toBe(`${"A".repeat(512)}…[cut at 512 of 1000 chars; rig queue show 'qitem-1' --full]`);
+      // #1806: stdout is the record alone and parses as JSON; the marker line, with the honest total byte size, is on stderr
+      expect(JSON.parse(logs.join("\n"))).toMatchObject({ qitemId: "qitem-1", bodyTruncated: true });
+      expect(errors.join("\n")).toContain("bounded preview — complete body is 1000 bytes; full record");
+      expect(errors.join("\n")).toContain("rig queue show 'qitem-1' --full --json");
+      expect(errors.join("\n")).not.toMatch(/\btruncated\b/i);
     });
 
     it("show default: small body → full body, NO marker, bodyTruncated=false", async () => {
@@ -1499,7 +2177,24 @@ describe("rig queue CLI", () => {
       const printed = JSON.parse(logs[0]);
       expect(printed.bodyTruncated).toBe(true);
       expect(printed.bodyBytes).toBe(1000);
-      expect(Array.from(printed.body).length).toBe(PREVIEW_MAX_CODEPOINTS);
+      const marker = "…[cut at 512 of 1000 chars; rig queue show 'qitem-1' --full]";
+      expect(printed.body.endsWith(marker)).toBe(true);
+      expect(Array.from(printed.body.slice(0, -marker.length)).length).toBe(PREVIEW_MAX_CODEPOINTS);
+    });
+
+    it("show default: a multibyte body's marker counts code points, not bytes", async () => {
+      const full = "😀".repeat(600); // 600 code points, 2400 bytes
+      const { deps } = showRoute({ qitemId: "qitem-1", body: full });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "show", "qitem-1", "--json"]);
+      const printed = JSON.parse(logs[0]);
+      expect(printed.bodyBytes).toBe(2400);
+      expect(printed.body).toBe(`${"😀".repeat(512)}…[cut at 512 of 600 chars; rig queue show 'qitem-1' --full]`);
+    });
+
+    it("previewCutMarker quotes the row id for the shell", () => {
+      expect(previewCutMarker("qitem-it's", 512, 3983)).toBe(`…[cut at 512 of 3983 chars; rig queue show 'qitem-it'\\''s' --full]`);
     });
 
     it("show --full --json: byte-identical COMPLETE item body (compatibility contract — no preview fields)", async () => {
@@ -1514,6 +2209,131 @@ describe("rig queue CLI", () => {
       expect(printed.body).toBe("C".repeat(1000)); // complete, untruncated
       expect(printed).not.toHaveProperty("bodyBytes");
       expect(printed).not.toHaveProperty("bodyTruncated");
+    });
+
+    it("update --resolution posts the text with the close", async () => {
+      const { deps, calls } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "update", "qitem-x", "--state", "done", "--closure-reason", "no-follow-on", "--resolution", "Fixed in #42"]);
+      expect(calls.find((c) => c.path === "/api/queue/qitem-x/update")?.body).toMatchObject({ state: "done", resolution: "Fixed in #42" });
+    });
+
+    it.each([
+      ["canceled", []],
+      ["denied", []],
+      ["failed", []],
+      ["handed-off", ["--closure-reason", "handed_off_to", "--closure-target", "next@rig"]],
+    ])("update --state %s --resolution posts the text, kept as typed", async (state, extra) => {
+      const { deps, calls } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "update", "qitem-x", "--state", state, ...extra, "--resolution", "  two\nlines \u2713 "]);
+      expect(calls.find((c) => c.path === "/api/queue/qitem-x/update")?.body).toMatchObject({ state, resolution: "  two\nlines \u2713 " });
+      expect(process.exitCode).toBeUndefined();
+    });
+
+    it.each([
+      ["no --state", ["--resolution", "Fixed"]],
+      ["a note only", ["--note", "n", "--resolution", "Fixed"]],
+      ["--state in-progress", ["--state", "in-progress", "--resolution", "Fixed"]],
+      ["--state pending", ["--state", "pending", "--resolution", "Fixed"]],
+      ["--state blocked", ["--state", "blocked", "--blocked-on", "external:x", "--wake-after", "1h", "--resolution", "Fixed"]],
+    ])("update --resolution with %s is a usage error before anything is sent", async (_label, args) => {
+      const { deps, calls } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "update", "qitem-x", ...args]);
+      expect(calls).toEqual([]);
+      expect(process.exitCode).toBe(1);
+      expect(errors.join("\n")).toContain("--resolution");
+      expect(errors.join("\n")).toContain("done, canceled, denied, failed or handed-off");
+    });
+
+    it.each([[""], ["   "], ["\n\t"]])("update --state done --resolution %j is a usage error before anything is sent", async (text) => {
+      const { deps, calls } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "update", "qitem-x", "--state", "done", "--closure-reason", "no-follow-on", "--resolution", text]);
+      expect(calls).toEqual([]);
+      expect(process.exitCode).toBe(1);
+      expect(errors.join("\n")).toContain("needs text");
+    });
+
+    it("a --resolution usage error with --json is a JSON error on stderr", async () => {
+      const { deps, calls } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "update", "qitem-x", "--state", "pending", "--resolution", "x", "--json"]);
+      expect(calls).toEqual([]);
+      expect(JSON.parse(errors[0])).toMatchObject({ error: "resolution_needs_closing_state" });
+    });
+
+    it("update --resolution --help names only what the CLI itself checks", async () => {
+      const { deps } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      const help = program.commands.find((c) => c.name() === "queue")!.commands.find((c) => c.name() === "update")!.helpInformation();
+      expect(help).toContain("--resolution <text>");
+      expect(help).not.toContain("resolution_not_admitted");
+      expect(help).not.toContain("resolution_already_closed");
+    });
+
+    it("update --help says how to cancel a row: --state done --closure-reason canceled", async () => {
+      const { deps } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      const help = program.commands.find((c) => c.name() === "queue")!.commands.find((c) => c.name() === "update")!.helpInformation().replace(/\s+/g, " ");
+      expect(help).toContain("To cancel a row: --state done --closure-reason canceled");
+      expect(help).toContain("--state canceled takes no reason, except 'superseded'");
+    });
+
+    it("update without --resolution sends no resolution", async () => {
+      const { deps, calls } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "update", "qitem-x", "--note", "n"]);
+      expect((calls.find((c) => c.path === "/api/queue/qitem-x/update")?.body as Record<string, unknown>).resolution).toBeUndefined();
+    });
+
+    const closed = {
+      qitemId: "qitem-1", state: "done", body: "work",
+      closingTransition: { transitionId: 7, ts: "2026-10-14T21:00:00.000Z", state: "done", closureReason: "no-follow-on", closureTarget: null, actorSession: "b@r", transitionNote: "shipped it" },
+    };
+
+    it("show without --full: an open row's readView stays complete", async () => {
+      const { deps } = showRoute({ qitemId: "qitem-1", state: "pending", body: "work" });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "show", "qitem-1", "--json"]);
+      expect(JSON.parse(logs[0]).readView).toMatchObject({ complete: true, omittedFields: [] });
+    });
+
+    it("show --full: a closed row's closing transition (note and reason) is printed, as JSON and as text", async () => {
+      for (const flags of [["--json"], []]) {
+        logs.length = 0;
+        const { deps } = showRoute(closed);
+        const program = createProgram({ queueDeps: deps });
+        program.exitOverride();
+        await program.parseAsync(["node", "rig", "queue", "show", "qitem-1", "--full", ...flags]);
+        expect(JSON.parse(logs[0]).closingTransition).toMatchObject({ closureReason: "no-follow-on", transitionNote: "shipped it", actorSession: "b@r" });
+      }
+    });
+
+    it("show without --full: a closed row prints as before, with no closing block", async () => {
+      for (const flags of [["--json"], []]) {
+        logs.length = 0;
+        const { deps } = showRoute(closed);
+        const program = createProgram({ queueDeps: deps });
+        program.exitOverride();
+        await program.parseAsync(["node", "rig", "queue", "show", "qitem-1", ...flags]);
+        const printed = JSON.parse(logs[0]);
+        expect(printed.state).toBe("done");
+        expect(printed).not.toHaveProperty("closingTransition");
+        expect(logs.join("\n")).not.toContain("shipped it");
+        // The omission is declared, so a reader that trusts readView runs --full.
+        expect(printed.readView.complete).toBe(false);
+        expect(printed.readView.omittedFields).toEqual([{ path: "closingTransition", jsonBytes: JSON.stringify(closed.closingTransition).length }]);
+        expect(printed.readView.fullCommand).toBe("rig queue show 'qitem-1' --full --json");
+      }
     });
 
     it("show --full (human): complete body, no preview fields, no marker", async () => {
@@ -1883,5 +2703,35 @@ describe("P3 — authored-summary teaching layer (advisory + --summary hint)", (
     const createCmd = queueCmd.commands.find((c) => c.name() === "create")!;
     const summaryOpt = createCmd.options.find((o) => o.long === "--summary")!;
     expect(summaryOpt.description).toMatch(TEACHES_WHERE);
+  });
+
+  // The summary is the row's subject on every surface that lists it, not only the needs-you
+  // view; an agent that reads "needs-you" alone leaves it off a row bound for an agent.
+  const SUBJECT_SURFACES = [/\bRECENT\b/, /\bstory\b/i, /needs-you view/];
+
+  it.each(["create", "handoff", "handoff-and-complete"])(
+    "%s --summary help names every surface that shows the row's subject",
+    (sub) => {
+      const { deps } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      const queueCmd = program.commands.find((c) => c.name() === "queue")!;
+      const cmd = queueCmd.commands.find((c) => c.name() === sub)!;
+      const summaryOpt = cmd.options.find((o) => o.long === "--summary")!;
+      for (const surface of SUBJECT_SURFACES) expect(summaryOpt.description).toMatch(surface);
+    },
+  );
+
+  it("the missing-summary warning names every surface that shows the row's subject", async () => {
+    const { deps } = makeDeps({
+      routes: { "POST /api/queue/create": { status: 201, data: { qitemId: "q1", state: "pending" } } },
+    });
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync([
+      "node", "rig", "queue", "create",
+      "--source", "a@rig", "--destination", "b@rig", "--body", "x", "--json",
+    ]);
+    const warn = stderrOut.join("");
+    for (const surface of SUBJECT_SURFACES) expect(warn).toMatch(surface);
   });
 });

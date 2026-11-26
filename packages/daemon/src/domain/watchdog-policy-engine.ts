@@ -1,17 +1,21 @@
 import { createHash } from "node:crypto";
 import { parse as parseYaml } from "yaml";
 import type { EventBus } from "./event-bus.js";
+import type { readSendOutcome } from "./connection-contract.js";
 import type { Policy, PolicyEvaluation, PolicyJob } from "./policies/types.js";
 import { artifactPoolReadyPolicy } from "./policies/artifact-pool-ready.js";
 import { edgeArtifactRequiredPolicy } from "./policies/edge-artifact-required.js";
 import { periodicReminderPolicy } from "./policies/periodic-reminder.js";
 import { contextUsageThresholdPolicy } from "./policies/context-usage-threshold.js";
+import { PARK_WAKE_GUIDANCE, parkContinuationPreview, withContinuationPreview } from "./park-wake-text.js";
+import { isRefusedInteractive } from "./policies/parked-owner-consumer.js";
 import {
   WatchdogJobsError,
   type WatchdogJob,
   type WatchdogJobsRepository,
 } from "./watchdog-jobs-repository.js";
-import type { WatchdogHistoryEntry, WatchdogHistoryLog } from "./watchdog-history-log.js";
+import { isQueueOnlyDeliveryCode, type QueueOnlyDeliveryCode, type WatchdogHistoryEntry, type WatchdogHistoryLog } from "./watchdog-history-log.js";
+import { resolveWakeRetryIntervalSeconds } from "./queue-wake-ladder.js";
 
 /**
  * Watchdog policy engine (PL-004 Phase C R1).
@@ -53,27 +57,68 @@ export interface DeliveryRequest {
 
 export interface DeliveryOutcome {
   status: "ok" | "failed" | "retained";
+  /** Typed admission refusal, kept independently of human-readable error text. On an `ok` at a queue-only seat, what
+   *  the reminder became instead of typed input (watchdog-history-log.ts, #3076). */
+  code?: "retained_quota_full" | "terminal_seat" | QueueOnlyDeliveryCode;
+  /** With `queued_as_row` or `noted_on_queued_row`: the queue row the reminder became, or was noted on. */
+  queuedQitemId?: string;
   outboxIds?: string[];
+  /** The existing transport's actual input boundary; failure never means no input by itself. */
+  inputPhase?: "not_reached" | "attempted" | "written";
   error?: string;
   /** Structured continuity custody was durably created or identified. */
   continuityActionCompleted?: boolean;
+  /** The text reported by a delivery implementation, without its scheduler header. */
+  sentMessage?: string;
+  /** Durable custody of this scheduled occurrence, separate from its recurrence. */
+  occurrenceTracked?: boolean;
+  sent?: boolean;
+  /** Failed occurrence is finished; a recurring job can start its next normal cycle. */
+  occurrenceComplete?: boolean;
+  /** A retained receipt or retry time was checked; no new input attempt happened. */
+  deferred?: boolean;
+  reconciled?: boolean;
+  transportReason?: string;
+  retryAt?: string;
+  nextAction?: string;
+  terminalReason?: string;
+  memberOutcomes?: Record<string, DeliveryOutcome>;
+  /** What the attempt's own send result says happened, in the shared words (member-connection.v1); `ok` beside it is
+   *  the status, not the fact, so `ok` with `unknown` is unknown. Absent where no send result was read (an exception, or a
+   *  reconciled receipt): that's no claim of delivery or verification. */
+  fact?: ReturnType<typeof readSendOutcome>;
 }
 
 export interface WatchdogDeliverySource {
   occurrenceId?: string;
   jobId: string;
   policy: string;
+  /** A digest's members, when one send carries several reminders: each job and the occurrence it was due for. */
+  members?: Array<{ jobId: string; occurrenceId: string }>;
+  /** A digest's parked rows, one per member's park timer. A queue-only seat gets the digest as a note on each. */
+  parkedRows?: Array<{ jobId: string; qitemId: string }>;
 }
 
-export type DeliveryFn = (
+/** The status a delivery is recorded under: at a queue-only seat, what the reminder became, never a typed `ok`. */
+export function deliveryStatusLabel(delivery: Pick<DeliveryOutcome, "status" | "code">): string {
+  return delivery.status === "ok" && isQueueOnlyDeliveryCode(delivery.code) ? delivery.code : delivery.status;
+}
+
+export type DeliveryFn = ((
   req: DeliveryRequest,
   source: WatchdogDeliverySource,
-) => Promise<DeliveryOutcome>;
+) => Promise<DeliveryOutcome>) & {
+  /** Resolve existing occurrence custody before grouping it with new reminders. */
+  reconcile?: (source: WatchdogDeliverySource) => DeliveryOutcome | null;
+};
 
 export function formatWatchdogDeliveryMessage(
   source: WatchdogDeliverySource,
   message: string,
 ): string {
+  if (source.members) {
+    return `[OpenRig watchdog scheduler · policy: ${source.policy} · ${source.members.length} jobs · digest: ${source.jobId}]\n${message}`;
+  }
   return `[OpenRig watchdog scheduler · policy: ${source.policy} · job: ${source.jobId}]\n${message}`;
 }
 
@@ -91,6 +136,8 @@ export interface PolicyContextParser {
 }
 
 interface WatchdogPolicyEngineDeps {
+  /** Opt-in per-rig maintenance: leave held jobs due, before evaluation and accounting. */
+  deliveryDeferred?: (jobId: string, targetSession: string) => boolean;
   jobsRepo: WatchdogJobsRepository;
   historyLog: WatchdogHistoryLog;
   eventBus: EventBus;
@@ -113,14 +160,65 @@ interface WatchdogPolicyEngineDeps {
    * SKIPPING, so an unknown target-generation must never skip a legitimate wake (note-2 inversion).
    */
   resolveTargetGeneration?: (sessionName: string) => string | null;
+  /** Whether an unarchived node still carries this name, even without a recorded tenure. When resolveTargetGeneration is
+   *  unknown, a carried name is unresolved (a context watch skips and measures again); one carried by
+   *  nothing is a seat that's gone (the watch ends). Absent → gone, as before. */
+  targetNameCarried?: (sessionName: string) => boolean;
+  /**
+   * Issue #1180 — the target seat's latest context-usage sample under its live
+   * occupant generation (generation-guarded by the jobs repository). Null = no
+   * usable sample; token/percent context jobs then tell their target once instead of firing.
+   */
+  resolveContextUsage?: (
+    sessionName: string,
+    occupantGeneration: string | null,
+  ) => {
+    usedTokens: number | null;
+    usedPercentage: number | null;
+    contextWindowSize: number | null;
+    sampledAt: string | null;
+    fresh: boolean;
+  } | null;
   /** Last defense before transport for persisted jobs whose owning domain can
    *  prove they are no longer actionable. A reason terminals the job without
    *  delivering; null preserves the existing send path. */
   resolvePreDeliveryTerminalReason?: (input: { jobId: string }) => string | null;
+  /** A due timer whose owning domain fires it with no recipient (a usage-limit blocker's expiry, #3704): the hook
+   *  performs the fire and returns the job's terminal reason, and nothing is sent. Null keeps the send path. */
+  fireWithoutDelivery?: (input: { jobId: string }) => string | null;
   /** Queue-side observer for a wake attempt. It appends resume evidence to
    *  every HELD row armed to this job; delivery outcome is preserved. */
   resolveQueueWait?: (input: { jobId: string }) => PolicyEvaluation | null | undefined;
-  onWakeAttempt?: (attempt: { jobId: string; deliveryStatus: string }) => void;
+  /** At a queue-only seat (#3076): `queuedQitemId`, the row the reminder became or was noted on, and `targetSession`,
+   *  the seat whose parked rows the delivery itself already noted. */
+  onWakeAttempt?: (attempt: { jobId: string; deliveryStatus: string; retryAt?: string; queuedQitemId?: string; targetSession?: string }) => void;
+  /** The parked row a due reminder is about, when it may share one message with other reminders due for the same
+   *  seat in the same scheduler pass. Null, or absent, keeps the reminder's own send. */
+  resolveDigestEntry?: (input: { jobId: string; message: string }) => ParkReminderEntry | null;
+  /** Seconds between tries to record a delivered wake whose recording failed (#3479). Absent → the wake retry
+   *  interval setting, as the watchdog's delivery receipts use it. */
+  accountingRetryIntervalSeconds?: () => number;
+}
+
+/** The parked row an ordinary park reminder is about, with the current park's recorded continuation for its preview. */
+export interface ParkReminderEntry {
+  qitemId: string;
+  summary: string | null;
+  continuation?: string | null;
+}
+
+/** A due reminder whose send waits for the end of its scheduler pass, so reminders for one seat go as one message. */
+interface HeldReminder {
+  job: WatchdogJob;
+  outcome: Extract<PolicyEvaluation, { action: "send" }>;
+  evaluatedAt: string;
+  occurrenceId: string;
+  entry: ParkReminderEntry;
+}
+
+/** The reminders held during one scheduler pass; `deliverHeldReminders` sends them when the pass ends. */
+export interface ReminderPass {
+  held: HeldReminder[];
 }
 
 const PHASE_C_BUILTIN_POLICIES: ReadonlyArray<Policy> = [
@@ -138,6 +236,10 @@ const PHASE_C_BUILTIN_POLICIES: ReadonlyArray<Policy> = [
  */
 const QUIET_SKIP_REASONS = new Set<string>([
   "not_due",
+  // Quiet hours: the window's release job while quiet is still on. Nothing changed, so no history row or event per minute.
+  "quiet_hours_still_on",
+  // A person's mode before its scheduled end (mode-scheduled-end): the same, for every minute it waits.
+  "mode_end_not_yet",
   "queue_wait_already_presented",
   "queue_wait_owner_working",
   "workflow_healthy_deadline_gated",
@@ -148,6 +250,8 @@ const QUIET_SKIP_REASONS = new Set<string>([
   "active_wake_not_due",
   "context_usage_below_threshold",
   "threshold_receipt_stable",
+  // A context watch that already told its target it can't read the sample, and still can't: told once, not every scan.
+  "context_sample_unreadable_notified",
   // OPR.0.4.3.16 idle-gate-qitem routine no-ops — analogues of
   // no_actionable_artifacts. Suppressed from history/SSE so a per-second
   // scan does not spam when there is simply nothing to wake about. The
@@ -163,11 +267,17 @@ const QUIET_SKIP_REASONS = new Set<string>([
   // for. Adding this string changes no throttle semantics and no other policy
   // emits it.
   "gate_condition_unchanged",
+  // #3076: a queue-only seat's pending gate row (idle-gate-qitem) or open rows (parked-owner consumer) are its own
+  // reminder; the hold is recorded once, not every scan.
+  "queue_only_seat_unchanged",
   // OPR.0.5.6.24 — the parked-owner consumer's clean-scan no-op: nothing
   // parked, nothing closed, nothing deferred. Suppressed so a routine rig
   // scan writes no history (the loud, audited signals are the SENT wake,
   // episode-ended, and all-parked-owners-deferred).
   "no-parked-owner",
+  // #3315 — every parked owner sits on a tmux server the daemon cannot reach. The loss is recorded once
+  // (tmux.server_gone); a history row per scan for as long as it lasts is the volume the issue measured.
+  "terminal-server-unreachable",
   // OPR.0.4.3.16 rev1-r1 fixback (advisor ruling 2026-07-03): seat_needs_input
   // and activity_stale_unknown are the COMMON recurring states for this
   // policy's own target scenario — a gate qitem pending on a seat that has
@@ -182,6 +292,16 @@ const QUIET_SKIP_REASONS = new Set<string>([
   "seat_needs_input",
   "activity_stale_unknown",
 ]);
+
+/** A job's quiet decisions since this daemon started (#3643): how many, by reason, and the last one. Kept in memory
+ *  only, so `since` says when counting began. It counts evaluations, not loud outcomes, and on its own it says nothing
+ *  about the scheduler's cadence or health. */
+export interface WatchdogQuietCount {
+  since: string;
+  total: number;
+  byReason: Record<string, number>;
+  lastReason: string | null;
+}
 
 export interface EvaluationResult {
   job: WatchdogJob;
@@ -199,11 +319,23 @@ export class WatchdogPolicyEngine {
   private readonly deliver: DeliveryFn;
   private readonly parseSpec: PolicyContextParser;
   private readonly now: () => Date;
+  private readonly deliveryDeferred?: WatchdogPolicyEngineDeps["deliveryDeferred"];
   private readonly policies: Map<string, Policy>;
   private readonly resolveTargetGeneration?: (sessionName: string) => string | null;
+  private readonly targetNameCarried?: (sessionName: string) => boolean;
+  private readonly resolveContextUsage?: WatchdogPolicyEngineDeps["resolveContextUsage"];
   private readonly resolvePreDeliveryTerminalReason?: (input: { jobId: string }) => string | null;
+  private readonly fireWithoutDelivery?: WatchdogPolicyEngineDeps["fireWithoutDelivery"];
   private readonly resolveQueueWait?: WatchdogPolicyEngineDeps["resolveQueueWait"];
-  private readonly onWakeAttempt?: (attempt: { jobId: string; deliveryStatus: string }) => void;
+  private readonly onWakeAttempt?: WatchdogPolicyEngineDeps["onWakeAttempt"];
+  private readonly resolveDigestEntry?: WatchdogPolicyEngineDeps["resolveDigestEntry"];
+  private readonly accountingRetryIntervalSeconds: () => number;
+  /** Jobs whose delivered wake couldn't be recorded: consecutive failures, and when to try recording it again. In memory:
+   *  a database that can't record the wake may not record this either, and a restart simply tries once more. */
+  private readonly accountingBackoff = new Map<string, { failures: number; retryAtMs: number }>();
+  /** #3643: the quiet decisions per job since this engine started. They write no history row or event. */
+  private readonly quietCounts = new Map<string, { total: number; byReason: Record<string, number>; lastReason: string }>();
+  private readonly quietSince: string;
 
   constructor(deps: WatchdogPolicyEngineDeps) {
     this.jobsRepo = deps.jobsRepo;
@@ -211,11 +343,18 @@ export class WatchdogPolicyEngine {
     this.eventBus = deps.eventBus;
     this.deliver = deps.deliver;
     this.resolveTargetGeneration = deps.resolveTargetGeneration;
+    this.targetNameCarried = deps.targetNameCarried;
+    this.resolveContextUsage = deps.resolveContextUsage;
     this.resolvePreDeliveryTerminalReason = deps.resolvePreDeliveryTerminalReason;
+    this.fireWithoutDelivery = deps.fireWithoutDelivery;
     this.onWakeAttempt = deps.onWakeAttempt;
     this.resolveQueueWait = deps.resolveQueueWait;
+    this.resolveDigestEntry = deps.resolveDigestEntry;
     this.parseSpec = deps.parseSpec ?? parseWatchdogSpec;
     this.now = deps.now ?? (() => new Date());
+    this.quietSince = this.now().toISOString();
+    this.deliveryDeferred = deps.deliveryDeferred;
+    this.accountingRetryIntervalSeconds = deps.accountingRetryIntervalSeconds ?? resolveWakeRetryIntervalSeconds;
     this.policies = new Map();
     for (const p of PHASE_C_BUILTIN_POLICIES) this.policies.set(p.name, p);
     if (deps.additionalPolicies) {
@@ -227,7 +366,54 @@ export class WatchdogPolicyEngine {
     return this.policies.get(name);
   }
 
-  async evaluate(job: WatchdogJob, evaluationPassStartedAt?: string): Promise<EvaluationResult> {
+  /** #3643: the job's quiet count since this engine started; a job with no quiet decision yet reads zero. */
+  quietCount(jobId: string): WatchdogQuietCount {
+    const count = this.quietCounts.get(jobId);
+    return {
+      since: this.quietSince,
+      total: count?.total ?? 0,
+      byReason: { ...count?.byReason },
+      lastReason: count?.lastReason ?? null,
+    };
+  }
+
+  private countQuiet(jobId: string, reason: string): void {
+    const count = this.quietCounts.get(jobId) ?? { total: 0, byReason: {}, lastReason: reason };
+    count.total += 1;
+    count.byReason[reason] = (count.byReason[reason] ?? 0) + 1;
+    count.lastReason = reason;
+    this.quietCounts.set(jobId, count);
+  }
+
+  private inactiveJobResult(jobId: string): EvaluationResult | null {
+    const job = this.jobsRepo.getByIdOrThrow(jobId);
+    if (job.state === "active") return null;
+    return {
+      job,
+      outcome: { action: "skip", reason: "job_not_active" },
+      history: null,
+      delivery: null,
+      meaningful: false,
+    };
+  }
+
+  private deferredJobResult(job: WatchdogJob, session = job.targetSession): EvaluationResult | null {
+    if (!this.deliveryDeferred?.(job.jobId, session)) return null;
+    return { job: this.jobsRepo.getById(job.jobId) ?? job,
+      outcome: { action: "skip", reason: "rig_delivery_drain" }, history: null, delivery: null, meaningful: false };
+  }
+
+  async evaluate(job: WatchdogJob, evaluationPassStartedAt?: string, pass?: ReminderPass): Promise<EvaluationResult> {
+    // #3479: a delivered wake whose recording failed again waits out its retry interval: no pass, history row or log until then.
+    const backoff = this.accountingBackoff.get(job.jobId);
+    if (backoff && this.now().getTime() < backoff.retryAtMs) {
+      return { job, outcome: { action: "skip", reason: "wake_accounting_retry_pending" }, history: null, delivery: null, meaningful: false };
+    }
+    // A prior job's delivery may have yielded since the scheduler selected this row.
+    const inactive = this.inactiveJobResult(job.jobId);
+    if (inactive) return inactive;
+    const deferred = this.deferredJobResult(job);
+    if (deferred) return deferred;
     const policy = this.resolvePolicy(job.policy);
     const evaluatedAt = this.now().toISOString();
     const receiptCutoffAt = evaluationPassStartedAt ?? evaluatedAt;
@@ -258,20 +444,30 @@ export class WatchdogPolicyEngine {
 
     const parsed = this.parseSpec(job.specYaml);
     const isContextUsageThreshold = job.policy === "context-usage-threshold";
-    const target = isContextUsageThreshold
-      ? { session: job.targetSession }
-      : (parsed.target ?? { session: job.targetSession });
+    const target = watchdogJobTarget(job, parsed.target);
+    const targetDeferred = this.deferredJobResult(job, target.session);
+    if (targetDeferred) return targetDeferred;
     const occupantGeneration = isContextUsageThreshold
       ? (this.resolveTargetGeneration?.(job.targetSession) ?? null)
       : null;
     let watchedFilePath = job.watchedFilePath;
     let currentGenerationTranscriptPending = false;
+    // Issue #1180 — token/percent jobs measure the seat's sampled context use,
+    // so only byte-gated jobs need a transcript-file binding.
+    const byteGated = job.thresholdBytes != null;
+    // A file the person named (`--watched-file`, the spec's `context.watched_file`) stays the watched file when the
+    // target's occupant changes, and a binding an earlier rebind moved off it goes back to it. Only a binding resolved
+    // from the target's own transcript follows its new occupant.
+    const namedWatchedFile = typeof parsed.context.watched_file === "string" && parsed.context.watched_file !== ""
+      ? parsed.context.watched_file
+      : null;
     if (
       isContextUsageThreshold &&
+      byteGated &&
       occupantGeneration &&
-      job.watchedFileGeneration !== occupantGeneration
+      (namedWatchedFile ? watchedFilePath !== namedWatchedFile : job.watchedFileGeneration !== occupantGeneration)
     ) {
-      watchedFilePath = this.jobsRepo.findTranscriptPath(job.targetSession, occupantGeneration);
+      watchedFilePath = namedWatchedFile ?? this.jobsRepo.findTranscriptPath(job.targetSession, occupantGeneration);
       if (watchedFilePath) {
         this.jobsRepo.recordWatchedFileBinding(job.jobId, watchedFilePath, occupantGeneration);
         this.historyLog.record({
@@ -325,15 +521,32 @@ export class WatchdogPolicyEngine {
       registeredAt: job.registeredAt,
       watchedFilePath,
       thresholdBytes: job.thresholdBytes,
+      thresholdTokens: job.thresholdTokens,
+      thresholdPercent: job.thresholdPercent,
+      // Issue #1180 — sampled context use for the target seat under its live
+      // occupant generation; only fetched for token/percent jobs.
+      contextUsageSample: isContextUsageThreshold && !byteGated
+        ? (this.resolveContextUsage?.(job.targetSession, occupantGeneration) ?? null)
+        : null,
       requiresJobId: job.requiresJobId,
       lastFiredGeneration: job.lastFiredGeneration,
+      lastFiredCondition: job.lastFiredCondition,
       occupantGeneration,
       currentGenerationTranscriptPending,
+      occupantGenerationAmbiguous: isContextUsageThreshold && !occupantGeneration
+        && (this.targetNameCarried?.(job.targetSession) ?? false),
       requiredReceiptSatisfied,
       requiredReceiptDeferred,
     };
 
     const outcome = this.resolveQueueWait?.({ jobId: job.jobId }) ?? await policy.evaluate(policyJob);
+
+    // Stop, park completion or seat handover may retire the job while its policy awaits I/O.
+    // Discard every outcome before it can deliver or overwrite the retirement's state.
+    const retired = this.inactiveJobResult(job.jobId);
+    if (retired) return retired;
+    const deferredAfterPolicy = this.deferredJobResult(job, outcome.action === "send" ? outcome.target.session : target.session);
+    if (deferredAfterPolicy) return deferredAfterPolicy;
 
     if (outcome.action === "skip") {
       // POC parity: skip clears actionable. Loud-vs-quiet decides
@@ -342,6 +555,7 @@ export class WatchdogPolicyEngine {
       this.jobsRepo.setActionable(job.jobId, false, evaluatedAt);
       const isQuiet = QUIET_SKIP_REASONS.has(outcome.reason);
       if (isQuiet) {
+        this.countQuiet(job.jobId, outcome.reason);
         return {
           job: this.jobsRepo.getByIdOrThrow(job.jobId),
           outcome,
@@ -418,6 +632,7 @@ export class WatchdogPolicyEngine {
         // last_actionable_at.
         this.jobsRepo.recordEvaluation(job.jobId, evaluatedAt, false);
         this.jobsRepo.setActionable(job.jobId, true, evaluatedAt, job.lastActionableAt);
+        this.countQuiet(job.jobId, "active_wake_not_due");
         return {
           job: this.jobsRepo.getByIdOrThrow(job.jobId),
           outcome: { action: "skip", reason: "active_wake_not_due" },
@@ -471,49 +686,57 @@ export class WatchdogPolicyEngine {
     // residue, where the row is already terminal and no transition remains to
     // intercept. It runs after normal policy/throttle/generation decisions but
     // before any custody or message delivery side effect.
-    const preDeliveryTerminalReason = this.resolvePreDeliveryTerminalReason?.({ jobId: job.jobId });
-    if (preDeliveryTerminalReason) {
-      this.jobsRepo.markTerminal(job.jobId, preDeliveryTerminalReason);
-      const history = this.historyLog.record({
-        jobId: job.jobId,
-        evaluatedAt,
-        outcome: "terminal",
-        skipReason: preDeliveryTerminalReason,
-      });
-      this.eventBus.emit({
-        type: "watchdog.evaluation_terminal",
-        jobId: job.jobId,
-        policy: job.policy,
-        terminalReason: preDeliveryTerminalReason,
-      });
-      return {
-        job: this.jobsRepo.getByIdOrThrow(job.jobId),
-        outcome: { action: "terminal", reason: preDeliveryTerminalReason },
-        history,
-        delivery: null,
-        meaningful: true,
-      };
-    }
+    const preDeliveryTerminal = this.terminalBeforeDelivery(job, evaluatedAt);
+    if (preDeliveryTerminal) return preDeliveryTerminal;
 
-    const continuityAction = parseContinuityAction(
+    // A notice about the watch itself is not the threshold: no fire receipt and no continuity action.
+    const thresholdFire = isContextUsageThreshold && !outcome.notice;
+    const continuityAction = outcome.notice ? undefined : parseContinuityAction(
       parsed.context["continuity_action"],
       job,
       occupantGeneration,
     );
 
+    const occurrence = [job.jobId, occupantGeneration, outcome.conditionReceipt ?? (job.policy === "periodic-reminder" ? job.lastFireAt : outcome.message)];
+    const recurring = outcome.conditionReceipt === undefined && job.policy !== "periodic-reminder" && job.policy !== "context-usage-threshold";
+    // Identify cadence for grouping/history and durable scheduled-occurrence custody, separate from explicit sends.
+    if (recurring && job.lastFireAt !== null) {
+      occurrence.push(job.lastFireAt);
+    }
+    const occurrenceId = createHash("sha256").update(JSON.stringify(occurrence)).digest("hex");
+    const recovered = this.deliver.reconcile?.({ jobId: job.jobId, policy: job.policy, occurrenceId });
+    if (recovered) return this.recordAttempt({ job, outcome, evaluatedAt,
+      deliverySchedule: this.jobsRepo.deliverySchedule(job.jobId), delivery: recovered,
+      isContextUsageThreshold: false, notice: outcome.notice === true });
+    // A parked-row reminder due in a scheduler pass waits for the pass's end, when every reminder held for its seat
+    // goes in one message. Nothing has changed for it yet, so a pass that stops early leaves it due.
+    const digestEntry = job.policy === "periodic-reminder" && !continuityAction
+      ? this.resolveDigestEntry?.({ jobId: job.jobId, message: outcome.message }) ?? null
+      : null;
+    if (pass && digestEntry) {
+      pass.held.push({ job, outcome, evaluatedAt, occurrenceId, entry: digestEntry });
+      return { job, outcome, history: null, delivery: null, meaningful: false };
+    }
+    // Outside a pass an ordinary park reminder still goes alone, with its continuation's preview.
+    const message = digestEntry ? withContinuationPreview(outcome.message, digestEntry.qitemId, digestEntry.continuation) : outcome.message;
+
+    const deferredBeforeEffect = this.deferredJobResult(job, outcome.target.session);
+    if (deferredBeforeEffect) return deferredBeforeEffect;
+
     // Plain wakes retain the proven at-most-once ordering. Structured
     // continuity custody is retry-safe by deterministic qitem id, so its
     // receipt waits until the durable action has completed.
-    if (isContextUsageThreshold && occupantGeneration && !continuityAction) {
+    if (thresholdFire && occupantGeneration && !continuityAction) {
       this.jobsRepo.recordThresholdFire(job.jobId, occupantGeneration, evaluatedAt);
     }
+    const deliverySchedule = this.jobsRepo.deliverySchedule(job.jobId);
     const delivery = await this.deliver(
       {
         targetSession: outcome.target.session,
-        message: outcome.message,
+        message,
         ...(continuityAction ? { continuityAction } : {}),
       },
-      { jobId: job.jobId, policy: job.policy, occurrenceId: createHash("sha256").update(JSON.stringify([job.jobId, occupantGeneration, outcome.conditionReceipt ?? (job.policy === "periodic-reminder" ? job.lastFireAt : outcome.message)])).digest("hex") },
+      { jobId: job.jobId, policy: job.policy, occurrenceId },
     );
     if (
       isContextUsageThreshold &&
@@ -523,25 +746,244 @@ export class WatchdogPolicyEngine {
     ) {
       this.jobsRepo.recordThresholdFire(job.jobId, occupantGeneration, evaluatedAt);
     }
+    return this.recordAttempt({ job, outcome, evaluatedAt, deliverySchedule, delivery, isContextUsageThreshold: thresholdFire, notice: outcome.notice === true, sentMessage: message });
+  }
+
+  /** The pre-transport guard: a job its owning domain can prove is no longer actionable, or fires itself with no
+   *  recipient, is terminaled, not sent. */
+  private terminalBeforeDelivery(job: WatchdogJob, evaluatedAt: string): EvaluationResult | null {
+    const preDeliveryTerminalReason = this.resolvePreDeliveryTerminalReason?.({ jobId: job.jobId })
+      ?? this.fireWithoutDelivery?.({ jobId: job.jobId });
+    if (!preDeliveryTerminalReason) return null;
+    this.jobsRepo.markTerminal(job.jobId, preDeliveryTerminalReason);
     const history = this.historyLog.record({
       jobId: job.jobId,
       evaluatedAt,
-      outcome: delivery.status === "retained" ? "skipped" : "sent",
-      skipReason: delivery.status === "retained" ? "typing_guard_retained" : null,
-      deliveryTargetSession: outcome.target.session,
-      deliveryStatus: delivery.status,
-      deliveryMessage: outcome.message,
-      // OPR.0.5.6.24 — the delivery error/reason string survives into the
-      // durable record so a policy can distinguish an interactive-prompt
-      // refusal from a generic failure (status alone discards that identity).
-      evaluationNotes:
-        delivery.error !== undefined
-          ? { ...(outcome.notes ?? {}), deliveryReason: delivery.error }
-          : delivery.status === "retained" ? { ...(outcome.notes ?? {}), outboxIds: delivery.outboxIds ?? [], retainedNotDelivered: true } : outcome.notes ?? null,
+      outcome: "terminal",
+      skipReason: preDeliveryTerminalReason,
     });
-    if (!isContextUsageThreshold) {
-      this.jobsRepo.recordEvaluation(job.jobId, evaluatedAt, true);
+    this.eventBus.emit({
+      type: "watchdog.evaluation_terminal",
+      jobId: job.jobId,
+      policy: job.policy,
+      terminalReason: preDeliveryTerminalReason,
+    });
+    return {
+      job: this.jobsRepo.getByIdOrThrow(job.jobId),
+      outcome: { action: "terminal", reason: preDeliveryTerminalReason },
+      history,
+      delivery: null,
+      meaningful: true,
+    };
+  }
+
+  /** Send the reminders held during a scheduler pass: one message per seat holding two or more, each naming every row
+   *  it covers, and a lone reminder exactly as it would have gone on its own. Every member keeps its own history,
+   *  schedule and wake receipt, all from the one attempt. */
+  async deliverHeldReminders(
+    pass: ReminderPass,
+    onError: (err: unknown) => void = (err) => { throw err; },
+    shouldStop: () => boolean = () => false,
+  ): Promise<void> {
+    const bySeat = new Map<string, HeldReminder[]>();
+    for (const held of pass.held) {
+      const seat = held.outcome.target.session;
+      bySeat.set(seat, [...(bySeat.get(seat) ?? []), held]);
     }
+    pass.held = [];
+    for (const [seat, group] of bySeat) {
+      // A stop leaves every seat not yet started untouched, and still due.
+      if (shouldStop()) return;
+      try {
+        await this.deliverHeldGroup(seat, group, shouldStop);
+      } catch (err) {
+        onError(err);
+      }
+    }
+  }
+
+  /** Re-check current job/park state before each call. Group current reminders; a receipt never replaces delivery.
+   * A stop leaves every unstarted member due, while the call already in flight finishes and is accounted. */
+  private async deliverHeldGroup(seat: string, group: HeldReminder[], shouldStop: () => boolean): Promise<void> {
+    const finished = new Set<HeldReminder>();
+    for (;;) {
+      if (shouldStop()) return;
+      const digest: HeldReminder[] = [];
+      let alone: { held: HeldReminder; entry: ParkReminderEntry | null } | null = null;
+      for (const held of group) {
+        if (finished.has(held)) continue;
+        if (this.inactiveJobResult(held.job.jobId) || this.deferredJobResult(held.job, seat) || this.terminalBeforeDelivery(held.job, held.evaluatedAt)) {
+          finished.add(held);
+          continue;
+        }
+        const current = this.resolveDigestEntry?.({ jobId: held.job.jobId, message: held.outcome.message }) ?? null;
+        if (current) digest.push({ ...held, entry: current });
+        else alone ??= { held, entry: current };
+      }
+      if (alone) {
+        finished.add(alone.held);
+        await this.deliverAlone(seat, alone.held, alone.entry);
+        continue;
+      }
+      if (digest.length === 1) await this.deliverAlone(seat, digest[0]!, digest[0]!.entry);
+      else if (digest.length > 1) await this.deliverDigest(seat, digest);
+      return;
+    }
+  }
+
+  private async deliverDigest(seat: string, digest: HeldReminder[]): Promise<void> {
+    digest = digest.filter(held => !this.deferredJobResult(held.job, seat));
+    if (!digest.length) return;
+    if (digest.length === 1) return this.deliverAlone(seat, digest[0]!, digest[0]!.entry);
+    const schedules = digest.map((held) => this.jobsRepo.deliverySchedule(held.job.jobId));
+    const members = digest.map((held) => ({ jobId: held.job.jobId, occurrenceId: held.occurrenceId }));
+    const digestId = `digest-${createHash("sha256").update(JSON.stringify(members.map((m) => m.occurrenceId).sort())).digest("hex")}`;
+    const lines = digest.map(({ entry }) => {
+      const recorded = entry.continuation?.trim();
+      return `- ${entry.qitemId}${entry.summary ? ` — ${entry.summary.replace(/\s+/g, " ")}` : ""}`
+        + (recorded ? `\n  ${parkContinuationPreview(entry.qitemId, recorded)}` : "");
+    });
+    const message = [
+      `Wake timers fired for ${digest.length} parked rows. Resume each row's recorded continuation and update it:`,
+      ...lines,
+      ...(digest.some(({ entry }) => entry.continuation?.trim()) ? [PARK_WAKE_GUIDANCE] : []),
+    ].join("\n");
+    const delivery = await this.deliver(
+      { targetSession: seat, message },
+      { jobId: digestId, policy: "periodic-reminder", occurrenceId: digestId, members,
+        parkedRows: digest.map(({ job, entry }) => ({ jobId: job.jobId, qitemId: entry.qitemId })) },
+    );
+    digest.forEach((held, i) => this.recordAttempt({
+      ...held, deliverySchedule: schedules[i]!, delivery: delivery.memberOutcomes?.[held.job.jobId] ?? delivery, isContextUsageThreshold: false,
+      digest: { deliveryId: digestId, size: digest.length, line: lines[i]! },
+    }));
+  }
+
+  /** A held reminder sent on its own, exactly as `evaluate` would have sent it: an ordinary park reminder with its
+   *  continuation's preview, anything else verbatim. */
+  private async deliverAlone(seat: string, held: HeldReminder, entry: ParkReminderEntry | null): Promise<void> {
+    if (this.deferredJobResult(held.job, seat)) return;
+    const schedule = this.jobsRepo.deliverySchedule(held.job.jobId);
+    const message = entry ? withContinuationPreview(held.outcome.message, entry.qitemId, entry.continuation) : held.outcome.message;
+    const delivery = await this.deliver(
+      { targetSession: seat, message },
+      { jobId: held.job.jobId, policy: held.job.policy, occurrenceId: held.occurrenceId },
+    );
+    this.recordAttempt({ ...held, deliverySchedule: schedule, delivery, isContextUsageThreshold: false, sentMessage: message });
+  }
+
+  /** Schedule the next try at recording a delivered wake (#3479): the next tick after a first failure, the wake retry
+   *  interval after a repeated one. The first failure of a run returns the error to report, once, through the scheduler's
+   *  tick-error log, with one history row a person reads in `rig watchdog status`; later failures in the same run return
+   *  null and stay quiet until a try succeeds. */
+  private backOffAccounting(job: WatchdogJob, outcome: Extract<PolicyEvaluation, { action: "send" }>, evaluatedAt: string,
+    delivery: DeliveryOutcome, err: unknown): Error | null {
+    const seconds = this.accountingRetryIntervalSeconds();
+    const failures = (this.accountingBackoff.get(job.jobId)?.failures ?? 0) + 1;
+    const retryAt = new Date(this.now().getTime() + seconds * 1000).toISOString();
+    this.accountingBackoff.set(job.jobId, { failures, retryAtMs: failures > 1 ? Date.parse(retryAt) : this.now().getTime() });
+    if (failures > 1) return null;
+    const cause = err instanceof Error ? err.message : String(err);
+    const code = (err as { code?: unknown } | null)?.code;
+    const nextAction = `The wake was delivered and its receipt kept; recording it failed (${cause}). It's tried again at the next check, then every ${seconds}s while it keeps failing, without delivering again.`;
+    try {
+      this.historyLog.record({ jobId: job.jobId, evaluatedAt, outcome: "failed", skipReason: null,
+        deliveryTargetSession: outcome.target.session, deliveryStatus: deliveryStatusLabel(delivery),
+        evaluationNotes: { wakeAccountingFailed: true, error: cause, ...(typeof code === "string" ? { code } : {}), retryIntervalSeconds: seconds, nextAction } });
+    } catch { /* the report below still goes out */ }
+    return new Error(`watchdog ${job.jobId}: ${nextAction}`, { cause: err });
+  }
+
+  /** Account for one input attempt or a recovered receipt, then advance only accounted occurrences. */
+  private recordAttempt(input: {
+    job: WatchdogJob;
+    outcome: Extract<PolicyEvaluation, { action: "send" }>;
+    evaluatedAt: string;
+    deliverySchedule: WatchdogJob;
+    delivery: DeliveryOutcome;
+    isContextUsageThreshold: boolean;
+    /** A notice about the watch itself (PolicyEvaluation `notice`), not its condition firing. */
+    notice?: boolean;
+    /** Set when this job's reminder went out inside a digest with others: the digest, its size and this job's line. */
+    digest?: { deliveryId: string; size: number; line: string };
+    /** The text a lone send delivered, when it differs from the outcome's message (a park wake's continuation preview). */
+    sentMessage?: string;
+  }): EvaluationResult {
+    const { job, outcome, evaluatedAt, deliverySchedule, delivery, isContextUsageThreshold, digest, sentMessage } = input;
+    if (delivery.deferred) {
+      this.jobsRepo.deliveryAccounted(job.jobId);
+      return { job: this.jobsRepo.getByIdOrThrow(job.jobId), outcome, history: null, delivery, meaningful: false };
+    }
+    const notes = digest
+      ? { ...(outcome.notes ?? {}), digestDeliveryId: digest.deliveryId, digestSize: digest.size }
+      : outcome.notes;
+    // Where a send returned, the history says what its result showed in the shared words, beside the status, with
+    // render-verified only when the screen showed it; no fact or flag claims no delivery or verification. Banking a
+    // receipt still follows `status` alone.
+    const deliveryNotes = delivery.inputPhase === undefined && delivery.code === undefined && delivery.fact === undefined ? notes
+      : { ...(notes ?? {}), ...(delivery.inputPhase === undefined ? {} : { deliveryInputPhase: delivery.inputPhase }),
+        ...(delivery.code === undefined ? {} : { deliveryCode: delivery.code }),
+        ...(delivery.queuedQitemId === undefined ? {} : { queuedQitemId: delivery.queuedQitemId }),
+        ...(delivery.fact === undefined ? {} : { deliveryFact: delivery.fact.fact, ...(delivery.fact.renderVerified ? { deliveryRenderVerified: true } : {}) }) };
+    const receiptNotes = delivery.retryAt || delivery.nextAction || delivery.occurrenceTracked
+      ? { ...(deliveryNotes ?? {}), ...(delivery.retryAt ? { retryAt: delivery.retryAt } : {}),
+        ...(delivery.nextAction ? { nextAction: delivery.nextAction } : {}),
+        ...(delivery.occurrenceTracked ? { outboxIds: delivery.outboxIds ?? [] } : {}) } : deliveryNotes;
+    let history: WatchdogHistoryEntry | null = null;
+    const retryPending = delivery.occurrenceTracked && delivery.status === "failed" && !delivery.occurrenceComplete;
+    const accountWake = () => {
+      const current = this.jobsRepo.getByIdOrThrow(job.jobId);
+      if (current.state === "active" && this.jobsRepo.scheduleUnchanged(current, deliverySchedule)
+        && (isContextUsageThreshold || current.lastEvaluationAt === evaluatedAt
+          || (retryPending && current.lastEvaluationAt === deliverySchedule.lastEvaluationAt))) {
+        this.onWakeAttempt?.({ jobId: job.jobId, deliveryStatus: deliveryStatusLabel(delivery),
+          ...(retryPending && delivery.retryAt ? { retryAt: delivery.retryAt } : {}),
+          ...(delivery.queuedQitemId ? { queuedQitemId: delivery.queuedQitemId } : {}),
+          ...(delivery.status === "ok" && isQueueOnlyDeliveryCode(delivery.code) ? { targetSession: outcome.target.session } : {}) });
+      }
+      if (delivery.terminalReason) this.jobsRepo.markTerminal(job.jobId, delivery.terminalReason);
+    };
+    const account = () => {
+      // The fire stamp and queue wake receipt/one-shot retirement commit together. A crash here leaves
+      // the old occurrence identity, whose durable positive receipt can finish accounting without input.
+      if (input.notice) this.jobsRepo.recordEvaluation(job.jobId, evaluatedAt, false);
+      else if (!isContextUsageThreshold && !retryPending) {
+        this.jobsRepo.recordEvaluation(job.jobId, evaluatedAt, true, deliverySchedule);
+      }
+      if (delivery.occurrenceTracked) accountWake();
+    };
+    try {
+      history = this.historyLog.record({
+        jobId: job.jobId,
+        evaluatedAt,
+        outcome: delivery.reconciled ? "skipped" : delivery.status === "retained" ? "skipped" : delivery.status === "ok" ? "sent"
+          : isRefusedInteractive(delivery.error) ? "refused" : "failed",
+        skipReason: delivery.reconciled ? "delivery_receipt_reconciled" : delivery.status === "retained" ? "typing_guard_retained" : null,
+        deliveryTargetSession: outcome.target.session,
+        // `sent` with a queue-only status (watchdog-history-log.ts) means it reached the seat's queue, not typed.
+        deliveryStatus: deliveryStatusLabel(delivery),
+        deliveryMessage: digest?.line ?? delivery.sentMessage ?? sentMessage ?? outcome.message,
+        // OPR.0.5.6.24 — the delivery error/reason string survives into the
+        // durable record so a policy can distinguish an interactive-prompt
+        // refusal from a generic failure (status alone discards that identity).
+        evaluationNotes:
+          delivery.error !== undefined
+            ? { ...receiptNotes, deliveryReason: delivery.error }
+            : delivery.status === "retained" ? { ...receiptNotes, outboxIds: delivery.outboxIds ?? [], retainedNotDelivered: true } : receiptNotes ?? null,
+      });
+      if (delivery.occurrenceTracked) this.eventBus.withNotifyEnvelope(account);
+      else account();
+    } catch (err) {
+      // #3479: this wake's receipt is already durable, so its next pass reconciles without typing it again. One failure
+      // is retried at the next tick, as before. When its recording keeps failing (the pass's history row, or a one-shot
+      // retirement SQLite can't journal), wait the wake retry interval between tries and report it once per failing run,
+      // instead of a pass, a history row and a stack trace every tick.
+      if (!(delivery.occurrenceTracked && delivery.status === "ok")) throw err;
+      const report = this.backOffAccounting(job, outcome, evaluatedAt, delivery, err);
+      if (report) throw report;
+      return { job: this.jobsRepo.getById(job.jobId) ?? job, outcome, history, delivery, meaningful: false };
+    }
+    this.accountingBackoff.delete(job.jobId);
     // OPR.0.5.8.1 S2 — a policy's condition receipt is banked ONLY on positive
     // delivery. `status` is "ok" | "failed"; anything that is not a definite ok
     // leaves the receipt untouched so the next scan retries. A policy that does
@@ -550,15 +992,18 @@ export class WatchdogPolicyEngine {
     if (outcome.conditionReceipt !== undefined && delivery.status === "ok") {
       this.jobsRepo.recordConditionReceipt(job.jobId, outcome.conditionReceipt);
     }
-    this.jobsRepo.setActionable(job.jobId, true, evaluatedAt, job.lastActionableAt);
+    if (input.notice) this.jobsRepo.setActionable(job.jobId, false, evaluatedAt);
+    else this.jobsRepo.setActionable(job.jobId, true, evaluatedAt, job.lastActionableAt);
     this.eventBus.emit({
       type: "watchdog.evaluation_fired",
       jobId: job.jobId,
       policy: job.policy,
       targetSession: outcome.target.session,
-      deliveryStatus: delivery.status,
+      deliveryStatus: deliveryStatusLabel(delivery),
+      ...(delivery.queuedQitemId ? { queuedQitemId: delivery.queuedQitemId } : {}),
     });
-    this.onWakeAttempt?.({ jobId: job.jobId, deliveryStatus: delivery.status });
+    if (!delivery.occurrenceTracked) accountWake();
+    this.jobsRepo.deliveryAccounted(job.jobId);
     return {
       job: this.jobsRepo.getByIdOrThrow(job.jobId),
       outcome,
@@ -592,6 +1037,17 @@ function parseContinuityAction(
     destination: value["destination"],
     body: value["body"],
   };
+}
+
+/** The seat a job is addressed to, before delivery resolves the name: a context-usage job measures and wakes its
+ *  stored target; every other policy prefers its spec's `target:`. A seat swap compares the same value (#1775). */
+export function watchdogJobTarget(
+  job: { policy: string; targetSession: string },
+  specTarget: { session: string } | null,
+): { session: string } {
+  return job.policy === "context-usage-threshold"
+    ? { session: job.targetSession }
+    : (specTarget ?? { session: job.targetSession });
 }
 
 /** Parse the operator-authored watchdog YAML before it reaches persistence. */

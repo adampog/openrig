@@ -18,6 +18,12 @@
 
 import nodePath from "node:path";
 import { shellQuote } from "./shell-quote.js";
+/** Run-local managed channel input, shared wire only; native execution remains in each runner. */
+export interface PiManagedRequest {
+  version: 1; runId: string; requestId: string; sequence: number; kind: "input" | "wake" | "cancel";
+  payload: { text?: string; question?: string; target?: { runId: string; nativeTurnId: string } };
+}
+
 export type RunnerRuntime = "pi" | "omp";
 
 // ── Seat state layout ────────────────────────────────────────────────────────
@@ -50,9 +56,35 @@ export const PI_RUNNER_ERROR_MARKER = "[pi-runner] ERROR";
 
 // ── Runner-state sidecar ─────────────────────────────────────────────────────
 
+export interface PiCompactionRecord {
+  /** The OpenRig manual-compaction attempt this run answers. Present only for a
+   *  requested run: the runner stamps the id carried by `/openrig-compact <id>`.
+   *  Automatic runs carry none, so an earlier result never answers a new request. */
+  readonly attemptId?: string;
+  readonly requestId?: string;
+  readonly reason?: string;
+  readonly startedAt?: string;
+  readonly endedAt?: string;
+  readonly result?: { readonly summary?: string; readonly firstKeptEntryId?: string; readonly tokensBefore?: number; readonly estimatedTokensAfter?: number } | null;
+  readonly aborted?: boolean;
+  readonly willRetry?: boolean;
+  readonly errorMessage?: string;
+}
+
 export interface PiRunnerState {
+  /** The latest run, automatic (threshold/overflow) or requested. */
+  compaction?: PiCompactionRecord;
+  /** The last attempt-stamped record, kept BESIDE `compaction`: a later
+   *  automatic run replaces `compaction` without erasing a completed request. */
+  requestedCompaction?: PiCompactionRecord;
+  /** The attempt the newest `/openrig-compact <id>` input named, written before
+   *  the native compact RPC is sent. It survives a daemon restart, so the newest
+   *  request reads uncertain instead of falling back to an older completion. */
+  pendingCompaction?: { readonly attemptId: string; readonly requestedAt: string };
   ready: boolean;
-  /** Launch-attempt scope (guard fold, code-review qitem-20260707011908):
+  /** This live runner's read-only recovery endpoint; absent on older runners. */
+  recovery?: { port: number; pid: number; childPid: number };
+  /** Launch-attempt scope (guard fold, code-review):
    *  the adapter mints a launchId per attempt, pre-writes a pending sidecar
    *  carrying it, and passes --launch-id to the runner; the runner stamps it
    *  into every sidecar write. Readiness/resume polls IGNORE any state whose
@@ -74,8 +106,8 @@ export interface PiRunnerState {
 /** The launch-scoped pending record every writer uses when resetting the
  *  sidecar for a new attempt. It deliberately CARRIES the prior lastEntryId:
  *  the durable catch-up cursor (FR-5) must survive the stale-artifact reset —
- *  erasing it broke get_entries-since on resume (guard re-verdict,
- *  qitem-20260707013815). Everything else from the prior record is exactly
+ *  erasing it broke get_entries-since on resume (guard re-verdict).
+ *  Everything else from the prior record is exactly
  *  the stale state the reset exists to scope away. */
 export function buildPendingRunnerState(
   launchId: string,
@@ -174,7 +206,9 @@ export const OMP_PROVIDER_EXTRA_ENV_VARS: Record<string, readonly string[]> = {
 };
 
 // Baseline process needs. No host credential families or shell customization.
-export const PI_ENV_BASELINE_VARS = ["PATH", "HOME", "USER", "LOGNAME", "TERM", "LANG", "LC_ALL", "SHELL", "TMPDIR"] as const;
+// SSH_AUTH_SOCK lets Pi's shell tools run git over SSH (#1159): the path isn't key material, but the socket lets the
+// agent use the keys loaded in ssh-agent.
+export const PI_ENV_BASELINE_VARS = ["PATH", "HOME", "USER", "LOGNAME", "SSH_AUTH_SOCK", "TERM", "LANG", "LC_ALL", "SHELL", "TMPDIR"] as const;
 
 // NodeLauncher supplies identity and instance routing on both fresh and resumed
 // seats. Pi's shell tools inherit this child env: dropping these values makes
@@ -199,7 +233,7 @@ export function providerFromModel(model: string | undefined): string | null {
  *  the runner's own env; only allowlisted names cross the boundary. */
 export function buildPiChildEnv(
   source: Record<string, string | undefined>,
-  opts: { agentDir: string; sessionsDir: string; model?: string; runtime?: RunnerRuntime; sessionName?: string; nodeId?: string; openrigHome?: string; openrigUrl?: string },
+  opts: { agentDir: string; sessionsDir: string; model?: string; runtime?: RunnerRuntime | string; sessionName?: string; nodeId?: string; openrigHome?: string; openrigUrl?: string },
 ): Record<string, string> {
   const env: Record<string, string> = {};
   for (const name of [...PI_ENV_BASELINE_VARS, ...PI_ENV_OPENRIG_VARS]) {
@@ -240,8 +274,12 @@ export function buildPiChildEnv(
 // ── Command construction ─────────────────────────────────────────────────────
 
 export interface PiRunnerLaunchOpts {
+  /** Explicit prepared account, never inferred from the shell environment. */
+  accountHome?: string;
   /** Explicit runtime; omitted keeps the original Pi command byte-for-byte. */
-  runtime?: RunnerRuntime;
+  runtime?: RunnerRuntime | string;
+  /** Custom executable to spawn inside the runner (e.g. for Pi-fork community harnesses). */
+  command?: string;
   /** Absolute path to the compiled runner entry (daemon dist). */
   runnerEntryPath: string;
   /** The seat's canonical session name (identity + sidecar key). */
@@ -254,12 +292,30 @@ export interface PiRunnerLaunchOpts {
   model?: string;
   /** Explicit posture; OMP maps it to --approval-mode, Pi to resource trust. */
   trust: "approve" | "no-approve";
+  /** Pi only: the seat's resolved effort, sent as Pi's own `--thinking <level>` (wins over a model `:level` suffix). */
+  thinking?: string;
   /** Exact session file to resume (FR-6). Mutually exclusive with forkRef. */
   sessionFile?: string;
+  /** OPR.0.7.0.2: Pi only — the runner reports usage facts from persisted entries (usage.pi_cost_facts). */
+  usageFacts?: boolean;
+  /** OPR.0.7.0.2 K4: Pi only, with usageFacts — the runner looks up OpenRouter's charge (usage.pi_openrouter_charge). */
+  openRouterCharge?: boolean;
   /** Session file path or id to fork from via CLI --fork (FR-6). */
   forkRef?: string;
   /** Launch-attempt scope stamped into every runner sidecar write. */
   launchId: string;
+  /** Pi only: resolved launch_wrapper argv (wrapper[0] resolved to an absolute path by the daemon). */
+  launchWrapper?: readonly string[];
+}
+
+/** The shape `rig seat set-effort` accepts for an effort level. */
+export const EFFORT_SHAPE = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/;
+
+/** The `--thinking` value a Pi launch sends: only one of set-effort's shape, so `ps` never shows it
+ *  as a flag or splits it on whitespace (the Pi identity check reads the runner's command line). */
+export function piThinkingValue(thinking: string | null | undefined): string | undefined {
+  const value = thinking?.trim();
+  return value && EFFORT_SHAPE.test(value) ? value : undefined;
 }
 
 /** The command typed into the seat's tmux pane. The runner owns everything
@@ -274,16 +330,35 @@ export function buildPiRunnerCommand(opts: PiRunnerLaunchOpts): string {
     "--launch-id", shellQuote(opts.launchId),
     ...(opts.runtime === "omp"
       ? ["--runtime", "omp", "--approval-mode", opts.trust === "approve" ? "yolo" : "always-ask"]
-      : [`--${opts.trust}`]),
+      : (opts.runtime && opts.runtime !== "pi"
+        ? ["--runtime", shellQuote(opts.runtime), `--${opts.trust}`]
+        : [`--${opts.trust}`])),
   ];
+  if (opts.command) {
+    parts.push("--command", shellQuote(opts.command));
+  }
   if (opts.model?.trim()) {
     parts.push("--model", shellQuote(opts.model.trim()));
+  }
+  const thinking = opts.runtime === "omp" ? undefined : piThinkingValue(opts.thinking);
+  if (thinking) {
+    parts.push("--thinking", shellQuote(thinking));
   }
   if (opts.sessionFile) {
     parts.push("--session", shellQuote(opts.sessionFile));
   }
   if (opts.forkRef) {
     parts.push("--fork", shellQuote(opts.forkRef));
+  }
+  if (opts.usageFacts && opts.runtime !== "omp") {
+    parts.push("--usage-facts");
+    if (opts.openRouterCharge) parts.push("--openrouter-charge");
+  }
+  if (opts.accountHome && opts.runtime !== "omp") parts.push("--account-home", shellQuote(opts.accountHome));
+  if (opts.launchWrapper?.length && opts.runtime !== "omp") {
+    for (const arg of opts.launchWrapper) {
+      parts.push("--launch-wrapper-arg", shellQuote(arg));
+    }
   }
   return parts.join(" ");
 }
@@ -295,10 +370,12 @@ export function buildPiChildArgs(opts: {
   sessionsDir: string;
   sessionName: string;
   model?: string;
+  /** Pi only: forwarded as `--thinking` when it has set-effort's shape; Pi warns on a level it does not know. */
+  thinking?: string;
   trust: "approve" | "no-approve";
   sessionFile?: string;
   forkRef?: string;
-  runtime?: RunnerRuntime;
+  runtime?: RunnerRuntime | string;
 }): string[] {
   const args = [
     "--mode", "rpc",
@@ -309,6 +386,10 @@ export function buildPiChildArgs(opts: {
   ];
   if (opts.model?.trim()) {
     args.push("--model", opts.model.trim());
+  }
+  const thinking = opts.runtime === "omp" ? undefined : piThinkingValue(opts.thinking);
+  if (thinking) {
+    args.push("--thinking", thinking);
   }
   if (opts.sessionFile) {
     // Exact file resume — NEVER --resume (interactive picker; forbidden in

@@ -15,12 +15,13 @@
 // path is preserved). Malformed settings are preserved (fail-closed). Missing
 // source produces NO dangling commands and NO false projected claim.
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { ClaudeCodeAdapter, type ClaudeAdapterFsOps } from "../src/adapters/claude-code-adapter.js";
 import { shellQuote } from "../src/adapters/shell-quote.js";
 import type { NodeBinding } from "../src/domain/runtime-adapter.js";
 import { readFileSync, existsSync, statSync } from "node:fs";
-import { resolve as pathResolve } from "node:path";
+import { basename, dirname, resolve as pathResolve } from "node:path";
+import { execFileSync } from "node:child_process";
 import { planProjection, type ProjectionPlan, type ProjectionEntry } from "../src/domain/projection-planner.js";
 import { resolveNodeConfig, type ResolutionContext } from "../src/domain/profile-resolver.js";
 import type { RigSpec, RigSpecPod, RigSpecPodMember } from "../src/domain/types.js";
@@ -33,7 +34,9 @@ const STATE_DIR = "/custom-instance/O'Brien";
 const RELAY_DEST = `${STATE_DIR}/state/claude-activity-hooks/activity-relay.cjs`;
 const SETTINGS = "/project/.claude/settings.local.json";
 // The concrete, absolute, shell-quoted leg-B firing shape — never ${CLAUDE_PLUGIN_ROOT}.
-const OWNED_CMD = `node ${shellQuote(RELAY_DEST)}`;
+const OWNED_CMD = `exec ${shellQuote(process.execPath)} ${shellQuote(RELAY_DEST)}`;
+/** The shape OpenRig wrote before #3416 (no leading exec); seats keep it until a launch refreshes it. */
+const PRE_EXEC_OWNED_CMD = OWNED_CMD.replace(/^exec /, "");
 const OWNED_MARKER = "state/claude-activity-hooks/activity-relay.cjs";
 const EVENTS = ["SessionStart", "UserPromptSubmit", "Stop", "Notification"] as const;
 
@@ -131,6 +134,18 @@ function seededOwned(): string {
   return JSON.stringify({ hooks });
 }
 
+/** The file's mode as recorded in the git index ("100755"), or null outside a git checkout. */
+function committedMode(filePath: string): string | null {
+  try {
+    const out = execFileSync("git", ["ls-files", "--stage", "--", basename(filePath)], {
+      cwd: dirname(filePath), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+    });
+    return out.trim().split(/\s+/)[0] || null;
+  } catch {
+    return null;
+  }
+}
+
 // Packaged contract (QA blocker 1f53796c): the projected relay must be 0755, and production
 // PRESERVES the source mode (no adapter chmod policy). So the SHIPPED asset itself must be
 // executable — this regression STATS the real committed asset, not a synthetic 0o755 fixture.
@@ -139,11 +154,42 @@ describe("Claude activity-hook delivery — shipped relay asset executable mode 
     const assetPath = pathResolve(import.meta.dirname, "../assets/plugins/openrig-core/hooks/scripts/activity-relay.cjs");
     const mode = statSync(assetPath).mode & 0o777;
     expect(mode & 0o111, `shipped relay mode is 0${mode.toString(8)}, expected executable`).not.toBe(0);
-    expect(mode, `shipped relay mode is 0${mode.toString(8)}, expected 0755`).toBe(0o755);
+    // A git checkout's working-tree mode is the committed mode filtered by the checkout user's
+    // umask (umask 002, the default for user-private-group accounts on many Linux distributions,
+    // yields 0775). So in a git checkout the exact 0755 is asserted on the GIT INDEX entry, which
+    // is what this measures: not HEAD's tree, and not the mode a later package tarball will carry
+    // (that is the packaging step's to keep). Outside a checkout (e.g. an extracted package) it
+    // is asserted on the file itself.
+    const indexMode = committedMode(assetPath);
+    if (indexMode !== null) {
+      expect(indexMode, "committed relay mode").toBe("100755");
+      expect(mode & 0o755, `checkout relay mode is 0${mode.toString(8)}, expected at least 0755`).toBe(0o755);
+      expect(mode & 0o002, `checkout relay mode is 0${mode.toString(8)}, world-writable`).toBe(0);
+    } else {
+      expect(mode, `shipped relay mode is 0${mode.toString(8)}, expected 0755`).toBe(0o755);
+    }
   });
 });
 
 describe("Claude activity-hook delivery — ENABLE (entry present, source + manifest readable)", () => {
+  it.each([false, true])("copies the diagnostic formatter without suppressing existing hooks if its copy fails (%s)", async fail => {
+    const source = "/assets/plugins/openrig-core/hooks/scripts/permission-stop-descriptor.cjs";
+    const destination = `${STATE_DIR}/state/claude-activity-hooks/permission-stop-descriptor.cjs`;
+    const fs = enableFs({ [source]: "// synthetic formatter" });
+    const copy = fs.copyFile;
+    fs.copyFile = (src, dest) => {
+      if (src === source && fail) throw new Error("fixture failure");
+      copy(src, dest);
+    };
+    await makeAdapter(fs).project(plan([activityEntry()]), binding());
+    expect(fs._store[RELAY_DEST]).toBe("// relay");
+    expect(fs._store[destination]).toBe(fail ? undefined : "// synthetic formatter");
+    for (const event of EVENTS) {
+      const commands = (readSettings(fs).hooks?.[event] ?? []).flatMap((group: any) => group.hooks.map((hook: any) => hook.command));
+      expect(commands).toContain(OWNED_CMD);
+    }
+  });
+
   it("leaves identical shared relay bytes alone and refreshes a changed installed asset", async () => {
     const fs = enableFs();
     const copy = fs.copyFile;
@@ -199,6 +245,22 @@ describe("Claude activity-hook delivery — ENABLE (entry present, source + mani
     expect(Object.keys(readSettings(fs).hooks)).toEqual(["Stop"]);
   });
 
+  it("adds the optional permission observation and formatter during normal managed reprojection", async () => {
+    const source = `${dirname(RELAY_SRC)}/permission-stop-descriptor.cjs`;
+    const formatter = readFileSync(new URL("../assets/plugins/openrig-core/hooks/scripts/permission-stop-descriptor.cjs", import.meta.url), "utf8");
+    const manifest = readFileSync(new URL("../assets/plugins/openrig-core/hooks/claude.json", import.meta.url), "utf8");
+    const fs = enableFs({ [MANIFEST_SRC]: manifest, [source]: formatter,
+      [SETTINGS]: JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: OWNED_CMD }] }] } }) });
+    await makeAdapter(fs).project(plan([activityEntry()]), binding());
+    const settings = readSettings(fs);
+    const commands = (settings.hooks.PermissionRequest ?? []).flatMap((group: any) => group.hooks.map((hook: any) => hook.command));
+    expect(commands).toContain(OWNED_CMD);
+    expect(fs._store[`${STATE_DIR}/state/claude-activity-hooks/permission-stop-descriptor.cjs`]).toBe(formatter);
+    for (const event of EVENTS) {
+      expect(settings.hooks[event].flatMap((group: any) => group.hooks.map((hook: any) => hook.command))).toContain(OWNED_CMD);
+    }
+  });
+
   it("is idempotent: a second project() adds no duplicate owned entries", async () => {
     const fs = enableFs();
     const adapter = makeAdapter(fs);
@@ -233,6 +295,8 @@ describe("Claude activity-hook delivery — instance path transition", () => {
     const userCommands = [
       `echo ${shellQuote(oldPath)}`,
       `node 'user-arg' ${shellQuote(priorInstance)}`,
+      `${shellQuote(process.execPath)} ${shellQuote(priorInstance)} 'extra'`,
+      `${shellQuote("/custom/wrapper")} ${shellQuote(priorInstance)}`,
       `node ${shellQuote(priorInstance + ".backup")}`,
     ];
     const seeded = JSON.stringify({ env: { USER_SETTING: "keep" }, hooks: { Stop: [{ hooks: [
@@ -261,15 +325,15 @@ describe("Claude activity-hook delivery — instance path transition", () => {
 });
 
 describe("Claude activity-hook delivery — DISABLE via the always-run project() seam", () => {
-  function seededManaged(extra?: Record<string, any>) {
+  function seededManaged(extra?: Record<string, any>, command = OWNED_CMD) {
     const hooks: Record<string, any> = {};
-    for (const ev of EVENTS) hooks[ev] = [{ hooks: [{ type: "command", command: OWNED_CMD, timeout: 5 }] }];
+    for (const ev of EVENTS) hooks[ev] = [{ hooks: [{ type: "command", command, timeout: 5 }] }];
     if (extra) for (const [k, v] of Object.entries(extra)) hooks[k] = [...(hooks[k] ?? []), ...v];
     return JSON.stringify({ hooks });
   }
 
-  it("strips owned entries when NO claude_activity_hooks entry is present (production-reachable disable)", async () => {
-    const fs = enableFs({ [SETTINGS]: seededManaged() });
+  it.each([OWNED_CMD, PRE_EXEC_OWNED_CMD])("strips owned entries when NO claude_activity_hooks entry is present (production-reachable disable): %s", async (command) => {
+    const fs = enableFs({ [SETTINGS]: seededManaged(undefined, command) });
     await makeAdapter(fs).project(plan([]), binding());
     expect(allCommands(readSettings(fs)).filter((c) => c.includes(OWNED_MARKER))).toEqual([]);
   });
@@ -336,6 +400,31 @@ describe("Claude activity-hook delivery — hardening (guard r3 findings)", () =
       expect(res.skipped).toContain("claude-activity-hooks");
     });
   }
+});
+
+// #226: a seat whose cwd resolves to '/' has no project workspace. Delivery is still attempted there, as on
+// main (it works where '/' is writable, e.g. root in a container); when it fails, the warning says why.
+describe("Claude activity-hook delivery — cwd at the filesystem root", () => {
+  it("a writable root still gets the hooks delivered", async () => {
+    const fs = enableFs();
+    const res = await makeAdapter(fs).project(plan([activityEntry()]), binding("/"));
+    expect(res.projected).toContain("claude-activity-hooks");
+    expect(allCommands(JSON.parse(fs._store["/.claude/settings.local.json"]!)).length).toBeGreaterThan(0);
+  });
+
+  it("an unwritable root reports skipped and names the filesystem root as the reason", async () => {
+    const fs = enableFs();
+    fs.mkdirp = (p: string) => { if (p === "/.claude") throw new Error(`ENOENT: no such file or directory, mkdir '${p}'`); };
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const res = await makeAdapter(fs).project(plan([activityEntry()]), binding("/"));
+      expect(res.projected).not.toContain("claude-activity-hooks");
+      expect(res.skipped).toContain("claude-activity-hooks");
+      expect(log.mock.calls.flat().join("\n")).toMatch(/reconcile warning \(cwd '\/' resolves to the filesystem root, not a project workspace\): ENOENT/);
+    } finally {
+      log.mockRestore();
+    }
+  });
 });
 
 // M1 (R1 verdict): ownership must ROUND-TRIP shellQuote. A cwd containing a legal apostrophe

@@ -9,15 +9,19 @@
 import fs from "node:fs";
 import path from "node:path";
 import { Command } from "commander";
-import { ConfigStore } from "../config-store.js";
+import YAML from "yaml";
+import { readParentScope, validateMissionParent } from "@openrig/daemon/mission-parent";
 import { DaemonClient } from "../client.js";
 import { attestationLineage, type AttestationLineage } from "../lib/scope/attestation-lineage.js";
-import { getDaemonStatus, getDaemonUrl , statusGuardMessage} from "../daemon-lifecycle.js";
+import { getDaemonStatus, getDaemonUrl , statusGuardMessage } from "../daemon-lifecycle.js";
+import { renderDaemonTransportError } from "../cli-error.js";
+import { daemonMayAnswer } from "../daemon-reachability.js";
 import { realDeps } from "./daemon.js";
 
 import {
   CLOSE_REASONS,
   MISSION_TEMPLATE_KINDS,
+  NON_DELIVERY_CLOSE_REASONS,
   SLICE_TEMPLATE_KINDS,
   STAGE_VALUES,
   ScopeCliError,
@@ -39,10 +43,13 @@ import {
 } from "../lib/scope/dot-id.js";
 import {
   buildMissionDependencyGraph,
-  assertScopeWritePaths,
   ensureMissionId,
   ensureMissionIdPersisted,
+  enclosingMissionsRoot,
+  projectIdPrefix,
   findMission,
+  indexerReadsStatusIn,
+  readIndexerSliceStatus,
   resolveNodeFile,
   findSlice,
   listMissions,
@@ -50,14 +57,17 @@ import {
   moveSlice,
   rollbackMovedSlice,
   nextSliceNN,
+  tryClaimSliceNN,
   NOTES_FILE_PRECEDENCE,
   pad2,
   readFrontmatter,
   resolveNotesFile,
+  readProjectMissionsRoot,
   resolveMissionsRoot,
   splitFrontmatter,
   todayDateISO,
   updateFrontmatter,
+  editFrontmatter,
 } from "../lib/scope/scope-fs.js";
 import {
   renderCapabilityDeltaTemplate,
@@ -75,14 +85,17 @@ import {
   parseStatus,
   PROGRESS_STATUSES,
   setProgressRow,
+  setCurrentState,
 } from "../lib/scope/progress-edit.js";
 import { deriveScopeTrust } from "../lib/scope/trust.js";
 import { capabilityDeltaExpiryFindings } from "../lib/scope/capability-delta.js";
 import {
   applyMissionCompositionEdits,
+  appendMissionMembership,
   nextMissionMembershipOrder,
   planMissionMembershipAdd,
   planMissionMembershipRemove,
+  planMissionMembershipSetActive,
   type MissionCompositionEdit,
 } from "../lib/scope/mission-composition.js";
 
@@ -98,8 +111,16 @@ function makeStdout(): Stdout {
   return { write: (text: string) => process.stdout.write(text) };
 }
 
-const MISSION_MANIFEST = `schema: openrig.mission/v0alpha1
+/** The lifecycle compiler names a mission's workflow by `metadata.name`, so the scaffold records it (quoted: a name
+ *  only excludes whitespace and path separators). */
+const missionManifest = (name: string) => `schema: openrig.mission/v0alpha1
 kind: mission
+# The project proof rollup counts only missions whose status is active or
+# release-candidate. A new mission is planned, so it stays outside the rollup
+# until you change this to active (or release-candidate).
+metadata:
+  name: ${JSON.stringify(name)}
+  status: planned
 composition:
   mission_markdown:
     spec: SPEC.md
@@ -107,7 +128,10 @@ composition:
 # Optional team and SDLC sections are added here.
 `;
 
-const SLICE_MANIFEST = `schema: openrig.slice/v0alpha1
+/** Proof readiness reads build-order edges only from `execution.depends_on` (sdlc-conventions EC-1); `--execution-depends-on`
+ *  is the explicit way to write them. Without it no `execution` block is written, so the slice keeps no recorded edges
+ *  and no execution contract. Edges never make a slice runnable: lifecycle eligibility also needs that contract. */
+const sliceManifest = (executionDependsOn: string[] | undefined) => `schema: openrig.slice/v0alpha1
 kind: slice
 composition:
   mission: ../../mission.yaml
@@ -115,7 +139,7 @@ composition:
     spec: SPEC.md
     progress: PROGRESS.md
     proof: PROOF.md
-# Optional assignment, SDLC, and evidence sections are added here.
+${executionDependsOn ? `execution:\n  depends_on: ${JSON.stringify(executionDependsOn)}\n` : ""}# Optional assignment, SDLC, and evidence sections are added here.
 `;
 
 function emit(out: Stdout, payload: unknown, json: boolean, lines?: string[]): void {
@@ -140,7 +164,8 @@ function fail(err: unknown, json: boolean, out: Stdout): never {
     } else {
       process.stderr.write(`Error: ${err.fact}\n${err.consequence}\n${err.action}\n`);
     }
-  } else {
+  } else if (!renderDaemonTransportError(err, { out: (l) => out.write(`${l}\n`), err: (l) => process.stderr.write(`${l}\n`), json })) {
+    // A daemon timeout says the outcome is unknown and to check before any retry; anything else as before.
     const message = err instanceof Error ? err.message : String(err);
     process.stderr.write(`Error: ${message}\n`);
   }
@@ -201,7 +226,7 @@ function buildSliceLsCommand(): Command {
   const cmd = new Command("ls")
     .description("List slices in a mission (or across all missions)")
     .option("--mission <name>", "Restrict to a single mission")
-    .option("--state <state>", "Filter: active | closed | shipped | all", "active")
+    .option("--state <state>", "Filter: active (in flight, blocked included) | shipped (delivered in place: shipped or done) | closed (in closed/, or superseded, retired or closed in place) | all", "active")
     .option("--json", "Machine-readable output")
     .action(async (opts, command) => {
       const out = makeStdout();
@@ -215,7 +240,7 @@ function buildSliceLsCommand(): Command {
         }), json, out);
       }
       try {
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, mission: opts.mission });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
         const missions = opts.mission
           ? [findMission(missionsRoot, opts.mission)]
           : listMissions(missionsRoot);
@@ -258,13 +283,16 @@ function buildSliceShowCommand(): Command {
       const out = makeStdout();
       const json = Boolean(opts.json);
       try {
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, slice: slicePath, mission: opts.mission });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, targetPath: slicePath });
         const slice = findSlice(missionsRoot, slicePath, opts.mission ?? null);
         const readme = slice.readmePath ? fs.readFileSync(slice.readmePath, "utf8") : null;
         const children = fs.readdirSync(slice.absPath, { withFileTypes: true })
           .map((e) => ({ name: e.name, kind: e.isDirectory() ? "dir" : "file" as const }));
         // FR-5: derive read-time trust from (stage x verified) — NEVER stored.
         const trust = deriveScopeTrust(slice.frontmatter);
+        const parentWarnings: string[] = [];
+        const scopeNodes = readParentScope(missionsRoot, { onInvalid: (message) => parentWarnings.push(message) });
+        const childMissions = slice.id && scopeNodes.filter((node) => node.id === slice.id).length === 1 ? scopeNodes.filter((node) => node.kind === "mission" && node.parent === slice.id) : [];
         const payload = {
           ok: true,
           slice: {
@@ -277,6 +305,8 @@ function buildSliceShowCommand(): Command {
             trust,
             readme,
             children,
+            childMissions,
+            parentWarnings,
           },
         };
         if (json) {
@@ -288,6 +318,8 @@ function buildSliceShowCommand(): Command {
           out.write(formatTrustLine(trust));
           out.write(`  path: ${slice.absPath}\n`);
           out.write(`  children: ${children.length}\n`);
+          for (const warning of parentWarnings) out.write(`  warning: ${warning}\n`);
+          if (childMissions.length) out.write(`  child missions: ${childMissions.map((node) => node.name).join(", ")}\n`);
           if (readme) {
             out.write("\n--- README ---\n");
             out.write(readme);
@@ -313,6 +345,7 @@ function buildSliceCreateCommand(): Command {
     .option("--title <text>", "Display title (defaults to titlecased slug)")
     .option("--intent <text>", "Authored intent stored in SPEC.md frontmatter (defaults to title)")
     .option("--depends-on <dot-id...>", "Advisory build-order dependencies on sibling slice dot-IDs")
+    .option("--execution-depends-on <dot-id...>", "Build-order edges on sibling slice dot-IDs written to slice.yaml execution.depends_on, which proof readiness reads (not copied to SPEC.md)")
     .option("--readme-only", "Write progress_rail: readme-only in README frontmatter instead of scaffolding PROGRESS.md")
     .option("--json", "Machine-readable output")
     .action(async (missionName: string, rawSlug: string, opts, command) => {
@@ -335,44 +368,59 @@ function buildSliceCreateCommand(): Command {
             action: "Pick a slug containing letters or digits.",
           });
         }
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, mission: missionName });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, strictOverride: true });
         const mission = findMission(missionsRoot, missionName);
-        const nn = nextSliceNN(mission.absPath);
-        const sliceFolder = `${pad2(nn)}-${slug}`;
-        const sliceAbs = path.join(mission.absPath, "slices", sliceFolder);
-        assertScopeWritePaths(missionsRoot, sliceAbs, path.join(mission.absPath, "mission.yaml"));
-        if (fs.existsSync(sliceAbs)) {
-          throw new ScopeCliError({
-            fact: `Slice folder ${sliceAbs} already exists.`,
-            consequence: "Refusing to overwrite.",
-            action: "Pick a different slug, or rm -rf the existing folder first.",
-          });
-        }
+        let nn = nextSliceNN(mission.absPath);
         const title = opts.title ?? titleFromSlug(slug);
         const intent = opts.intent ?? title;
-        const compositionEdit = planMissionMembershipAdd(
-          mission.absPath,
-          `slices/${sliceFolder}/slice.yaml`,
-          nextMissionMembershipOrder(mission.absPath),
-        );
         const missionId = ensureMissionId(mission, missionsRoot);
-        const id = sliceIdFromMission(missionId, nn);
+        let id = sliceIdFromMission(missionId, nn);
         const dependsOn = Array.isArray(opts.dependsOn) ? [...new Set(opts.dependsOn as string[])] : [];
-        for (const dependency of dependsOn) {
-          if (dependency === id) {
+        const executionDependsOn = Array.isArray(opts.executionDependsOn)
+          ? [...new Set(opts.executionDependsOn as string[])]
+          : undefined;
+        const dependencyLists: Array<[flag: string, ids: string[]]> = [
+          ["--depends-on", dependsOn],
+          ["--execution-depends-on", executionDependsOn ?? []],
+        ];
+        // Validate before reserving any number; re-check self-dependency if a
+        // competing creator claimed the initial candidate.
+        let sliceFolder: string;
+        let sliceAbs: string;
+        for (;;) {
+          for (const [flag, ids] of dependencyLists) for (const dependency of ids) {
+            if (dependency === id) {
+              throw new ScopeCliError({
+                fact: `Slice ${id} cannot depend on itself.`,
+                consequence: "Slice not created.",
+                action: `Use a different sibling slice ID, or omit ${flag}.`,
+              });
+            }
+            if (!isSliceDotId(dependency) || !dependency.startsWith(`${missionId}.`)) {
+              throw new ScopeCliError({
+                fact: `Dependency "${dependency}" is not a sibling slice dot-ID under ${missionId}.`,
+                consequence: "Slice not created.",
+                action: `Use a sibling ID shaped like ${missionId}.<n>, or omit ${flag}.`,
+              });
+            }
+          }
+          sliceFolder = `${pad2(nn)}-${slug}`;
+          sliceAbs = path.join(mission.absPath, "slices", sliceFolder);
+          if (fs.existsSync(sliceAbs)) {
             throw new ScopeCliError({
-              fact: `Slice ${id} cannot depend on itself.`,
-              consequence: "Slice not created.",
-              action: "Use a different sibling slice ID, or omit --depends-on.",
+              fact: `Slice folder ${sliceAbs} already exists.`,
+              consequence: "Refusing to overwrite.",
+              action: "Pick a different slug, or rm -rf the existing folder first.",
             });
           }
-          if (!isSliceDotId(dependency) || !dependency.startsWith(`${missionId}.`)) {
-            throw new ScopeCliError({
-              fact: `Dependency "${dependency}" is not a sibling slice dot-ID under ${missionId}.`,
-              consequence: "Slice not created.",
-              action: `Use a sibling ID shaped like ${missionId}.<n>, or omit --depends-on.`,
-            });
-          }
+          // Validate an explicit manifest before reserving an ordinal. The
+          // post-scaffold write re-plans from the latest manifest and disk.
+          planMissionMembershipAdd(
+            mission.absPath, `slices/${pad2(nn)}-${slug}/slice.yaml`,
+          );
+          if (tryClaimSliceNN(mission.absPath, nn, `slices/${sliceFolder}/slice.yaml`)) break;
+          nn++;
+          id = sliceIdFromMission(missionId, nn);
         }
         const createdDate = todayDateISO();
         const body = renderSliceTemplate(kind, {
@@ -386,11 +434,12 @@ function buildSliceCreateCommand(): Command {
           depends_on: dependsOn,
         });
         const proofBody = renderSliceProofTemplate({ id, title });
-        const originalMissionNode = mission.readmePath ? fs.readFileSync(mission.readmePath, "utf8") : null;
         const readmePath = path.join(sliceAbs, "SPEC.md");
+        const proofPath = path.join(sliceAbs, "PROOF.md");
+        let scaffoldCompleted = false;
         try {
-          // Persist the parent id in the same rollback boundary as the child
-          // and composition membership. Validation above performs no writes.
+          // Persist the parent id before building the scaffold. Incomplete
+          // scaffolds roll back; the ordinal remains reserved even then.
           ensureMissionIdPersisted(mission, missionsRoot);
           fs.mkdirSync(sliceAbs, { recursive: true });
           fs.mkdirSync(path.join(sliceAbs, "proof"), { recursive: true });
@@ -398,8 +447,8 @@ function buildSliceCreateCommand(): Command {
           const readmeOnly = Boolean(opts.readmeOnly);
           if (readmeOnly) {
             const markerBody = body.replace(
-              /^(---\n)/,
-              `---\nprogress_rail: readme-only\n`,
+              /^(---)(\r?\n)/,
+              "$1$2progress_rail: readme-only$2",
             );
             fs.writeFileSync(readmePath, markerBody, "utf8");
           } else {
@@ -407,12 +456,21 @@ function buildSliceCreateCommand(): Command {
             const progressPath = path.join(sliceAbs, "PROGRESS.md");
             fs.writeFileSync(progressPath, renderSliceProgressTemplate(title), "utf8");
           }
-          fs.writeFileSync(path.join(sliceAbs, "slice.yaml"), SLICE_MANIFEST, "utf8");
-          fs.writeFileSync(path.join(sliceAbs, "PROOF.md"), proofBody, "utf8");
-          applyMissionCompositionEdits(compositionEdit ? [compositionEdit] : []);
+          fs.writeFileSync(path.join(sliceAbs, "slice.yaml"), sliceManifest(executionDependsOn), "utf8");
+          // Publish the completion sentinel only after its entire contents exist.
+          const proofTemporary = `${proofPath}.openrig-${process.pid}.tmp`;
+          fs.writeFileSync(proofTemporary, proofBody, { encoding: "utf8", flag: "wx" });
+          fs.renameSync(proofTemporary, proofPath);
+          scaffoldCompleted = true;
+          await appendMissionMembership(mission.absPath, `slices/${sliceFolder}/slice.yaml`);
         } catch (error) {
-          fs.rmSync(sliceAbs, { recursive: true, force: true });
-          if (originalMissionNode !== null && mission.readmePath) fs.writeFileSync(mission.readmePath, originalMissionNode, "utf8");
+          // PROOF.md is the final scaffold file. Once complete, leave this
+          // pending registration available for a later creator to repair.
+          if (!scaffoldCompleted) {
+            fs.rmSync(sliceAbs, { recursive: true, force: true });
+            // The parent identity may already be shared by another creator.
+            // Rolling this child back must not undo it or authored parent edits.
+          }
           throw error;
         }
         const payload = {
@@ -427,10 +485,10 @@ function buildSliceCreateCommand(): Command {
           },
         };
         emit(out, payload, json, [
-          `Created ${mission.name}/slices/${sliceFolder}`,
-          `  id: ${id}`,
+          `Created ${payload.slice.mission}/slices/${payload.slice.name}`,
+          `  id: ${payload.slice.id}`,
           `  template: ${kind}`,
-          `  path: ${sliceAbs}`,
+          `  path: ${payload.slice.path}`,
         ]);
       } catch (err) {
         fail(err, json, out);
@@ -453,11 +511,10 @@ function buildSliceShipCommand(): Command {
       const out = makeStdout();
       const json = Boolean(opts.json);
       try {
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, slice: slicePath, mission: opts.mission });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, targetPath: slicePath });
         const slice = findSlice(missionsRoot, slicePath, opts.mission ?? null);
-        const targetRoot = resolveMissionsRoot({ override: getOpts(command).workspace, mission: releaseMission });
-        const target = findMission(targetRoot, releaseMission);
-        if (target.absPath === path.join(missionsRoot, slice.missionName)) {
+        const target = findMission(missionsRoot, releaseMission);
+        if (target.name === slice.missionName) {
           throw new ScopeCliError({ fact: "Source and release mission are the same.", consequence: "Slice not shipped.", action: "Choose a different release mission." });
         }
         const targetSlicesDir = path.join(target.absPath, "slices");
@@ -466,8 +523,6 @@ function buildSliceShipCommand(): Command {
         const newName = `${pad2(newNN)}-${slug}`;
         const destAbs = path.join(targetSlicesDir, newName);
         const sourceMission = findMission(missionsRoot, slice.missionName);
-        assertScopeWritePaths(missionsRoot, path.join(sourceMission.absPath, "mission.yaml"));
-        assertScopeWritePaths(targetRoot, destAbs, path.join(target.absPath, "mission.yaml"));
         const edits = [
           planMissionMembershipRemove(sourceMission.absPath, sliceManifestRef(sourceMission.absPath, slice.absPath)),
           planMissionMembershipAdd(target.absPath, `slices/${newName}/slice.yaml`, nextMissionMembershipOrder(target.absPath)),
@@ -478,8 +533,7 @@ function buildSliceShipCommand(): Command {
         let moveResult: ReturnType<typeof moveSlice> | null = null;
         try {
           moveResult = moveSlice(slice.absPath, destAbs);
-          assertScopeWritePaths(targetRoot, path.join(destAbs, "SPEC.md"), path.join(destAbs, "README.md"));
-          const targetId = ensureMissionIdPersisted(target, targetRoot);
+          const targetId = ensureMissionIdPersisted(target, missionsRoot);
           const newSliceId = sliceIdFromMission(targetId, newNN);
           const newReadme = resolveNodeFile(destAbs);
           if (newReadme) {
@@ -521,11 +575,25 @@ function buildSliceShipCommand(): Command {
 // rig scope slice close
 // ---------------------------------------------------------------------
 
+/** How many judgment files the slice records, or `null` when the judgments folder cannot be read (unknown, not zero).
+ *  A folder that does not exist records none. */
+function countRecordedSliceJudgments(sliceAbsPath: string): number | null {
+  const judgmentsDir = path.join(sliceAbsPath, "proof", "judgments");
+  try {
+    return fs.readdirSync(judgmentsDir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".md"))
+      .length;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT" ? 0 : null;
+  }
+}
+
 function buildSliceCloseCommand(): Command {
   return new Command("close")
-    .description("Close a slice (move to <mission>/closed/, update status)")
+    .description("Close a slice (move to <mission>/closed/ by default, or update status in place with --in-place)")
     .argument("<slice-path>", "Slice path (absolute, relative, or NN-slug)")
     .requiredOption("--reason <reason>", `Closure reason: ${CLOSE_REASONS.join(" | ")}`)
+    .option("--in-place", "Keep the slice under <mission>/slices/ instead of moving to <mission>/closed/")
     .option("--note <text>", "Optional closure note")
     .option("--mission <name>", "Hint mission when slice-path is just NN-slug")
     .option("--json", "Machine-readable output")
@@ -533,6 +601,7 @@ function buildSliceCloseCommand(): Command {
       const out = makeStdout();
       const json = Boolean(opts.json);
       try {
+        const inPlace = Boolean(opts.inPlace);
         const reason = opts.reason as CloseReason;
         if (!CLOSE_REASONS.includes(reason)) {
           throw new ScopeCliError({
@@ -541,13 +610,172 @@ function buildSliceCloseCommand(): Command {
             action: `Pick one of: ${CLOSE_REASONS.join(", ")}.`,
           });
         }
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, slice: slicePath, mission: opts.mission });
+        if (!inPlace && reason === "delivered") {
+          throw new ScopeCliError({
+            fact: `--reason "delivered" requires --in-place.`,
+            consequence: "Slice not closed; moving to closed/ is reserved for non-delivery closures.",
+            action: `Pass --in-place with --reason delivered, or use rig scope slice ship, or pick a non-delivery reason (${NON_DELIVERY_CLOSE_REASONS.join(", ")}).`,
+          });
+        }
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, targetPath: slicePath });
         const slice = findSlice(missionsRoot, slicePath, opts.mission ?? null);
         const mission = findMission(missionsRoot, slice.missionName);
         const closedDir = path.join(mission.absPath, "closed");
+        const judgmentCount = countRecordedSliceJudgments(slice.absPath);
+
+        if (inPlace) {
+          const resolvedSliceAbs = path.resolve(slice.absPath);
+          const resolvedClosedDir = path.resolve(closedDir);
+          if (resolvedSliceAbs === resolvedClosedDir || resolvedSliceAbs.startsWith(`${resolvedClosedDir}${path.sep}`)) {
+            throw new ScopeCliError({
+              fact: `Slice "${slice.name}" is already under ${slice.missionName}/closed/.`,
+              consequence: "Slice not closed in place.",
+              action: "Inspect the slice under closed/, or move it back under slices/ before updating in place.",
+            });
+          }
+          if (!slice.readmePath) {
+            throw new ScopeCliError({
+              fact: `Slice "${slice.name}" at ${slice.absPath} has no SPEC.md or README.md.`,
+              consequence: "Cannot record in-place closure status without a slice node file.",
+              action: "Repair or add SPEC.md before closing --in-place.",
+            });
+          }
+          const targetStatus = reason === "delivered" ? "done" : `closed-${reason}`;
+          const compositionEdit = planMissionMembershipSetActive(
+            mission.absPath,
+            sliceManifestRef(mission.absPath, slice.absPath),
+            reason === "delivered",
+          );
+          const edits = compositionEdit ? [compositionEdit] : [];
+          const nodePath = slice.readmePath;
+          const originalNode = fs.readFileSync(nodePath, "utf8");
+          const progressPath = path.join(slice.absPath, "PROGRESS.md");
+          let originalProgress: string | null = null;
+          try {
+            originalProgress = fs.readFileSync(progressPath, "utf8");
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+          }
+          // The slice indexer lets PROGRESS.md override the node file, so a status it reads there is reconciled too.
+          const shouldReconcileProgressStatus = originalProgress !== null && indexerReadsStatusIn(originalProgress);
+
+          applyMissionCompositionEdits(edits);
+          let attemptedProgressWrite = false;
+          let readBackMismatch: ScopeCliError | null = null;
+          try {
+            const updates: Record<string, unknown> = {
+              status: targetStatus,
+              "closed-on": todayDateISO(),
+            };
+            if (opts.note) updates["closure-note"] = opts.note;
+            updateFrontmatter(nodePath, updates);
+            if (shouldReconcileProgressStatus) {
+              attemptedProgressWrite = true;
+              updateFrontmatter(progressPath, { status: targetStatus });
+            }
+            // Read the status back the way the slice indexer does; a shape that reads differently rolls everything back.
+            const readBack = readIndexerSliceStatus(slice.absPath);
+            if (readBack.status !== targetStatus) {
+              const readFile = readBack.file ?? nodePath;
+              readBackMismatch = new ScopeCliError({
+                fact: `After writing status "${targetStatus}", the slice indexer reads ${readBack.status === null ? "no status" : `"${readBack.status}"`} from ${readFile}.`,
+                consequence: "In-place closure refused.",
+                action: `Give ${path.basename(readFile)} one top-level scalar "status:" line, with no inline "#" comment and no duplicate or nested "status:" entry, or close without --in-place, then retry.`,
+              });
+              throw readBackMismatch;
+            }
+          } catch (error) {
+            const rollbackFailures: string[] = [];
+            try {
+              fs.writeFileSync(nodePath, originalNode, "utf8");
+            } catch (rbErr) {
+              rollbackFailures.push(
+                `restore ${nodePath}: ${rbErr instanceof Error ? rbErr.message : String(rbErr)}`,
+              );
+            }
+            if (attemptedProgressWrite && originalProgress !== null) {
+              try {
+                fs.writeFileSync(progressPath, originalProgress, "utf8");
+              } catch (rbErr) {
+                rollbackFailures.push(
+                  `restore ${progressPath}: ${rbErr instanceof Error ? rbErr.message : String(rbErr)}`,
+                );
+              }
+            }
+            if (edits.length > 0) {
+              try {
+                rollbackComposition(edits);
+              } catch (rbErr) {
+                rollbackFailures.push(
+                  `rollback mission composition: ${rbErr instanceof Error ? rbErr.message : String(rbErr)}`,
+                );
+              }
+            }
+            if (rollbackFailures.length > 0) {
+              if (error instanceof ScopeCliError) {
+                // Never promise restoration here: the slice may be left partly changed, and the failures below say where.
+                const stateKnown = error === readBackMismatch
+                  ? ` Rollback did NOT complete (${rollbackFailures.join("; ")}). The slice's files and ${path.join(mission.absPath, "mission.yaml")} may be partly changed and their current state is unknown.`
+                  : ` (rollback failure(s): ${rollbackFailures.join("; ")})`;
+                throw new ScopeCliError({
+                  fact: error.fact,
+                  consequence: `${error.consequence}${stateKnown}`,
+                  action: error === readBackMismatch
+                    ? `Inspect ${nodePath}, ${progressPath} and ${path.join(mission.absPath, "mission.yaml")} and repair any leftover change before closing this slice again. ${error.action}`
+                    : error.action,
+                });
+              }
+              const origMessage = error instanceof Error ? error.message : String(error);
+              throw new Error(
+                `${origMessage} (rollback failure(s): ${rollbackFailures.join("; ")})`,
+                { cause: error },
+              );
+            }
+            if (error instanceof ScopeCliError && error === readBackMismatch) {
+              throw new ScopeCliError({
+                fact: error.fact,
+                consequence: "In-place closure rolled back: every file it changed was restored, so readers cannot disagree about this slice's status.",
+                action: error.action,
+              });
+            }
+            throw error;
+          }
+          emit(out, {
+            ok: true,
+            closed: {
+              mission: slice.missionName,
+              name: slice.name,
+              id: slice.id,
+              reason,
+              status: targetStatus,
+              inPlace: true,
+              note: opts.note ?? null,
+              path: slice.absPath,
+              git: { usedGit: false, repoRoot: null },
+              proofApplicability: {
+                evaluated: false,
+                changed: null,
+                pathPreserved: true,
+                receiptFilesPreserved: true,
+                judgmentCount,
+              },
+            },
+          }, json, [
+            `Closed ${slice.missionName}/${slice.name} in place (${targetStatus})`,
+            `  reason: ${reason}`,
+            `  status: ${targetStatus}`,
+            `  path: ${slice.absPath}`,
+            ...(judgmentCount === null
+              ? ["  proof: judgment folder could not be read (judgment count unknown; applicability not evaluated; run rig proof show to check current readiness)"]
+              : judgmentCount > 0
+                ? [`  proof: ${judgmentCount} recorded judgment file(s) kept in place (applicability not evaluated; run rig proof show to check current readiness)`]
+                : []),
+          ]);
+          return;
+        }
+
         const destName = slice.name;
         const destAbs = path.join(closedDir, destName);
-        assertScopeWritePaths(missionsRoot, destAbs, path.join(mission.absPath, "mission.yaml"));
         const compositionEdit = planMissionMembershipRemove(
           mission.absPath,
           sliceManifestRef(mission.absPath, slice.absPath),
@@ -564,11 +792,11 @@ function buildSliceCloseCommand(): Command {
         }
         const { usedGit, repoRoot } = moveResult;
         const newReadme = resolveNodeFile(destAbs);
+        const targetStatus = `closed-${reason}`;
         try {
-          assertScopeWritePaths(missionsRoot, path.join(destAbs, "SPEC.md"), path.join(destAbs, "README.md"));
           if (newReadme) {
             const updates: Record<string, unknown> = {
-              status: `closed-${reason}`,
+              status: targetStatus,
               "closed-on": todayDateISO(),
             };
             if (opts.note) updates["closure-note"] = opts.note;
@@ -587,14 +815,28 @@ function buildSliceCloseCommand(): Command {
             name: destName,
             id: slice.id,
             reason,
+            status: targetStatus,
+            inPlace: false,
             note: opts.note ?? null,
             path: destAbs,
             git: { usedGit, repoRoot },
+            proofApplicability: {
+              evaluated: false,
+              changed: judgmentCount === null ? null : judgmentCount > 0,
+              pathPreserved: false,
+              receiptFilesPreserved: true,
+              judgmentCount,
+            },
           },
         }, json, [
           `Closed ${slice.missionName}/${slice.name} → ${slice.missionName}/closed/${destName}`,
           `  reason: ${reason}`,
           `  git: ${usedGit ? "git mv" : "fs.rename (not in a git repo)"}`,
+          ...(judgmentCount === null
+            ? ["  proof: judgment folder could not be read, so recorded judgments (if any) now read unknown after path move (use --in-place to keep slice path in place; accepted proof still requires unchanged item, policy, and cited evidence)"]
+            : judgmentCount > 0
+              ? [`  proof: ${judgmentCount} recorded judgment(s) now read unknown after path move (use --in-place to keep slice path in place; accepted proof still requires unchanged item, policy, and cited evidence)`]
+              : []),
         ]);
       } catch (err) {
         fail(err, json, out);
@@ -617,11 +859,10 @@ function buildSliceMoveCommand(): Command {
       const out = makeStdout();
       const json = Boolean(opts.json);
       try {
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, slice: slicePath, mission: opts.mission });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, targetPath: slicePath });
         const slice = findSlice(missionsRoot, slicePath, opts.mission ?? null);
-        const targetRoot = resolveMissionsRoot({ override: getOpts(command).workspace, mission: destMission });
-        const target = findMission(targetRoot, destMission);
-        if (target.absPath === path.join(missionsRoot, slice.missionName)) {
+        const target = findMission(missionsRoot, destMission);
+        if (target.name === slice.missionName) {
           throw new ScopeCliError({ fact: "Source and destination mission are the same.", consequence: "Slice not moved.", action: "Choose a different destination mission." });
         }
         const targetSlicesDir = path.join(target.absPath, "slices");
@@ -630,8 +871,6 @@ function buildSliceMoveCommand(): Command {
         const newName = `${pad2(newNN)}-${slug}`;
         const destAbs = path.join(targetSlicesDir, newName);
         const sourceMission = findMission(missionsRoot, slice.missionName);
-        assertScopeWritePaths(missionsRoot, path.join(sourceMission.absPath, "mission.yaml"));
-        assertScopeWritePaths(targetRoot, destAbs, path.join(target.absPath, "mission.yaml"));
         // Cross-mission dependencies cannot remain sibling edges. Name affected dependents at the move.
         const dependencyWarnings = slice.id === null ? [] : listSlices(sourceMission, "all")
           .filter((sibling) => sibling.absPath !== slice.absPath
@@ -648,8 +887,7 @@ function buildSliceMoveCommand(): Command {
         let moveResult: ReturnType<typeof moveSlice> | null = null;
         try {
           moveResult = moveSlice(slice.absPath, destAbs);
-          assertScopeWritePaths(targetRoot, path.join(destAbs, "SPEC.md"), path.join(destAbs, "README.md"));
-          const targetId = ensureMissionIdPersisted(target, targetRoot);
+          const targetId = ensureMissionIdPersisted(target, missionsRoot);
           const newSliceId = sliceIdFromMission(targetId, newNN);
           const newReadme = resolveNodeFile(destAbs);
           if (newReadme) {
@@ -707,12 +945,13 @@ function buildMissionLsCommand(): Command {
           id: m.id,
           path: m.absPath,
           activeSliceCount: m.activeSliceCount,
+          shippedSliceCount: m.shippedSliceCount,
           closedSliceCount: m.closedSliceCount,
         }));
         emit(out, { ok: true, count: rows.length, missions: rows }, json,
           rows.length === 0
             ? ["(no missions)"]
-            : rows.map((r) => `${r.name}    ${r.id ?? "—"}    active=${r.activeSliceCount}  closed=${r.closedSliceCount}`),
+            : rows.map((r) => `${r.name}    ${r.id ?? "—"}    active=${r.activeSliceCount}  shipped=${r.shippedSliceCount}  closed=${r.closedSliceCount}`),
         );
       } catch (err) {
         fail(err, json, out);
@@ -729,7 +968,7 @@ function buildMissionShowCommand(): Command {
       const out = makeStdout();
       const json = Boolean(opts.json);
       try {
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, mission: missionName });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
         const mission = findMission(missionsRoot, missionName);
         const readme = mission.readmePath ? fs.readFileSync(mission.readmePath, "utf8") : null;
         const slices = listSlices(mission, "all").map((s) => ({
@@ -737,6 +976,29 @@ function buildMissionShowCommand(): Command {
         }));
         // FR-5: derive read-time trust from (stage x verified) — NEVER stored.
         const trust = deriveScopeTrust(mission.frontmatter);
+        const parentWarnings: string[] = [];
+        const scopeNodes = readParentScope(missionsRoot, { onInvalid: (message) => parentWarnings.push(message) });
+        const own = scopeNodes.find((node) => node.kind === "mission" && node.path === mission.absPath);
+        const parentMatches = own?.parent ? scopeNodes.filter((node) => node.id === own.parent) : [];
+        const parent = parentMatches.length === 1 ? parentMatches[0] : null;
+        const parentChain: typeof scopeNodes = [];
+        let parentGap: string | null = null;
+        const seenParents = new Set<string>();
+        let currentParent = own;
+        while (currentParent?.parent) {
+          const matches = scopeNodes.filter((node) => node.id === currentParent!.parent);
+          if (matches.length !== 1) { parentGap = `${currentParent.parent} does not resolve uniquely`; break; }
+          const next = matches[0]!;
+          if (seenParents.has(next.id!) || next.id === own?.id) { parentGap = `cycle at ${next.id}`; break; }
+          seenParents.add(next.id!);
+          parentChain.push(next);
+          if (next.kind === "slice") {
+            const owners = scopeNodes.filter((node) => node.kind === "mission" && node.id === next.missionId);
+            if (owners.length !== 1) { parentGap = `${next.missionId} does not resolve uniquely`; break; }
+            currentParent = owners[0];
+          } else currentParent = next;
+        }
+        const childMissions = mission.id && scopeNodes.filter((node) => node.id === mission.id).length === 1 ? scopeNodes.filter((node) => node.kind === "mission" && node.parent === mission.id) : [];
         const payload = {
           ok: true,
           mission: {
@@ -744,11 +1006,18 @@ function buildMissionShowCommand(): Command {
             id: mission.id,
             path: mission.absPath,
             activeSliceCount: mission.activeSliceCount,
+            shippedSliceCount: mission.shippedSliceCount,
             closedSliceCount: mission.closedSliceCount,
             frontmatter: mission.frontmatter,
             trust,
             readme,
             slices,
+            parent,
+            parentId: own?.parent ?? null,
+            parentChain,
+            parentGap,
+            parentWarnings,
+            childMissions,
           },
         };
         if (json) {
@@ -756,8 +1025,12 @@ function buildMissionShowCommand(): Command {
         } else {
           out.write(`Mission: ${mission.name}\n`);
           out.write(`  id: ${mission.id ?? "—"}\n`);
+          if (own?.parent) out.write(`  parent: ${parent?.name ?? own.parent} (${own.parent})\n`);
+          for (const warning of parentWarnings) out.write(`  warning: ${warning}\n`);
+          if (childMissions.length) out.write(`  child missions: ${childMissions.map((node) => node.name).join(", ")}\n`);
           out.write(formatTrustLine(trust));
           out.write(`  active slices: ${mission.activeSliceCount}\n`);
+          out.write(`  shipped slices: ${mission.shippedSliceCount}\n`);
           out.write(`  closed slices: ${mission.closedSliceCount}\n`);
           out.write(`  path: ${mission.absPath}\n`);
           if (readme) {
@@ -772,6 +1045,46 @@ function buildMissionShowCommand(): Command {
     });
 }
 
+function resolveMissionCreateRoot(override: string | null | undefined, advisories: string[]): string {
+  const selected = override ?? process.env.OPENRIG_WORK_ROOT;
+  if (!selected) return resolveMissionsRoot({ allowMissingProjectMissions: true });
+
+  const candidate = path.isAbsolute(selected) ? selected : path.resolve(process.cwd(), selected);
+  const childMissionsRoot = path.join(candidate, "missions");
+  const hasChildMissionsRoot =
+    fs.existsSync(childMissionsRoot) && fs.statSync(childMissionsRoot).isDirectory();
+  const directMissionsRoot = path.basename(candidate) === "missions" && !hasChildMissionsRoot;
+  const workspaceRoot = directMissionsRoot ? path.dirname(candidate) : candidate;
+  // A named workspace that doesn't exist is refused, not created: a mistyped path would otherwise start a new tree
+  // there. The configured root is never used in its place (#70).
+  if (!fs.existsSync(workspaceRoot) || !fs.statSync(workspaceRoot).isDirectory()) {
+    const source = override ? "--workspace" : "OPENRIG_WORK_ROOT";
+    throw new ScopeCliError({
+      fact: `The workspace named by ${source} is not an existing directory: ${workspaceRoot}.`,
+      consequence: "Mission not created; the configured workspace was NOT used as a fallback.",
+      action: `Point ${source} at an existing workspace, or create ${workspaceRoot} first.`,
+    });
+  }
+
+  // A named workspace uses its project.yaml missions.root, as work positions do; a named missions folder is used as is.
+  const missionsRoot = directMissionsRoot ? candidate : readProjectMissionsRoot(workspaceRoot, advisories);
+  if (!missionsRoot) {
+    throw new ScopeCliError({
+      fact: `project.yaml missions.root in ${workspaceRoot} resolves outside the workspace.`,
+      consequence: "Mission not created.",
+      action: "Set missions.root to a relative path inside the workspace.",
+    });
+  }
+  if (fs.existsSync(missionsRoot) && !fs.statSync(missionsRoot).isDirectory()) {
+    throw new ScopeCliError({
+      fact: `Mission root is not a directory: ${missionsRoot}.`,
+      consequence: "Mission not created.",
+      action: "Move the conflicting path and retry mission creation.",
+    });
+  }
+  return missionsRoot;
+}
+
 function buildMissionCreateCommand(): Command {
   return new Command("create")
     .description("Create a new mission with SPEC.md and mission.yaml (mints a stable dot-ID into frontmatter)")
@@ -781,6 +1094,7 @@ function buildMissionCreateCommand(): Command {
     .option("--title <text>", "Display title (defaults to titlecased name)")
     .option("--intent <text>", "Authored intent stored in SPEC.md frontmatter (defaults to title)")
     .option("--depends-on <dot-id...>", "Advisory build-order dependencies on sibling mission dot-IDs")
+    .option("--parent <dot-id>", "Mission or slice this mission breaks down")
     .option("--no-notes", "Skip NOTES.md scaffolding")
     .option("--no-mission-notes", "Deprecated alias for --no-notes")
     .option("--json", "Machine-readable output")
@@ -796,7 +1110,8 @@ function buildMissionCreateCommand(): Command {
             action: "Pick a name with no whitespace or path separators.",
           });
         }
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
+        const rootAdvisories: string[] = [];
+        const missionsRoot = resolveMissionCreateRoot(getOpts(command).workspace, rootAdvisories);
         const absPath = path.join(missionsRoot, name);
         if (fs.existsSync(absPath)) {
           throw new ScopeCliError({
@@ -832,12 +1147,28 @@ function buildMissionCreateCommand(): Command {
             });
           }
           id = opts.id;
-        } else if (isReleaseName) {
-          id = inferMissionDotId(name, null);
         } else {
-          const peers = listMissions(missionsRoot);
-          const ordinal = nextEscapeBandOrdinal(peers.map((p) => p.id));
-          id = inferMissionDotId(name, ordinal);
+          // The project's own prefix (project.yaml scope.idPrefix; OPR unless declared).
+          const idPrefix = projectIdPrefix(missionsRoot, rootAdvisories);
+          if (isReleaseName) {
+            id = inferMissionDotId(name, null, idPrefix);
+          } else {
+            const peers = listMissions(missionsRoot);
+            const ordinal = nextEscapeBandOrdinal(peers.map((p) => p.id), idPrefix);
+            id = inferMissionDotId(name, ordinal, idPrefix);
+          }
+        }
+        // A project nested in another: an id the enclosing project's missions already use is named, not refused. It's
+        // advisory, so a check that can't read the enclosing project says so, and the create goes on as before.
+        try {
+          const enclosing = enclosingMissionsRoot(missionsRoot);
+          if (enclosing) {
+            for (const node of readParentScope(enclosing).filter((node) => node.id === id)) {
+              rootAdvisories.push(`Mission ID ${id} is already used by ${node.path} in the enclosing project's missions (${enclosing}). Edit this mission's id: before creating its slices, since their ids inherit it. For later missions, set scope.idPrefix (2-3 uppercase letters, such as OPS) in this project's project.yaml, or pass --id.`);
+            }
+          }
+        } catch (error) {
+          rootAdvisories.push(`The enclosing project's mission IDs couldn't be checked for ${id}: ${(error as Error).message}`);
         }
         // Resolve titles + render templates before any filesystem side
         // effects. A stale current or legacy notes-template override must
@@ -845,6 +1176,12 @@ function buildMissionCreateCommand(): Command {
         const title = opts.title ?? titleFromSlug(name.replace(/^release-/, ""));
         const intent = opts.intent ?? title;
         const dependsOn = Array.isArray(opts.dependsOn) ? [...new Set(opts.dependsOn as string[])] : [];
+        const parentWarnings: string[] = [];
+        if (opts.parent !== undefined) {
+          const nodes = readParentScope(missionsRoot, { onInvalid: (message) => parentWarnings.push(message) });
+          for (const node of nodes.filter((node) => node.id === id)) parentWarnings.push(`Mission ID ${id} is already in use at ${node.path}.`);
+          validateMissionParent(nodes, id, opts.parent, (message) => parentWarnings.push(message));
+        }
         const project = id.split(".")[0];
         for (const dependency of dependsOn) {
           if (dependency === id) {
@@ -900,7 +1237,13 @@ function buildMissionCreateCommand(): Command {
         // New scaffolds author SPEC.md; existing README-backed nodes are never rewritten.
         const readmePath = path.join(absPath, "SPEC.md");
         fs.writeFileSync(readmePath, readmeBody, "utf8");
-        fs.writeFileSync(path.join(absPath, "mission.yaml"), MISSION_MANIFEST, "utf8");
+        let manifestBody = missionManifest(name);
+        if (opts.parent !== undefined) {
+          const manifest = YAML.parseDocument(manifestBody);
+          manifest.setIn(["metadata", "parent"], opts.parent);
+          manifestBody = manifest.toString();
+        }
+        fs.writeFileSync(path.join(absPath, "mission.yaml"), manifestBody, "utf8");
         const progressPath = path.join(absPath, "PROGRESS.md");
         fs.writeFileSync(progressPath, progressBody, "utf8");
         const capabilityDeltaPath = capabilityDeltaBody
@@ -924,9 +1267,14 @@ function buildMissionCreateCommand(): Command {
           humanLines.push(`  notes: ${notesPath} (template: ${notesRendered?.resolvedFrom})`);
         }
         if (capabilityDeltaPath) humanLines.push(`  capability delta: ${capabilityDeltaPath}`);
-        if (notesRendered?.resolvedFrom === "legacy-env") {
-          humanLines.push("  advisory: OPENRIG_MISSION_NOTES_TEMPLATE_PATH is deprecated; use OPENRIG_NOTES_TEMPLATE_PATH");
-        }
+        const advisories = [
+          ...rootAdvisories,
+          ...parentWarnings,
+          ...(notesRendered?.resolvedFrom === "legacy-env"
+            ? ["OPENRIG_MISSION_NOTES_TEMPLATE_PATH is deprecated; use OPENRIG_NOTES_TEMPLATE_PATH"]
+            : []),
+        ];
+        for (const advisory of advisories) humanLines.push(`  advisory: ${advisory}`);
         emit(out, {
           ok: true,
           mission: {
@@ -938,14 +1286,61 @@ function buildMissionCreateCommand(): Command {
             notesPath,
             capabilityDeltaPath,
             notesResolvedFrom: notesRendered?.resolvedFrom ?? null,
-            advisories: notesRendered?.resolvedFrom === "legacy-env"
-              ? ["OPENRIG_MISSION_NOTES_TEMPLATE_PATH is deprecated; use OPENRIG_NOTES_TEMPLATE_PATH"]
-              : [],
+            advisories,
           },
         }, json, humanLines);
       } catch (err) {
         fail(err, json, out);
       }
+    });
+}
+
+function buildMissionParentCommand(): Command {
+  return new Command("parent")
+    .description("Set or clear the mission or slice this mission breaks down")
+    .argument("<mission>", "Mission name or path")
+    .argument("[parent]", "Parent mission or slice dot-ID")
+    .option("--clear", "Remove the parent link")
+    .option("--json", "Machine-readable output")
+    .action(async (name: string, parent: string | undefined, opts, command) => {
+      const out = makeStdout(), json = Boolean(opts.json);
+      try {
+        if (Boolean(parent) === Boolean(opts.clear)) throw new ScopeCliError({ fact: "Choose a parent ID or --clear.", consequence: "No parent was changed.", action: "Pass exactly one parent ID or --clear." });
+        const root = resolveMissionsRoot({ override: getOpts(command).workspace, strictOverride: true });
+        const mission = findMission(root, name);
+        const realRoot = fs.realpathSync(root);
+        const realMission = fs.realpathSync(mission.absPath);
+        if (path.dirname(realMission) !== realRoot) throw new ScopeCliError({ fact: `Mission ${name} is outside the selected missions root.`, consequence: "No parent was changed.", action: "Select a mission inside the selected workspace." });
+        const writeTarget = fs.existsSync(path.join(mission.absPath, "mission.yaml")) ? path.join(mission.absPath, "mission.yaml") : mission.readmePath!;
+        if (path.dirname(fs.realpathSync(writeTarget)) !== realMission) throw new ScopeCliError({ fact: `Mission file for ${name} is outside its directory.`, consequence: "No parent was changed.", action: "Use a mission whose authored files are inside its directory." });
+        const warnings: string[] = [];
+        if (parent) {
+          const nodes = readParentScope(root, { onInvalid: (message) => warnings.push(message) });
+          validateMissionParent(nodes, mission.id ?? "", parent, (message) => warnings.push(message));
+        }
+        const manifestPath = path.join(mission.absPath, "mission.yaml");
+        if (fs.existsSync(manifestPath)) {
+          const doc = YAML.parseDocument(fs.readFileSync(manifestPath, "utf8"));
+          if (doc.errors.length) throw doc.errors[0];
+          if (parent) doc.setIn(["metadata", "parent"], parent);
+          else doc.deleteIn(["metadata", "parent"]);
+          fs.writeFileSync(manifestPath, doc.toString(), "utf8");
+        } else if (parent) {
+          updateFrontmatter(mission.readmePath!, { parent });
+        } else {
+          const original = fs.readFileSync(mission.readmePath!, "utf8");
+          const match = /^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?=\r?\n|$)/.exec(original);
+          if (match) {
+            const doc = YAML.parseDocument(match[1]!);
+            if (doc.errors.length) updateFrontmatter(mission.readmePath!, { parent: null });
+            else {
+              doc.delete("parent");
+              fs.writeFileSync(mission.readmePath!, `---\n${doc.toString()}---${original.slice(match[0].length)}`, "utf8");
+            }
+          }
+        }
+        emit(out, { ok: true, mission: mission.name, parent: parent ?? null, warnings }, json, [`Mission ${mission.name} parent: ${parent ?? "(none)"}`, ...warnings.map((message) => `Warning: ${message}`)]);
+      } catch (err) { fail(err, json, out); }
     });
 }
 
@@ -958,7 +1353,7 @@ function buildMissionGraphCommand(): Command {
       const out = makeStdout();
       const json = Boolean(opts.json);
       try {
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, mission: missionName });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
         const graph = buildMissionDependencyGraph(findMission(missionsRoot, missionName));
         emit(out, { ok: true, graph }, json, [
           `Ready: ${graph.ready.join(", ") || "(none)"}`,
@@ -1005,18 +1400,18 @@ function buildResolveNotesCommand(): Command {
 
 function buildAuditCommand(): Command {
   return new Command("audit")
-    .description("Read-only scope audit: flag scope findings and show the advisory dependency graph")
+    .description("Read-only scope audit: flag scope structure findings and show the advisory dependency graph. It doesn't read proof readiness: use rig proof show")
     .requiredOption("--mission <name>", "Mission to audit")
     .option("--json", "Machine-readable JSON output")
     .action(async (opts, command) => {
       const out = makeStdout();
       const json = Boolean(opts.json);
       try {
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, mission: opts.mission });
-        const { classifyScopeItem } = await import("../lib/scope/scope-audit.js");
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
+        const { classifyScopeItem, SLICE_DIRECTORY_NAME } = await import("../lib/scope/scope-audit.js");
         const missionName = opts.mission as string;
 
-        const missionDir = path.resolve(missionsRoot, missionName);
+        const missionDir = path.join(missionsRoot, missionName);
         if (!fs.existsSync(missionDir)) {
           throw new ScopeCliError({ fact: `Mission "${missionName}" not found at ${missionDir}.`, consequence: "Cannot audit.", action: "Check the mission name." });
         }
@@ -1037,6 +1432,7 @@ function buildAuditCommand(): Command {
               frontmatter: {},
               id: null,
               activeSliceCount: 0,
+              shippedSliceCount: 0,
               closedSliceCount: 0,
             };
         const graph = buildMissionDependencyGraph(auditMission);
@@ -1152,7 +1548,7 @@ function buildAuditCommand(): Command {
                 : null,
             });
 
-            if (!/^\d{2,}-/.test(entry)) {
+            if (!SLICE_DIRECTORY_NAME.test(entry)) {
               sliceResult.findings.push({
                 kind: "id_convention_violation",
                 severity: "high",
@@ -1169,12 +1565,29 @@ function buildAuditCommand(): Command {
         for (const sr of sliceResults) {
           const shadow = shadowedNodeFileFinding(path.join(slicesDir, sr.name), "slice");
           if (shadow) sr.result.findings.push(shadow);
+          const shared = sharedSliceNameFinding(missionsRoot, missionName, sr.name);
+          if (shared) sr.result.findings.push(shared);
         }
 
         const allFindings = [
           ...missionResult.findings.map((f) => ({ ...f, scope: "mission" as const, scopeName: missionName })),
           ...sliceResults.flatMap((s) => s.result.findings.map((f) => ({ ...f, scope: "slice" as const, scopeName: s.name }))),
         ];
+        const parentFindings: string[] = [];
+        const parentNodes = readParentScope(missionsRoot, { onInvalid: (message) => parentFindings.push(message) });
+        const audited = parentNodes.find((node) => node.kind === "mission" && node.path === missionDir);
+        if (audited?.parent) {
+          try { validateMissionParent(parentNodes, audited.id ?? "", audited.parent, (message) => parentFindings.push(message)); }
+          catch (error) { parentFindings.push((error as Error).message); }
+        }
+        if (audited) {
+          const children = parentNodes.filter((node) => node.kind === "mission" && node.parent && (node.parent === audited.id || parentNodes.some((target) => target.kind === "slice" && target.missionId === audited.id && target.id === node.parent)));
+          for (const child of children) {
+            const target = parentNodes.filter((node) => node.id === child.parent);
+            if (target.length !== 1) parentFindings.push(`Child ${child.id} has an ambiguous parent ${child.parent}.`);
+            else if (target[0]!.kind === "slice" && /^(done|closed|shipped)(?:$|-)/.test(target[0]!.status ?? "") && ["active", "in-progress", "wip", "blocked"].includes(child.status ?? "")) parentFindings.push(`Child ${child.id} is active while parent slice ${child.parent} is complete.`);
+          }
+        }
         const hardFindings = allFindings.filter((f) => f.severity === "high");
 
         if (json) {
@@ -1189,8 +1602,8 @@ function buildAuditCommand(): Command {
               // OPR.0.5.0.18 — amendment lineage (present only when re-stamped).
               ...(s.attestations ? { attestations: s.attestations } : {}),
             })),
-            graph,
-            totalFindings: allFindings.length,
+            graph, parentFindings,
+            totalFindings: allFindings.length + parentFindings.length,
           }, null, 2));
           out.write("\n");
           if (hardFindings.length > 0) process.exitCode = 1;
@@ -1221,6 +1634,7 @@ function buildAuditCommand(): Command {
           out.write("\n");
         }
 
+        for (const finding of parentFindings) out.write(`PARENT LINK: ${finding}\n`);
         if (allFindings.length > 0) {
           out.write("FINDINGS:\n");
           for (const f of allFindings) {
@@ -1234,7 +1648,7 @@ function buildAuditCommand(): Command {
           } else {
             out.write(`\nWARN: ${allFindings.length} advisory finding(s)\n`);
           }
-        } else {
+        } else if (!parentFindings.length) {
           out.write("PASS: all scope items have valid rails\n");
         }
       } catch (err) {
@@ -1330,19 +1744,18 @@ function runProgressUpdate(
   scopeDir: string,
   level: "mission" | "slice",
   scopeName: string,
-  opts: { add?: string; set?: string; section?: string; status?: string },
+  opts: { add?: string; set?: string; currentState?: string; section?: string; status?: string },
   out: Stdout,
   json: boolean,
 ): void {
   const hasAdd = typeof opts.add === "string";
   const hasSet = typeof opts.set === "string";
-  if (hasAdd === hasSet) {
+  const hasCurrentState = typeof opts.currentState === "string";
+  if (Number(hasAdd) + Number(hasSet) + Number(hasCurrentState) !== 1) {
     throw new ScopeCliError({
-      fact: hasAdd
-        ? "Both --add and --set were given."
-        : "Neither --add nor --set was given.",
+      fact: "Choose exactly one progress operation.",
       consequence: "No progress update was made.",
-      action: 'Pass exactly one of --add "<row text>" or --set "<row text>".',
+      action: 'Pass exactly one of --add, --set, or --current-state.',
     });
   }
   const status = parseStatus(opts.status ?? "active");
@@ -1350,8 +1763,21 @@ function runProgressUpdate(
   const before = fs.readFileSync(targetPath, "utf8");
 
   let result: { content: string; changed: boolean };
-  let operation: "add" | "set";
-  if (hasAdd) {
+  let operation: "add" | "set" | "current-state";
+  if (hasCurrentState) {
+    operation = "current-state";
+    result = setCurrentState(before, opts.currentState!);
+    if (result.changed) {
+      const hasOpening = /^---[ \t]*\r?\n/.test(before);
+      const emptyHeader = /^---[ \t]*(\r?\n)---[ \t]*(?=\r?\n|$)/.test(before);
+      const hasClosing = /^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?=\r?\n|$)/.test(before);
+      if (hasOpening && !hasClosing && !emptyHeader) console.warn(`[warn] ${targetPath}: frontmatter is unterminated; Current state was updated without a timestamp.`);
+      else {
+        if (emptyHeader) result.content = result.content.replace(/^(---[ \t]*)(\r?\n)(---[ \t]*)(?=\r?\n|$)/, "$1$2$2$3");
+        result.content = editFrontmatter(result.content, { current_state_updated: new Date().toISOString() }, targetPath);
+      }
+    }
+  } else if (hasAdd) {
     operation = "add";
     result = addProgressRow(before, {
       section: opts.section ?? DEFAULT_PROGRESS_SECTION,
@@ -1390,6 +1816,7 @@ function buildSliceProgressCommand(): Command {
     .option("--mission <name>", "Hint mission when slice-path is just NN-slug")
     .option("--add <text>", "Append a checkbox row with this text")
     .option("--set <text>", "Set the status of the row whose trimmed text exactly matches")
+    .option("--current-state <text>", "Replace the Current state section and timestamp it")
     .option("--section <heading>", `Section heading for --add (default: ${DEFAULT_PROGRESS_SECTION})`)
     .option("--status <status>", `Row status: ${PROGRESS_STATUSES.join(" | ")}`, "active")
     .option("--json", "Machine-readable output")
@@ -1397,9 +1824,8 @@ function buildSliceProgressCommand(): Command {
       const out = makeStdout();
       const json = Boolean(opts.json);
       try {
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, slice: slicePath, mission: opts.mission });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, targetPath: slicePath });
         const slice = findSlice(missionsRoot, slicePath, opts.mission ?? null);
-        assertScopeWritePaths(missionsRoot, path.join(slice.absPath, "PROGRESS.md"));
         runProgressUpdate(slice.absPath, "slice", slice.name, opts, out, json);
       } catch (err) {
         fail(err, json, out);
@@ -1413,6 +1839,7 @@ function buildMissionProgressCommand(): Command {
     .argument("<mission>", "Mission name")
     .option("--add <text>", "Append a checkbox row with this text")
     .option("--set <text>", "Set the status of the row whose trimmed text exactly matches")
+    .option("--current-state <text>", "Replace the Current state section and timestamp it")
     .option("--section <heading>", `Section heading for --add (default: ${DEFAULT_PROGRESS_SECTION})`)
     .option("--status <status>", `Row status: ${PROGRESS_STATUSES.join(" | ")}`, "active")
     .option("--json", "Machine-readable output")
@@ -1420,9 +1847,8 @@ function buildMissionProgressCommand(): Command {
       const out = makeStdout();
       const json = Boolean(opts.json);
       try {
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, mission: missionName });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
         const mission = findMission(missionsRoot, missionName);
-        assertScopeWritePaths(missionsRoot, path.join(mission.absPath, "PROGRESS.md"));
         runProgressUpdate(mission.absPath, "mission", mission.name, opts, out, json);
       } catch (err) {
         fail(err, json, out);
@@ -1545,7 +1971,7 @@ function buildSliceStageCommand(): Command {
       const json = Boolean(opts.json);
       try {
         const stage = validateStage(newStage);
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, slice: slicePath, mission: opts.mission });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, targetPath: slicePath });
         const slice = findSlice(missionsRoot, slicePath, opts.mission ?? null);
         if (!slice.readmePath) {
           throw new ScopeCliError({
@@ -1579,7 +2005,7 @@ function buildMissionStageCommand(): Command {
       const json = Boolean(opts.json);
       try {
         const stage = validateStage(newStage);
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, mission: missionName });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
         const mission = findMission(missionsRoot, missionName);
         if (!mission.readmePath) {
           throw new ScopeCliError({
@@ -1613,7 +2039,7 @@ function buildSliceVerifiedCommand(): Command {
       const json = Boolean(opts.json);
       try {
         const source = validateAgainst(opts.against);
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, slice: slicePath, mission: opts.mission });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, targetPath: slicePath });
         const slice = findSlice(missionsRoot, slicePath, opts.mission ?? null);
         if (!slice.readmePath) {
           throw new ScopeCliError({
@@ -1644,7 +2070,7 @@ function buildMissionVerifiedCommand(): Command {
       const json = Boolean(opts.json);
       try {
         const source = validateAgainst(opts.against);
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, mission: missionName });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
         const mission = findMission(missionsRoot, missionName);
         if (!mission.readmePath) {
           throw new ScopeCliError({
@@ -1780,9 +2206,8 @@ function buildSliceRepairCommand(): Command {
       const out = makeStdout();
       const json = Boolean(opts.json);
       try {
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, slice: slicePath, mission: opts.mission });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, targetPath: slicePath });
         const legacySlice = findSlice(missionsRoot, slicePath, opts.mission ?? null);
-        assertRepairPaths(missionsRoot, legacySlice.absPath);
         const specPath = ensureCurrentSpec(legacySlice.absPath, legacySlice.readmePath, legacySlice.name);
         const slice = findSlice(missionsRoot, legacySlice.absPath, opts.mission ?? null);
         const result = backfillScopeProgress(slice.absPath, "slice");
@@ -1811,11 +2236,8 @@ function buildMissionRepairCommand(): Command {
       const out = makeStdout();
       const json = Boolean(opts.json);
       try {
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, mission: missionName });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
         const legacyMission = findMission(missionsRoot, missionName);
-        assertRepairPaths(missionsRoot, legacyMission.absPath);
-        assertScopeWritePaths(missionsRoot, path.join(legacyMission.absPath, "slices"), path.join(legacyMission.absPath, "closed"));
-        for (const slice of listSlices(legacyMission, "all")) assertRepairPaths(missionsRoot, slice.absPath);
         const missionSpec = ensureCurrentSpec(legacyMission.absPath, legacyMission.readmePath, legacyMission.name);
         const mission = findMission(missionsRoot, missionName);
         const results: BackfillResult[] = [];
@@ -1890,10 +2312,6 @@ function ensureConventionFrontmatter(specPath: string, fallbackName: string): vo
     updates.depends_on = [];
   }
   if (Object.keys(updates).length > 0) updateFrontmatter(specPath, updates);
-}
-
-function assertRepairPaths(root: string, dir: string): void {
-  assertScopeWritePaths(root, ...["SPEC.md", "README.md", "PROGRESS.md", "PROOF.md", "proof", ...NOTES_FILE_PRECEDENCE].map(name => path.join(dir, name)));
 }
 
 function ensureMissionNotesSurface(dir: string, mission: ReturnType<typeof findMission>): void {
@@ -2011,7 +2429,16 @@ function buildApproveCommand(tier: "slice" | "mission"): Command {
         }
         // Resolve the scope target LOCALLY (rich NN-slug resolution), then
         // send the canonical missions-root-relative path to the daemon.
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, ...(tier === "slice" ? { slice: target, mission: opts.mission } : { mission: target }) });
+        // #995 — approve is the one scope write that happens inside the DAEMON.
+        // The resolved root travels WITH the request so the daemon stamps the
+        // tree the caller named instead of its own; strictOverride stops a
+        // named workspace without a missions/ directory from falling back to
+        // the configured root, which would stamp a tree nobody named.
+        const missionsRoot = resolveMissionsRoot({
+          override: getOpts(command).workspace,
+          strictOverride: true,
+          ...(tier === "slice" ? { targetPath: target } : {}),
+        });
         let scopeAbsPath: string;
         if (tier === "slice") {
           const slice = findSlice(missionsRoot, target, opts.mission ?? null);
@@ -2020,19 +2447,11 @@ function buildApproveCommand(tier: "slice" | "mission"): Command {
           const mission = findMission(missionsRoot, target);
           scopeAbsPath = mission.absPath;
         }
-        const centralRoot = new ConfigStore().get("workspace.slices_root") as string;
-        if (!fs.existsSync(centralRoot) || fs.realpathSync(missionsRoot) !== fs.realpathSync(centralRoot)) {
-          throw new ScopeCliError({
-            fact: "project-root scopes can't be approved yet.",
-            consequence: "No approval request was sent; the daemon approval path only supports the central folder.",
-            action: `Use the central folder (${centralRoot}) for approval until project-root approval is supported.`,
-          });
-        }
         const scopePath = path.relative(missionsRoot, scopeAbsPath).split(path.sep).join("/");
 
         const lifecycleDeps = realDeps();
         const status = await getDaemonStatus(lifecycleDeps);
-        if (status.state !== "running" || status.healthy === false) {
+        if (!daemonMayAnswer(status)) {
           throw new ScopeCliError({
             fact: statusGuardMessage(status).fact, // B8-1b: down ≠ busy
             consequence: "scope approve writes the stamp + audit row through the daemon (one operation).",
@@ -2043,6 +2462,7 @@ function buildApproveCommand(tier: "slice" | "mission"): Command {
         const res = await client.post<Record<string, unknown>>("/api/scope/approve", {
           scopeTier: tier,
           scopePath,
+          missionsRoot,
           approvalScope: opts.scope,
           // P21: no body actorSession — the daemon derives the approver from the transport header.
           onBehalfOf: opts.onBehalfOf ?? null,
@@ -2098,10 +2518,49 @@ function shadowedNodeFileFinding(dir: string, level: "mission" | "slice"): {
   };
 }
 
+/**
+ * Advisory-only: another mission has a slice folder of the same name. The slice list and the routes that
+ * find a slice by name keep one slice per name, so the others are hidden there with no sign they exist.
+ * Twin of the daemon's finding of the same name.
+ */
+function sharedSliceNameFinding(missionsRoot: string, missionName: string, sliceName: string): {
+  kind: "slice_name_shared"; severity: "low"; path: string; message: string; remediation: string;
+} | null {
+  let others: string[];
+  try {
+    others = fs.readdirSync(missionsRoot, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && !e.name.startsWith(".") && e.name !== missionName
+        && fs.statSync(path.join(missionsRoot, e.name, "slices", sliceName), { throwIfNoEntry: false })?.isDirectory() === true)
+      .map((e) => e.name)
+      .sort();
+  } catch {
+    return null;
+  }
+  if (others.length === 0) return null;
+  return {
+    kind: "slice_name_shared",
+    severity: "low",
+    path: path.join(missionsRoot, missionName, "slices", sliceName),
+    message: `Mission ${others.join(", ")} also ${others.length === 1 ? "has" : "have"} a slice named "${sliceName}". The slice list (GET /api/slices) and the routes that find a slice by name keep one slice per name, so all but one of these slices are hidden there.`,
+    remediation: "Rename one of the slice folders so each slice name is unique across missions. Advisory only — nothing is blocked.",
+  };
+}
+
+/** Show the inherited workspace route because Commander lists a parent option only in the parent's help. */
+export function scopeWorkspaceHelp(tier: "slice" | "mission", verb?: string): string {
+  return `
+Workspace: the parent option --workspace selects the missions root this command reads.
+  rig scope --workspace <project root> ${tier} ${verb ?? "<verb>"} ...
+A project root uses its project.yaml missions.root, else its missions/ folder; a
+folder named missions is used as is. Use it for a catalog project, for example
+$(rig config get workspace.projects_root)/<project>. Without --workspace,
+OPENRIG_WORK_ROOT applies, then the configured workspace.slices_root.`;
+}
+
 export function scopeCommand(): Command {
   const cmd = new Command("scope")
     .description("Scope tree primitive: missions, slices, sub-slices (per conventions/scope-and-versioning)")
-    .option("--workspace <path>", "Override workspace root (otherwise inferred from cwd or $OPENRIG_WORK_ROOT)");
+    .option("--workspace <path>", "Workspace root; use its project.yaml missions.root, else missions/. A directory named missions without its own missions/ child is used directly. If the tree is missing, fall back to configured workspace.slices_root, except slice create and approve, which refuse, and mission create, which refuses a path that isn't an existing directory and otherwise creates the missions tree inside it. Without this flag, OPENRIG_WORK_ROOT is tried first with the same exceptions.");
 
   const slice = new Command("slice").description("Slice-tier commands");
   slice.addCommand(buildSliceLsCommand());
@@ -2121,6 +2580,7 @@ export function scopeCommand(): Command {
   mission.addCommand(buildMissionLsCommand());
   mission.addCommand(buildMissionShowCommand());
   mission.addCommand(buildMissionCreateCommand());
+  mission.addCommand(buildMissionParentCommand());
   mission.addCommand(buildMissionGraphCommand());
   mission.addCommand(buildMissionProgressCommand());
   mission.addCommand(buildMissionRepairCommand());
@@ -2128,6 +2588,10 @@ export function scopeCommand(): Command {
   mission.addCommand(buildMissionVerifiedCommand());
   mission.addCommand(buildApproveCommand("mission"));
   cmd.addCommand(mission);
+  for (const [tier, group] of [["slice", slice], ["mission", mission]] as const) {
+    group.addHelpText("after", scopeWorkspaceHelp(tier));
+    for (const verb of group.commands) verb.addHelpText("after", scopeWorkspaceHelp(tier, verb.name()));
+  }
   cmd.addCommand(buildResolveNotesCommand());
   cmd.addCommand(buildAuditCommand());
 

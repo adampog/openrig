@@ -84,6 +84,32 @@ describe("parsePaceMs", () => {
 });
 
 describe("rig walk — paced push-delivery (Atom 6)", () => {
+
+  it.each([false, true])("two-piece walk reports recorded nondelivery honestly (recorded=%s)", async recorded => {
+    const sends: RecordedSend[] = [];
+    const deps = testDeps(sends, []);
+    deps.clientFactory = () => ({
+      get: async () => ({ status: 404, data: { error: "No generation record" } }),
+      post: async (url: string, body: unknown) => {
+        sends.push({ path: url, body: body as Record<string, unknown> });
+        return { status: 200, data: recorded
+          ? { outcome: "recorded", sent: false, persisted: true, outboxIds: ["outbox-walk"] }
+          : { outcome: "delivered", sent: true } };
+      },
+    }) as never;
+    const a = tmpFile("a.md", "AAA"); const b = tmpFile("b.md", "BBB");
+    const result = await captureLogs(() => makeCmd(deps).parseAsync([
+      "node", "rig", "walk", "dev@rig", "--through", a, b, "--pace", "0s",
+    ]).then(() => {}));
+    expect(sends).toHaveLength(recorded ? 1 : 2);
+    expect(result.exitCode ?? 0).toBe(recorded ? 1 : 0);
+    if (recorded) {
+      expect(result.errLogs.join("\n")).toMatch(/recorded.*not delivered/i);
+      expect(result.errLogs.join("\n")).toContain("outbox-walk");
+      expect(result.logs.join("\n")).not.toMatch(/sent|Walked/);
+    } else expect(result.logs.join("\n")).toContain("Walked dev@rig through 2 piece(s)");
+  });
+
   for (const flag of ["--pace", "--consume-timeout", "--consume-poll", "--turn-timeout"] as const) {
     it(`S4b RED: ${flag} refuses a bare number and names the required unit suffix`, async () => {
       const sends: RecordedSend[] = [];
@@ -320,6 +346,22 @@ describe("rig walk — per-piece consumption verification (RED-first, mechanics-
     expect(result.logs.some(l => l.includes('"consumptionVerified":true'))).toBe(succeeds);
   });
 
+  it("reports a lost guarded submit response as unconfirmed without retrying", async () => {
+    const w: ScriptedWorld = { record: { generationId: "g1", content: "" }, pane: "", sends: [], gets: [] };
+    w.sendBehavior = (body) => {
+      if (body["text"] !== undefined) {
+        w.pane = `❯ ${String(body["text"])} `;
+        return { status: 200, data: { ok: true } };
+      }
+      return "throw";
+    };
+    const { errLogs, exitCode } = await captureLogs(() => makeCmd(consumptionDeps(w)).parseAsync(walkArgs));
+    expect(exitCode).toBe(1);
+    expect(w.sends.filter(s => s.path === "/api/transport/send" && s.body["submitOnly"] === true)).toHaveLength(1);
+    expect(w.sends.filter(s => s.path === "/api/transport/send" && s.body["text"] !== undefined)).toHaveLength(1);
+    expect(errLogs.join("\n")).toContain("unconfirmed");
+  });
+
   it.each(["during-send", "between-pieces"])("generation changes %s cannot produce a verified walk", async when => {
     const w: ScriptedWorld = { record: { generationId: "g1", content: "" }, pane: "", sends: [], gets: [] };
     w.sendBehavior = b => {
@@ -333,6 +375,7 @@ describe("rig walk — per-piece consumption verification (RED-first, mechanics-
     expect(result.exitCode).toBe(1);
     expect(w.sends.filter(s => s.path === "/api/transport/send")).toHaveLength(1);
     expect(result.logs.some(l => l.includes('"consumptionVerified":true'))).toBe(false);
+    if (when === "during-send") expect(result.errLogs.join("\n")).toMatch(/delivery is unconfirmed/i);
   });
 
   it("PIN W1 — a typed-but-never-consumed piece FAILS LOUD naming the piece; the next piece is never sent [GREEN — consumption verification]", async () => {
@@ -346,6 +389,31 @@ describe("rig walk — per-piece consumption verification (RED-first, mechanics-
     expect(pieceSends).toHaveLength(1);                       // piece 2 never sent
     expect(errLogs.join("\n")).toMatch(/piece 1\/2/);         // names the piece
     expect(errLogs.join("\n")).toMatch(/consum/i);            // names the failure class
+  });
+
+  it("keeps delivery unknown when the send times out and neither record nor pane proves its effect", async () => {
+    const w: ScriptedWorld = { record: { generationId: "g1", content: "" }, pane: "", sends: [], gets: [], sendBehavior: () => "throw" };
+    const { errLogs, exitCode } = await captureLogs(() => makeCmd(consumptionDeps(w)).parseAsync(walkArgs));
+    expect(exitCode).toBe(1);
+    expect(w.sends.filter(s => s.path === "/api/transport/send")).toHaveLength(1);
+    expect(errLogs.join("\n")).toMatch(/unconfirmed/i);
+    expect(errLogs.join("\n")).not.toMatch(/delivery lost/i);
+    expect(errLogs.join("\n")).toMatch(/before.*resend/i);
+  });
+
+  it("reports a generation change after the guarded Enter without claiming the piece was lost", async () => {
+    const w: ScriptedWorld = { record: { generationId: "g1", content: "" }, pane: "", sends: [], gets: [] };
+    w.sendBehavior = body => {
+      if (body["text"] !== undefined) w.pane = `❯ ${String(body["text"]).slice(0, 40)}`;
+      else w.record.generationId = "g2";
+      return { status: 200, data: { ok: true } };
+    };
+    const { errLogs, exitCode } = await captureLogs(() => makeCmd(consumptionDeps(w)).parseAsync(walkArgs));
+    expect(exitCode).toBe(1);
+    expect(w.sends.filter(s => s.path === "/api/transport/send" && s.body["submitOnly"] === true)).toHaveLength(1);
+    expect(w.sends.filter(s => s.path === "/api/transport/send" && s.body["text"] !== undefined)).toHaveLength(1);
+    expect(errLogs.join("\n")).toMatch(/generation rolled.*unconfirmed/i);
+    expect(errLogs.join("\n")).not.toMatch(/never entered|delivery lost/i);
   });
 
   it("PIN W2 — staged text detected -> exactly ONE submit retry (bare Enter, never a piece re-send), then consumed -> walk proceeds [GREEN — the retry path]", async () => {
@@ -370,6 +438,28 @@ describe("rig walk — per-piece consumption verification (RED-first, mechanics-
     const enterRetries = w.sends.filter((s) => s.path === "/api/transport/send" && s.body["submitOnly"] === true);
     expect(pieceSends.map((s) => (s.body["text"] as string).slice(0, 9))).toEqual(["PIECE ONE", "PIECE TWO"]); // each piece sent ONCE
     expect(enterRetries).toHaveLength(2); // exactly one Enter per staged piece
+  });
+
+  it.each([
+    [{ reason: "submit_failed", inputPhase: "attempted", error: "reply lost" }, "unconfirmed"],
+    [{ reason: "submit_failed", error: "old daemon" }, "unconfirmed"],
+    [{ reason: "staged_mismatch", inputPhase: "not_reached", sent: false, error: "changed" }, "refused"],
+  ] as const)("classifies a guarded submit error %j as %s", async (failure, wording) => {
+    const w: ScriptedWorld = { record: { generationId: "g1", content: "" }, pane: "", sends: [], gets: [] };
+    w.sendBehavior = (body) => {
+      if (body["text"] !== undefined) {
+        w.pane = `❯ ${String(body["text"])} `;
+        return { status: 200, data: { ok: true } };
+      }
+      return { status: 500, data: { ok: false, ...failure } };
+    };
+    const { errLogs, exitCode } = await captureLogs(() => makeCmd(consumptionDeps(w)).parseAsync(walkArgs));
+    expect(exitCode).toBe(1);
+    expect(w.sends.filter(s => s.path === "/api/transport/send" && s.body["submitOnly"] === true)).toHaveLength(1);
+    expect(w.sends.filter(s => s.path === "/api/transport/send" && s.body["text"] !== undefined)).toHaveLength(1);
+    expect(errLogs.join("\n")).toContain(wording);
+    expect(errLogs.join("\n")).not.toMatch(/typed but not consumed/i);
+    if (wording === "unconfirmed") expect(errLogs.join("\n")).not.toMatch(/was refused/i);
   });
 
   it("PIN W3 — a client timeout with server-side completion reconciles BY EFFECT: no re-send, walk proceeds [GREEN — reconcile-by-effect]", async () => {

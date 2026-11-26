@@ -1,5 +1,10 @@
 import type Database from "better-sqlite3";
 import { isQueueWait } from "./queue-wait-backoff.js";
+import { deliveryReachedSeat } from "./watchdog-history-log.js";
+import { isTypedGateBlocker } from "./queue-blocker.js";
+import { isHumanSeatSessionRef } from "./session-name.js";
+import { loadHumanRegistry, resolveRegisteredHumanAddress } from "./gateway/human-registry.js";
+import { readWithCurrentParkBoundary } from "./current-park-arm.js";
 
 export type ParkWakeKind = "watchdog" | "timer" | "blocker";
 export type ParkWakePhase = "armed" | "fired";
@@ -56,8 +61,16 @@ interface WakeRow {
 /** Persistence + live-state projection for transition-bound park wakes. */
 export class QueueWakeRepository {
   private readonly available: boolean;
+  /** One lookup statement for this connection, prepared on first use: history reads call it once per transition, and
+   *  compiling it each time dominated their cost. It holds no result; every call reads afresh. */
+  private lookup: Database.Statement | undefined;
 
-  constructor(private readonly db: Database.Database) {
+  constructor(private readonly db: Database.Database, private readonly isPersonAddress: (value: string) => boolean = (value) => {
+    if (!value.includes("@")) return false;
+    if (isHumanSeatSessionRef(value)) return true;
+    const registry = loadHumanRegistry();
+    return registry.ok && resolveRegisteredHumanAddress(value, registry.entities) !== null;
+  }) {
     this.available = this.db.prepare(
       "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'queue_transition_wakes'",
     ).get() !== undefined;
@@ -81,20 +94,34 @@ export class QueueWakeRepository {
 
   getForTransition(transitionId: number): QueueWakeRecord | null {
     if (!this.available) return null;
-    const row = this.db.prepare(
-      "SELECT * FROM queue_transition_wakes WHERE transition_id = ?",
-    ).get(transitionId) as WakeRow | undefined;
+    this.lookup ??= this.db.prepare("SELECT * FROM queue_transition_wakes WHERE transition_id = ?");
+    const row = this.lookup.get(transitionId) as WakeRow | undefined;
     return row ? this.row(row) : null;
   }
 
   getStatus(qitemId: string): ParkWakeStatus | null {
     if (!this.available) return null;
-    const armed = this.db.prepare(
+    let armed = this.db.prepare(
       `SELECT * FROM queue_transition_wakes
         WHERE qitem_id = ? AND phase = 'armed'
         ORDER BY transition_id DESC LIMIT 1`,
     ).get(qitemId) as WakeRow | undefined;
-    if (!armed) return null;
+    const current = this.db.prepare("SELECT state, blocked_on FROM queue_items WHERE qitem_id = ?")
+      .get(qitemId) as { state: string; blocked_on: string | null } | undefined;
+    if (armed && current?.state === "blocked" && this.db.prepare(
+      "SELECT 1 FROM queue_transitions WHERE qitem_id = ? AND transition_id > ? AND state <> 'blocked' LIMIT 1",
+    ).get(qitemId, armed.transition_id)) armed = undefined;
+    if (armed?.wake_kind === "blocker" && current?.state === "blocked"
+      && (armed.wake_ref !== current.blocked_on || isTypedGateBlocker(armed.wake_ref) || this.isPersonAddress(armed.wake_ref))) armed = undefined;
+    if (!armed) {
+      // Older parks on custom queue IDs have no wake receipt, although the
+      // blocker transition still unparks them. Only an existing live row is
+      // evidence of that continuation; typed gates and missing rows are not.
+      if (current?.state !== "blocked" || !current.blocked_on || current.blocked_on === qitemId
+        || isTypedGateBlocker(current.blocked_on) || this.isPersonAddress(current.blocked_on)
+        || !this.isLive("blocker", current.blocked_on)) return null;
+      return { kind: "blocker", ref: current.blocked_on, phase: "armed", live: true, deliveryStatus: null, unconsumed: false };
+    }
     const fired = this.db.prepare(
       `SELECT * FROM queue_transition_wakes
         WHERE qitem_id = ? AND phase = 'fired' AND wake_ref = ?
@@ -106,21 +133,76 @@ export class QueueWakeRepository {
     ).get(qitemId) as { state: string } | undefined)?.state;
     const kind = armed.wake_kind as ParkWakeKind;
     const expiresAt = this.wakeExpiry(qitemId, kind, armed.wake_ref);
+    const repeating = this.isRepeatingTimer(armed.wake_ref);
+    // A retained attempt (held back by the typing guard) was not delivered, so it doesn't consume a one-shot wake:
+    // the backstop is still live and nothing awaits the owner. The attempt stays in the history.
+    const heldBack = fired?.delivery_status === "retained" && !repeating;
     return {
       kind,
       ref: armed.wake_ref,
       phase: fired ? "fired" : "armed",
-      live: fired && !this.isRepeatingTimer(armed.wake_ref) ? false : this.isLive(kind, armed.wake_ref),
+      live: fired && !repeating && !heldBack ? false : this.isLive(kind, armed.wake_ref),
       deliveryStatus: fired?.delivery_status ?? null,
-      unconsumed: fired !== undefined && state === "blocked",
-      ...(this.isRepeatingTimer(armed.wake_ref) ? { recoveryOwner: "queue-stuck-sweep" as const } : {}),
+      unconsumed: fired !== undefined && !heldBack && state === "blocked",
+      ...(repeating ? { recoveryOwner: "queue-stuck-sweep" as const } : {}),
       ...(expiresAt ? { expiresAt } : {}),
     };
   }
 
+  /** A blocked row whose current wake is an attached, active `periodic-reminder` aimed at the row's own owner, which
+   *  has fired since this park and whose latest delivery reached that owner. Its owner is being woken by that reminder
+   *  on its cadence, so parked diagnosis needn't count the row as stranded. Read only from existing records; anything
+   *  it can't establish (no fire yet, a failed or retained attempt, a refused or skipped latest evaluation, a stopped
+   *  job, another target, a one-shot park timer, a blocker, missing history) answers false, leaving today's result. */
+  servedByOwnRepeatingReminder(qitemId: string): boolean {
+    if (!this.available) return false;
+    const armed = this.db.prepare(
+      `SELECT * FROM queue_transition_wakes
+        WHERE qitem_id = ? AND phase = 'armed'
+        ORDER BY transition_id DESC LIMIT 1`,
+    ).get(qitemId) as WakeRow | undefined;
+    if (!armed || armed.wake_kind !== "watchdog") return false;
+    // That arm must belong to the current park: a row that has left `blocked` since then and was blocked again with no
+    // wake of its own (a gate or a person) wrote no arm, so the earlier park's reminder isn't serving this one.
+    // Note-only transitions stay `blocked`.
+    const leftSince = this.db.prepare(
+      `SELECT 1 FROM queue_transitions WHERE qitem_id = ? AND transition_id > ? AND state <> 'blocked' LIMIT 1`,
+    ).get(qitemId, armed.transition_id);
+    if (leftSince) return false;
+    const job = this.db.prepare(
+      `SELECT j.policy, j.spec_yaml, j.state, j.target_session, q.destination_session, q.state AS row_state
+         FROM watchdog_jobs j JOIN queue_items q ON q.qitem_id = ?
+        WHERE j.job_id = ?`,
+    ).get(qitemId, armed.wake_ref) as
+      | { policy: string; spec_yaml: string; state: string; target_session: string; destination_session: string; row_state: string }
+      | undefined;
+    if (!job || job.row_state !== "blocked" || job.policy !== "periodic-reminder" || job.state !== "active"
+      || job.target_session !== job.destination_session || isQueueWait(job.spec_yaml)) return false;
+    const fired = this.db.prepare(
+      `SELECT delivery_status FROM queue_transition_wakes
+        WHERE qitem_id = ? AND phase = 'fired' AND wake_ref = ? AND transition_id > ?
+        ORDER BY transition_id DESC LIMIT 1`,
+    ).get(qitemId, armed.wake_ref, armed.transition_id) as { delivery_status: string | null } | undefined;
+    if (!deliveryReachedSeat(fired?.delivery_status)) return false;
+    // A refusal never reaches the row's own records (it isn't a delivery attempt), so the job's latest evaluation
+    // must itself be a delivered send. Latest = the history log's own order: evaluated_at, then history_id (a ULID).
+    const hasHistory = this.db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'watchdog_history'",
+    ).get() !== undefined;
+    if (!hasHistory) return false;
+    // It must have reached this owner: the session the delivery went to, not only the one the job was registered for
+    // (a job's spec can name another target). An unknown delivery target keeps today's result.
+    const latest = this.db.prepare(
+      `SELECT outcome, delivery_status, delivery_target_session FROM watchdog_history
+        WHERE job_id = ? ORDER BY evaluated_at DESC, history_id DESC LIMIT 1`,
+    ).get(armed.wake_ref) as { outcome: string; delivery_status: string | null; delivery_target_session: string | null } | undefined;
+    return latest?.outcome === "sent" && deliveryReachedSeat(latest.delivery_status)
+      && latest.delivery_target_session === job.destination_session;
+  }
+
   findBlockedQitemsByWatchdog(jobId: string, latestArmedOnly = false): Array<{ qitemId: string; kind: "watchdog" | "timer" }> {
     if (!this.available) return [];
-    return this.db.prepare(
+    const select = (boundary: string) => this.db.prepare(
       `SELECT DISTINCT w.qitem_id, w.wake_kind
          FROM queue_transition_wakes w
          JOIN queue_items q ON q.qitem_id = w.qitem_id
@@ -132,15 +214,50 @@ export class QueueWakeRepository {
             SELECT MAX(a.transition_id) FROM queue_transition_wakes a
              WHERE a.qitem_id = w.qitem_id AND a.phase = 'armed'
           ))
+          ${boundary}
           AND (? OR NOT EXISTS (
             SELECT 1 FROM queue_transition_wakes f
              WHERE f.qitem_id = w.qitem_id AND f.phase = 'fired'
                AND f.wake_ref = w.wake_ref AND f.transition_id > w.transition_id
+               -- A retained attempt was not delivered: the one-shot binding still owns the next attempt.
+               AND (f.delivery_status IS NULL OR f.delivery_status != 'retained')
           ))`,
-    ).all(jobId, latestArmedOnly ? 1 : 0, this.isRepeatingTimer(jobId) ? 1 : 0).map((row) => {
+    ).all(jobId, latestArmedOnly ? 1 : 0, this.isRepeatingTimer(jobId) ? 1 : 0);
+    return (latestArmedOnly ? readWithCurrentParkBoundary(select) : select("")).map((row) => {
       const r = row as { qitem_id: string; wake_kind: "watchdog" | "timer" };
       return { qitemId: r.qitem_id, kind: r.wake_kind };
     });
+  }
+
+  /** The blocked rows of `owner` whose CURRENT park this job wakes and hasn't consumed: the latest arm, with no exit
+   *  from `blocked` since (a row parked again with no wake of its own, by a gate or a person, wrote no arm). Read only
+   *  by a queue-only seat's delivery (#3076), where the reminder becomes a note on these rows, never typed. An active
+   *  recurring reminder attached with --wake-watchdog isn't consumed here: each occurrence notes the row while it stays
+   *  parked, rather than becoming a second assignment. A generated one-shot timer still is. */
+  findCurrentParkRowsByWatchdog(jobId: string, owner: string): string[] {
+    if (!this.available) return [];
+    return this.db.prepare(
+      `SELECT DISTINCT w.qitem_id
+         FROM queue_transition_wakes w
+         JOIN queue_items q ON q.qitem_id = w.qitem_id
+        WHERE w.phase = 'armed' AND w.wake_ref = ?
+          AND w.wake_kind IN ('watchdog', 'timer') AND q.state = 'blocked' AND q.destination_session = ?
+          AND w.transition_id = (
+            SELECT MAX(a.transition_id) FROM queue_transition_wakes a
+             WHERE a.qitem_id = w.qitem_id AND a.phase = 'armed'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM queue_transitions t
+             WHERE t.qitem_id = w.qitem_id AND t.transition_id > w.transition_id AND t.state <> 'blocked'
+          )
+          AND (? OR (? AND w.wake_kind = 'watchdog') OR NOT EXISTS (
+            SELECT 1 FROM queue_transition_wakes f
+             WHERE f.qitem_id = w.qitem_id AND f.phase = 'fired'
+               AND f.wake_ref = w.wake_ref AND f.transition_id > w.transition_id
+               AND (f.delivery_status IS NULL OR f.delivery_status != 'retained')
+          ))`,
+    ).all(jobId, owner, this.isRepeatingTimer(jobId) ? 1 : 0, this.isRecurringReminder(jobId) ? 1 : 0)
+      .map((row) => (row as { qitem_id: string }).qitem_id);
   }
 
   /** Queue rows bound to a park-generated timer, regardless of whether that
@@ -161,10 +278,10 @@ export class QueueWakeRepository {
   }
 
   /** A current attachment keeps a shared generated job alive until consumed.
-   *  Failed or retained repeating deliveries keep ownership for the next retry. */
+   *  A retained attempt never consumes it; a failed one does, except on a repeating timer, which retries. */
   findLiveQitemsByAttachedWatchdog(jobId: string): Array<{ qitemId: string; state: string }> {
     if (!this.available) return [];
-    return this.db.prepare(
+    return readWithCurrentParkBoundary(boundary => this.db.prepare(
       `SELECT DISTINCT w.qitem_id, q.state
          FROM queue_transition_wakes w
          JOIN queue_items q ON q.qitem_id = w.qitem_id
@@ -174,16 +291,18 @@ export class QueueWakeRepository {
             SELECT MAX(a.transition_id) FROM queue_transition_wakes a
              WHERE a.qitem_id = w.qitem_id AND a.phase = 'armed'
           )
+          ${boundary}
           AND NOT EXISTS (
             SELECT 1 FROM queue_transition_wakes f
              WHERE f.qitem_id = w.qitem_id AND f.phase = 'fired'
                AND f.wake_ref = w.wake_ref AND f.transition_id > w.transition_id
+               -- A retained attempt never consumes an attachment; a failed one consumes it only on a one-shot timer.
+               AND (f.delivery_status IS NULL OR f.delivery_status != 'retained')
                AND (? = 0 OR f.delivery_status IS NULL OR (
                  f.delivery_status != 'failed' AND f.delivery_status NOT LIKE 'failed:%'
-                 AND f.delivery_status != 'retained'
                ))
           )`,
-    ).all(jobId, this.isRepeatingTimer(jobId) ? 1 : 0).map((row) => {
+    ).all(jobId, this.isRepeatingTimer(jobId) ? 1 : 0)).map((row) => {
       const r = row as { qitem_id: string; state: string };
       return { qitemId: r.qitem_id, state: r.state };
     });
@@ -196,12 +315,19 @@ export class QueueWakeRepository {
       row.state === "blocked" && this.getStatus(row.qitemId)?.ref === jobId);
   }
 
+  /** An ordinary one-shot park has no later cycle to replace a failed wake.
+   * Repeating waits and provider-limit expiry keep their own existing lifecycle. */
+  hasOwedOneShotParkWake(jobId: string): boolean {
+    return this.findCurrentQitemsByGeneratedTimer(jobId).some(row => !this.isUsageLimitBlocker(row.qitemId))
+      && !this.isRepeatingTimer(jobId);
+  }
+
   /** Active park-generated timers that are still their blocked row's current wake and still target the
    *  row's owner. These wake the seat that owns the row, not a particular occupant, so a seat swap keeps
    *  them; any other job the retiring occupant registered still stops. */
   currentParkTimerIds(): string[] {
     if (!this.available) return [];
-    return this.db.prepare(
+    return readWithCurrentParkBoundary(boundary => this.db.prepare(
       `SELECT w.wake_ref
          FROM queue_transition_wakes w
          JOIN queue_items q ON q.qitem_id = w.qitem_id
@@ -211,8 +337,9 @@ export class QueueWakeRepository {
           AND w.transition_id = (
             SELECT MAX(a.transition_id) FROM queue_transition_wakes a
              WHERE a.qitem_id = w.qitem_id AND a.phase = 'armed'
-          )`,
-    ).all().map((row) => (row as { wake_ref: string }).wake_ref);
+          )
+          ${boundary}`,
+    ).all()).map((row) => (row as { wake_ref: string }).wake_ref);
   }
 
   private isLive(kind: ParkWakeKind, ref: string): boolean {
@@ -231,6 +358,14 @@ export class QueueWakeRepository {
   private isRepeatingTimer(ref: string): boolean {
     const row = this.db.prepare("SELECT spec_yaml FROM watchdog_jobs WHERE job_id = ? AND state = 'active'").get(ref) as { spec_yaml: string } | undefined;
     return row ? isQueueWait(row.spec_yaml) : false;
+  }
+
+  /** An active `periodic-reminder` that no park generated (no park armed it as its timer): it repeats on its interval. */
+  private isRecurringReminder(ref: string): boolean {
+    return this.db.prepare(
+      `SELECT 1 FROM watchdog_jobs j WHERE j.job_id = ? AND j.state = 'active' AND j.policy = 'periodic-reminder'
+          AND NOT EXISTS (SELECT 1 FROM queue_transition_wakes w WHERE w.wake_ref = j.job_id AND w.wake_kind = 'timer')`,
+    ).get(ref) !== undefined;
   }
 
   private isUsageLimitBlocker(qitemId: string): boolean {

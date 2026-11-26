@@ -5,6 +5,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
+  chmodSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -67,6 +68,33 @@ test("the content scan executes the named full-mode guard with the artifact boun
   } finally {
     rmSync(harnessRoot, { recursive: true, force: true });
   }
+});
+
+test("the substance gate needs the leak guard's term lists: --rules or the file the environment names", () => {
+  withFixture(({ repo, rules, review, receipt }) => {
+    const publicFile = join(repo, "public/guide.md");
+    write(publicFile, "# Public guide\nGeneric user-facing guidance.\n");
+    commitAll(repo, "public surface");
+    const cutSha = gitHead(repo);
+    writeFileSync(review, JSON.stringify({
+      surfaces: [{ path: "public/guide.md", sha256: sha256(publicFile), verdict: "ship",
+        reason: "Generic product guidance with no instance dependency.", candidateDispositions: [] }],
+    }));
+    const env = { ...process.env };
+    delete env.OPENRIG_LEAK_GUARD_RULES;
+    const gate = (extra) => spawnSync(process.execPath, [GATE, "--repo", repo, "--package-root", repo,
+      "--surface-manifest", join(repo, "substance-surfaces.json"), "--review", review, "--receipt", receipt,
+      "--judge", "dev-qa@fixture", "--cut-sha", cutSha], { encoding: "utf8", env: { ...env, ...extra } });
+
+    const refused = gate({});
+    assert.notEqual(refused.status, 0);
+    assert.match(refused.stderr, /--rules <file> or OPENRIG_LEAK_GUARD_RULES is required/);
+    assert.equal(existsSync(receipt), false);
+
+    const named = gate({ OPENRIG_LEAK_GUARD_RULES: rules });
+    assert.equal(named.status, 0, named.stderr);
+    assert.equal(JSON.parse(readFileSync(receipt, "utf8")).gate, "substance gate");
+  });
 });
 
 test("the named substance gate writes a cut-bound, per-surface receipt and records the full scan", () => {
@@ -378,6 +406,44 @@ test("exact-line allowances reach content and derived scans and are recorded in 
   });
 });
 
+test("npm output that is a JSON string is refused, even when the string holds a serialized list", () => {
+  withFixture(({ root, repo, rules, review, receipt }) => {
+    write(join(repo, "public/guide.md"), "Generic product guidance.\n");
+    commitAll(repo, "string output fixture");
+    writeFileSync(review, JSON.stringify({ surfaces: [] }));
+    const bin = join(root, "bin");
+    const serialized = JSON.stringify([{ files: [{ path: "package.json" }, { path: "public/guide.md" }] }]);
+    write(join(bin, "npm"), `#!${process.execPath}\nprocess.stdout.write(${JSON.stringify(JSON.stringify(serialized))});\n`);
+    chmodSync(join(bin, "npm"), 0o755);
+
+    const result = runGate({ repo, rules, review, receipt, cutSha: gitHead(repo),
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /npm artifact enumeration returned no files array/);
+  });
+});
+
+test("npm output that lists more than one package is refused before any scan or receipt", () => {
+  const first = { name: "first", files: [{ path: "package.json" }, { path: "public/guide.md" }] };
+  const second = { name: "second", files: [{ path: "package.json" }, { path: "public/other.md" }] };
+  for (const printed of [[first, second], { first, second }]) {
+    withFixture(({ root, repo, rules, review, receipt }) => {
+      write(join(repo, "public/guide.md"), "Generic product guidance.\n");
+      commitAll(repo, "two package output fixture");
+      writeFileSync(review, JSON.stringify({ surfaces: [] }));
+      const bin = join(root, "bin");
+      write(join(bin, "npm"), `#!${process.execPath}\nprocess.stdout.write(${JSON.stringify(JSON.stringify(printed))});\n`);
+      chmodSync(join(bin, "npm"), 0o755);
+
+      const result = runGate({ repo, rules, review, receipt, cutSha: gitHead(repo),
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /npm artifact enumeration listed 2 packages where one was packed; run the gate for one package \(check --package-root and any npm workspaces setting\)/);
+      assert.equal(existsSync(receipt), false);
+    });
+  }
+});
+
 test("the release ceremony names the gate and its durable receipt", () => {
   const pkg = JSON.parse(readFileSync("package.json", "utf8"));
   assert.equal(pkg.scripts["gate:substance"], "node scripts/check-substance-gate.mjs");
@@ -393,10 +459,9 @@ function writeGateHarness(root, source, invocationPath) {
   mkdirSync(root, { recursive: true });
   const gate = join(root, "check-substance-gate.mjs");
   writeFileSync(gate, source);
-  writeFileSync(
-    join(root, "internal-leak-scanner.mjs"),
-    readFileSync(resolve("scripts/internal-leak-scanner.mjs")),
-  );
+  for (const module of ["internal-leak-scanner.mjs", "leak-guard-rules.mjs", "npm-pack-json.mjs"]) {
+    writeFileSync(join(root, module), readFileSync(resolve("scripts", module)));
+  }
   writeFileSync(join(root, "check-internal-leak-guard.mjs"), [
     "import { readFileSync, writeFileSync } from \"node:fs\";",
     `const invocationPath = ${JSON.stringify(invocationPath)};`,
@@ -448,7 +513,7 @@ function withFixture(run) {
   }
 }
 
-function runGate({ repo, rules, review, receipt, cutSha, gate = GATE }) {
+function runGate({ repo, rules, review, receipt, cutSha, gate = GATE, env = process.env }) {
   return spawnSync(process.execPath, [
     gate,
     "--repo", repo,
@@ -459,7 +524,7 @@ function runGate({ repo, rules, review, receipt, cutSha, gate = GATE }) {
     "--receipt", receipt,
     "--judge", "dev-qa@fixture",
     "--cut-sha", cutSha,
-  ], { encoding: "utf8" });
+  ], { encoding: "utf8", env });
 }
 
 function write(path, content) {

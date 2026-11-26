@@ -181,6 +181,29 @@ files: []
     lib.unpin(id);
     expect(existsSync(join(userRoot, "p", ".pinned"))).toBe(false);
     expect(lib.list()[0]!.pinned).toBe(false);
+    expect(() => lib.unpin(id)).not.toThrow();
+  });
+
+  it("keeps the image pinned when removing the sentinel fails", () => {
+    writeImage(userRoot, "p", `
+name: p
+version: 1
+runtime: claude-code
+source_seat: x
+source_session_id: s
+source_resume_token: t
+files: []
+`, {});
+    const sentinel = join(userRoot, "p", ".pinned");
+    // A directory cannot be unlinked as a file, on both Windows and Unix.
+    mkdirSync(sentinel);
+    const lib = new AgentImageLibraryService({ roots: [{ path: userRoot, sourceType: "user_file" }] });
+    lib.scan();
+    const id = lib.list()[0]!.id;
+    expect(lib.get(id)!.pinned).toBe(true);
+    expect(() => lib.unpin(id)).toThrow();
+    expect(lib.get(id)!.pinned).toBe(true);
+    expect(existsSync(sentinel)).toBe(true);
   });
 
   it("install writes manifest + stats + supplementary files", () => {
@@ -207,6 +230,21 @@ files: []
     lib.scan();
     expect(lib.list()).toHaveLength(1);
     expect(lib.list()[0]!.name).toBe("installed");
+  });
+
+  it("install accepts a file name with literal dots but rejects a '..' segment", () => {
+    const lib = new AgentImageLibraryService({
+      roots: [{ path: userRoot, sourceType: "user_file" }],
+    });
+    const manifest = (name: string, path: string): AgentImageManifest => ({
+      name, version: "1", runtime: "claude-code",
+      sourceSeat: "x", sourceSessionId: "s", sourceResumeToken: "t",
+      createdAt: "2026-01-01T00:00:00Z", files: [{ path, role: "notes" }],
+    });
+    const targetDir = lib.install(userRoot, manifest("dots", "v1..final.md"), new Map([["v1..final.md", "notes"]]));
+    expect(readFileSync(join(targetDir, "v1..final.md"), "utf-8")).toBe("notes");
+    expect(() => lib.install(userRoot, manifest("escape", "../escape.md"), new Map([["../escape.md", "x"]])))
+      .toThrow(/relative inside the image/);
   });
 
   it("install rejects duplicate name", () => {
