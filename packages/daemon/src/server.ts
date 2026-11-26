@@ -1,3 +1,13 @@
+import { hookBridgeRoutes } from "./routes/hook-bridge.js";
+import type { RunnerChannel } from "./domain/runner-channel.js";
+import { CoreAppJob } from "./domain/core-app-job.js";
+import { MissionControlActionLog } from "./domain/mission-control/mission-control-action-log.js";
+import { coreAppRoutes } from "./routes/core-app.js";
+import { CoreAppAccess } from "./domain/core-app-access.js";
+import { EnvironmentLifecycle } from "./domain/environment-lifecycle.js";
+import { EnvironmentPlatform, type EnvironmentDriver } from "./domain/environment-platform.js";
+import { OpenShellDriver } from "./adapters/openshell-driver.js";
+import { environmentRoutes } from "./routes/environments.js";
 import { healthDiagnosisRoutes } from "./routes/health-diagnosis.js";
 import type { HealthDiagnosisService } from "./domain/health-diagnosis.js";
 import type { HealthPolicyStore } from "./domain/health-policy.js";
@@ -33,6 +43,11 @@ import type { DiscoveryRepository } from "./domain/discovery-repository.js";
 import type { ClaimService } from "./domain/claim-service.js";
 import type { SelfAttachService } from "./domain/self-attach-service.js";
 import { rigsRoutes } from "./routes/rigs.js";
+import { rigDeliveryDrainRoutes } from "./routes/rig-delivery-drain.js";
+import { OPERATION_CONTRACT, OPERATION_KINDS } from "./domain/operation-correlation.js";
+import { teamOperationsCapabilities } from "./domain/team-operations.js";
+import { MEMBER_CONNECTION_CONTRACT, ROUTE_DECLARATIONS } from "./domain/connection-contract.js";
+import { resolveMemberConnection } from "./domain/member-connection.js";
 import { sessionsRoutes, nodesRoutes, sessionAdminRoutes } from "./routes/sessions.js";
 import { adaptersRoutes } from "./routes/adapters.js";
 import { eventsRoute } from "./routes/events.js";
@@ -61,7 +76,7 @@ import { transcriptRoutes } from "./routes/transcripts.js";
 import { transportRoutes } from "./routes/transport.js";
 import { compactionRoutes } from "./routes/compaction.js";
 import type { ClaudeCompactionEnforcer } from "./domain/claude-compaction-enforcer.js";
-import { activityRoutes } from "./routes/activity.js";
+import { activityRoutes, guestActivityRoutes } from "./routes/activity.js";
 import { askRoutes } from "./routes/ask.js";
 import { wakeResolveRoutes } from "./routes/wake-resolve.js";
 import type { AskService } from "./domain/ask-service.js";
@@ -79,11 +94,13 @@ import { skillsRoutes } from "./routes/skills.js";
 import type { SkillLibraryDiscoveryService } from "./domain/skill-library-discovery.js";
 import { configRoutes } from "./routes/config.js";
 import { hostsRoutes } from "./routes/hosts.js";
+import { networkRoutes } from "./routes/network.js";
 import { hostReadThrough } from "./domain/hosts/read-through.js";
 import { jsonBodyErrorHandler, trackJsonBodyParseErrors } from "./middleware/json-body-error.js";
 import { getSelfHostId, getSelfHostIdSource } from "./domain/hosts/fanout-contract.js";
 import { contextPacksRoutes } from "./routes/context-packs.js";
 import { agentImagesRoutes } from "./routes/agent-images.js";
+import { communityHarnessesRoutes } from "./routes/community-harnesses.js";
 import type { SpecReviewService } from "./domain/spec-review-service.js";
 import type { SpecLibraryService } from "./domain/spec-library-service.js";
 import type { ChatRepository } from "./domain/chat-repository.js";
@@ -125,6 +142,7 @@ import { healthRoutes } from "./routes/health.js";
 import { gatewayRoutes } from "./routes/gateway.js";
 import type { StreamStore } from "./domain/stream-store.js";
 import { createSlowOpRequestMiddleware, type SlowOperationInstrumentation } from "./domain/slow-op-recorder.js";
+import { createMutationTraceMiddleware, type MutationTraceSink } from "./domain/mutation-trace.js";
 import type { QueueRepository } from "./domain/queue-repository.js";
 import type { InboxHandler } from "./domain/inbox-handler.js";
 import type { OutboxHandler } from "./domain/outbox-handler.js";
@@ -144,6 +162,12 @@ import { createRouteTimingMiddleware } from "./domain/route-timing-recorder.js";
 import { browserBoundary, type BrowserBoundaryOptions } from "./middleware/browser-boundary.js";
 
 export interface AppDeps {
+  runnerChannel?: RunnerChannel;
+  environmentDriver?: EnvironmentDriver;
+  environmentArtifactRoot?: string;
+  environmentStateRoot?: string;
+  /** Boot-time DB context observations, not a live exclusion guarantee. */
+  databaseWarnings?: string[];
   proofSourceWatch?: import("./domain/proof/source-watch.js").ProofSourceWatch;
   /** S20 — effective bind plan for the health surface (absent = legacy body). */
   bindPlan?: { mode: "explicit" | "default"; hosts: string[]; tailscaleDetected: boolean; ignoredRoutingHost?: string };
@@ -156,7 +180,11 @@ export interface AppDeps {
   nodeLauncher: NodeLauncher;
   /** Seat-scoped explicit fresh launch composes the same startup owner as rig launch. */
   startupOrchestrator?: import("./domain/startup-orchestrator.js").StartupOrchestrator;
+  /** Arms a seat's continuity notice for the occupant a fresh launch just started (the restore path has its own copy of this dep). */
+  armSeatContinuity?: (rigId: string, nodeId: string) => Promise<string | null>;
   tmuxAdapter: TmuxAdapter;
+  /** Shared process census used by startup observations and native lineage checks. */
+  listProcesses?: import("./domain/native-process-lineage.js").NativeProcessLister;
   /** OPR.0.4.6.02 S1 — the shared tmux option-defaults applier, exposed to
    *  the seat-handover route so a fresh successor gets launch-only defaults. */
   tmuxOptionDefaults?: TmuxOptionDefaultsApplier;
@@ -206,7 +234,10 @@ export interface AppDeps {
   wakeResolveService?: WakeResolveService;
   chatRepo?: ChatRepository;
   streamStore?: StreamStore;
+  streamIntakeCoordinator?: import("./domain/stream-intake.js").StreamIntakeCoordinator;
   slowOpRecorder?: SlowOperationInstrumentation;
+  /** Edge trace of state-changing requests through the diagnostics path; absent = off. */
+  mutationTrace?: MutationTraceSink;
   requestPhaseObserver?: import("./domain/request-phase-observer.js").RequestPhaseObserver;
   queueRepo?: QueueRepository;
   /** S02 — the standing stuck sweep's observable heartbeat (ADDITIVE on healthz;
@@ -215,6 +246,9 @@ export interface AppDeps {
   /** S01 — the wake-or-escalate ladder's heartbeat + open-escalations count (ADDITIVE on
    *  healthz; absent = legacy body). Part of the operator rung's stated delivery floor. */
   wakeLadderStatus?: import("./domain/queue-wake-ladder.js").WakeLadderStatus;
+  /** #3315 — whether the daemon reaches its tmux server(s), a separate axis from the daemon being up: healthz keeps
+   *  `status: "ok"` and adds `terminals` (ADDITIVE; absent = legacy body). */
+  terminalReachability?: import("./domain/terminal-server-reachability.js").TerminalServerReachability;
   inboxHandler?: InboxHandler;
   outboxHandler?: OutboxHandler;
   shadowCapture?: import("./domain/shadow-capture.js").ShadowCapture;
@@ -228,12 +262,18 @@ export interface AppDeps {
   watchdogHistoryLog?: WatchdogHistoryLog;
   watchdogPolicyEngine?: WatchdogPolicyEngine;
   watchdogScheduler?: WatchdogScheduler;
+  /** #2940: relaunches a keep_alive seat that falls while the daemon runs. Started after the listener binds; stopped first. */
+  keepAliveSupervisor?: import("./domain/keep-alive-supervisor.js").KeepAliveSupervisor;
+  /** The outbound network connector (`rig network`); started after the listener binds. */
+  networkConnector?: import("./domain/network/network-connector.js").NetworkConnectorService;
   /** B8 / slice-07 A3 — the model-divergence monitor (effective-vs-pinned, four-channel proclaim). */
   modelDivergenceMonitor?: import("./domain/model-divergence/model-divergence-monitor.js").ModelDivergenceMonitor;
   /** S10 — the in-daemon gateway subsystem (amended M1 §3: in-process, no second deployable).
    *  Optional so test harnesses constructing AppDeps directly need not provide one; the health
    *  route reports honestly when absent. */
   gatewaySubsystem?: import("./domain/gateway/gateway-subsystem.js").GatewaySubsystem;
+  /** Concrete local relay inbound handler (`POST /api/gateway/relay/inbound`). */
+  relayInboundHandler?: import("./domain/gateway/relay-inbound.js").RelayInboundHandler;
   periodicSnapshotScheduler?: import("./domain/periodic-snapshot-scheduler.js").PeriodicSnapshotScheduler;
   workflowRuntime?: WorkflowRuntime;
   /**
@@ -266,6 +306,7 @@ export interface AppDeps {
   reviewGatherer?: import("./domain/review/gather.js").ReviewGatherer;
   // OPR.0.4.6.02 C3 — the terminal-provider-ride composer (herdr/cmux views).
   terminalService?: import("./domain/terminal/terminal-service.js").TerminalService;
+  rexStatusRelay?: import("./domain/terminal/rex-agent-status.js").RexAgentStatusRelay;
   sliceDetailProjector?: import("./domain/slices/slice-detail-projector.js").SliceDetailProjector;
   /** User Settings v0 — daemon-side settings store (env > file > default). */
   settingsStore?: import("./domain/user-settings/settings-store.js").SettingsStore;
@@ -330,6 +371,7 @@ export interface AppDeps {
   whoamiService?: WhoamiService;
   /** W3 single-seat, read-only runtime-policy observer. */
   permissionDriftObserver?: PermissionDriftReader;
+  currentModelReader?: import("./domain/model-divergence/current-model-reader.js").CurrentModelReader;
   contextUsageStore?: import("./domain/context-usage-store.js").ContextUsageStore;
   /** 0.5.10 S04 — one on-demand, read-only health projection shared by consumers. */
   healthProjection?: import("./domain/health-detectors.js").HealthProjectionService;
@@ -344,6 +386,7 @@ export interface AppDeps {
    * auto share one back-half state machine — no second restore path).
    */
   compactionEnforcer?: ClaudeCompactionEnforcer;
+  piCompactionService?: import("./domain/pi-compaction-service.js").PiCompactionService;
   /**
    * GHOST-STAGE (e/Class-B) — the canonical OccupantInvalidator, constructed once in startup and
    * injected so SeatHandoverService.commit()'s re-key call actually FIRES (dev-driver's fold added
@@ -354,6 +397,8 @@ export interface AppDeps {
   agentActivityStore?: AgentActivityStore;
   seatAttentionReconciler?: import("./domain/seat-attention-reconciler.js").SeatAttentionReconciler;
   activityHookToken?: string;
+  /** Slice 13: opted-in Claude seats' hook bridge (the waiters' routes and the seat preference). */
+  hookBridge?: import("./domain/hook-bridge.js").HookBridge;
   serviceOrchestrator?: import("./domain/service-orchestrator.js").ServiceOrchestrator;
   composeAdapter?: import("./adapters/compose-services-adapter.js").ComposeServicesAdapter;
   uiDistDir?: string | null;
@@ -439,6 +484,26 @@ function isUiAssetRequestPath(requestPath: string): boolean {
     || relativePath === "manifest.webmanifest";
 }
 
+/** Dedicated activity ingress. Never mount the host API or activity read routes here. */
+export function createGuestActivityApp(deps: AppDeps): Hono {
+  const app = new Hono();
+  app.use("*", async (c, next) => {
+    c.set("agentActivityStore" as never, deps.agentActivityStore);
+    c.set("sessionRegistry" as never, deps.sessionRegistry);
+    c.set("eventBus" as never, deps.eventBus);
+    c.set("seatActivityService" as never, deps.seatActivityService);
+    c.set("runtimeAdapters" as never, deps.runtimeAdapters ?? {});
+    c.set("tmuxAdapter" as never, deps.tmuxAdapter);
+    // Read only by the runner permission routes, the one other thing a grant can do on this router.
+    c.set("queueRepo" as never, deps.queueRepo);
+    c.set("rigRepo" as never, deps.rigRepo);
+    c.set("streamStore" as never, deps.streamStore);
+    await next();
+  });
+  app.route("/api/activity", guestActivityRoutes);
+  return app;
+}
+
 export function createApp(deps: AppDeps): Hono {
   // Hard runtime invariant: all domain services must share the same db handle.
   if (deps.rigRepo.db !== deps.eventBus.db) {
@@ -493,6 +558,29 @@ export function createApp(deps: AppDeps): Hono {
     throw new Error("createApp: podInstantiator must share the same db handle");
   }
 
+  const environmentPlatform = new EnvironmentPlatform(deps.rigRepo.db, deps.environmentDriver ?? new OpenShellDriver());
+  const environmentLifecycle = new EnvironmentLifecycle(environmentPlatform, deps.queueRepo,
+    deps.environmentStateRoot ?? nodePath.join(process.cwd(), ".openrig-environment-state"), async binding => {
+      const current = deps.sessionRegistry.getBindingForNode(binding.nodeId!);
+      if (!current?.tmuxSession || current.tmuxSession !== binding.seat) return { confirmed: false };
+      const result = await deps.tmuxAdapter.killSession(current.tmuxSession, () => {
+        const now = deps.sessionRegistry.getBindingForNode(binding.nodeId!);
+        if (now?.id !== current.id || now.tmuxSession !== current.tmuxSession) throw new Error("The selected viewer changed");
+      });
+      return { confirmed: result.ok || result.code === "session_not_found" };
+    });
+  let completionPending = false, completionDirty = false;
+  const requestCompletionCheck = () => {
+    completionDirty = true;
+    if (completionPending) return;
+    completionPending = true;
+    void (async () => {
+      while (completionDirty) { completionDirty = false; await environmentLifecycle.checkCompletions(); }
+    })().catch(() => {}).finally(() => { completionPending = false; });
+  };
+  deps.eventBus.subscribe(event => { if (event.type === "queue.updated") requestCompletionCheck(); });
+  // Reconcile durable selected completions after a daemon restart; construction itself invokes no provider.
+  queueMicrotask(requestCompletionCheck);
   const app = new Hono();
   if (deps.requestPhaseObserver) app.use("*", deps.requestPhaseObserver.middleware());
   // A malformed request body is a 400, not the default 500.
@@ -504,17 +592,23 @@ export function createApp(deps: AppDeps): Hono {
   // Inject dependencies into context for all routes
   app.use("*", async (c, next) => {
     c.set("rigRepo" as never, deps.rigRepo);
+    c.set("environmentPlatform" as never, environmentPlatform);
+    c.set("environmentLifecycle" as never, environmentLifecycle);
+    c.set("environmentArtifactRoot" as never, deps.environmentArtifactRoot ?? nodePath.join(process.cwd(), "artifacts", "environments"));
     c.set("sessionRegistry" as never, deps.sessionRegistry);
     c.set("eventBus" as never, deps.eventBus);
     c.set("nodeLauncher" as never, deps.nodeLauncher);
     c.set("startupOrchestrator" as never, deps.startupOrchestrator);
+    c.set("armSeatContinuity" as never, deps.armSeatContinuity);
     c.set("tmuxAdapter" as never, deps.tmuxAdapter);
+    c.set("listProcesses" as never, deps.listProcesses);
     c.set("tmuxOptionDefaults" as never, deps.tmuxOptionDefaults);
     c.set("sessionEnv" as never, deps.sessionEnv);
     c.set("runtimeSessionEnv" as never, deps.runtimeSessionEnv);
     c.set("cmuxAdapter" as never, deps.cmuxAdapter);
     // S10 — the in-daemon gateway subsystem handle (health surface + dispatch seam).
     c.set("gatewaySubsystem" as never, deps.gatewaySubsystem);
+    c.set("relayInboundHandler" as never, deps.relayInboundHandler);
     // Slice 24 — per-rig CMUX workspace launcher wiring.
     c.set(
       "cmuxLayoutService" as never,
@@ -551,6 +645,7 @@ export function createApp(deps: AppDeps): Hono {
     c.set("podBundleSourceResolver" as never, deps.podBundleSourceResolver);
     c.set("runtimeAdapters" as never, deps.runtimeAdapters ?? {});
     c.set("transcriptStore" as never, deps.transcriptStore);
+    c.set("runnerChannel" as never, deps.runnerChannel);
     c.set("sessionTransport" as never, deps.sessionTransport);
     c.set("askService" as never, deps.askService);
     c.set("wakeResolveService" as never, deps.wakeResolveService);
@@ -569,6 +664,7 @@ export function createApp(deps: AppDeps): Hono {
     c.set("watchdogHistoryLog" as never, deps.watchdogHistoryLog);
     c.set("watchdogPolicyEngine" as never, deps.watchdogPolicyEngine);
     c.set("watchdogScheduler" as never, deps.watchdogScheduler);
+    c.set("networkConnector" as never, deps.networkConnector);
     c.set("workflowRuntime" as never, deps.workflowRuntime);
     c.set("workflowBuiltinSpecsDir" as never, deps.workflowBuiltinSpecsDir);
     c.set("workflowsFolderDir" as never, deps.workflowsFolderDir);
@@ -601,12 +697,14 @@ export function createApp(deps: AppDeps): Hono {
     c.set("whoamiService" as never, deps.whoamiService);
     c.set("permissionDriftObserver" as never, permissionDriftObserver);
     c.set("contextUsageStore" as never, deps.contextUsageStore);
+    c.set("currentModelReader" as never, deps.currentModelReader);
     c.set("healthProjection" as never, deps.healthProjection);
     c.set("healthDiagnosis" as never, deps.healthDiagnosis);
     c.set("healthPolicy" as never, deps.healthPolicy);
     c.set("healthCheckpoints" as never, deps.healthCheckpoints);
     c.set("contextMonitor" as never, deps.contextMonitor);
     c.set("compactionEnforcer" as never, deps.compactionEnforcer);
+    c.set("piCompactionService" as never, deps.piCompactionService);
     c.set("occupantInvalidator" as never, deps.occupantInvalidator);
     c.set("nodeCmuxService" as never, deps.nodeCmuxService);
     c.set("agentActivityStore" as never, deps.agentActivityStore);
@@ -617,6 +715,7 @@ export function createApp(deps: AppDeps): Hono {
     c.set("seatActivityService" as never, deps.seatActivityService);
     c.set("seatStructuralActivityService" as never, deps.seatStructuralActivityService);
     c.set("activityHookToken" as never, deps.activityHookToken);
+    c.set("hookBridge" as never, deps.hookBridge);
     c.set("serviceOrchestrator" as never, deps.serviceOrchestrator);
     c.set("composeAdapter" as never, deps.composeAdapter);
     c.set("kernelBootTracker" as never, deps.kernelBootTracker);
@@ -641,6 +740,12 @@ export function createApp(deps: AppDeps): Hono {
   if (deps.slowOpRecorder?.recordRequest) {
     app.use("*", createSlowOpRequestMiddleware(deps.slowOpRecorder));
   }
+  // Mutation trace: same registration seam and isolation contract as the request-timing
+  // observer above — registered only when the trace is turned on (opt-in), and it rides
+  // the recorder's bounded diagnostics path rather than writing on the request thread.
+  if (deps.mutationTrace) {
+    app.use("*", createMutationTraceMiddleware(deps.mutationTrace));
+  }
 
   // Browser boundary: target name and browser Origin, checked once per /api request
   // (WebSocket upgrades included), before the remote read-through and every route.
@@ -663,12 +768,15 @@ export function createApp(deps: AppDeps): Hono {
 
   app.get("/healthz", (c) => {
     // OPR.0.4.3.21 — enrich the health surface with event-loop wedge evidence
-    // when the monitor is wired. Absent monitor keeps the exact legacy body so
-    // existing probes / tests that assert `{ status: "ok" }` are unchanged.
+    // when the monitor is wired. Process identity is additive with or without the monitor.
     // OPR.0.4.4.11 FR-7 — a STAMPED build additionally carries
     // {semver, commit, dirty, builtAt}; dev runs add NOTHING (stampFields is
     // {} without a stamp — no invented identity, legacy bodies preserved).
     const stamp = stampFields();
+    // Self-report for the optional CLI effective-user check, not authentication.
+    const euid = process.geteuid?.();
+    const databaseContext = deps.databaseWarnings?.length ? { databaseWarnings: deps.databaseWarnings } : {};
+    const processIdentity = { ...databaseContext, pid: process.pid, ...(euid === undefined ? {} : { euid }) };
     // 51-09 increment 3 (arch ruling 2e1b737f; local always-suffix rendering since
     // superseded by the 2026-08-27 root invariant) — expose the daemon's boot-reconciled
     // self-host id so the CLI edge can detect cross-host targets, self-resolve a
@@ -702,13 +810,29 @@ export function createApp(deps: AppDeps): Hono {
     // S01 — the wake ladder's heartbeat is half of the operator rung's honest delivery
     // floor (escalation view + daemon-health); same additive contract.
     const wakeLadder = deps.wakeLadderStatus ? { wakeLadder: deps.wakeLadderStatus.snapshot() } : {};
+    // #3315 — the daemon answering (status "ok") is not its terminals answering: `terminals` says whether its tmux
+    // server is reachable, from memory, without calling tmux. ADDITIVE; absent = legacy body.
+    const terminals = deps.terminalReachability ? { terminals: deps.terminalReachability.snapshot() } : {};
+    // Health is unauthenticated: report only a conservative executable name, never arguments or paths.
+    const backgroundWork = (() => {
+      if (!deps.seatIdentityReconciler) return {};
+      try {
+        return { backgroundWork: deps.seatIdentityReconciler.backgroundWorkUnknown()
+          .map(({ processes, ...item }) => ({ ...item, processes: processes.map(({ pid, startedAt, command }) => {
+            const executable = nodePath.basename(command.trim().split(/\s+/, 1)[0] ?? "");
+            return { pid, startedAt, command: /^[a-zA-Z0-9._+-]{1,128}$/.test(executable) ? executable : "unknown" };
+          }) })) };
+      } catch {
+        return { backgroundWorkUnavailable: true };
+      }
+    })();
     if (!monitor) {
-      return c.json({ status: "ok", pid: process.pid, ...stamp, ...selfHost, ...slowOperations, ...bind, ...stuckSweep, ...wakeLadder });
+      return c.json({ status: "ok", ...processIdentity, ...stamp, ...selfHost, ...slowOperations, ...bind, ...stuckSweep, ...wakeLadder, ...terminals, ...backgroundWork });
     }
     const eventLoop = monitor.snapshot();
     return c.json({
       status: "ok",
-      pid: process.pid,
+      ...processIdentity,
       ...stamp,
       ...selfHost,
       eventLoop,
@@ -717,10 +841,22 @@ export function createApp(deps: AppDeps): Hono {
       ...bind,
       ...stuckSweep,
       ...wakeLadder,
+      ...backgroundWork,
+      ...terminals,
     });
   });
 
   app.route("/api/rigs", rigsRoutes);
+  app.route("/api/rigs/:rigId/delivery-drain", rigDeliveryDrainRoutes);
+  app.get("/api/operations/capabilities", (c) => c.json({ contract: OPERATION_CONTRACT, kinds: OPERATION_KINDS }));
+  app.get("/api/team-operations/capabilities", (c) => c.json(teamOperationsCapabilities()));
+  // What each delivery route declares it supports, and with ?session=, the route and declaration of the member that
+  // address names.
+  app.get("/api/member-connection/capabilities", (c) => {
+    const member = c.req.query("session")?.trim();
+    return c.json({ contract: MEMBER_CONNECTION_CONTRACT, routes: ROUTE_DECLARATIONS,
+      ...(member ? { member: resolveMemberConnection(deps.rigRepo.db, deps.queueRepo, member) } : {}) });
+  });
   app.route("/api/rigs/:rigId/sessions", sessionsRoutes);
   // Slice 24 — per-rig CMUX workspace launcher.
   app.route("/api/rigs/:rigId/cmux", rigCmuxRoutes);
@@ -757,7 +893,8 @@ export function createApp(deps: AppDeps): Hono {
     const ws = createNodeWebSocket({ app });
     injectWebSocket = ws.injectWebSocket as never;
     _lastInjectWebSocket = injectWebSocket;
-    registerTerminalWs(app, ws.upgradeWebSocket as never, { bearerToken: deps.terminalBearerToken ?? null });
+    registerTerminalWs(app, ws.upgradeWebSocket as never, { bearerToken: deps.terminalBearerToken ?? null,
+      fixedGeometry: () => deps.settingsStore?.resolveOne("terminal.fixed_geometry").value === true });
   } else if (deps.enableNodeWebSocket) {
     registerTerminalAuthOnly(app, { bearerToken: deps.terminalBearerToken ?? null });
   }
@@ -774,11 +911,14 @@ export function createApp(deps: AppDeps): Hono {
   app.route("/api/agent-images", agentImagesRoutes({
     specRoots: deps.agentImageSpecRoots ?? (() => []),
   }));
+  app.route("/api/community-harnesses", communityHarnessesRoutes());
   app.route("/api/whoami", whoamiRoutes());
   // Slice-04 OPR.0.5.0.4: registered so the endpoints exist and 503 honestly; the providerService
   // is not set in context until the collection/service seam (C) wires it (until then -> 503).
   app.route("/api/provider", providerRoutes());
+  app.route("/api/environments", environmentRoutes);
   app.route("/api/seat", seatRoutes);
+  app.route("/api/hook-bridge", hookBridgeRoutes);
   app.route("/api/rigs/:rigId/chat", chatRoutes());
   app.route("/api/stream", streamRoutes());
   app.route("/api/queue", queueRoutes());
@@ -787,6 +927,10 @@ export function createApp(deps: AppDeps): Hono {
   app.route("/api/views", viewsRoutes());
   app.route("/api/watchdog", watchdogRoutes());
   app.route("/api/workflow", workflowRoutes());
+  const coreAppAccess = deps.queueRepo ? new CoreAppAccess(deps.queueRepo.db, deps.queueRepo) : undefined;
+  app.route("/api/apps", coreAppRoutes({ access: coreAppAccess, operatorToken: deps.missionControlBearerToken,
+    job: coreAppAccess && deps.queueRepo && deps.missionControlWriteContract
+      ? new CoreAppJob(coreAppAccess, deps.queueRepo, deps.eventBus, deps.missionControlWriteContract, new MissionControlActionLog(deps.queueRepo.db)) : undefined }));
   app.route(
     "/api/mission-control",
     missionControlRoutes({ bearerToken: deps.missionControlBearerToken ?? null }),
@@ -799,6 +943,9 @@ export function createApp(deps: AppDeps): Hono {
     "/api/hosts",
     hostsRoutes({ bearerToken: deps.missionControlBearerToken ?? null }),
   );
+  // A selected local seat's connections to a remote hub (`rig network`): bindings, status and disconnect. Its writes carry
+  // a participant's token, so they take the same operator-bearer posture as the hosts routes.
+  app.route("/api/network", networkRoutes({ bearerToken: deps.missionControlBearerToken ?? null }));
   // Slice Story View v0 — slice indexer + per-tab payload routes.
   app.route("/api/slices", slicesRoutes());
   // Living Notes Packet 2 (OPR.0.4.4.20) — composed-review read contract.
@@ -806,7 +953,7 @@ export function createApp(deps: AppDeps): Hono {
   // OPR.0.4.6.02 C3 — the canonical non-rig-scoped terminal composer + the
   // rig-scoped thin alias (composes view=rig:<rigId>, delegates to the same
   // TerminalService; arch R1 / guard b1).
-  app.route("/api/terminal", terminalRoutes());
+  app.route("/api/terminal", terminalRoutes({ bearerToken: deps.terminalBearerToken ?? null }));
   app.route("/api/rigs/:rigId/terminal", rigTerminalRoutes);
   // V0.3.1 slice 12 walk-item 1 — mission scope data layer
   // (aggregated mission metadata + slices filter; pairs with
@@ -831,7 +978,14 @@ export function createApp(deps: AppDeps): Hono {
   app.route("/api/attention", attentionRoutes());
   app.route("/api/health-diagnosis", healthDiagnosisRoutes());
   // S10 — gateway subsystem admin (slack enable/disable with the seeding rule preserved).
-  app.route("/api/gateway", gatewayRoutes());
+  // A shared Slack app's relay carries the token `rig host pair` issued: this daemon's auth bearer.
+  app.route(
+    "/api/gateway",
+    gatewayRoutes({
+      relayBearerToken: deps.missionControlBearerToken ?? null,
+      relayInboundHandler: deps.relayInboundHandler,
+    }),
+  );
   app.route("/api/rigs/:rigId/env", envRoutes());
   app.route("/api/restore-check", restoreCheckRoutes);
   // Slice 09 (OPR.0.3.2.9) — rig-policy bindings (operator context mode).

@@ -1,4 +1,5 @@
 import { helpScreen } from "./commands/help.js";
+import { replaceControlCharacters, stripTerminalEscapes, terminalSafeText } from "./terminal-safe-text.js";
 import { commandFocusVisible } from "./motion.js";
 import { attentionLines } from "./attention/attention-model.js";
 import { fileLines, externalLines, fileTargetForPath, referenceLines, referenceAction } from "./reading.js";
@@ -6,6 +7,9 @@ import { DEFAULT_TIME_ZONE, displayTime } from "./time.js";
 import { startupLines, type StartupState } from "./startup.js";
 import { configLines } from "./config/config-model.js";
 import { connectionsLines } from "./connections/connections-model.js";
+import { usageLines } from "./usage/usage-model.js";
+import { usageHostsLines } from "./usage/usage-hosts-model.js";
+import { costLines } from "./cost/cost-model.js";
 // Hand-rolled ANSI renderer (Phase-0 substrate decision). Pure function:
 // (state, snapshot) → {lines, hitMap, explorerRows}. BOTH panes emit hit
 // targets — explorer rows AND content-pane surfaces (table rows, view tabs,
@@ -14,6 +18,7 @@ import { connectionsLines } from "./connections/connections-model.js";
 // swap touches only this module (spike verdict revisit trigger).
 import { computeExplorerRows, findAgent, findSpec, findAgentBySession, agentsRunningSpec, agentsRunningSpecTargets, specDetailArrowsScroll } from "./state.js";
 import { scopesContentLines } from "./scopes/scopes-model.js";
+import { fleetScopesLines } from "./scopes/fleet-scopes-model.js";
 import { executionContentLines, executionSliceStripLines } from "./execution/execution-model.js";
 import { navigatorDisplay } from "./navigator.js";
 import { specGraph } from "./specs/graph.js";
@@ -27,13 +32,15 @@ import { buildLedgerExplorer } from "./crash-cart/ledger-explorer.js";
 import type { CrashCartModel } from "./crash-cart/crash-cart-model.js";
 import type { DaemonState, DaemonUnverifiedEvidence } from "./crash-cart/contract.js";
 import { runtimeMarkSegs } from "./topology/runtime-marks.js";
+import { hostLabel, hostReachabilityLabel } from "./topology/host-label.js";
+import { connectedAssistantLines } from "./connected-assistants.js";
 import { barCells, flashActive, reducedMotion, spinnerFrame } from "./motion.js";
-import { explorerWidth, MOTION_FRAME_MS } from "./visual-layout.js";
+import { columnIndex, columns, explorerWidth, MOTION_FRAME_MS } from "./visual-layout.js";
 import type { ColorMode, Token } from "./theme.js";
 import { terminalLines } from "./terminals/terminal-model.js";
 import { detailPage, fieldLine, sectionRule, listItem, alignedRow, LABEL_W, wrapDetailLines } from "./detail.js";
 import { healthAgentLines, healthDetailLines, healthListLines, healthSummaryLine } from "./health/health-model.js";
-import type { Action, FleetSnapshot, LoadState, NeedsItem, RecentTransitionSnap, RowFlash, Screen, ViewState } from "./types.js";
+import type { Action, FleetSnapshot, LoadState, NeedsItem, RecentTransitionSnap, RowFlash, Screen, SeatEffortRead, ViewState } from "./types.js";
 
 interface ContentLine {
   text: string;
@@ -44,23 +51,59 @@ interface ContentLine {
   zones?: Array<{ start: number; end: number; action: Action }>;
   /** slice-17: token segments for canvas-rendered rows (graph view) */
   segs?: Array<{ text: string; token?: import("./theme.js").Token; bold?: boolean; bg?: import("./theme.js").Token }>;
+  /** Row of a labelled group. The first visible row of each group shows `text` when set, so a scrolled group keeps its label. */
+  sticky?: { group: string; text?: string };
+}
+
+/** `text` in exactly `width` columns; a wide character that doesn't fit before the ellipsis leaves a space. */
+function fit(text: string | number | null | undefined, width: number, align: Align): string {
+  const t = String(text ?? "");
+  // never hard-clip mid-word: any truncation reads as an ellipsis (glance honesty)
+  const shown = columns(t) <= width ? t : t.slice(0, columnIndex(t, Math.max(width - 1, 0))) + "…";
+  const fill = " ".repeat(Math.max(width - columns(shown), 0));
+  return align === "right" ? fill + shown : shown + fill;
 }
 
 function pad(text: string | number | null | undefined, width: number): string {
-  const t = String(text ?? "");
-  if (t.length <= width) return t + " ".repeat(width - t.length);
-  // never hard-clip mid-word: any truncation reads as an ellipsis (glance honesty)
-  return t.slice(0, Math.max(width - 1, 0)) + "…";
+  return fit(text, width, "left");
 }
 
 function padLeft(text: string | number | null | undefined, width: number): string {
-  const t = String(text ?? "");
-  if (t.length <= width) return " ".repeat(width - t.length) + t;
-  return t.slice(0, Math.max(width - 1, 0)) + "…";
+  return fit(text, width, "right");
+}
+
+const commandGraphemes = new Intl.Segmenter();
+
+function commandViewport(draft: string, cols: number, caret = draft.length): string {
+  const prefix = "cmd ▸ ";
+  if (!draft) return `${prefix}▊`;
+  const budget = cols - columns(prefix) - 1;
+  if (budget <= 0) return `${prefix.slice(0, Math.max(0, cols - 1))}▊`;
+
+  const segments = commandGraphemes.segment(draft);
+  const point = segments.containing(caret)?.index ?? draft.length;
+  const after = draft.slice(point);
+  const afterWidth = columns(after);
+  const beforeWidth = columns(draft.slice(0, point));
+  const rightContext = Math.min(afterWidth, Math.floor(budget / 2));
+  let left = budget - rightContext - 1;
+  let start = point;
+  if (beforeWidth <= budget) {
+    start = 0;
+  } else {
+    for (let part = segments.containing(start - 1); part; part = segments.containing(start - 1)) {
+      left -= columns(part.segment);
+      if (left < 0) break;
+      start = part.index;
+    }
+  }
+  const before = (start > 0 ? "…" : "") + draft.slice(start, point);
+  const right = budget - columns(before);
+  return `${prefix}${before}▊${right > 0 ? pad(after, right) : ""}`;
 }
 
 type Align = "left" | "right";
-type AgentColumnKey = "rig" | "pod" | "seat" | "runtime" | "model" | "context" | "status" | "queue" | "work" | "now" | "actions";
+type AgentColumnKey = "rig" | "pod" | "seat" | "runtime" | "model" | "effort" | "context" | "status" | "queue" | "work" | "now" | "actions";
 type AgentColumn = [key: AgentColumnKey, name: string, width: number, align: Align];
 
 function columnsWidth(columns: AgentColumn[]): number {
@@ -70,14 +113,14 @@ function columnsWidth(columns: AgentColumn[]): number {
 function agentColumns(contentWidth: number): AgentColumn[] {
   if (contentWidth >= 110) return [
     ["pod", "POD", 8, "left"], ["seat", "SEAT", 15, "left"], ["runtime", "RT", 4, "left"],
-    ["model", "MODEL", 12, "left"], ["context", "CTX", 8, "right"], ["status", "STATE", 11, "left"],
-    ["queue", "Q", 3, "right"], ["work", "WORK", 15, "left"], ["now", "NOW", 27, "left"],
+    ["model", "MODEL", 12, "left"], ["effort", "CFG EFF", 7, "left"], ["context", "CTX", 8, "right"], ["status", "STATE", 11, "left"],
+    ["queue", "Q", 3, "right"], ["work", "WORK", 15, "left"], ["now", "NOW", 19, "left"],
     ["actions", "ACTIONS", 14, "left"],
   ];
   if (contentWidth >= 88) return [
-    ["pod", "POD", 6, "left"], ["seat", "SEAT", 12, "left"], ["runtime", "RT", 3, "left"],
-    ["model", "MODEL", 8, "left"], ["context", "CTX", 6, "right"], ["status", "STATE", 9, "left"],
-    ["queue", "Q", 2, "right"], ["work", "WORK", 8, "left"], ["now", "NOW", 11, "left"],
+    ["pod", "POD", 5, "left"], ["seat", "SEAT", 10, "left"], ["runtime", "RT", 3, "left"],
+    ["model", "MODEL", 8, "left"], ["effort", "CFG", 4, "left"], ["context", "CTX", 6, "right"], ["status", "STATE", 9, "left"],
+    ["queue", "Q", 2, "right"], ["work", "WORK", 6, "left"], ["now", "NOW", 11, "left"],
     ["actions", "ACTIONS", 14, "left"],
   ];
   // At 84x28 the L2 content pane is 58 cells. The three explicitly deferred
@@ -90,17 +133,24 @@ function agentColumns(contentWidth: number): AgentColumn[] {
   ];
 }
 
-function instanceAgentColumns(contentWidth: number): AgentColumn[] {
-  if (contentWidth >= 110) return [
-    ["rig", "RIG", 13, "left"], ["pod", "POD", 8, "left"], ["seat", "SEAT", 14, "left"],
-    ["runtime", "RT", 3, "left"], ["context", "CTX", 7, "right"], ["status", "STATE", 10, "left"],
-    ["queue", "Q", 2, "right"], ["work", "WORK", 12, "left"], ["now", "NOW", Math.max(18, contentWidth - 78), "left"],
-  ];
-  if (contentWidth >= 78) return [
-    ["rig", "RIG", 10, "left"], ["pod", "POD", 6, "left"], ["seat", "SEAT", 12, "left"],
-    ["runtime", "RT", 3, "left"], ["context", "CTX", 5, "right"], ["status", "STATE", 9, "left"],
-    ["queue", "Q", 2, "right"], ["work", "WORK", Math.max(8, contentWidth - 54), "left"],
-  ];
+/** RIG fits the longest rig name shown, between the tier's old width and its cap; NOW or WORK gives up the difference. */
+function instanceAgentColumns(contentWidth: number, longestRigName = 0): AgentColumn[] {
+  if (contentWidth >= 110) {
+    const rig = Math.min(Math.max(longestRigName, 13), 24);
+    return [
+      ["rig", "RIG", rig, "left"], ["pod", "POD", 8, "left"], ["seat", "SEAT", 14, "left"],
+      ["runtime", "RT", 3, "left"], ["context", "CTX", 7, "right"], ["status", "STATE", 10, "left"],
+      ["queue", "Q", 2, "right"], ["work", "WORK", 12, "left"], ["now", "NOW", Math.max(18, contentWidth - 78 - (rig - 13)), "left"],
+    ];
+  }
+  if (contentWidth >= 78) {
+    const rig = Math.min(Math.max(longestRigName, 10), 16);
+    return [
+      ["rig", "RIG", rig, "left"], ["pod", "POD", 6, "left"], ["seat", "SEAT", 12, "left"],
+      ["runtime", "RT", 3, "left"], ["context", "CTX", 5, "right"], ["status", "STATE", 9, "left"],
+      ["queue", "Q", 2, "right"], ["work", "WORK", Math.max(8, contentWidth - 54 - (rig - 10)), "left"],
+    ];
+  }
   const fixed = 8 + 5 + 11 + 2 + 5 + 8 + 2 + 7;
   return [
     ["rig", "RIG", 8, "left"], ["pod", "POD", 5, "left"], ["seat", "SEAT", 11, "left"],
@@ -125,6 +175,104 @@ function runtimeShort(runtime: string): string {
 function tableModel(model: string | null | undefined): string {
   return model?.replace(/^claude-/i, "") || "—";
 }
+
+/** Table cell for the CONFIGURED value only. A trailing mark names its source:
+ *  `*` the seat's saved choice, `+` the authored value. `—` = no configured level
+ *  (runtime default); `?` = the daemon did not report one (older daemon / read gap).
+ *  A value compacts only when the mark would otherwise overflow the cell. */
+const CONFIGURED_MARK: Record<string, string> = { seat_choice: "*", authored: "+" };
+const COMPACT_EFFORT: Record<string, string> = { high: "hi", medium: "med", xhigh: "xhi", minimal: "min", none: "no" };
+
+function tableEffort(
+  effort: string | null | undefined,
+  source: "seat_choice" | "authored" | "runtime_default" | null | undefined,
+  width: number,
+): string {
+  const value = effort?.trim();
+  if (!value) return source === "runtime_default" ? "—" : "?";
+  const mark = source ? CONFIGURED_MARK[source] ?? "" : "";
+  if (value.length + mark.length <= width) return `${value}${mark}`;
+  const compact = COMPACT_EFFORT[value] ?? value;
+  return `${compact.slice(0, Math.max(0, width - mark.length))}${mark}`;
+}
+
+/** The report-level reason when the whole read is unavailable; null when it answered. */
+function effortReportStatus(report: SeatEffortRead | null): string | null {
+  if (!report) return "report not read";
+  if (report.ok !== true) return `report refused ${report.code ?? "unknown_code"}`;
+  return null;
+}
+
+/** requested: the last saved choice request. null (no event) and an explicit clear differ. */
+function effortRequestedText(report: SeatEffortRead | null): string {
+  if (!report || report.ok !== true) return "unknown";
+  if (!report.requested) return "never set";
+  return report.requested.value == null ? "cleared" : report.requested.value;
+}
+
+/** The configured side. The report's saved resolution is authoritative; the node
+ *  inventory (same resolver) fills in when the report was not read. */
+function effortSavedText(
+  report: SeatEffortRead | null,
+  agent: { effort?: string | null; effortSource?: "seat_choice" | "authored" | "runtime_default" | null },
+): string {
+  const saved = report?.ok === true ? report.saved : undefined;
+  if (saved?.effective) {
+    if (saved.source === "seat_choice") {
+      const authored = saved.authored && saved.authored !== saved.effective ? `; authored ${saved.authored}` : "";
+      return `${saved.effective} (seat choice${authored})`;
+    }
+    if (saved.source === "authored") return `${saved.effective} (authored)`;
+    return `${saved.effective} (source ${saved.source ?? "not reported"})`;
+  }
+  if (saved?.source === "runtime_default") return "none (runtime default)";
+  if (agent.effort) {
+    const source = agent.effortSource === "seat_choice" ? "seat choice"
+      : agent.effortSource === "authored" ? "authored"
+      : "source not reported";
+    return `${agent.effort} (${source}; node inventory)`;
+  }
+  if (agent.effortSource === "runtime_default") return "none (runtime default; node inventory)";
+  return "unknown";
+}
+
+/** emitted: the flag the running process was launched with, never a saved value. */
+function effortEmittedText(report: SeatEffortRead | null): string {
+  if (!report || report.ok !== true) return "unknown";
+  const emitted = report.emitted;
+  if (!emitted || emitted.state !== "observed") return "unknown";
+  const value = emitted.value == null ? "no flag" : emitted.value;
+  return emitted.matchesSaved === false ? `${value} (differs from saved)` : value;
+}
+
+/** The native side. "applied" appears only for outcome `accepted`: every other
+ *  outcome leaves the applied level unproven or judged not taken. */
+function effortObservedText(report: SeatEffortRead | null): string {
+  if (!report || report.ok !== true) return "unknown";
+  const observed = report.observed;
+  if (!observed || observed.state !== "observed") return "unknown";
+  const value = observed.value ?? "—";
+  const outcome = observed.outcome ?? "not reported";
+  const wording = outcome === "accepted" ? "accepted — applied"
+    : outcome === "recorded" ? "recorded; applied not proven"
+    : outcome === "rejected" ? "rejected — not taken"
+    : outcome === "failed" || outcome === "interrupted" || outcome === "pending" ? `${outcome} — not judged`
+    : `outcome ${outcome}`;
+  const differs = observed.matchesEmitted === false ? "; differs from launch" : "";
+  return `${value} (${wording}${differs})`;
+}
+
+/** One wrapped row: the four values stay labelled and distinguishable. */
+function effortDetailText(
+  report: SeatEffortRead | null,
+  agent: { effort?: string | null; effortSource?: "seat_choice" | "authored" | "runtime_default" | null },
+): string {
+  const status = effortReportStatus(report);
+  return `requested ${effortRequestedText(report)} · saved ${effortSavedText(report, agent)} · emitted ${effortEmittedText(report)} · observed ${effortObservedText(report)}${status ? ` · ${status}` : ""}`;
+}
+
+/** One line under the table naming what the column holds: configured, never observed. */
+const EFFORT_LEGEND = "EFFORT (configured): * seat choice · + authored · — none · ? unknown; observed on drill";
 
 function contextCompact(value: number | null, narrow: boolean): string {
   if (value == null) return "—";
@@ -166,7 +314,7 @@ function queueFacts(snap: FleetSnapshot, session: string | null | undefined): { 
     rows.push({ role, row });
   }
   const primary = rows[0];
-  if (!primary) return { count: 0, work: "—", now: "—" };
+  if (!primary) return { count: 0, work: queueIncomplete(snap) ? "unknown" : "—", now: queueIncomplete(snap) ? "not in sample" : "—" };
   const slice = primary.row.tags?.find((tag) => tag.startsWith("slice:"))?.slice("slice:".length);
   const work = slice?.match(/^OPR(?:\.\d+){3}\.(\d+)$/)?.[1]
     ? `S${slice.slice(slice.lastIndexOf(".") + 1)}`
@@ -174,6 +322,22 @@ function queueFacts(snap: FleetSnapshot, session: string | null | undefined): { 
   const summary = primary.row.summary?.trim() || primary.row.body.split("\n").find((line) => line.trim())?.trim() || primary.row.qitemId;
   const now = primary.role === "working" ? summary : `${primary.role} · ${summary}`;
   return { count: rows.length, work, now };
+}
+
+function queueIncomplete(snap: FleetSnapshot): boolean {
+  return snap.queueCoverage === "partial" || snap.queueCoverage === "unavailable" || snap.queueCoverage === "pending";
+}
+
+function queueCount(snap: FleetSnapshot, count: number): string | number {
+  return queueIncomplete(snap) ? count ? `${count}+` : "?" : count || "·";
+}
+
+function queueSampleLines(snap: FleetSnapshot, width: number): ContentLine[] {
+  return queueIncomplete(snap) ? wrapDetailLines([
+    { text: snap.queueCoverage === "pending" ? "Queue lists pending: read after the rigs and seats."
+      : snap.queueCoverage === "unavailable" ? "Queue sample incomplete: a list read failed." : "Queue sample may be incomplete: a list reached its cap." },
+    { text: "Counts are lower bounds; unlisted work is unknown." },
+  ], width) : [];
 }
 
 function number(value: number | null | undefined): string {
@@ -214,8 +378,8 @@ function rowsForAgent(snap: FleetSnapshot, session: string, sources: Array<Fleet
   return rows;
 }
 
-function workRows(rows: FleetSnapshot["attention"], width: number): ContentLine[] {
-  if (rows.length === 0) return [fieldLine({ label: "rows", value: "none in the served bounded lists" })];
+function workRows(rows: FleetSnapshot["attention"], width: number, incomplete = false): ContentLine[] {
+  if (rows.length === 0) return [fieldLine({ label: "rows", value: incomplete ? "not in sample; work unknown" : "none in the served bounded lists" })];
   return rows.flatMap((row) => {
     const summary = row.summary?.trim() || row.body.split("\n").find((line) => line.trim())?.trim() || "no summary served";
     return [
@@ -239,7 +403,7 @@ function agentDetailLines(
   const pendingRows = session ? rowsForAgent(snap, session, [snap.pending]) : [];
   const recentRows = session ? rowsForAgent(snap, session, [snap.recentlyFinished]) : [];
   const needs = session ? snap.needs.filter((item) => item.target === session) : [];
-  const visibleAssigned = currentRows.length + pendingRows.length;
+  const visibleAssigned = new Set([...currentRows, ...pendingRows].map(row => row.qitemId)).size;
   const assigned = agent.assignedWorkCount ?? visibleAssigned;
   const pending = agent.pendingWorkCount ?? pendingRows.length;
   const inProgress = agent.inProgressWorkCount ?? currentRows.filter((row) => row.state === "in-progress").length;
@@ -256,7 +420,18 @@ function agentDetailLines(
     ...runtimeMarkSegs(agent.runtime),
   ];
   const runtimeLine: ContentLine = { text: rtSegs.map((segment) => segment.text).join(""), segs: rtSegs };
+  const effortReport = snap.seatEffort && snap.seatEffort.seatRef === `${agent.name}@${rig.name}`
+    ? snap.seatEffort.report
+    : null;
+  // A remote agent's page is a read-only view: actions that only work for a
+  // local seat (opening its terminal, cross-drilling its spec) are left out
+  // rather than offered as dead ends; identity, state and context stay.
+  const localSeat = found.host === snap.hosts[0];
   const activityReason = agent.activity?.needsInput?.reason ?? agent.activity?.signalReason ?? null;
+  const attention = agent.needsAttention == null ? "unknown" : agent.needsAttention ? "needed" : "not raised";
+  const rawInputSource = agent.activity?.signalSource === "runtime_hook" ? "hook"
+    : agent.activity?.signalSource === "pane_heuristic" ? "pane" : "unknown";
+  const inputEvidence = agent.arbitratedNeedsInput == null ? (agent.activity?.signalState === "needs_input" ? rawInputSource : "absent") : `${agent.arbitratedNeedsInput ? "observed input" : "observed clear"}${agent.needsInputEvidence ? ` · ${agent.needsInputEvidence.rung} · ${displayTime(agent.needsInputEvidence.observedAt, timeZone)}` : ""}`;
   const needsRows = needs.length > 0
     ? needs.flatMap((item) => [
       ...wrapDetailValue("qitem", item.qitemId ?? "no actionable qitem id served", contentWidth),
@@ -276,14 +451,24 @@ function agentDetailLines(
           fieldLine({ label: "meter", value: context == null ? "— (not yet known)" : `${context}% used  ${barCells(context / 100, meterWidth)}` }),
           fieldLine({ label: "tokens", value: `${number(agent.totalInputTokens)} input · ${number(agent.totalOutputTokens)} output · ${number(agent.contextWindowSize)} window` }),
           runtimeLine,
+          // #1347 — four values stay distinguishable on one wrapped row. "applied"
+          // appears only for outcome `accepted`; unknowns stay unknown. The
+          // effort report is this host's read — a remote seat has none here.
+          ...(localSeat ? wrapDetailValue("effort", effortDetailText(effortReport, agent), contentWidth) : []),
           ...(agent.attach ? [fieldLine({ label: "attach", value: agent.attach })] : []),
-          fieldLine({ label: "terminal", value: `Open terminals ▸ pod ${pod.name}`, link: { type: "act", act: "open-terminal", view: `pod:${rig.name}/${pod.name}` } }),
+          ...(localSeat && (agent.canRun ?? !agent.live)
+            ? [fieldLine({ label: "action", value: "run ▸", link: { type: "act", act: "run", rigId: rig.id ?? rig.name, agent: agent.name } })]
+            : []),
+          // The agent page opens just this agent; the pod and rig pages open theirs.
+          ...(localSeat
+            ? [fieldLine({ label: "terminal", value: `Open terminal ▸ ${agent.name}`, link: { type: "act", act: "open-terminal", view: `seat:${rig.name}/${agent.name}` } })]
+            : [fieldLine({ label: "terminal", value: `on ${hostLabel(found.host)} · read-only view — open it there` })]),
         ],
       },
       {
         title: "CURRENT ACTIVITY",
         fields: [
-          { label: "activity", value: agent.activity?.activity ?? agent.status },
+          { label: "activity", value: `${agent.activity?.activity ?? agent.status} · attention ${attention} · needs-input evidence ${inputEvidence}` },
           ...(activityReason ? [{ label: "reason", value: activityReason }] : []),
           ...(agent.activity?.decidedBy ? [{ label: "decided by", value: agent.activity.decidedBy }] : []),
           ...(agent.activity?.signalSource || agent.activity?.signalReason ? [{ label: "signal", value: `${agent.activity.signalSource ?? "unknown"} · ${agent.activity.signalReason ?? "no reason"}` }] : []),
@@ -300,33 +485,48 @@ function agentDetailLines(
           local: found.host === snap.hosts[0],
         }, contentWidth),
       },
-      { title: `CURRENT WORK · ${currentRows.length}`, lines: workRows(currentRows, contentWidth) },
+      // CURRENT WORK / UP NEXT / NEEDS YOU / RECENTLY FINISHED match this
+      // host's queue by session name — a remote seat's page must not show
+      // them as if they were the remote agent's; read-only identity, state
+      // and context only.
+      ...(localSeat ? [{ title: `CURRENT WORK · ${currentRows.length}${queueIncomplete(snap) ? " sampled" : ""}`, lines: workRows(currentRows, contentWidth, queueIncomplete(snap)) }] : []),
       {
         title: "QUEUE",
-        lines: [
-          ...wrapDetailValue("depth", `${assigned} assigned · ${pending} pending · ${inProgress} in progress · ${blocked} blocked`, contentWidth),
+        lines: localSeat ? [
+          ...queueSampleLines(snap, contentWidth),
+          ...wrapDetailValue("depth", `${agent.assignedWorkCount == null && queueIncomplete(snap) ? `${assigned}+` : assigned} assigned · ${agent.pendingWorkCount == null && queueIncomplete(snap) ? `${pending}+` : pending} pending · ${agent.inProgressWorkCount == null && queueIncomplete(snap) ? `${inProgress}+` : inProgress} in progress · ${agent.blockedWorkCount == null && queueIncomplete(snap) ? `${blocked}+` : blocked} blocked`, contentWidth),
           ...(agent.assignedWorkCount == null ? wrapDetailValue("basis", `${visibleAssigned} rows visible in bounded list reads; complete count not served`, contentWidth) : []),
+        ] : [
+          // A remote seat's counts are its own host's inventory when it serves
+          // them — "not served" when it doesn't. Never this host's queue
+          // matched by session name, and no local sample note or basis line.
+          ...wrapDetailValue("depth", agent.assignedWorkCount == null
+            ? "not served by the remote inventory"
+            : `${agent.assignedWorkCount} assigned · ${agent.pendingWorkCount ?? "—"} pending · ${agent.inProgressWorkCount ?? "—"} in progress · ${agent.blockedWorkCount ?? "—"} blocked`, contentWidth),
         ],
       },
-      { title: `UP NEXT · ${pending}`, lines: workRows(pendingRows, contentWidth) },
-      { title: `NEEDS YOU · ${needs.length || agent.activity?.needsInput?.count || 0}`, lines: needsRows },
-      ...(recentRows.length ? [{ title: "RECENTLY FINISHED · bounded window", lines: workRows(recentRows, contentWidth) }] : []),
+      ...(localSeat ? [
+        { title: `UP NEXT · ${pending}${queueIncomplete(snap) ? " · sampled rows" : ""}`, lines: workRows(pendingRows, contentWidth, queueIncomplete(snap)) },
+        { title: `NEEDS YOU · ${needs.length || agent.activity?.needsInput?.count || 0}`, lines: needsRows },
+        ...(recentRows.length ? [{ title: "RECENTLY FINISHED · bounded window", lines: workRows(recentRows, contentWidth) }] : []),
+      ] : []),
       {
         title: "SEAT",
         fields: [
-          { label: "host", value: found.host.name },
+          { label: "host", value: hostLabel(found.host) },
           { label: "rig", value: rig.name },
           { label: "pod", value: pod.name },
         ],
         lines: [
           fieldLine({ label: "cwd", value: agent.cwd ?? "— (not served)" }),
+          ...(agent.runtime === "claude-code" ? wrapDetailValue("configured account", `${agent.configuredAccount ?? "unknown"} (not verified sign-in)`, contentWidth) : []),
         ],
       },
       {
         title: "SPEC · effective seat binding",
-        fields: [specInLibrary
+        fields: [specInLibrary && localSeat
           ? { label: "spec", value: agent.spec, link: { type: "cross", kind: "spec-of", name: agent.name, target: { host: found.host.name, rig: rig.name, pod: pod.name } } }
-          : { label: "spec", value: agent.spec ? `${agent.spec}  (not in library)` : "—" }],
+          : { label: "spec", value: agent.spec ? `${agent.spec}${localSeat ? "  (not in library)" : `  · read-only view`}` : "—" }],
         lines: [
           ...wrapDetailValue("profile", agent.profile ?? "not served", contentWidth),
           ...wrapDetailValue("version", agent.specVersion ?? "not served", contentWidth),
@@ -371,7 +571,7 @@ function queueRows(snap: FleetSnapshot): FleetSnapshot["attention"] {
 function recentWorkText(snap: FleetSnapshot, row: RecentTransitionSnap): string {
   const qitem = queueRows(snap).find((candidate) => candidate.qitemId === row.qitemId);
   const work = qitem?.summary?.trim() || qitem?.body.split("\n").find((line) => line.trim())?.trim();
-  return row.summary?.trim() || work || "no work served";
+  return row.summary?.trim() || row.bodyPreview?.trim() || work || "no work served";
 }
 
 function agentDrillForSession(snap: FleetSnapshot, session: string): Action | undefined {
@@ -567,6 +767,80 @@ interface MotionCtx {
   loading: boolean;
 }
 
+/** A host page's line for a host with no rigs listed. Another host's rigs are read only once it is drilled into, through
+ *  this daemon, so for it "none" is claimed only when that read answered. */
+function noRigsText(snap: FleetSnapshot, host: FleetSnapshot["hosts"][number], local: boolean, motion: MotionCtx): string {
+  if (local) return "  (no local rigs served — proven empty)";
+  if (motion.loading) {
+    if (!motion.reduced) motion.used = true;
+    return `  ${motion.frame} ${host.name} rigs read pending`;
+  }
+  return snap.readErrors.some((error) => error.startsWith(`rigs-summary(${host.name})`))
+    ? "  ✕ rigs read failed — named in the status line"
+    : `  (no rigs served by ${host.name})`;
+}
+/** A remote rig page reads identity, state and context only: queue, work, actions and seat detail are this host's
+ *  reads and are deliberately absent, never rendered as zero. */
+function remoteSeatColumns(contentWidth: number): AgentColumn[] {
+  if (contentWidth >= 110) return [
+    ["pod", "POD", 10, "left"], ["seat", "SEAT", 20, "left"], ["runtime", "RT", 4, "left"],
+    ["model", "MODEL", 16, "left"], ["effort", "CFG EFF", 8, "left"], ["context", "CTX", 7, "right"], ["status", "STATE", 12, "left"],
+  ];
+  if (contentWidth >= 78) return [
+    ["pod", "POD", 7, "left"], ["seat", "SEAT", 14, "left"], ["runtime", "RT", 3, "left"],
+    ["context", "CTX", 5, "right"], ["status", "STATE", 10, "left"],
+  ];
+  return [
+    ["pod", "POD", 5, "left"], ["seat", "SEAT", 12, "left"], ["runtime", "RT", 3, "left"],
+    ["context", "CTX", 4, "right"], ["status", "STATE", 8, "left"],
+  ];
+}
+
+function remoteRigSeatLines(state: ViewState, rig: FleetSnapshot["hosts"][number]["rigs"][number], contentWidth: number, motion: MotionCtx): ContentLine[] {
+  const leaf = state.drill.at(-1);
+  const podFilter = leaf?.kind === "pod" ? leaf.name : null;
+  const all = rig.pods.flatMap((pod) => pod.agents.map((agent) => ({ pod: pod.name, agent })));
+  const rows = all
+    .filter(({ pod, agent }) => !podFilter || pod === podFilter)
+    .filter(({ pod, agent }) => !state.filter || agent.name.includes(state.filter) || pod.includes(state.filter));
+  const columns = remoteSeatColumns(contentWidth);
+  const lines: ContentLine[] = [
+    { text: `rig ${rig.name} on ${rig.remoteHost} · ${rig.lifecycleState ?? "unknown"} · seats read through this daemon` },
+    { text: "  QUEUE, WORK, NOW, seat detail and actions are this host's reads; a remote page shows identity, state and context only." },
+    { text: tableRow(columns, { pod: "POD", seat: "SEAT", runtime: "RT", model: "MODEL", effort: "CFG EFF", context: "CTX", status: "STATE" }) },
+    { text: "━".repeat(columnsWidth(columns)) },
+  ];
+  if (rows.length === 0) {
+    lines.push({ text: all.length > 0 && state.filter
+      ? `  (no seats match the filter "${state.filter}")`
+      : "  (no seats reported for this rig)" });
+    return lines;
+  }
+  let previousPod: string | null = null;
+  for (const { pod, agent } of rows) {
+    const firstInPod = pod !== previousPod;
+    if (firstInPod && previousPod != null) lines.push({ text: "┈".repeat(columnsWidth(columns)) });
+    previousPod = pod;
+    const stateCell = operationalState(agent.status, motion);
+    lines.push({
+      text: tableRow(columns, {
+        pod: firstInPod ? pod : "",
+        seat: `${stateCell.mark} ${seatName(pod, agent.name)}`,
+        runtime: runtimeShort(agent.runtime),
+        model: tableModel(agent.model),
+        effort: tableEffort(agent.effort, agent.effortSource, 8),
+        context: contextCompact(agent.context, contentWidth < 110),
+        status: stateCell.word,
+      }),
+    });
+  }
+  const working = rows.filter(({ agent }) => ["active", "working", "running"].includes(agent.status)).length;
+  lines.push({ text: "" }, { text: `${rows.length} seats · ${working} working` });
+  return lines;
+}
+
+
+/** Rig boundaries take a solid rule and pod boundaries a dotted one; RIG shows on a rig's first visible row so scrolled rows keep it. */
 function instanceContentLines(
   state: ViewState,
   snap: FleetSnapshot,
@@ -574,35 +848,37 @@ function instanceContentLines(
   contentWidth: number,
   motion: MotionCtx,
 ): ContentLine[] {
-  const lines = tabsLine(state, `instance ${host.name}`);
+  const lines = tabsLine(state, `instance ${hostLabel(host)}`);
   const scope = { kind: "instance", local: host === snap.hosts[0] } as const;
   if (state.viewTab === "health") return [...lines, { text: "" }, ...healthListLines(snap, scope, contentWidth)];
   if (state.viewTab === "recent") {
-    const recent = recentLines(snap, scope, contentWidth, true, state.timeZone);
+    // This host's queue changes are never listed under another host's name.
+    const recent = scope.local ? recentLines(snap, scope, contentWidth, true, state.timeZone) : [];
     return recent.length > 0
       ? [...lines, ...recent]
-      : [...lines, { text: "" }, { text: motion.loading ? `${motion.frame} instance RECENT read pending` : "(instance RECENT window not served)" }];
+      : [...lines, { text: "" }, { text: motion.loading && scope.local ? `${motion.frame} instance RECENT read pending` : "(instance RECENT window not served)" }];
   }
   if (state.viewTab === "overview") {
     return [
       ...lines,
-      ...detailPage({ text: `instance ${host.name}` }, [
+      ...detailPage({ text: `instance ${hostLabel(host)}` }, [
         {
           title: "instance",
           fields: [
             { label: "identity", value: host.name },
             { label: "transport", value: host.id ?? "local" },
-            { label: "shape", value: host.rigs.some(r => r.inventoryUnavailable) ? `${host.rigs.length} rigs · seat inventory incomplete` : `${host.rigs.length} rigs · ${host.rigs.reduce((n, rig) => n + rig.pods.reduce((m, pod) => m + pod.agents.length, 0), 0)} seats` },
+            { label: "shape", value: !scope.local ? `${host.rigs.length} rigs · seats not read here`
+              : host.rigs.some(r => r.inventoryUnavailable) ? `${host.rigs.length} rigs · seat inventory incomplete` : `${host.rigs.length} rigs · ${host.rigs.reduce((n, rig) => n + rig.pods.reduce((m, pod) => m + pod.agents.length, 0), 0)} seats` },
           ],
         },
         {
           title: "rigs",
           lines: host.rigs.length > 0
             ? host.rigs.map((rig) => listItem(
-                alignedRow([[rig.name, 20], [rig.lifecycleState ?? "unknown", 20], [rig.inventoryUnavailable ? "inventory unavailable" : `${rig.pods.length} pods · ${rig.pods.reduce((n, pod) => n + pod.agents.length, 0)} seats`, 24]]),
+                alignedRow([[rig.name, 20], [rig.lifecycleState ?? "unknown", 20], [rig.remoteHost ? "seats not read here" : rig.inventoryUnavailable ? "inventory unavailable" : `${rig.pods.length} pods · ${rig.pods.reduce((n, pod) => n + pod.agents.length, 0)} seats`, 24]]),
                 { type: "drill", resource: "rig", name: rig.name, target: { host: host.name } },
               ))
-            : [{ text: "  (no local rigs served — proven empty)" }],
+            : [{ text: noRigsText(snap, host, scope.local, motion) }],
         },
       ]),
     ];
@@ -611,7 +887,9 @@ function instanceContentLines(
     for (const rig of host.rigs) {
       lines.push({ text: "" }, sectionRule(`rig ${rig.name} · ${rig.lifecycleState ?? "unknown"}`, contentWidth));
       if (!rig.graph) {
-        if (motion.loading) {
+        if (rig.remoteHost) {
+          lines.push({ text: "  (another host's topology graph isn't read in this view)" });
+        } else if (motion.loading) {
           if (!motion.reduced) motion.used = true;
           lines.push({ text: `  ${motion.frame} topology graph read pending` });
         } else if (snap.readErrors.some((error) => error.startsWith(`graph(${rig.name})`))) {
@@ -630,24 +908,47 @@ function instanceContentLines(
         zones: canvas.zones.filter((zone) => zone.y === row).map((zone) => ({ start: zone.start, end: zone.end, action: zone.action })),
       });
     }
-    if (host.rigs.length === 0) lines.push({ text: "" }, { text: "  (no local rigs served — proven empty)" });
+    if (host.rigs.length === 0) lines.push({ text: "" }, { text: noRigsText(snap, host, scope.local, motion) });
     lines.push({ text: "" }, { text: `  style: ${state.graphStyle} · style hatchet|braille|braille-fallback rides the command bar` });
     return lines;
   }
 
+  // Another registered host: its reachability and its rigs' names and states, read through this daemon. Its seats and
+  // queue aren't read here, so none of this machine's are shown under its name.
+  if (!scope.local) return [
+    ...lines,
+    healthSummaryLine(snap, scope, contentWidth),
+    ...wrapDetailLines([
+      { text: `host ${host.name} · ${hostReachabilityLabel(host)}` },
+      { text: `Its seats aren't read in this view: rig ps --host ${host.name} --nodes -A` },
+    ], contentWidth),
+    { text: "" },
+    ...(host.rigs.length > 0
+      ? host.rigs.map((rig) => listItem(alignedRow([[rig.name, 20], [rig.lifecycleState ?? "unknown", 20]]),
+        { type: "drill", resource: "rig", name: rig.name, target: { host: host.name } }))
+      : [{ text: noRigsText(snap, host, false, motion) }]),
+  ];
+
   lines.push(healthSummaryLine(snap, scope, contentWidth));
+  lines.push(...queueSampleLines(snap, contentWidth));
   lines.push({ text: state.filter ? `/ filter instance rows: ${state.filter} · / replace · esc clear` : "/ filter instance rows…" });
-  const columns = instanceAgentColumns(contentWidth);
+  const shownRigs = host.rigs.map((rig) => ({
+    rig,
+    agents: rig.pods.flatMap((pod) => pod.agents.map((agent) => ({ pod: pod.name, agent })))
+      .filter(({ pod, agent }) => !state.filter || rig.name.includes(state.filter) || pod.includes(state.filter) || agent.name.includes(state.filter)),
+  })).filter(({ rig, agents }) => !state.filter || agents.length > 0 || rig.name.includes(state.filter));
+  const columns = instanceAgentColumns(contentWidth, Math.max(0, ...shownRigs.map(({ rig }) => rig.name.length)));
   lines.push({ text: tableRow(columns, { rig: "RIG", pod: "POD", seat: "SEAT", runtime: "RT", context: "CTX", status: "STATE", queue: "Q", work: "WORK", now: "NOW" }) });
   lines.push({ text: "━".repeat(columnsWidth(columns)) });
   let seatCount = 0;
   let workingCount = 0;
   let attentionCount = 0;
+  let attentionUnknown = 0;
   let openCount = 0;
-  for (const rig of host.rigs) {
-    const agents = rig.pods.flatMap((pod) => pod.agents.map((agent) => ({ pod: pod.name, agent })))
-      .filter(({ pod, agent }) => !state.filter || rig.name.includes(state.filter) || pod.includes(state.filter) || agent.name.includes(state.filter));
-    if (state.filter && agents.length === 0 && !rig.name.includes(state.filter)) continue;
+  let firstRig = true;
+  for (const { rig, agents } of shownRigs) {
+    if (!firstRig) lines.push({ text: "─".repeat(columnsWidth(columns)) });
+    firstRig = false;
     const rigAction: Action = { type: "drill", resource: "rig", name: rig.name, target: { host: host.name } };
     if (agents.length === 0) {
       lines.push({
@@ -657,7 +958,7 @@ function instanceContentLines(
       continue;
     }
     let previousPod: string | null = null;
-    for (const { pod, agent } of agents) {
+    for (const [index, { pod, agent }] of agents.entries()) {
       const firstInPod = pod !== previousPod;
       if (firstInPod && previousPod != null) lines.push({ text: "┈".repeat(columnsWidth(columns)) });
       previousPod = pod;
@@ -665,26 +966,31 @@ function instanceContentLines(
       const queue = queueFacts(snap, agent.session);
       seatCount += 1;
       if (["active", "working", "running"].includes(agent.status)) workingCount += 1;
-      if (/attention|needs|blocked|unknown|failed/.test(agent.status)) attentionCount += 1;
+      if (agent.needsAttention === true) attentionCount += 1;
+      else if (agent.needsAttention == null) attentionUnknown += 1;
       openCount += queue.count;
+      const cells = {
+        rig: rig.name,
+        pod: firstInPod ? pod : "",
+        seat: `${stateCell.mark} ${seatName(pod, agent.name)}`,
+        runtime: runtimeShort(agent.runtime),
+        context: contextCompact(agent.context, contentWidth < 110),
+        status: stateCell.word,
+        queue: queueCount(snap, queue.count),
+        work: queue.work,
+        now: queue.now,
+      };
+      const named = tableRow(columns, cells);
       lines.push({
-        text: tableRow(columns, {
-          rig: rig.name,
-          pod: firstInPod ? pod : "",
-          seat: `${stateCell.mark} ${seatName(pod, agent.name)}`,
-          runtime: runtimeShort(agent.runtime),
-          context: contextCompact(agent.context, contentWidth < 110),
-          status: stateCell.word,
-          queue: queue.count || "·",
-          work: queue.work,
-          now: queue.now,
-        }),
+        text: index === 0 ? named : tableRow(columns, { ...cells, rig: "" }),
+        sticky: { group: `rig:${rig.name}`, ...(index === 0 ? {} : { text: named }) },
         action: { type: "drill", resource: "agent", name: agent.name, target: { host: host.name, rig: rig.name, pod } },
         zones: [{ start: 0, end: columns[0]![2], action: rigAction }],
       });
     }
   }
-  lines.push({ text: "" }, { text: host.rigs.some(r => r.inventoryUnavailable) ? `${host.rigs.length} rigs · inventory incomplete · ${seatCount} seats read` : `${host.rigs.length} rigs · ${seatCount} seats · ${workingCount} working · ${attentionCount} need attention · ${openCount} open rows` });
+  lines.push(...connectedAssistantLines(host.connectedAssistants, host.connectedAssistantsUnavailable, null, state.filter, contentWidth, state.timeZone, host.connectedAssistantsPending));
+  lines.push({ text: "" }, { text: host.rigs.some(r => r.inventoryUnavailable) ? `${host.rigs.length} rigs · inventory incomplete · ${seatCount} seats read` : `${host.rigs.length} rigs · ${seatCount} seats · ${workingCount} working · ${attentionCount} need attention${attentionUnknown ? ` · ${attentionUnknown} attention unknown` : ""} · ${openCount}${queueIncomplete(snap) ? "+ sampled" : ""} open rows` });
   lines.push(...recentLines(snap, scope, contentWidth, false, state.timeZone));
   return lines;
 }
@@ -703,6 +1009,9 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
   if (state.section === "terminals") return terminalLines(state, snap, contentWidth);
   if (state.section === "config") return configLines(state, snap, contentWidth);
   if (state.section === "connections") return connectionsLines(snap, contentWidth, state.timeZone, state.expanded);
+  if (state.section === "usage") return usageLines(snap, contentWidth);
+  if (state.section === "usage-hosts") return usageHostsLines(snap, contentWidth);
+  if (state.section === "cost") return costLines(snap.cost, contentWidth);
   if (state.healthOpen) return healthDetailLines(snap, state.healthOpen, contentWidth, state.timeZone);
   if (state.section === "system") return [{ text: "System · Instance health" }, { text: "" }, ...healthListLines(snap, { kind: "instance", local: true }, contentWidth)];
   // PULSE is a FULL-WIDTH view handled by an early return in renderScreen
@@ -739,7 +1048,7 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
     const host = (hostName ? snap.hosts.find((candidate) => candidate.name === hostName) : snap.hosts[0]);
     if (leaf?.kind === "host" && host) return instanceContentLines(state, snap, host, contentWidth, motion);
     if (!leaf && host?.rigs.length) return wrapDetailLines([
-      { text: `TOPOLOGY · ${host.name}` }, { text: "Choose a rig to read its seats and work." },
+      { text: `TOPOLOGY · ${hostLabel(host)}` }, { text: "Choose a rig to read its seats and work." },
       { text: `${host.rigs.length} rig${host.rigs.length === 1 ? "" : "s"} · select one in Explorer` },
       { text: "Bright ▦ live agents · gray ▦ none · ? unknown" },
     ], contentWidth);
@@ -759,10 +1068,32 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
       if (snap.readErrors.some((e) => e.startsWith("rigs-summary"))) {
         return [{ text: "✕ rigs read failed — named in the status line (honest-empty, not fabricated)" }];
       }
+      // A drilled host this snapshot doesn't list proves nothing about its rigs.
+      if (hostName && !host) return [{ text: snap.readErrors.some((e) => e.startsWith("hosts:"))
+        ? `✕ host ${hostName} not listed: the hosts read failed — named in the status line`
+        : `host ${hostName} is not a registered host here · rig host list` }];
       return [{ text: "(no rigs served — proven empty, not fabricated)" }];
     }
-    if (rig.inventoryNotLoaded) return [{ text: `Reading ${rig.name}…` }];
-    if (rig.inventoryUnavailable) return [{ text: `Inventory unavailable for ${rig.name} · refresh to Retry` }];
+    if (rig.remoteHost && (snap.topologyRemoteSeats !== true || state.viewTab !== "table")) {
+      // ui.topology_remote_seats (default off): the TABLE tab reads the open rig's seats through this daemon and
+      // renders them here; every other tab, and the shipped default, keeps the CLI pointer.
+      return [
+        { text: `rig ${rig.name} on ${rig.remoteHost} · ${rig.lifecycleState ?? "unknown"}` },
+        snap.topologyRemoteSeats === true
+          ? { text: `Seats are read on the TABLE tab; graph, health and recent stay unread for a remote host: rig ps --host ${rig.remoteHost} --nodes --rig ${rig.name}` }
+          : { text: `Its seats aren't read in this view: rig ps --host ${rig.remoteHost} --nodes --rig ${rig.name}` },
+      ];
+    }
+    // The local inventory states sit BEFORE the remote branch again: a
+    // person's own rigs keep "Reading…" and "Inventory unavailable" (with the
+    // remote-seats setting off too); a remote rig names its host.
+    if (rig.inventoryNotLoaded) return [{ text: `Reading ${rig.name}${rig.remoteHost ? ` on ${rig.remoteHost}` : ""}…` }];
+    if (rig.inventoryUnavailable) return [
+      { text: `Inventory unavailable for ${rig.name}${rig.remoteHost ? ` on ${rig.remoteHost}` : ""} · refresh to Retry` },
+      ...(rig.remoteHost || leaf?.kind === "pod" ? [] : connectedAssistantLines(host.connectedAssistants, host.connectedAssistantsUnavailable,
+        rig.name, state.filter, contentWidth, state.timeZone, host.connectedAssistantsPending)),
+    ];
+    if (rig.remoteHost) return remoteRigSeatLines(state, rig, contentWidth, motion);
     const podFilter = leaf?.kind === "pod" ? leaf.name : null;
     const all = rig.pods.flatMap((p) => p.agents.map((a) => ({ pod: p.name, ...a })));
     const rows = all
@@ -770,8 +1101,10 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
       .filter((a) => !state.filter || a.name.includes(state.filter) || a.pod.includes(state.filter));
     const suffix = `rig ${rig.name}${podFilter ? ` · pod ${podFilter}` : ""}${state.filter ? ` · filter "${state.filter}"` : ""}`;
     lines.push(...tabsLine(state, suffix));
-    // Keep the explicit desktop action above the rig's grid.
-    if (!podFilter) lines.push(fieldLine({ label: "terminal", value: `Open terminals ▸ rig ${rig.name}`, link: { type: "act", act: "open-terminal", view: `rig:${rig.name}` } }));
+    // Keep the explicit desktop action above the rig's grid: the whole rig, or on a pod's page that pod.
+    lines.push(podFilter
+      ? fieldLine({ label: "terminal", value: `Open terminals ▸ pod ${podFilter}`, link: { type: "act", act: "open-terminal", view: `pod:${rig.name}/${podFilter}` } })
+      : fieldLine({ label: "terminal", value: `Open terminals ▸ rig ${rig.name}`, link: { type: "act", act: "open-terminal", view: `rig:${rig.id ?? rig.name}` } }));
     const healthScope = { kind: "rig" as const, rigId: rig.id ?? rig.name, rigName: rig.name, local: host === snap.hosts[0] };
     if (state.viewTab === "health") return [...lines, { text: "" }, ...healthListLines(snap, healthScope, contentWidth)];
     if (state.viewTab === "recent") {
@@ -834,7 +1167,7 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
           {
             title: "rig",
             fields: [
-              { label: "host", value: host.name },
+              { label: "host", value: hostLabel(host) },
               { label: "shape", value: `${rig.pods.length} pods · ${all.length} agents` },
               ...(rig.lifecycleState ? [{ label: "state", value: rig.lifecycleState }] : []),
             ],
@@ -853,14 +1186,17 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
       return lines;
     }
     const agentCols = agentColumns(contentWidth);
+    lines.push(...queueSampleLines(snap, contentWidth));
     const narrowFactory = !agentCols.some(([key]) => key === "model");
-    if (narrowFactory) lines.push({ text: "MODEL/NOW/ACTIONS on drill (enter)" });
+    const effortCol = agentCols.find(([key]) => key === "effort");
+    if (narrowFactory) lines.push({ text: "MODEL/EFFORT/NOW/ACTIONS on drill (enter)" });
     lines.push({
       text: tableRow(agentCols, {
-        pod: "POD", seat: "SEAT", runtime: "RT", model: "MODEL", context: "CTX",
+        pod: "POD", seat: "SEAT", runtime: "RT", model: "MODEL", effort: effortCol?.[1] ?? "CFG EFF", context: "CTX",
         status: "STATE", queue: "Q", work: "WORK", now: "NOW", actions: "ACTIONS",
       }),
     });
+    if (effortCol) lines.push({ text: EFFORT_LEGEND });
     lines.push({ text: "━".repeat(columnsWidth(agentCols)) });
     const actionsIndex = agentCols.findIndex(([key]) => key === "actions");
     const actionsColStart = actionsIndex < 0 ? -1 : agentCols.slice(0, actionsIndex).reduce((n, [, , width]) => n + width + 1, 0);
@@ -872,13 +1208,13 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
       // ACTIONS = drive-structure ONLY (BR-9), each mapped to an EXISTING
       // write contract: `run ▸` = the rig-restore write (rendered only where
       // it applies — the seat is not running); `term ▸` = the terminal-open
-      // view contract (pod-scoped, the web's granularity). No false affordance.
+      // view contract for this row's own seat. No false affordance.
       const canRun = a.canRun ?? !a.live;
       const actionsCell = canRun ? "run ▸ · term ▸" : "term ▸";
       const zones: ContentLine["zones"] = [];
       if (actionsColStart >= 0) {
         const termOffset = actionsColStart + actionsCell.indexOf("term ▸");
-        zones.push({ start: termOffset, end: termOffset + "term ▸".length, action: { type: "act", act: "open-terminal", view: `pod:${rig.name}/${a.pod}` } });
+        zones.push({ start: termOffset, end: termOffset + "term ▸".length, action: { type: "act", act: "open-terminal", view: `seat:${rig.name}/${a.name}` } });
       }
       if (canRun && actionsColStart >= 0)
         zones.push({
@@ -896,9 +1232,10 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
           seat: `${stateCell.mark} ${seatName(a.pod, a.name)}`,
           runtime: runtimeShort(a.runtime),
           model: tableModel(a.model),
+          effort: tableEffort(a.effort, a.effortSource, effortCol?.[2] ?? 0),
           context: contextCompact(a.context, narrowFactory),
           status: stateCell.word,
-          queue: queue.count || "·",
+          queue: queueCount(snap, queue.count),
           work: queue.work,
           now: queue.now,
           actions: actionsCell,
@@ -907,10 +1244,11 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
         zones,
       });
     }
+    if (!podFilter) lines.push(...connectedAssistantLines(host.connectedAssistants, host.connectedAssistantsUnavailable, rig.name, state.filter, contentWidth, state.timeZone, host.connectedAssistantsPending));
     lines.push({ text: "" });
     const working = rows.filter((agent) => ["active", "working", "running"].includes(agent.status)).length;
     const attention = rows.filter((agent) => /attention|needs|blocked|unknown|failed/.test(agent.status)).length;
-    lines.push({ text: `${rows.length} seats · ${working} working · ${attention} need attention · ${rows.reduce((n, agent) => n + queueFacts(snap, agent.session).count, 0)} open rows` });
+    lines.push({ text: `${rows.length} seats · ${working} working · ${attention} need attention · ${rows.reduce((n, agent) => n + queueFacts(snap, agent.session).count, 0)}${queueIncomplete(snap) ? "+ sampled" : ""} open rows` });
     if (!podFilter) lines.push(...recentLines(snap, { kind: "rig", rig: rig.name }, contentWidth, false, state.timeZone));
     return lines;
   }
@@ -1089,7 +1427,8 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
                     }))),
                 {
                   label: "seats now",
-                  value: seats.join(", ") || "(none)",
+                  // Consumers are undefined when this page didn't read the seat inventory: unknown, not none.
+                  value: spec.consumers === undefined ? "not loaded in this view" : seats.join(", ") || "(none)",
                   link: { type: "cross", kind: "running", name: spec.name },
                 },
               ],
@@ -1129,6 +1468,7 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
   }
 
   if (state.section === "needs") return attentionLines(state, snap, contentWidth);
+  if (state.section === "fleet") return fleetScopesLines(state, snap, contentWidth);
   if (state.section === "scopes") {
     const catalog = snap.projects;
     if (!state.project && catalog !== undefined) return wrapDetailLines([
@@ -1190,12 +1530,16 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
 export interface RenderOptions {
   /** Independent endpoint chosen for a standalone TUI after a collision. */
   controlSocketPath?: string;
+  /** No control socket could be bound this session; the status bar says so. */
+  controlSocketUnavailable?: boolean;
   /** First visit: preserve the prior frame with its original label and no effect targets. */
   previousPage?: { state: ViewState; snapshot: FleetSnapshot };
   startup?: StartupState;
   /** I5 — the live command context (from the C3 detector); default "standard". */
   commandContext?: string;
   completion?: { candidates: string[]; message: string } | null;
+  /** Display-only UTF-16 insertion offset; the terminal editor defaults to the end. */
+  readonly commandCaret?: number;
   cols?: number;
   rows?: number;
   /** wall-clock ms for time-driven motion (spinner frames, flash windows);
@@ -1297,11 +1641,12 @@ function truncateSegs(
   for (const s of segs) {
     if (used >= width) break;
     const room = width - used;
-    if (s.text.length <= room) {
+    const w = columns(s.text);
+    if (w <= room) {
       out.push(s);
-      used += s.text.length;
+      used += w;
     } else {
-      out.push({ ...s, text: s.text.slice(0, room) });
+      out.push({ ...s, text: s.text.slice(0, columnIndex(s.text, room)) });
       break;
     }
   }
@@ -1327,6 +1672,7 @@ function pushExplorerTargets(
 function readStatus(load: import("./types.js").LoadState, zone: string): string {
   const at = load.retainedAt ?? load.lastSuccessAt;
   const basis = at === undefined ? "" : ` · last ${displayTime(new Date(at).toISOString(), zone)}`;
+  if (load.skew) return load.skew;
   if (load.inFlight) return `${load.settled ? "Refreshing" : "Loading"}…${basis} · ? Help`;
   if (load.stale) return `${at === undefined ? "Read failed" : "Could not refresh"}${basis} · refresh to Retry`;
   return `Tab complete · ? help${basis}`;
@@ -1367,7 +1713,7 @@ function renderPulseScreen(state: ViewState, snap: FleetSnapshot, options: Rende
   const flashRows: number[] = [];
   let flashAck = false;
 
-  lines.push(pad(`cmd ▸ ${inputLine}▊${inputLine ? "" : "  " + readStatus(load, state.timeZone)}`, cols));
+  lines.push(pad(commandViewport(inputLine, cols, options.commandCaret) + (inputLine ? "" : "  " + readStatus(load, state.timeZone)), cols));
   if (load.stale && !inputLine) hitMap.push({ y: 1, x1: 9, x2: cols, action: { type: "noop" } });
   if (options.completion) {
     lines.push(pad(options.completion.message, cols));
@@ -1380,7 +1726,7 @@ function renderPulseScreen(state: ViewState, snap: FleetSnapshot, options: Rende
   lines.push(paneRule(cols, explW, "top", explorerTitle, contentTitle));
 
   const contentWidth = Math.max(cols - explW - 2, 0);
-  const model = buildPulseModel(snap, nowMs);
+  const model = buildPulseModel(snap, nowMs, state.timeZone);
   const chromeRows = 3; // bottom rule + hint bar + status line
   const bodyRows = Math.max(rows - lines.length - chromeRows, 1);
 
@@ -1438,8 +1784,10 @@ function renderPulseScreen(state: ViewState, snap: FleetSnapshot, options: Rende
     // the per-cell bg on the segs (mock affordance), so the content marker slot
     // stays blank — no "›" chevron (the native affordance the mock overrides).
     const citem = visiblePulse[i];
-    const contentText = (citem?.text ?? "").slice(0, contentWidth);
-    lines.push(pad(`${left}┃ ${contentText}`, cols));
+    const fullText = citem?.text ?? "";
+    const contentText = fullText.slice(0, columnIndex(fullText, contentWidth));
+    const line = `${left}┃ ${contentText}${" ".repeat(Math.max(contentWidth - columns(contentText), 0))}`;
+    lines.push(columns(line) > cols ? pad(line, cols) : line);
     if (row) {
       pushExplorerTargets(hitMap, row, explorerDisplay[explorerIndex] ?? row.label, y, explW);
       explorerRows.push({ ...row, y });
@@ -1539,14 +1887,14 @@ function crashCartShell(
   contentTitle: string,
   cols: number,
   rows: number,
-  inputLine: string,
+  commandLine: string,
   opts?: { wrap?: boolean; scroll?: number },
 ): Screen {
   const explW = explorerWidth(cols);
   const lines: string[] = [];
   const segRows: NonNullable<Screen["segRows"]> = {};
   const hitMap: Screen["hitMap"] = [];
-  lines.push(pad(`cmd ▸ ${inputLine}▊`, cols));
+  lines.push(pad(commandLine, cols));
   lines.push(paneRule(cols, explW, "top", "{ EXPLORER }", contentTitle));
 
   // The explorer's source note, then any discovered rigs (name + seat count).
@@ -1563,9 +1911,11 @@ function crashCartShell(
     const y = lines.length + 1;
     const left = pad(leftRows[i] ?? "", explW);
     const citem = content[scroll + i];
-    const contentText = (citem?.text ?? "").slice(0, contentWidth);
+    const fullText = citem?.text ?? "";
+    const contentText = fullText.slice(0, columnIndex(fullText, contentWidth));
     if (citem?.action) hitMap.push({ y, x1: explW + 2, x2: cols, action: citem.action });
-    lines.push(pad(`${left}┃ ${contentText}`, cols));
+    const line = `${left}┃ ${contentText}${" ".repeat(Math.max(contentWidth - columns(contentText), 0))}`;
+    lines.push(columns(line) > cols ? pad(line, cols) : line);
     if (citem?.segs) segRows[y] = truncateSegs(citem.segs, contentWidth);
   }
   lines.push(paneRule(cols, explW, "bottom"));
@@ -1584,18 +1934,61 @@ function crashCartShell(
   };
 }
 
+/** The size to draw at, or null when the terminal reports 0 rows or columns (a detached, headless or just-resizing pane):
+ *  nothing fits yet, so the caller skips the frame and draws on the next resize. An unreported size keeps the defaults. */
+export function drawableSize(columns: number | undefined, rows: number | undefined): { cols: number; rows: number } | null {
+  const size = { cols: columns ?? 120, rows: rows ?? 32 };
+  return size.cols > 0 && size.rows > 0 ? size : null;
+}
+
+/** Credentials out of text headed for the screen: URL userinfo and Bearer tokens. */
+function redactCredentials(text: string): string {
+  return text
+    .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, "$1[redacted]@")
+    .replace(/Bearer\s+[^\s]+/gi, "Bearer [redacted]");
+}
+
+/**
+ * Detail text that is both cleaned and redacted, in the order that keeps the redaction effective.
+ *
+ * Escape sequences go first, before any redaction. Redacting a URL inside an OSC payload can delete the
+ * sequence's own introducer — the credential pattern happily matches across `\x9d`, or across the bytes
+ * that follow `\x1b]` — and then the stripper no longer recognises the sequence and its tail survives as
+ * literal text. Consuming the sequence whole is what makes its payload leave with it.
+ *
+ * Then redaction, then control replacement, then redaction again. Redacting after the escapes are gone
+ * catches a credential a sequence was interrupting (`https:<CSI>//user:...`) and a Bearer token the
+ * sequence split. The pass after control replacement catches one a control byte split, since that byte
+ * becomes a space the credential pattern cannot cross.
+ */
+function redactedDetailText(text: string): string {
+  return redactCredentials(
+    replaceControlCharacters(redactCredentials(stripTerminalEscapes(text))),
+  );
+}
+
 export function renderScreen(state: ViewState, snap: FleetSnapshot, options: RenderOptions = {}, inputLine = ""): Screen {
   const screen = state.palette
     ? helpScreen(state.palette, options.commandContext ?? "standard", options.cols ?? 120, options.rows ?? 32)
     : renderBody(state, snap, options, inputLine);
   if (options.controlSocketPath && screen.lines.length) {
     const row = screen.lines.length - 1;
-    const socketPath = options.controlSocketPath.replace(/[\x00-\x1f\x7f]/g, " ");
+    // The row shows the path with terminal control cleaned out, and the copy action keeps the bound
+    // path itself: main.ts recognises this action by `value === socket.path`, so rewriting the value
+    // here would hand the click to whichever screen is underneath. The copy sink cleans the bytes it
+    // prints, so the shown text and the copied text still agree.
+    const shownPath = terminalSafeText(options.controlSocketPath);
     const label = "socket: [copy]";
     const cols = options.cols ?? 120;
-    screen.lines[row] = pad(`${label} ${socketPath} · ${screen.lines[row]!.trimEnd()}`, cols);
-    // The status stays compact; its copy target retains the actual bound path.
+    screen.lines[row] = pad(`${label} ${shownPath} · ${screen.lines[row]!.trimEnd()}`, cols);
     screen.hitMap.unshift({ y: row + 1, x1: 1, x2: Math.min(cols, label.length), action: { type: "print-for-copy", label: "Control socket", value: options.controlSocketPath } });
+    if (screen.segRows) delete screen.segRows[row + 1];
+  } else if (options.controlSocketUnavailable && screen.lines.length) {
+    // Said here rather than only in a notice: a notice is replaced as soon as work is chosen, and this
+    // is a fact about the session that stays true. Short on purpose, so it fits a narrow status bar.
+    const row = screen.lines.length - 1;
+    const cols = options.cols ?? 120;
+    screen.lines[row] = pad(`socket: unavailable · ${screen.lines[row]!.trimEnd()}`, cols);
     if (screen.segRows) delete screen.segRows[row + 1];
   }
   const commandReady = !state.palette && !options.startup?.open && !options.restore && !options.unavailable && (!options.daemonState || options.daemonState === "up");
@@ -1618,12 +2011,11 @@ function renderBody(state: ViewState, snap: FleetSnapshot, options: RenderOption
   if (options.startup?.open) {
     const startup = options.startup;
     const content = wrapContentLines(startupLines(startup).map((line) => ({ ...line,
-      text: line.text.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").replace(/[\x00-\x1f\x7f]/g, " ")
-        .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, "$1[redacted]@").replace(/Bearer\s+[^\s]+/gi, "Bearer [redacted]"),
+      text: redactedDetailText(line.text),
     })), Math.max(1, cols - explW - 2));
     const selected = content.findIndex((line) => line.action?.type === "startup" && line.action.key === `select:${startup.local?.selected ?? startup.selected}`);
     const scroll = startup.local && !startup.local.result.entries ? startup.local.scroll : startup.expanded ? startup.scroll : Math.max(0, selected - Math.max(1, rows - 12));
-    const screen = crashCartShell(content, { note: "startup", rows: [] }, "START AND RETURN", cols, rows, "", { scroll });
+    const screen = crashCartShell(content, { note: "startup", rows: [] }, "START AND RETURN", cols, rows, commandViewport("", cols), { scroll });
     screen.lines[rows - 1] = pad("? Help · w Skip · L Local · ↑↓ scroll · Enter read · Esc Back · q Quit", cols);
     return screen;
   }
@@ -1633,22 +2025,19 @@ function renderBody(state: ViewState, snap: FleetSnapshot, options: RenderOption
   // verbatim; all rails stand. DOWN → cockpit; UNVERIFIED → cannot-verify (no restore).
   // B1 ROUND 2 — an ACTIVE fleet restore takes precedence over the cockpit: the operator sees live
   // progress (from the poll stream) and, on done, the rollup + keyboard-walkable triage list.
+  const commandLine = commandViewport(inputLine, cols, options.commandCaret);
   if (options.restore) {
     const led = buildLedgerExplorer(options.crashCart?.foundOnHost ?? []);
     // wrap: the triage needs are full sentences — wrap them to the pane so the EXACT need is never
     // clipped off the edge. scroll: a triage list longer than the viewport is vertically scrollable so
     // the final row's exact need is reachable (HIGH-2 — keyboard-walkable, not viewport-truncated).
-    return crashCartShell(renderRestoreLifecycleView(options.restore), led, "RESTORE", cols, rows, inputLine, {
+    return crashCartShell(renderRestoreLifecycleView(options.restore), led, "RESTORE", cols, rows, commandLine, {
       wrap: true,
       scroll: options.restoreScroll ?? 0,
     });
   }
   if (options.unavailable) {
-    const detail = options.unavailable
-      .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")
-      .replace(/[\x00-\x1f\x7f]/g, " ")
-      .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, "$1[redacted]@")
-      .replace(/Bearer\s+[^\s]+/gi, "Bearer [redacted]");
+    const detail = redactedDetailText(options.unavailable);
     const summary = /NODE_MODULE_VERSION|ERR_DLOPEN_FAILED|better-sqlite3/i.test(detail)
       ? "The installed native module cannot load in this runtime. Repair the installation prerequisite, then retry."
       : "Startup state could not be read. Retry after resolving the reported prerequisite.";
@@ -1659,7 +2048,7 @@ function renderBody(state: ViewState, snap: FleetSnapshot, options: RenderOption
       { text: "" },
       { text: "r retry · d details · q quit" },
       ...(options.unavailableExpanded ? [{ text: "" }, { text: detail }] : []),
-    ], { note: "state unavailable", rows: [] }, "STARTUP", cols, rows, inputLine,
+    ], { note: "state unavailable", rows: [] }, "STARTUP", cols, rows, commandLine,
     { wrap: true, scroll: options.restoreScroll ?? 0 });
   }
   if (options.daemonState === "down" && options.crashCart) {
@@ -1671,11 +2060,11 @@ function renderBody(state: ViewState, snap: FleetSnapshot, options: RenderOption
       : options.confirm
       ? [...renderConfirmBanner(options.confirm), ...renderCrashCartView(options.crashCart)]
       : renderCrashCartView(options.crashCart);
-    return crashCartShell(content, led, "CRASH-CART", cols, rows, inputLine, options.confirm ? { wrap: true } : undefined);
+    return crashCartShell(content, led, "CRASH-CART", cols, rows, commandLine, options.confirm ? { wrap: true } : undefined);
   }
   if (options.daemonState === "unverified" && options.daemonEvidence) {
     const led = { note: "daemon unverified", rows: [] }; // No ledger discovery occurred on this path.
-    return crashCartShell(renderUnverifiedView(options.daemonEvidence), led, "DAEMON?", cols, rows, inputLine);
+    return crashCartShell(renderUnverifiedView(options.daemonEvidence), led, "DAEMON?", cols, rows, commandLine);
   }
   // PULSE (founder Option-B): a content-pane view inside the NORMAL explorer│
   // content chrome — renderPulseScreen builds its own split (sidebar + lanes)
@@ -1699,7 +2088,7 @@ function renderBody(state: ViewState, snap: FleetSnapshot, options: RenderOption
   // shell accepts typing from the empty state, so the honest readiness
   // affordance must show BEFORE the first key (no new focus state; stylize
   // paints the cell; the shared motion clock controls its visibility).
-  lines.push(pad(`cmd ▸ ${inputLine}▊${inputLine ? "" : "  " + readStatus(load, state.timeZone)}`, cols));
+  lines.push(pad(commandLine + (inputLine ? "" : "  " + readStatus(load, state.timeZone)), cols));
   if (load.stale && !inputLine) hitMap.push({ y: 1, x1: 9, x2: cols, action: { type: "noop" } });
   if (options.completion) {
     lines.push(pad(options.completion.message, cols));
@@ -1707,7 +2096,7 @@ function renderBody(state: ViewState, snap: FleetSnapshot, options: RenderOption
     if (options.completion.candidates.length > 4) lines.push(pad("  … keep typing to narrow matches", cols));
   }
 
-  const sectionTitle = { topology: "TOPOLOGY", specs: "SPECS", scopes: "PROJECTS", needs: "FEED", system: "SYSTEM · HEALTH", config: "SYSTEM · CONFIGURATION", connections: "SYSTEM · CONNECTIONS" }[state.section] ?? state.section.toUpperCase();
+  const sectionTitle = { topology: "TOPOLOGY", specs: "SPECS", scopes: "PROJECTS", fleet: "FLEET · PROJECTS", needs: "FEED", system: "SYSTEM · HEALTH", config: "SYSTEM · CONFIGURATION", connections: "SYSTEM · CONNECTIONS" }[state.section] ?? state.section.toUpperCase();
   // active-pane emphasis (k9s-class chrome): the focused pane's title is bracketed
   const explorerTitle = state.focusedPane === "explorer" ? "{ EXPLORER }" : "EXPLORER";
   const contentTitle = noticeDetail ? "{ ACTION RESULT }" : state.focusedPane === "content" ? `{ ${sectionTitle} }` : sectionTitle;
@@ -1749,7 +2138,12 @@ function renderBody(state: ViewState, snap: FleetSnapshot, options: RenderOption
   const contentRows = content.length > bodyRows ? Math.max(bodyRows - 1, 0) : bodyRows;
   const maxContentOffset = Math.max(content.length - contentRows, 0);
   const contentStart = Math.min(state.contentOffset, maxContentOffset);
-  const visibleContent = content.slice(contentStart, contentStart + contentRows);
+  const labelledGroups = new Set<string>();
+  const visibleContent = content.slice(contentStart, contentStart + contentRows).map((line) => {
+    if (!line.sticky || labelledGroups.has(line.sticky.group)) return line;
+    labelledGroups.add(line.sticky.group);
+    return line.sticky.text == null ? line : { ...line, text: line.sticky.text };
+  });
   if (content.length > bodyRows) {
     const scrollText = `scroll ↑/↓ · ${contentStart + 1}-${contentStart + visibleContent.length} of ${content.length}`;
     const up = scrollText.indexOf("↑");
@@ -1792,11 +2186,12 @@ function renderBody(state: ViewState, snap: FleetSnapshot, options: RenderOption
     let contentMarker = selectedAction ? "›" : " ";
     let rowSegs = item?.segs;
     if (selectedZone) {
-      if (selectedZone.start > 0) {
-        contentText = `${contentText.slice(0, selectedZone.start - 1)}›${contentText.slice(selectedZone.start)}`;
+      const before = selectedZone.start > 0 ? columnIndex(contentText, selectedZone.start - 1) : -1;
+      if (contentText[before] === " ") {
+        contentText = `${contentText.slice(0, before)}›${contentText.slice(before + 1)}`;
         // R2 HIGH-3: a segs row's paint source must carry the SAME splice the
         // plain text carries, or stylization erases the keyboard focus marker
-        if (rowSegs) rowSegs = spliceMarkerIntoSegs(rowSegs, selectedZone.start - 1);
+        if (rowSegs) rowSegs = spliceMarkerIntoSegs(rowSegs, before);
       } else contentMarker = "›";
     }
     lines.push(pad(fullReading ? `${contentMarker}${contentText}` : `${left}┃${contentMarker}${contentText}`, cols));

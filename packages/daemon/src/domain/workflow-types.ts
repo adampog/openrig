@@ -8,7 +8,12 @@
 // gate-return-sweep + complex routing tables are graduations
 // (per PRD § Risks "Workflow runtime over-engineered").
 
+import type { WorkflowScope } from "./workflow-scope.js";
+
 export type WorkflowExitKind = "handoff" | "waiting" | "done" | "failed";
+
+/** A step-trail row's reason: an exit, or `resumed` for a resume line (no exit; the step's packet is redriven). */
+export type WorkflowTrailReason = WorkflowExitKind | "resumed";
 
 /** OPR.0.4.6.WF2 FR-1: the closed v1 branch-key set — exactly the recorded
  *  exit enum. Growth ONLY via the step-declared-outcome-enums rail (PRD §6
@@ -20,6 +25,12 @@ export const WORKFLOW_EXIT_KINDS = ["handoff", "waiting", "done", "failed"] as c
  *  agent harness); Pi Agent joins in 0.4.7 as a value-space extension. */
 export const WORKFLOW_AGENT_HARNESSES = ["claude-code", "codex"] as const;
 export type WorkflowAgentHarness = (typeof WORKFLOW_AGENT_HARNESSES)[number];
+
+/** Opt-in next-owner rule for a handoff. `same_as_previous`: on a `handoff` into a step of the same `actor_role`, with no
+ *  gate on that step and no explicit next owner, the next packet goes to the session that closed the current one, when
+ *  that session was the closed packet's destination. Otherwise owner resolution is unchanged. */
+export const WORKFLOW_NEXT_OWNER_MODES = ["same_as_previous"] as const;
+export type WorkflowNextOwnerMode = (typeof WORKFLOW_NEXT_OWNER_MODES)[number];
 
 /** OPR.0.4.6.WF2 FR-5: the structured step-level gate declaration (singular
  *  per step; arch-RULED shape — supersedes the removed `gates[]` string
@@ -60,6 +71,9 @@ export interface WorkflowRoleSpec {
 export interface WorkflowStepSpec {
   /** Stable step identifier within the workflow (e.g., "produce"). */
   id: string;
+  /** Optional short name a person sees for the step (e.g., "QA pass"). Display only: `id` stays the step's identity and
+   *  its display when no label is set, and `objective` stays its instruction. */
+  label?: string;
   /** Role name; resolved against `roles` map. */
   actor_role: string;
   /** Human description of the step's intent. */
@@ -91,6 +105,9 @@ export interface WorkflowStepSpec {
    *  matches; no match = structured routing failure (never a silent
    *  mis-route). Absent = today's preferred_targets[0] exactly. */
   harness?: WorkflowAgentHarness;
+  /** The next-owner rule for the handoff INTO this step (see WORKFLOW_NEXT_OWNER_MODES). Overrides the spec-level
+   *  `next_owner`; absent = the spec's value, or today's resolution. */
+  next_owner?: WorkflowNextOwnerMode;
   /** OPR.0.4.6.WF2 FR-3: pin this step to a host — "local" (or absent:
    *  full execution today) or a registered hosts.yaml id. A REMOTE pin
    *  validates as language but fails loud at instantiate with the MH-3
@@ -172,6 +189,12 @@ export interface WorkflowExceptionRoutingSpec {
   classes?: Record<string, WorkflowExceptionDialPosition>;
 }
 
+/** #2607: the spec an instance started with, and the file that spec came from. */
+export interface StartedWorkflowSpec {
+  sourcePath: string;
+  spec: WorkflowSpec;
+}
+
 export interface WorkflowSpec {
   id: string;
   version: string;
@@ -196,11 +219,16 @@ export interface WorkflowSpec {
   exception_routing?: WorkflowExceptionRoutingSpec;
   /** Coordination terminal-turn rule; defaults to "hot_potato". */
   coordination_terminal_turn_rule?: string;
+  /** The default next-owner rule for every step without its own `next_owner` (see WORKFLOW_NEXT_OWNER_MODES). */
+  next_owner?: WorkflowNextOwnerMode;
 }
 
 export type WorkflowInstanceStatus = "active" | "waiting" | "completed" | "failed" | "aborted";
 
 export interface WorkflowInstance {
+  /** The project / mission / slice and free-form tags this instance works for
+   *  (migration 110); stamped on every packet it creates. null = unscoped. */
+  scope?: WorkflowScope | null;
   instanceId: string;
   workflowName: string;
   workflowVersion: string;
@@ -253,9 +281,21 @@ export interface WorkflowInstance {
    * site. null = unbound = pre-FAC-1 behavior byte-identical.
    */
   boundRig: string | null;
+  boundPod?: string | null;
   lifecycleOperationKey: string | null;
   compiledInputDigest: string | null;
   lifecycleBinding: Record<string, unknown> | null;
+  /**
+   * #2607 (migration 152): the spec this instance started with (rig placeholders resolved) and the file it came from.
+   * The instance reads the cache row for its id and version while that row still comes from this file, so an edit to
+   * the file reaches it; once another file with the same id and version has replaced the row, it runs this copy.
+   * null for instances from before it, and after a lifecycle revision: they read the cache row.
+   */
+  startedSpec?: StartedWorkflowSpec | null;
+  /** #2730 (migration 154): the root objective it was started with. null for instances from before it: not recorded. */
+  rootObjective?: string | null;
+  /** Optional operator-visible title for this particular run. */
+  runTitle?: string | null;
 }
 
 export interface WorkflowFrontierBinding {
@@ -290,7 +330,7 @@ export interface WorkflowStepTrailEntry {
   stepId: string;
   stepRole: string;
   closedAt: string;
-  closureReason: WorkflowExitKind;
+  closureReason: WorkflowTrailReason;
   closureEvidence: Record<string, unknown> | null;
   actorSession: string;
   nextQitemId: string | null;

@@ -12,8 +12,9 @@
 // The ladder's state IS the transition log (AM-P3-F6): attempts, rungs, and suspension are
 // derived from markers at every tick, so a daemon restart resumes at the exact position —
 // forgotten-ladder and reset-count are both REDs below.
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import Database from "better-sqlite3";
+import { renderQueueHandoffNudge } from "../src/domain/queue-nudge-text.js";
 import { migrate } from "../src/db/migrate.js";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 import { QueueRepository, type QueueItem } from "../src/domain/queue-repository.js";
@@ -23,6 +24,11 @@ import { WatchdogJobsRepository } from "../src/domain/watchdog-jobs-repository.j
 import { USAGE_LIMIT_BLOCKER_TAG } from "../src/domain/queue-wake-repository.js";
 import { ViewProjector } from "../src/domain/view-projector.js";
 import { SettingsStore } from "../src/domain/user-settings/settings-store.js";
+import nodePath from "node:path";
+import { ProviderServiceImpl } from "../src/domain/provider/provider-service-impl.js";
+import { CodexUsageWindows } from "../src/domain/provider/codex-usage-windows.js";
+import { codexUsageReader } from "../src/domain/provider/codex-usage-reader.js";
+import { ACCOUNT_ANSWER, makeFakeCodex, rateLimitsAnswer } from "./helpers/fake-codex-usage.js";
 import {
   LADDER_ATTEMPT_PREFIX,
   LADDER_RUNG_PREFIX,
@@ -269,6 +275,75 @@ describe("S01 wake-or-escalate — retry ladder, named rungs, derived suspension
     expect(calls.some((c) => c.target === "worker@r")).toBe(false);
   });
 
+  it("UNKNOWN READS UNKNOWN: a baton whose recorded wake result no reader recognises escalates past the window, never re-sent, and the notice says the outcome is unknown", async () => {
+    const baton = await mkBaton();
+    setNudgeResult(baton.qitemId, "accepted-by-some-new-route", 45);
+    ageCreated(baton.qitemId, 45);
+    await tick();
+    expect(markersOf(baton.qitemId, LADDER_ATTEMPT_PREFIX)).toHaveLength(0);
+    const rungs = markersOf(baton.qitemId, LADDER_RUNG_PREFIX);
+    expect(rungs).toHaveLength(1);
+    expect(rungs[0]).toMatch(/wake outcome unknown \(unrecognised result "accepted-by-some-new-route"\)/);
+    expect(calls.some((c) => c.target === "worker@r")).toBe(false);
+  });
+
+  it("UNKNOWN READS UNKNOWN (negative controls): inside the window, or once claimed, an unrecognised result gets nothing", async () => {
+    const fresh = await mkBaton();
+    setNudgeResult(fresh.qitemId, "accepted-by-some-new-route", 5);
+    const claimed = await mkBaton("other@r");
+    setNudgeResult(claimed.qitemId, "accepted-by-some-new-route", 45);
+    ageCreated(claimed.qitemId, 45);
+    repo.claim({ qitemId: claimed.qitemId, destinationSession: "other@r" });
+    await tick();
+    expect(calls).toHaveLength(0);
+    expect(markersOf(fresh.qitemId, LADDER_RUNG_PREFIX)).toHaveLength(0);
+    expect(markersOf(claimed.qitemId, LADDER_RUNG_PREFIX)).toHaveLength(0);
+  });
+
+  it("KNOWN OUTCOMES KEEP THEIR PATH: a verified wake, a hosted trigger's accepted ring and an unroutable address never enter the ladder", async () => {
+    const batons = [];
+    for (const [idx, result] of ["verified", "wake-accepted:webhook (hook) answered 202; pickup is the member's claim on this row",
+      "unroutable: 'w2@r' has no terminal transport on this daemon"].entries()) {
+      const baton = await mkBaton(`w${idx}@r`);
+      setNudgeResult(baton.qitemId, result, 45);
+      ageCreated(baton.qitemId, 45);
+      batons.push(baton);
+    }
+    await tick();
+    expect(calls).toHaveLength(0);
+    for (const baton of batons) {
+      expect(markersOf(baton.qitemId, LADDER_ATTEMPT_PREFIX)).toHaveLength(0);
+      expect(markersOf(baton.qitemId, LADDER_RUNG_PREFIX)).toHaveLength(0);
+    }
+  });
+
+  it("A WEBHOOK FAILURE AFTER THE POST KEEPS THE FAILED PATH: its effect is unknown, but it is retried as it always was", async () => {
+    const baton = await mkBaton();
+    setNudgeResult(baton.qitemId, "failed:webhook (hook) answered 500", 10);
+    await tick();
+    expect(markersOf(baton.qitemId, LADDER_ATTEMPT_PREFIX)).toHaveLength(1);
+    expect(calls).toEqual([{ qitemId: baton.qitemId, target: "worker@r" }]);
+  });
+
+  it("DELIVERY MACHINERY IS NOT PICKUP: a relay-owner-notification-transport-failed note on an unconfirmed or held baton does not count as pickup evidence", async () => {
+    const mod = await ladderMod();
+    for (const [idx, result] of ["gateway-owned: virtual destination", "retained:typing_guard"].entries()) {
+      const baton = await mkBaton(`worker-${idx}@r`);
+      setNudgeResult(baton.qitemId, result, 45);
+      ageCreated(baton.qitemId, 45);
+      repo.transitionLog.append({
+        qitemId: baton.qitemId,
+        state: "pending",
+        actorSession: "daemon@kernel",
+        transitionNote: `relay-owner-notification-transport-failed notification_key=${baton.qitemId}:1 connector_ref=wa-main class=http-503 error=http 503`,
+      });
+      expect(mod.readWakeLadderBackstop(db, baton.qitemId)).not.toBeNull();
+      await tick();
+      expect(markersOf(baton.qitemId, LADDER_RUNG_PREFIX)).toHaveLength(1);
+      expect(markersOf(baton.qitemId, LADDER_RUNG_PREFIX)[0]).toMatch(/orchestrator/);
+    }
+  });
+
   // ── G4: F2 — SUSPENSION DERIVES FROM THE SWAP STATE ──────────────────────────
 
   it("SWAP SUSPENDS THE LADDER: a destination inside the post-swap grace gets ZERO wake attempts and one recorded suspend marker (the stale-wake-burst specimen)", async () => {
@@ -301,6 +376,31 @@ describe("S01 wake-or-escalate — retry ladder, named rungs, derived suspension
     expect(calls).toHaveLength(0);
     expect(markersOf(baton.qitemId, "ladder-suspend:")).toHaveLength(1);
     expect(markersOf(baton.qitemId, "ladder-suspend:")[0]).toMatch(/operator/i); // named as the override
+  });
+
+  it("DECLARED WINDOW PARSES EXTERNAL DESTINATIONS: a colon in the session does not disable the override", async () => {
+    const baton = await mkBaton("slack:U123@external");
+    setNudgeResult(baton.qitemId, "failed:tmux session not found", 60);
+    process.env.OPENRIG_WAKE_SUSPEND = `slack:U123@external:${new Date(Date.now() + 3600_000).toISOString()}`;
+    await tick();
+    expect(calls).toHaveLength(0);
+    expect(markersOf(baton.qitemId, "ladder-suspend:")).toHaveLength(1);
+  });
+
+  // Any form Date.parse reads keeps suspending: `date -u '+%Y-%m-%d %H:%M'` prints the space form. (A comma can't
+  // appear: entries are comma-separated, so the textual form drops toUTCString's weekday.)
+  it.each([
+    ["the space form", "worker@r", (d: Date) => d.toISOString().replace("T", " ")],
+    ["the space form", "slack:U123@external", (d: Date) => d.toISOString().replace("T", " ")],
+    ["a textual date", "worker@r", (d: Date) => d.toUTCString().replace(/^\w+, /, "")],
+    ["a textual date", "slack:U123@external", (d: Date) => d.toUTCString().replace(/^\w+, /, "")],
+  ])("DECLARED WINDOW KEEPS EVERY DATE FORM Date.parse reads: %s suspends %s", async (_form, destination, format) => {
+    const baton = await mkBaton(destination);
+    setNudgeResult(baton.qitemId, "failed:tmux session not found", 60);
+    process.env.OPENRIG_WAKE_SUSPEND = `${destination}:${format(new Date(Date.now() + 3600_000))}`;
+    await tick();
+    expect(calls).toHaveLength(0);
+    expect(markersOf(baton.qitemId, "ladder-suspend:")).toHaveLength(1);
   });
 
   // ── G5: F3 — STORMS AGGREGATE ────────────────────────────────────────────────
@@ -418,6 +518,195 @@ describe("S01 wake-or-escalate — retry ladder, named rungs, derived suspension
     expect(calls.some((c) => c.target === "worker@r")).toBe(false); // never escalated INTO the dead seat
   });
 
+  // #811 — queue.wake_human_rung: "explicit-only" keeps agent-to-agent escalations
+  // out of a person's channel; the default posts exactly as before.
+  async function exhaustToSelfSkip(dest = "worker@r"): Promise<QueueItem> {
+    const baton = await mkBaton(dest);
+    setNudgeResult(baton.qitemId, "failed:tmux session not found", 120);
+    for (let a = 1; a <= 3; a++) {
+      repo.transitionLog.append({
+        qitemId: baton.qitemId,
+        state: "pending",
+        actorSession: "wake-ladder@system",
+        transitionNote: `${LADDER_ATTEMPT_PREFIX} ${a}/3 outcome=failed:tmux session not found`,
+      });
+    }
+    ageMarkers(baton.qitemId, 30);
+    return baton;
+  }
+  function recordingEngine(posted: string[]) {
+    return {
+      dispatchEscalation: async (row: QueueItem) => {
+        posted.push(row.qitemId);
+        return { decision: "post", resolved: true, dispatched: true };
+      },
+    };
+  }
+
+  const founderRegistry = () => ({ ok: true as const, entities: [{
+    entityId: "human-founder", class: "human" as const, displayName: "Founder", address: "human-founder@external",
+    connectorBindings: [], prefs: { deliveryClass: "B" as const, availability: "available" as const },
+  }] });
+
+  it.each([false, true])("an inadmissible sender cannot abort a failed baton escalation (consumed hop=%s)", async consumed => {
+    const baton = await exhaustToSelfSkip();
+    const staleSource = "sender@remote@retired-host";
+    db.prepare("UPDATE queue_items SET source_session=?, tags=? WHERE qitem_id=?")
+      .run(staleSource, JSON.stringify(consumed ? ["escalation-route:one-hop"] : []), baton.qitemId);
+    repo = new QueueRepository(db, new EventBus(db), { validateRig: target => target !== staleSource });
+    const posted: string[] = [];
+    const overrides = { resolveOrchestrator: () => null, deliveryEngine: recordingEngine(posted), humanRung: "always" };
+    const result = await tick(overrides);
+    expect(result.outcome).not.toBe("failed");
+    expect(posted).toEqual([baton.qitemId]);
+    expect(calls).toEqual([]);
+    const tag = consumed ? `consumed-hop:${baton.qitemId}` : (await ladderMod()).escalationDedupTag(baton.destinationSession);
+    const carriers = repo.list({ limit: 500 }).filter(row => row.tags?.includes(tag));
+    expect(carriers).toHaveLength(1);
+    expect(carriers[0]).toMatchObject({ sourceSession: "daemon@kernel", destinationSession: baton.destinationSession });
+    await tick(overrides);
+    expect(posted).toEqual([baton.qitemId]);
+  });
+
+  it("HUMAN RUNG DEFAULT: with the engine wired and no setting, the operator rung posts the escalation as before", async () => {
+    const baton = await exhaustToSelfSkip();
+    const posted: string[] = [];
+    await tick({ resolveOrchestrator: () => null, deliveryEngine: recordingEngine(posted) });
+    expect(posted).toEqual([baton.qitemId]);
+    expect(markersOf(baton.qitemId, LADDER_RUNG_PREFIX).some((r) => /dispatched-to-engine/.test(r))).toBe(true);
+  });
+
+  it("OPERATOR RUNG RELAY RECEIPT: pending dispatch resolves on matching post-marker relay-owner-notification-accepted", async () => {
+    const baton = await exhaustToSelfSkip();
+    const notificationKey = "notif-key-123";
+    let dispatchCount = 0;
+    const pendingEngine = {
+      dispatchEscalation: async (row: QueueItem) => {
+        dispatchCount++;
+        return { decision: "post", resolved: false, dispatched: true, notificationKey };
+      },
+    };
+
+    // Pre-marker receipt in history (simulates receipt from a previous episode before dispatch):
+    // Must NOT resolve the upcoming dispatch.
+    repo.transitionLog.append({
+      qitemId: baton.qitemId,
+      state: "pending",
+      actorSession: "daemon@kernel",
+      transitionNote: `relay-owner-notification-accepted notification_key=${notificationKey} delivery_id=d-pre`,
+    });
+
+    // 1. Initial tick with pending deliveryEngine outcome (resolved: false).
+    await tick({ resolveOrchestrator: () => null, deliveryEngine: pendingEngine });
+    expect(dispatchCount).toBe(1);
+    expect(markersOf(baton.qitemId, LADDER_RUNG_PREFIX).some((r) => /dispatched-to-engine.*notification_key=notif-key-123/.test(r))).toBe(true);
+    // Pre-marker matching receipt did not resolve it; ladder not exhausted yet, underlying baton remains pending.
+    expect(markersOf(baton.qitemId, LADDER_EXHAUSTED_PREFIX)).toHaveLength(0);
+    expect(repo.getById(baton.qitemId)!.state).toBe("pending");
+
+    // 2. Wrong key post-marker relay receipt -> no resolution.
+    repo.transitionLog.append({
+      qitemId: baton.qitemId,
+      state: "pending",
+      actorSession: "daemon@kernel",
+      transitionNote: "relay-owner-notification-accepted notification_key=wrong-key delivery_id=d-1",
+    });
+    ageMarkers(baton.qitemId, 30);
+    await tick({ resolveOrchestrator: () => null, deliveryEngine: pendingEngine });
+    expect(dispatchCount).toBe(1); // No second dispatch/resume!
+    expect(markersOf(baton.qitemId, LADDER_EXHAUSTED_PREFIX)).toHaveLength(0);
+
+    // 3. Matching post-marker relay receipt -> exhausts operator rung without second dispatch and without closing pending work.
+    repo.transitionLog.append({
+      qitemId: baton.qitemId,
+      state: "pending",
+      actorSession: "daemon@kernel",
+      transitionNote: `relay-owner-notification-accepted notification_key=${notificationKey} delivery_id=d-2`,
+    });
+    ageMarkers(baton.qitemId, 30);
+    await tick({ resolveOrchestrator: () => null, deliveryEngine: pendingEngine });
+    expect(dispatchCount).toBe(1); // Exactly-once dispatch preserved
+    expect(markersOf(baton.qitemId, LADDER_EXHAUSTED_PREFIX)).toHaveLength(1);
+    expect(markersOf(baton.qitemId, LADDER_EXHAUSTED_PREFIX)[0]).toContain("engine outcome resolved");
+    // Underlying blocked/pending work is NOT closed/cancelled
+    expect(repo.getById(baton.qitemId)!.state).toBe("pending");
+  });
+
+  it("HUMAN RUNG EXPLICIT-ONLY: an agent-to-agent baton ends at the escalation row and nothing is posted to a person", async () => {
+    const baton = await exhaustToSelfSkip();
+    const posted: string[] = [];
+    await tick({ resolveOrchestrator: () => null, deliveryEngine: recordingEngine(posted), humanRung: "explicit-only", loadHumanRegistry: founderRegistry });
+    expect(posted).toEqual([]);
+    const rungs = markersOf(baton.qitemId, LADDER_RUNG_PREFIX);
+    expect(rungs.some((r) => /operator floor=escalation view \(human rung explicit-only/.test(r))).toBe(true);
+    expect(markersOf(baton.qitemId, LADDER_EXHAUSTED_PREFIX)).toHaveLength(1);
+    const escRows = await escalationRowsFor("worker@r");
+    expect(escRows).toHaveLength(1);
+    expect(escRows[0]!.state).toBe("pending");
+    ageMarkers(baton.qitemId, 30);
+    await tick({ resolveOrchestrator: () => null, deliveryEngine: recordingEngine(posted), humanRung: "explicit-only", loadHumanRegistry: founderRegistry });
+    expect(posted).toEqual([]); // exhausted: never posts later either
+  });
+
+  it("HUMAN RUNG EXPLICIT-ONLY: after a failed orchestrator rung, the operator rung still posts nothing", async () => {
+    const baton = await exhaustToSelfSkip();
+    const posted: string[] = [];
+    outcomes["orch@r"] = "failed:tmux session not found";
+    await tick({ deliveryEngine: recordingEngine(posted), humanRung: "explicit-only", loadHumanRegistry: founderRegistry });
+    ageMarkers(baton.qitemId, 30);
+    await tick({ deliveryEngine: recordingEngine(posted), humanRung: "explicit-only", loadHumanRegistry: founderRegistry });
+    expect(posted).toEqual([]);
+    expect(markersOf(baton.qitemId, LADDER_RUNG_PREFIX)[1]).toMatch(/human rung explicit-only/);
+    expect(markersOf(baton.qitemId, LADDER_EXHAUSTED_PREFIX)).toHaveLength(1);
+  });
+
+  it("HUMAN RUNG EXPLICIT-ONLY: a handoff to a registry alias of a person still posts to that person", async () => {
+    const baton = await exhaustToSelfSkip("human-founder@r");
+    const posted: string[] = [];
+    await tick({ resolveOrchestrator: () => null, deliveryEngine: recordingEngine(posted), humanRung: "explicit-only", loadHumanRegistry: founderRegistry });
+    expect(posted).toEqual([baton.qitemId]);
+    expect(markersOf(baton.qitemId, LADDER_RUNG_PREFIX).some((r) => /human rung explicit-only/.test(r))).toBe(false);
+  });
+
+  it("HUMAN RUNG EXPLICIT-ONLY: a handoff to a one-off @external address the registry does not know still posts", async () => {
+    const baton = await exhaustToSelfSkip("slack:U012AB3CD@external");
+    const posted: string[] = [];
+    await tick({ resolveOrchestrator: () => null, deliveryEngine: recordingEngine(posted), humanRung: "explicit-only", loadHumanRegistry: founderRegistry });
+    expect(posted).toEqual([baton.qitemId]);
+    expect(markersOf(baton.qitemId, LADDER_RUNG_PREFIX).some((r) => /human rung explicit-only/.test(r))).toBe(false);
+  });
+
+  it("HUMAN RUNG EXPLICIT-ONLY: a person-shaped address the registry does not know is agent-to-agent", async () => {
+    const baton = await exhaustToSelfSkip("human-stranger@r");
+    const posted: string[] = [];
+    await tick({ resolveOrchestrator: () => null, deliveryEngine: recordingEngine(posted), humanRung: "explicit-only", loadHumanRegistry: founderRegistry });
+    expect(posted).toEqual([]);
+    expect(markersOf(baton.qitemId, LADDER_RUNG_PREFIX).some((r) => /human rung explicit-only/.test(r))).toBe(true);
+  });
+
+  it("HUMAN RUNG EXPLICIT-ONLY: an unreadable registry is not evidence of agent-to-agent work, so the rung posts", async () => {
+    const baton = await exhaustToSelfSkip();
+    const posted: string[] = [];
+    await tick({ resolveOrchestrator: () => null, deliveryEngine: recordingEngine(posted), humanRung: "explicit-only",
+      loadHumanRegistry: () => ({ ok: false as const, error: "registry projection missing" }) });
+    expect(posted).toEqual([baton.qitemId]);
+  });
+
+  it("HUMAN RUNG SETTING: defaults to always; explicit-only resolves from the env; other values are refused", async () => {
+    const mod = await ladderMod();
+    const missingConfig = `/tmp/openrig-811-missing-${process.pid}-${Date.now()}.json`;
+    const store = new SettingsStore(missingConfig);
+    expect(store.resolveOne("queue.wake_human_rung" as never)).toMatchObject({ value: "always", source: "default" });
+    expect(mod.DEFAULT_WAKE_HUMAN_RUNG).toBe("always");
+    process.env.OPENRIG_QUEUE_WAKE_HUMAN_RUNG = "explicit-only";
+    try {
+      expect(store.resolveOne("queue.wake_human_rung" as never)).toMatchObject({ value: "explicit-only", source: "env" });
+      expect(() => store.set("queue.wake_human_rung" as never, "never")).toThrow(/always.*explicit-only/);
+    } finally {
+      delete process.env.OPENRIG_QUEUE_WAKE_HUMAN_RUNG;
+    }
+  });
+
   // ── G7: F5 — THE S02 SEAM HOLDS ──────────────────────────────────────────────
 
   it("SEAM (live ladder): a baton under a live ladder produces ZERO S02 undelivered findings", async () => {
@@ -517,6 +806,37 @@ describe("S01 wake-or-escalate — retry ladder, named rungs, derived suspension
 
   // ── S16 — PROVIDER LIMITS PARK ON ONE SHARED TIMER ─────────────────────────
 
+  it("#48: a held created row that isn't an agent's held wake keeps its own path at a usage limit: it isn't parked", async () => {
+    const now = new Date();
+    const jobs = new WatchdogJobsRepository(db, () => now);
+    repo.attachWatchdogJobsRepository(jobs);
+    const raised = await repo.create({ sourceSession: "daemon@kernel", destinationSession: "dev-a@r", body: "an OpenRig notice", nudge: false });
+    setNudgeResult(raised.qitemId, "retained:typing_guard", 45);
+    ageCreated(raised.qitemId, 45);
+    await tick({
+      now,
+      usageLimitJitterSeconds: 0,
+      getProviderReadModel: async () => ({
+        bindings: [],
+        signals: [{
+          provider: "claude" as const,
+          seatSession: "dev-a@r",
+          sourceClass: "provider_statusline" as const,
+          authority: "account_cross_device" as const,
+          window: "five_hour",
+          usedPercent: 100,
+          resetsAt: new Date(now.getTime() + 15 * 60_000).toISOString(),
+          asOf: now.toISOString(),
+          staleAfter: new Date(now.getTime() + 30 * 60_000).toISOString(),
+          supportsNotification: false,
+          automationUse: "allow_switch_decision" as const,
+        }],
+      }),
+    });
+    expect(repo.getById(raised.qitemId)!.state).toBe("pending");
+    expect(markersOf(raised.qitemId, LADDER_RUNG_PREFIX)).toHaveLength(0);
+  });
+
   it("USAGE LIMIT SUPPRESSES WRONG RUNGS: three Claude seats share one blocker timer and zero retry/escalation attempts", async () => {
     const now = new Date();
     const reset = new Date(now.getTime() + 15 * 60_000).toISOString();
@@ -575,6 +895,26 @@ describe("S01 wake-or-escalate — retry ladder, named rungs, derived suspension
     });
     expect(repo.list({ limit: 500 }).filter((row) => row.tags?.includes(USAGE_LIMIT_BLOCKER_TAG))).toHaveLength(1);
     expect(calls).toEqual([]);
+  });
+
+  it("slice 01: a ladder tick over the real provider service with usage windows on starts no native read", async () => {
+    const fake = makeFakeCodex();
+    fake.setPlan({ mode: "ok", account: ACCOUNT_ANSWER, rateLimits: rateLimitsAnswer({ secondaryUsed: 100 }) });
+    const windows = new CodexUsageWindows({
+      read: codexUsageReader({ launchPath: `${fake.binDir}${nodePath.delimiter}${process.env.PATH}`, codexHome: fake.codexHome, deadlineMs: 5_000 }),
+    });
+    const svc = new ProviderServiceImpl({
+      db,
+      listRigs: () => [],
+      env: { CODEX_HOME: fake.codexHome } as NodeJS.ProcessEnv,
+      usageWindows: { enabled: () => true, windows },
+    });
+    let reads = 0;
+    const getProviderReadModel = () => { reads += 1; return svc.getReadModel(); };
+    await tick({ now: new Date(), usageLimitJitterSeconds: 0, getProviderReadModel });
+    await tick({ now: new Date(), usageLimitJitterSeconds: 0, getProviderReadModel });
+    expect(reads).toBe(2);
+    expect(fake.spawns()).toBe(0);
   });
 
   it("A FAILED EXPIRY WAKE RESUMES the shipped ladder after the provider reset", async () => {
@@ -732,5 +1072,145 @@ describe("S01 wake-or-escalate — retry ladder, named rungs, derived suspension
     expect(store.resolveOne("queue.wake_retry_cap" as never)).toMatchObject({ value: 3, source: "default" });
     expect(store.resolveOne("queue.wake_unconfirmed_window_minutes" as never)).toMatchObject({ value: 30, source: "default" });
     expect(store.resolveOne("queue.wake_swap_grace_seconds" as never)).toMatchObject({ value: 180, source: "default" });
+  });
+
+  // ── Permission prompt read clear: the alert each seat's clear bounds ─────────
+
+  const CLEARED_NOTE = "prompt escalation: the seat's prompt read clear";
+  const clearMarks = (qitemId: string) => repo.listTransitions(qitemId)
+    .filter(t => t.actorSession === "wake-ladder@system" && t.transitionNote === CLEARED_NOTE).length;
+  const readClear = (...seats: Array<[string, string]>) => (only?: string) => seats
+    .filter(([dest]) => !only || dest === only)
+    .map(([destination, episode]) => ({ destination, episode, state: "clear" as const,
+      observedAt: new Date().toISOString(), evidenceRef: "retained hook" }));
+  async function closedAlert(tags: string[], minutesAgo: number): Promise<string> {
+    const row = await repo.create({ sourceSession: "sender@r", destinationSession: "desk@r", body: "alert", tags, nudge: false });
+    db.prepare("UPDATE queue_items SET ts_created = ? WHERE qitem_id = ?")
+      .run(new Date(Date.UTC(2026, 0, 1, 12) - minutesAgo * 60_000).toISOString(), row.qitemId);
+    repo.update({ qitemId: row.qitemId, actorSession: "desk@r", state: "done", closureReason: "no-follow-on" } as never);
+    return row.qitemId;
+  }
+
+  it("seats read clear in one tick with no prompt alert: nothing is marked and no row appears", async () => {
+    await tick({ readPermissionPrompts: readClear(["a-seat@r", "e1"], ["b-seat@r", "e1"]) });
+    expect(repo.list({ limit: 100 })).toEqual([]);
+    expect(db.prepare("SELECT count(*) AS n FROM queue_transitions WHERE transition_note = ?").get(CLEARED_NOTE)).toEqual({ n: 0 });
+  });
+
+  it("seats read clear in one tick: each marks only its newest closed alert of that episode, ties to the higher id", async () => {
+    const { PROMPT_ALERT_TAG: alert } = await ladderMod();
+    const episode = (dest: string, ep: string, rest = "after:start") => `prompt-episode:${dest}|permission-hook:${ep}|${rest}`;
+    const aOld = await closedAlert([alert, episode("a-seat@r", "e1")], 30);
+    const aTie = [
+      await closedAlert([alert, episode("a-seat@r", "e1", "prompt:2026-01-01T11:50:00.000Z|after:start")], 10),
+      await closedAlert([alert, episode("a-seat@r", "e1", "prompt:2026-01-01T11:50:00.000Z|after:start")], 10),
+    ];
+    // Newer, but not the seat's episode: another episode that shares its text, another seat that shares its name,
+    // a row without the alert tag, and a seat that read nothing.
+    const others = [
+      await closedAlert([alert, episode("a-seat@r", "e10")], 5),
+      await closedAlert([alert, episode("a-seat@r2", "e1")], 4),
+      await closedAlert([episode("a-seat@r", "e1")], 3),
+      await closedAlert([alert, episode("c-seat@r", "e1")], 1),
+    ];
+    // Seat b's newest alert already carries the clear: its older one stays unmarked.
+    const bOld = await closedAlert([alert, episode("b-seat@r", "e1")], 20);
+    const bNew = await closedAlert(["owner-decision", alert, episode("b-seat@r", "e1")], 2);
+    repo.transitionLog.append({ qitemId: bNew, state: "done", actorSession: "wake-ladder@system", transitionNote: CLEARED_NOTE });
+
+    await tick({ readPermissionPrompts: readClear(["a-seat@r", "e1"], ["b-seat@r", "e1"]) });
+
+    const aPick = [...aTie].sort().at(-1)!;
+    expect(clearMarks(aPick)).toBe(1);
+    for (const id of [aOld, ...aTie.filter(id => id !== aPick), ...others, bOld]) expect(clearMarks(id)).toBe(0);
+    expect(clearMarks(bNew)).toBe(1);
+    // A second clear tick finds the same alerts already marked.
+    await tick({ readPermissionPrompts: readClear(["a-seat@r", "e1"], ["b-seat@r", "e1"]) });
+    expect(clearMarks(aPick)).toBe(1);
+    expect(clearMarks(bNew)).toBe(1);
+  });
+
+  it("open newer alert keeps an older closed alert of the same episode unmarked", async () => {
+    const { PROMPT_ALERT_TAG: alert } = await ladderMod();
+    const tag = "prompt-episode:a-seat@r|permission-hook:e1|after:start";
+    const older = await closedAlert([alert, tag], 20);
+    const open = await repo.create({ sourceSession: "sender@r", destinationSession: "desk@r", body: "alert", tags: [alert, tag], nudge: false });
+    db.prepare("UPDATE queue_items SET ts_created = ? WHERE qitem_id = ?").run(new Date(Date.UTC(2026, 0, 1, 12) - 60_000).toISOString(), open.qitemId);
+    await tick({ readPermissionPrompts: readClear(["a-seat@r", "e1"]) });
+    expect(repo.getById(open.qitemId)?.state).toBe("pending");
+    expect(clearMarks(older)).toBe(0);
+    expect(clearMarks(open.qitemId)).toBe(0);
+  });
+
+  it("an episode containing '|' still matches by prefix", async () => {
+    const { PROMPT_ALERT_TAG: alert } = await ladderMod();
+    const mine = await closedAlert([alert, "prompt-episode:a-seat@r|permission-hook:g|1|after:start"], 10);
+    const other = await closedAlert([alert, "prompt-episode:a-seat@r|permission-hook:g|2|after:start"], 5);
+    await tick({ readPermissionPrompts: readClear(["a-seat@r", "g|1"]) });
+    expect(clearMarks(mine)).toBe(1);
+    expect(clearMarks(other)).toBe(0);
+  });
+
+  it("alert-row reads per tick do not grow with the number of clear seats", async () => {
+    const { PROMPT_ALERT_TAG: alert } = await ladderMod();
+    const seats = ["s1@r", "s2@r", "s3@r", "s4@r", "s5@r", "s6@r"];
+    for (const s of seats) await closedAlert([alert, `prompt-episode:${s}|permission-hook:e1|after:start`], 10);
+    const reads = async (n: number) => {
+      let count = 0;
+      const spied = db as unknown as { prepare: (sql: string) => Record<string, (...a: unknown[]) => unknown> };
+      const original = spied.prepare;
+      spied.prepare = function (sql: string) {
+        const st = original.call(db, sql);
+        if (sql.includes('"wake-prompt-refusal"')) for (const m of ["get", "all", "iterate"]) {
+          const f = st[m].bind(st);
+          st[m] = (...a: unknown[]) => { count++; return f(...a); };
+        }
+        return st;
+      };
+      try { await tick({ readPermissionPrompts: readClear(...seats.slice(0, n).map(s => [s, "e1"] as [string, string])) }); }
+      finally { spied.prepare = original; }
+      return count;
+    };
+    const one = await reads(1);
+    const six = await reads(6);
+    expect(one).toBeGreaterThan(0);
+    expect(six).toBe(one);
+  });
+});
+
+describe("wake ladder retry — envelope sender", () => {
+  it("a default ladder retry is sent as OpenRig and keeps the row's source visible in the body", async () => {
+    const db = new Database(":memory:");
+    migrate(db, ALL_MIGRATIONS);
+    const repo = new QueueRepository(db, new EventBus(db), { validateRig: () => true });
+    const src = await repo.create({ sourceSession: "sender@r", destinationSession: "relay@r", body: "obligation" });
+    const { created } = await repo.handoff({ qitemId: src.qitemId, fromSession: "relay@r", toSession: "worker@r", nudge: false });
+    db.prepare("UPDATE queue_items SET last_nudge_attempt = ?, last_nudge_result = ? WHERE qitem_id = ?").run(
+      new Date(Date.now() - 10 * 60_000).toISOString(),
+      "failed:tmux session not found",
+      created.qitemId,
+    );
+    const maybeNudge = vi.spyOn(repo, "maybeNudge").mockResolvedValue();
+    const mod = await ladderMod();
+    await mod.runWakeLadderTick({
+      db,
+      queueRepo: repo,
+      resolveOrchestrator: () => "orch@r",
+      retryIntervalSeconds: 300,
+      retryCap: 3,
+      unconfirmedWindowMinutes: 30,
+      swapGraceSeconds: 180,
+      log: () => {},
+    });
+    // The body is the default handoff nudge text, plus only the row-source suffix.
+    expect(maybeNudge).toHaveBeenCalledWith(
+      created.qitemId,
+      "worker@r",
+      true,
+      "daemon@kernel",
+      `${renderQueueHandoffNudge(created.qitemId, null)} Row source: relay@r.`,
+      "openrig",
+    );
+    db.close();
   });
 });

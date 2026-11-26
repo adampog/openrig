@@ -74,6 +74,8 @@ export interface WebApiResult {
   grantedScopes: string[]; // parsed from x-oauth-scopes response header (item 5)
   json: Record<string, unknown>;
   error?: string;
+  /** A 2xx whose body couldn't be read: the outcome is unknown, not failed (the post may have landed). */
+  responseUnreadable?: true;
 }
 
 /** S10 shape-fix — the per-method REQUEST SHAPE. Slack's read methods (conversations.info /
@@ -136,19 +138,39 @@ export async function callWebApi(
         .map((s) => s.trim())
         .filter(Boolean);
       let json: Record<string, unknown> = {};
+      let unreadable: string | undefined;
       try {
         json = (await res.json()) as Record<string, unknown>;
-      } catch {
-        /* non-JSON */
+      } catch (e) {
+        // A 2xx whose body we couldn't read (a timeout that fired after the headers, say) leaves the outcome
+        // unknown, not failed: keep why, and say so, rather than reporting a bare status.
+        if (res.ok) unreadable = withoutToken((e as Error)?.message ?? String(e), token);
       }
       const ok = res.ok && json.ok === true;
       const retryAfter = Number(res.headers.get("retry-after"));
+      const error = ok ? undefined
+        : unreadable !== undefined ? `response unreadable after HTTP ${res.status}: ${unreadable}`
+        : String(json.error ?? `http ${res.status}`);
       return { ok, status: res.status, grantedScopes, json,
-        ...(Number.isFinite(retryAfter) && retryAfter > 0 ? { retryAfterSeconds: retryAfter } : {}), error: ok ? undefined : String(json.error ?? `http ${res.status}`) };
+        ...(Number.isFinite(retryAfter) && retryAfter > 0 ? { retryAfterSeconds: retryAfter } : {}),
+        ...(unreadable !== undefined ? { responseUnreadable: true as const } : {}), error };
     });
   } catch (e) {
-    return { ok: false, status: 0, grantedScopes: [], json: {}, error: `web-api transport: ${(e as Error).message}` };
+    return { ok: false, status: 0, grantedScopes: [], json: {}, error: `web-api transport: ${withoutToken((e as Error).message, token)}` };
   }
+}
+
+/** A transport error's message can quote the request's Authorization header (Node's fetch does for an invalid value),
+ *  so the token, and each line of it, is removed before the message goes anywhere, as sent and as trimmed (Node trims
+ *  the value before quoting it). A line shorter than 6 characters is left: removing it everywhere would garble the rest
+ *  of the message. One pass, so a marker is never rescanned. */
+function withoutToken(message: string, token: string): string {
+  const lines = token.split(/[\r\n]+/).flatMap((line) => [line, line.trim()]).filter((part) => part.length >= 6);
+  const parts = [...new Set([token, token.trim(), ...lines])].filter((part) => part.length > 0)
+    .sort((a, b) => b.length - a.length);
+  if (parts.length === 0) return message;
+  const pattern = new RegExp(parts.map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "g");
+  return message.replace(pattern, "[redacted]");
 }
 
 /** Item 5: read the ACTUAL granted scopes from the response header (configured != granted). */
@@ -159,6 +181,24 @@ export async function getGrantedScopes(
 ): Promise<{ ok: boolean; granted: string[]; error?: string }> {
   const r = await callWebApi("auth.test", token, {}, fetchImpl, timeoutMs);
   return { ok: r.ok, granted: r.grantedScopes, error: r.error };
+}
+
+/** Named-bot delivery: the app a bot's posts belong to (`bots.info`, needs `users:read`). A transport,
+ *  rate-limit or server failure is retryable; Slack's own refusal (`missing_scope`, `bot_not_found`) is not. */
+export async function lookupBotApp(
+  token: string,
+  botId: string,
+  fetchImpl: FetchImpl = defaultFetch,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<{ ok: true; appId: string } | { ok: false; retryable: boolean; error: string }> {
+  const r = await callWebApi("bots.info", token, { bot: botId }, fetchImpl, timeoutMs, "get-query");
+  const appId = (r.json.bot as { app_id?: unknown } | undefined)?.app_id;
+  if (r.ok && typeof appId === "string" && appId) return { ok: true, appId };
+  return {
+    ok: false,
+    retryable: r.status === 0 || r.status === 429 || r.status >= 500,
+    error: r.ok ? "bots.info named no app_id" : (r.error ?? "bots.info failed"),
+  };
 }
 
 /** OPR.0.5.6.2 — authenticated private-file download (`url_private` + Bearer,
@@ -233,7 +273,7 @@ export async function downloadPrivateFile(
       return { ok: true as const, bytes };
     });
   } catch (e) {
-    return { ok: false, error: (e as Error).message || "download failed" };
+    return { ok: false, error: withoutToken((e as Error).message, token) || "download failed" };
   }
 }
 
@@ -264,11 +304,59 @@ export async function verifyChannelMembership(
   channel: string,
   fetchImpl: FetchImpl = defaultFetch,
   timeoutMs = DEFAULT_TIMEOUT_MS,
-): Promise<{ ok: boolean; isMember: boolean; name?: string; error?: string }> {
+): Promise<{ ok: boolean; isMember: boolean; isPrivate: boolean | null; name?: string; error?: string }> {
   const r = await callWebApi("conversations.info", token, { channel }, fetchImpl, timeoutMs, "get-query");
-  if (!r.ok) return { ok: false, isMember: false, error: r.error };
-  const ch = (r.json.channel ?? {}) as { is_member?: boolean; name?: string };
-  return { ok: true, isMember: ch.is_member === true, name: ch.name };
+  if (!r.ok) return { ok: false, isMember: false, isPrivate: null, error: r.error };
+  const ch = (r.json.channel ?? {}) as { is_member?: boolean; is_private?: unknown; name?: string };
+  return {
+    ok: true,
+    isMember: ch.is_member === true,
+    isPrivate: typeof ch.is_private === "boolean" ? ch.is_private : null,
+    name: ch.name,
+  };
+}
+
+/** One page of a directory read: only the projected fields, never Slack's whole object; on failure, Slack's own result. */
+export type DirectoryPage<T> = { ok: true; items: T[]; nextCursor: string | null } | { ok: false; result: WebApiResult };
+export interface DirectoryChannel { id: string; name: string; isMember: boolean }
+export interface DirectoryUser { id: string; name: string; realName: string | null; displayName: string | null; isBot: boolean; deleted: boolean }
+
+function directoryPage<T>(r: WebApiResult, key: string, project: (raw: Record<string, unknown>) => T): DirectoryPage<T> {
+  if (!r.ok) return { ok: false, result: r };
+  const raw = Array.isArray(r.json[key]) ? (r.json[key] as Record<string, unknown>[]) : [];
+  const next = (r.json.response_metadata as { next_cursor?: unknown } | undefined)?.next_cursor;
+  return { ok: true, items: raw.map(project), nextCursor: typeof next === "string" && next ? next : null };
+}
+
+/** One page of the workspace's public, unarchived channels (conversations.list; channels:read). */
+export async function listPublicChannels(
+  token: string,
+  page: { cursor?: string; limit: number },
+  fetchImpl: FetchImpl = defaultFetch,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<DirectoryPage<DirectoryChannel>> {
+  const r = await callWebApi("conversations.list", token,
+    { types: "public_channel", exclude_archived: true, limit: page.limit, cursor: page.cursor }, fetchImpl, timeoutMs, "get-query");
+  return directoryPage(r, "channels", (c) => ({ id: String(c.id), name: String(c.name ?? ""), isMember: c.is_member === true }));
+}
+
+/** One page of the workspace's people (users.list; users:read), without email or other profile fields. */
+export async function listUsers(
+  token: string,
+  page: { cursor?: string; limit: number },
+  fetchImpl: FetchImpl = defaultFetch,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<DirectoryPage<DirectoryUser>> {
+  const r = await callWebApi("users.list", token, { limit: page.limit, cursor: page.cursor }, fetchImpl, timeoutMs, "get-query");
+  return directoryPage(r, "members", (u) => {
+    const profile = (u.profile ?? {}) as { display_name?: unknown };
+    return {
+      id: String(u.id), name: String(u.name ?? ""),
+      realName: typeof u.real_name === "string" ? u.real_name : null,
+      displayName: typeof profile.display_name === "string" && profile.display_name ? profile.display_name : null,
+      isBot: u.is_bot === true, deleted: u.deleted === true,
+    };
+  });
 }
 
 /** Inbound Socket Mode: open a WebSocket URL via apps.connections.open (app-level xapp token). */
@@ -391,11 +479,23 @@ export interface PostChatMessageInput {
   blocks?: unknown[];
   /** Thread reply: the PARENT message's ts (never a reply's ts — the affordance discriminator). */
   thread_ts?: string;
+  unfurl_links?: boolean;
+  unfurl_media?: boolean;
 }
 
 export type PostChatMessageResult =
-  | { ok: true; status: number; ts: string }
-  | { ok: false; status: number; error?: string };
+  /** `threadTs`: where Slack placed the message, from the posted message in its answer: the thread's parent, or null for a
+   *  top-level message. Absent when the answer doesn't include the posted message. */
+  | { ok: true; status: number; ts: string; threadTs?: string | null }
+  | { ok: false; status: number; error?: string; responseUnreadable?: true };
+
+/** The longest Retry-After `postChatMessage` waits for inline. A 429 means Slack
+ *  rejected the post WITHOUT accepting it, so one bounded wait and one retry can
+ *  never double-post (and delivery reconciles by marker on any later replay). A
+ *  longer requested pause, a missing header, or any non-429 failure keeps the
+ *  immediate-failure behavior: the existing retain-and-replay machinery owns
+ *  long rate-limit windows, not this call. */
+const MAX_POST_RATE_LIMIT_WAIT_MS = 10_000;
 
 /** S10 — outbound posting via the Web API (`chat.postMessage`). The R2 native shape needs
  *  thread_ts, which an incoming webhook cannot carry — the webhook path retires with the relay.
@@ -407,15 +507,30 @@ export async function postChatMessage(
   input: PostChatMessageInput,
   fetchImpl: FetchImpl = defaultFetch,
   timeoutMs = DEFAULT_TIMEOUT_MS,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 ): Promise<PostChatMessageResult> {
   const body: Record<string, unknown> = { channel: input.channel, text: input.text };
   if (input.blocks?.length) body.blocks = input.blocks;
   if (input.thread_ts) body.thread_ts = input.thread_ts;
-  const r = await callWebApi("chat.postMessage", token, body, fetchImpl, timeoutMs);
-  if (!r.ok) return { ok: false, status: r.status, error: r.error };
+  if (input.unfurl_links !== undefined) body.unfurl_links = input.unfurl_links;
+  if (input.unfurl_media !== undefined) body.unfurl_media = input.unfurl_media;
+  let r = await callWebApi("chat.postMessage", token, body, fetchImpl, timeoutMs);
+  if (!r.ok && r.status === 429) {
+    const waitMs = (r.retryAfterSeconds ?? 0) * 1000;
+    if (waitMs > 0 && waitMs <= MAX_POST_RATE_LIMIT_WAIT_MS) {
+      await sleep(waitMs);
+      r = await callWebApi("chat.postMessage", token, body, fetchImpl, timeoutMs);
+    }
+  }
+  if (!r.ok) return { ok: false, status: r.status, error: r.error, ...(r.responseUnreadable ? { responseUnreadable: true as const } : {}) };
   const ts = typeof r.json.ts === "string" ? r.json.ts.trim() : "";
   if (!ts) {
     return { ok: false, status: r.status, error: "chat.postMessage returned ok without a message ts" };
   }
-  return { ok: true, status: r.status, ts };
+  // #2234: Slack can accept a reply to a deleted thread root as a new top-level message, with no thread_ts.
+  const message = (r.json as { message?: unknown }).message;
+  if (!message || typeof message !== "object") return { ok: true, status: r.status, ts };
+  const parent = (message as { thread_ts?: unknown }).thread_ts;
+  const threadTs = typeof parent === "string" && parent.trim() && parent.trim() !== ts ? parent.trim() : null;
+  return { ok: true, status: r.status, ts, threadTs };
 }

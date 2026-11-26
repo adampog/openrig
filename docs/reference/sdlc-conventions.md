@@ -37,7 +37,7 @@ one does not deprecate the others. Nothing below deletes or overrides an existin
 | **PRODUCT / MISSION PREPARATION** | **The product-management pass** — the layer above planning, run by the advisor/PM seat before planners touch a mission. The build is a lossy compression pipeline (PM intent → planner spec → builder code); nothing leaks downward by proximity, so this pass grounds in the raw sources, synthesizes ONE scope of record, presents owner decisions decision-ready, mints slices at plan time, deposits the full design contract INLINE in each design-bearing spec (owner words verbatim, settled decisions, evidence, shape of done, anti-goals), routes the complete reading list and internet-research assignments from the spec itself, frames each slice's planning-dial rung with its reason, and rereads every spec as the narrow downstream reader. The measuring stick: SPEC.md alone, plus what it explicitly routes to, reproduces the intent in a reader with none of the author's context. Full reference: `product-management-pass.md`. |
 | **PLAN** | **The planning dial** — planning rigor is a spectrum chosen per piece: P0 mini-requirements and pointers (simple, reversible work) · P1 an authored spec with a proof contract (the default) · P2 plus a research round before the spec freezes, run BEFORE build dispatch · P3 plus an adversarial pass by a non-author, judged against product goals, landing amendments with proof-contract teeth · P4 plus a blind from-scratch design diffed against priors before proceeding. Dial up by what the piece is, exactly as build care is priced below. Full reference: `planning-dial.md`. |
 | **BUILD** | **Part A, the simple flow** (below — the default) · **product-journey components** — a mission-selectable menu for greenfield work, drift recovery, public journey probes, one evidence-gated look at the layer below, minimal repair, independent QA/review, integration, and installed smoke; compose only what the work needs in mission/slice YAML, never as a new mode or mandatory pipeline. Full reference: `product-journey-sdlc.md` · **the wave model** — slices build in parallel in disjoint file territories, an integrator merges serially, and independent review fires once per wave (two reviewers with different vantages, never the writers; fix rounds re-earn verdicts at one final revision; per-slice discipline stays failing-test-first and verify-by-effect). The wave IS the care dial: what shares a wave decides how much review each piece gets · **Part B, the rigorous overlay** (below — only when assigned). These combine: a wave can carry one Part-B piece. Full wave reference: `wave-sdlc.md`. |
-| **DISPATCH DATA** | **The execution-data conventions (S27)** — three tiny data disciplines that make execution state derivable instead of hand-tabulated, consumed by `rig view show execution`. **EC-1, edges in frontmatter:** every open slice carries its hard edges in `depends_on:` (an inline JSON array; an explicit `[]` is a statement, absence is INDETERMINATE; when the slice's `slice.yaml` carries `execution.depends_on`, that list takes precedence); soft/serialization edges are one machine-readable Territory line, exactly `SOFT-AFTER: [ids] — reason`. **EC-2, wave-as-data:** wave composition + review model live in `mission.yaml` `arrangement.waves` (`{id, slices, review_model?}`; a slice may also name its wave in `slice.yaml` `execution.wave`). Only when the mission has no `mission.yaml`, or it is malformed, does the view fall back to the legacy form: the newest queue row tagged `format:wave-map-v1` and `mission:<mission>` whose body carries one fenced ```json block (`{format:"wave-map-v1", mission, waves:[{id, slices, serialized_order?, review_model?}]}`) — composition only, never status labels (status derives at read time); the planning dial recorded at lock surfaces as the frontmatter field `approved-spec-dial:` beside the approve stamp. **EC-3, dispatch names the worktree:** build batons carry the exact body line `worktree_path=<path>` from dispatch onward — it is Q1's join key; batons without it join by naming only and the view marks them `fragile_join`. Existing batons are never rewritten. |
+| **DISPATCH DATA** | **The execution-data conventions (S27)** — three tiny data disciplines that make execution state derivable instead of hand-tabulated, consumed by `rig view show execution`. **EC-1, edges in frontmatter:** every open slice carries its build-order edges in `depends_on:` (an inline JSON array; an explicit `[]` is a statement, absence is INDETERMINATE), and the execution view's sequencing reads them as edges. Proof readiness and eligibility use only `slice.yaml`'s `execution.depends_on`; frontmatter-only edges stay advisory there (#1372). `rig scope slice create` keeps the two paths apart: `--depends-on` writes the advisory SPEC frontmatter list, and `--execution-depends-on` writes `slice.yaml` `execution.depends_on` (#3615). Recorded edges never make a slice runnable; lifecycle eligibility also needs its execution contract. When `slice.yaml` carries `execution.depends_on`, that list takes precedence; soft/serialization edges are one machine-readable Territory line, exactly `SOFT-AFTER: [ids] — reason`. In `rig view show execution`, each `readiness.slices[]` entry says which applied in `dependsOnBasis`: `slice.yaml` (its list, `[]` included), `frontmatter-advisory` (an inline JSON array in the SPEC frontmatter only), `frontmatter-unparsed` (a frontmatter list in another form, not read as edges) or `not-recorded` (no order recorded: INDETERMINATE, not none). In all but `slice.yaml`, eligibility assumes no recorded edges. **EC-2, wave-as-data:** wave composition + review model live in `mission.yaml` `arrangement.waves` (`{id, slices, review_model?}`; a slice may also name its wave in `slice.yaml` `execution.wave`). Only when the mission has no `mission.yaml`, or it is malformed, does the view fall back to the legacy form: the newest queue row tagged `format:wave-map-v1` and `mission:<mission>` whose body carries one fenced ```json block (`{format:"wave-map-v1", mission, waves:[{id, slices, serialized_order?, review_model?}]}`) — composition only, never status labels (status derives at read time); the planning dial recorded at lock surfaces as the frontmatter field `approved-spec-dial:` beside the approve stamp. **EC-3, dispatch names the worktree:** build batons carry the exact body line `worktree_path=<path>` from dispatch onward — it is Q1's join key; batons without it join by naming only and the view marks them `fragile_join`. **Lanes:** Q1 lists each in-progress row as a lane; a row parked on `external:<what>` also appears as a waiting lane, marked `waiting: {on}`. `external:` records an outside dependency (a review, a decision, a capacity limit, a lifecycle step); it does not mean an outside party owns all the work, or that the parked seat is the slice's builder. The views show it as a waiting row (the seat, the blocker, a link to the row), not as the slice's assignment. It yields to an in-progress lane on the same slice, and it is not counted in `lanes_live`, so `q1_lanes` can be longer than `lanes_live`. Rows parked on a qitem, a human seat, or a `fold:`/`auth:` gate are not lanes. Existing batons are never rewritten. |
 | **RELEASE** | The release ceremony conventions (publication identity, honest release notes) and the CAPABILITY-DELTA LIFECYCLE LAW: each release's delta is authored at the fence and bound to the exact candidate, then reconciled to the published cut. Expiry requires both the canon header naming the absorbed delta and a distinct successor delta existing; a draft header alone is insufficient. Verify the actual boundary event and stop citing an expired delta. Full statement: `release-boundary.md` §6. |
 | **BOUNDARY** | **The release boundary** — housekeeping run once per fence so the next release starts clean: seats reset or re-primed per their continuity needs, memory distilled (keep what changed a decision recently), every queue swept by destination and dispositioned, substrate torn down, boards frozen as records, a clean-box baseline captured. A checklist of judgment guides, not gates. Full reference: `release-boundary.md`. |
 
@@ -83,6 +83,25 @@ truth is reconciled to main. Continuous integration to main and a
 release-line fold followed by one explicit merge are both valid; leaving the
 choice implicit is not.
 
+A candidate that merges by squash or rebase is never an ancestor of that ref, so
+ancestry alone cannot read it as merged. A `merged:<pr-number>` tag on a queue row
+bound to the slice (the `slice:` tag, like `candidate:`) is a recorded report of a
+merge, not a verified one: `rig view show execution` shows it on the "merged" rung
+(`folded`) as `merge_report` (`pr`, `row`, `recorded_at`, `linked`) and in the basis
+text, and `recorded_at` is when the row recorded the merge, not when it happened.
+A report never changes the merged answer by itself: without a candidate, with an
+unresolvable candidate, with an unusable declared integration ref or with no
+repository context, the answer, next-up and dependent slices stay as ancestry gives
+them. A row that carries a `merged:` tag is a report, not a build, so it never picks
+which commit counts as built: that stays the newest `candidate:<sha>` tag on a row
+without a `merged:` tag. A report is `linked: true` when its own row's `candidate:<sha>`
+resolves, through the repository context, to that built commit, and `linked: false`
+otherwise (no candidate on the row, or a different commit). The answer changes only
+for a linked report when ancestry answered false (not an ancestor): then the rung
+reads merged and the basis says so. A linked report never turns an answer ancestry
+could not give into merged. The report never changes which commit counts as built
+or reviewed.
+
 **The heavier flow — proof contracts, plan-lock, C1 drops, proof-lock — is PART B and is not in
 force unless assigned.**
 
@@ -102,6 +121,10 @@ Each slice directory carries:
     approval starts here.
   - **`## Proof contract`** — a checkbox list of promised deliverables (see
     B1). The UI's DELIVERED section pairs each item with its proof.
+  - Since 2026-11-15 the scope audit also accepts, in place of those two lists,
+    a single `## Requirements` list of bullets that start `R<n>.` and carry
+    their proof after `Observable:`; the scaffold and `rig proof` still use the
+    two lists.
 - **`PROGRESS.md`** — the slice's current delivery state and retained outcome
   log. Record material changes with links to proof; historical checkboxes are
   testimony, not current acceptance authority. For a selected proof policy,
@@ -117,16 +140,109 @@ Legacy `README.md`, `IMPLEMENTATION-PRD.md`, and pre-convention trees remain
 readable indefinitely. New scaffolds do not create or mirror them, and repair
 is additive: it never deletes, renames, or rewrites legacy bytes.
 
+A slice's frontmatter carries `stage:` (`wip`, `provisional`, `established`,
+`canonical`, or the exits `superseded` and `retired`) and `verified:`
+(`<date> against <source>`). Set them with `rig scope slice stage <slice> <stage>`
+and `rig scope slice verified <slice> --against <source>`; no approval stamp
+changes either. `rig scope` reads an `established` or `canonical` slice whose
+`verified:` is missing, has no source, names a tool-scaffolded placeholder, or is
+older than 90 days as `provisional`.
+
+A slice's frontmatter may also carry `status:`. `GET /api/slices` reports the
+bucket each word falls in as the slice's `status`, and its
+`?filter=all|active|done|closed|blocked` filters on that bucket:
+
+| `status:` word | Bucket |
+| --- | --- |
+| `active`, `in-flight`, `ratified` | `active` |
+| `draft`, `draft-pending-orch-ratification`, `placeholder` | `draft` |
+| `done`, `shipped`, `promoted`, `closed` | `done` |
+| `closed-wontfix`, `closed-deferred`, `closed-superseded`, `closed-stale` | `closed` |
+| `blocked`, `parked-with-evidence` | `blocked` |
+
+Words are matched ignoring case. Any other word is matched by what it contains:
+`done`, `ship` or `close` makes it `done`; `block` or `park`, `blocked`; `draft`
+or `pending`, `draft`. A word that matches none of these counts as `active`, so a
+slice marked `complete` counts as `active`, and so does one marked a bare `wontfix`,
+`deferred`, `superseded` or `stale`: only the `closed-<reason>` words that
+`rig scope slice close` writes read as `closed` (a slice moved to `closed/` with one
+of them used to read `done`). A slice with no `status:` counts as
+`draft`.
+
+`rig view show execution` shows the slice's own `status:` word (from its
+`SPEC.md`, or a legacy `README.md`) and that word's bucket beside each slice's
+ladder as `recorded_status` (`word: null` when there's none). Like the scopes
+views, it never reads `PROGRESS.md`; `GET /api/slices` lets a `status:` in
+`PROGRESS.md` frontmatter override the node file's. It's the team's record, not
+verified, so it never turns a rung true or makes a slice next-up.
+The ladder's rungs read Part B records: plan lock, `candidate:<sha>` rows, review
+artifacts and an EC-3 `worktree_path=` row. On this flow they read `INDETERMINATE`
+(plan lock reads `false`), and `q4_records` says once for the mission that no
+build is recorded. Built means a Git commit, so work that isn't a commit never
+reads built.
+
 When the owning scope selects `proofPolicy.judges`, use `rig proof judge` to
 record an attributed accept, reject or withdraw decision on a contract item,
 and `rig proof show` to read derived readiness up through slice, mission and
-project. The nearest slice, mission or project policy selects authorized judges;
-`rig proof --help` describes setup, selectors and evidence requirements. A
+project. The nearest slice, mission or project policy selects authorized judges.
+By default an item's latest judgment from any of them decides it; with
+`proofPolicy.everyJudge: true`, every listed judge's own current accept is
+required, and `rig proof show` lists each judge's own latest judgment either way.
+`rig proof --help` describes setup, selectors and evidence requirements. In a
+multi-project workspace catalog, name the project with `--project <id>` or a
+`<id>:` scope prefix (`alpha:m0/slices/01-t001`); unqualified scopes use the
+daemon's selected workspace. The prefix counts only when it names a catalogued
+project and no scope exists at that literal path, so a mission folder with a
+colon (`alpha:trial/slices/01-t001`) still resolves as written. The scopes views
+read a catalog project's readiness against the same project root, so they agree
+with `rig proof show`. A catalog-project read names the project
+(`project: { id, root }`) and reports its source watcher as unavailable; a
+judgment carries that root and is refused (409 `project_changed`) if the
+catalog has since moved the project. A
 correction preserves history and unrelated judgments without editing ancestor
 status checklists. An artifact can identify non-code work without a fabricated
 commit. Evidence capture (`proof add`), policy acceptance, higher outcome
 judgment and publication are distinct. This optional component does not select
 Part B or add a mandatory review gate.
+
+A judgment binds the slice's path, the item's text and the policy. A policy edit
+that keeps the judging actor listed and `everyJudge` unchanged, such as adding a
+judge, leaves the judgment current; removing its actor or toggling `everyJudge`
+does not. A judgment recorded by an earlier release doesn't carry the
+`everyJudge` it was recorded under, so any policy edit still reopens it. Moving or
+renaming a slice (`rig scope slice move`, default moving `rig scope slice close`,
+or by hand) reopens its judged items:
+`rig proof show` reports each as `unknown`, and each needs a new judgment on its
+current revision. Opt-in `rig scope slice close <slice> --in-place --reason delivered`
+(or `--in-place --reason <wontfix|deferred|superseded|stale>` for non-delivery
+exits) updates status in place under `<mission>/slices/<slice>` (and writes the same
+status to a `status:` that the slice indexer reads in `PROGRESS.md` frontmatter).
+It then reads the status back the way the slice indexer does; if the indexer does
+not read the new status (for example a duplicate, nested or commented `status:`
+line), it restores the files it changed and refuses with one message naming the
+file. If a restore itself fails, the message keeps the mismatch, lists every failed
+restore, and says the slice's files and `mission.yaml` may be partly changed, so
+inspect them before closing again. It does not move the folder, so recorded judgments stay applicable while the item
+text, policy and cited evidence bytes are unchanged (judgments citing files
+updated by closure, such as `SPEC.md`, reconciled `PROGRESS.md` or `mission.yaml`,
+reopen to `unknown`), and parent mission status is never automatically marked
+delivered. `rig scope slice close` and `rig scope audit` do not evaluate proof
+readiness, so check `rig proof show` for current applicability.
+
+The project readiness that `rig proof show --project` reports counts only
+missions whose `mission.yaml` carries `metadata.status: active` or
+`metadata.status: release-candidate`. `rig scope mission create` writes
+`metadata.status: planned`, for ordinary and release missions alike, so creating
+a mission does not change the project's readiness. A `planned` mission stays
+outside the rollup, even after its slices are accepted, until someone changes
+its status to `active` (or `release-candidate` for a release that is ready to
+judge). Nothing changes the status automatically. A mission can also carry
+`metadata.status: complete`, which only `POST /api/missions/:missionId/complete`
+writes (no `rig` verb does); a `complete` mission is outside the rollup too.
+Missions created before this default carry no status and are not counted either;
+add the line by hand to include them. It also writes `metadata.name`, the mission's folder name, which
+the project lifecycle compiler requires; a mission created without it refuses to
+compile with `lifecycle_field_missing` until you add that line.
 
 The three sections project into the UI's one review structure: a vertical
 stack of **INTENT → PLAN → DELIVERED**. A slice missing a section still
@@ -134,6 +250,25 @@ renders (a missing Intent or Delivered source shows a muted "—", missing
 mini-requirements show "Not compliant · mini-requirements not authored";
 nothing is invented) —
 but it does not carry its weight in review.
+
+### A2.1. Missions that break down another scope
+
+A mission can link to the mission or slice whose work it breaks down. Use
+`rig scope mission create <name> --parent <dot-id>` when creating it, or
+`rig scope mission parent <mission> <dot-id>` to set the link later. Use
+`rig scope mission parent <mission> --clear` to remove it. The target must
+resolve uniquely within the project's missions root. Cycles and unresolved
+ancestors are warnings and are reported by scope audit. A mission without an
+authored ID can still have a parent; reverse views show its ID as unknown. When
+creating a mission with a duplicate ID and a parent, the command warns with the
+existing path because references to that ID are ambiguous.
+The link is `metadata.parent` in `mission.yaml`, or `parent` in the node
+frontmatter for a legacy mission without a manifest. It does not change
+folder layout, slice membership, or the meaning of `depends-on`.
+
+Mission and slice show surfaces expose the link in both directions; scope
+audit reports dangling links and active children of completed slices. The
+refocus trace follows the logical parent to show the outcome's intent.
 
 ## A3. Honesty rails (public surfaces + cited hashes)
 

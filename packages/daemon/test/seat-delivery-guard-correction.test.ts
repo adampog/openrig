@@ -25,6 +25,8 @@ function fixture(hooks: { file?: () => Promise<void>; exec?: (command: string) =
     commands.push(command);
     return hooks.exec ? hooks.exec(command)
       : command.includes("list-panes") ? "%1|0|/inert|80|24|1\n"
+      : command.startsWith("tmux show-environment") ? "OPENRIG_NODE_ID=a\n"
+      : command.startsWith("tmux display-message") && command.includes("#{pid}") ? "$1|4242|1700000000"
       : command.includes("#{session_id}") ? "$1" : "";
   }, { writeFile: async () => { await hooks.file?.(); }, unlink: async () => {}, tmpName: () => "/inert/buffer", bufferName: () => "inert" });
   const guard = new SeatDeliveryGuard(db, name => resolveGuardTarget(db, name)); tmux.deliveryGuard = guard;
@@ -40,6 +42,44 @@ function fixture(hooks: { file?: () => Promise<void>; exec?: (command: string) =
   return { ...deps, tmux, guard, commands, claim, teardown, transport, outbox: new OutboxHandler(db) };
 }
 function signal() { let release!: () => void; const ready = new Promise<void>(r => { release = r; }); return { ready, release }; }
+
+describe("missing-pane repair through real guard/adapter/transport", () => {
+  it("keeps a matching-binding send working without adopting it", async () => {
+    const f = fixture();
+    try {
+      expect((await f.transport.send("worker@fixture", "control", { force: true })).ok).toBe(true);
+      const before = f.guard.target("a");
+      const opts = { sessionName: "worker@fixture", repairMissingPane: true as const };
+      expect(await f.claim.reconcileSession(opts)).toMatchObject({ ok: false, code: "repair_not_applicable" });
+      expect(f.guard.target("a")).toEqual(before);
+    } finally { f.db.close(); }
+  });
+  it("refuses a NULL-pane send, repairs only the binding, then sends through the same guard", async () => {
+    const f = fixture();
+    try {
+      f.db.exec("UPDATE bindings SET tmux_pane=NULL; UPDATE sessions SET origin='launched'");
+      f.tmux.listSessions = async () => [{ name: "worker@fixture", windows: 1, created: "123", attached: false }];
+      f.tmux.getPanePid = async () => 4242;
+      const before = f.db.prepare("SELECT * FROM sessions").all();
+      f.outbox.retain({ outboxId: "old-held", senderSession: "sender@fixture", destinationSession: "worker@fixture", body: "held" }, f.guard.target("a"));
+      expect(await f.transport.send("worker@fixture", "before", { force: true })).toMatchObject({ ok: false });
+      expect(f.commands.some(c => c.includes("paste-buffer") || c.includes("send-keys"))).toBe(false);
+      const count = f.commands.length;
+      const opts = { sessionName: "worker@fixture", repairMissingPane: true as const };
+      expect(await f.claim.reconcileSession(opts)).toMatchObject({ ok: true, result: { mode: "repair-missing-pane", sessionId: "sa", pane: "%1" } });
+      expect(f.commands).toHaveLength(count);
+      expect(f.db.prepare("SELECT * FROM sessions").all()).toEqual(before);
+      expect(f.guard.target("a")).toEqual({ nodeId: "a", session: "worker@fixture", occupant: "g1", pane: "%1" });
+      expect((await f.transport.send("worker@fixture", "after", { force: true })).ok).toBe(true);
+      expect(f.commands.filter(c => c.includes("paste-buffer"))).toHaveLength(1);
+      expect(f.commands.filter(c => c.includes("send-keys"))).toHaveLength(1);
+      const countAfter = f.commands.length;
+      expect(await f.transport.send("worker@fixture", "held", { committedOutboxIds: ["old-held"] })).toMatchObject({ ok: false, reason: "guard_target_changed" });
+      expect(f.outbox.getById("old-held")).toMatchObject({ deliveryState: "retained", guardBinding: { pane: null } });
+      expect(f.commands).toHaveLength(countAfter);
+    } finally { f.db.close(); }
+  });
+});
 
 describe("guard-wired teardown", () => {
   it("cleans positively missing session through actual exec-to-listPanes", async () => {
@@ -65,7 +105,7 @@ describe("guard-wired teardown", () => {
     expect(f.sessionRegistry.getBindingForNode("a")?.tmuxPane).toBe("%1");
     await f.guard.set("a", false, "person", "stop");
     expect(await f.teardown.teardown("r")).toMatchObject({ sessionsKilled: 1, errors: [] });
-    expect(f.commands).toContain("tmux kill-session -t '$1'");
+    expect(f.commands.some(c => /^tmux if-shell -F -t '\$1' .*#\{==:#\{pid\},4242\}.*kill-session -t .*\$1/.test(c))).toBe(true);
     expect(f.commands.filter(c => c.includes("list-panes"))).toHaveLength(1);
     expect(f.db.prepare("SELECT status FROM sessions WHERE id='sa'").get()).toEqual({ status: "exited" });
     expect(f.sessionRegistry.getBindingForNode("a")).toBeNull(); f.db.close();

@@ -3,6 +3,9 @@
 // only, so that notice is never posted, yet the ledger took it as the current episode and, finding no receipt for it,
 // reported never-posted after the post window.
 import { describe, it, expect, beforeEach } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createDb } from "../src/db/connection.js";
 import { migrate } from "../src/db/migrate.js";
 import { coreSchema } from "../src/db/migrations/001_core_schema.js";
@@ -18,7 +21,12 @@ import { humanNotificationIntentSchema } from "../src/db/migrations/081_human_no
 import { EventBus } from "../src/domain/event-bus.js";
 import { OutboxHandler } from "../src/domain/outbox-handler.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
-import type { HumanFragment } from "../src/domain/gateway/human-registry.js";
+import {
+  addHumanFragment,
+  loadHumanRegistry,
+  setHumanField,
+  type HumanFragment,
+} from "../src/domain/gateway/human-registry.js";
 
 const FOUNDER = { entityId: "human-founder", class: "human", displayName: "F", address: "human-founder@external",
   connectorBindings: [{ connector: "slack", ref: "U0F", primary: true }], prefs: {} } as unknown as HumanFragment;
@@ -37,7 +45,7 @@ describe("delivery outcome: a resolved notice on a closed row opens no delivery 
   const latestKey = (id: string) => `${id}:${repo.transitionLog.latestOwnerNotificationForQitem(id)!.transitionId}`;
   async function askHuman() {
     const item = await repo.create({ sourceSession: "lead@rig", destinationSession: "human-founder@external", body: "decide?",
-      summary: "decision", priority: "routine" as never, humanIntent: "decision" as never } as never);
+      summary: "decision", priority: "routine" as never, humanIntent: "decision" as never, humanAlert: true } as never);
     const id = (item as unknown as { qitemId: string }).qitemId;
     expect(repo.transitionLog.latestOwnerNotificationForQitem(id)?.ownerNotificationKind).toBe("human-required");
     return id;
@@ -61,6 +69,18 @@ describe("delivery outcome: a resolved notice on a closed row opens no delivery 
     directReplyClose(id);
     age();
     expect(repo.deliveryOutcomeFor(id)?.outcome).toBe("never-posted");
+  });
+
+  it("an ask on Steering without an alert, closed by the person, reads no delivery at all: nothing was owed", async () => {
+    // A person whose Slack subscription is urgent-only.
+    const founder = FOUNDER as { subscriptions?: unknown };
+    founder.subscriptions = [{ destination: { connector: "slack" }, filter: { preset: "urgent-only" } }];
+    const item = await repo.create({ sourceSession: "lead@rig", destinationSession: "human-founder@external", body: "decide?",
+      summary: "decision", priority: "routine" as never, humanIntent: "decision" as never } as never).finally(() => { delete founder.subscriptions; });
+    const id = (item as unknown as { qitemId: string }).qitemId;
+    directReplyClose(id);
+    age();
+    expect(repo.deliveryOutcomeFor(id)).toBeNull();
   });
 
   it("unchanged while the row is active: a resolved notice on an active row is its own episode (posted when delivered)", async () => {
@@ -101,5 +121,75 @@ describe("delivery outcome: a resolved notice on a closed row opens no delivery 
     directReplyClose(id);
     age();
     expect(repo.deliveryOutcomeFor(id)?.outcome).toBe("posted");
+  });
+
+  it("an existing never-posted ask AND a parked row on the person flip to null and drop out of findUndelivered after unsetting the person's last binding", async () => {
+    const home = mkdtempSync(join(tmpdir(), "unbind-outcome-"));
+    try {
+      mkdirSync(join(home, "gateway", "humans"), { recursive: true });
+      expect(
+        addHumanFragment(
+          {
+            entityId: "jam",
+            class: "human",
+            displayName: "Jam",
+            address: "jam@external",
+            connectorBindings: [{ kind: "slack", connectorRef: "tui-only", secretsRef: "none", role: "primary" }],
+            prefs: { deliveryClass: "B" },
+          },
+          home,
+        ).ok,
+      ).toBe(true);
+
+      const realRepo = new QueueRepository(db, new EventBus(db), {
+        transport: { send: async () => ({ ok: true, verified: true }) },
+        loadHumanRegistry: () => loadHumanRegistry(home),
+      });
+      realRepo.attachOutbox(new OutboxHandler(db));
+
+      const askItem = await realRepo.create({
+        sourceSession: "lead@rig",
+        destinationSession: "jam@external",
+        body: "decide?",
+        summary: "d",
+        priority: "routine" as never,
+        humanIntent: "decision" as never,
+        humanAlert: true,
+      } as never);
+      const askId = (askItem as unknown as { qitemId: string }).qitemId;
+
+      const parkItem = await realRepo.create({
+        sourceSession: "lead@rig",
+        destinationSession: "dev@rig",
+        body: "work",
+        summary: "w",
+        priority: "routine" as never,
+      } as never);
+      const parkId = (parkItem as unknown as { qitemId: string }).qitemId;
+      realRepo.update({ qitemId: parkId, actorSession: "dev@rig", state: "in-progress" } as never);
+      realRepo.update({
+        qitemId: parkId,
+        actorSession: "dev@rig",
+        state: "blocked",
+        blockedOn: "jam@external",
+        transitionNote: "need jam",
+      } as never);
+
+      age();
+
+      expect(realRepo.deliveryOutcomeFor(askId)?.outcome).toBe("never-posted");
+      expect(realRepo.findUndelivered({ qitemId: askId })).toHaveLength(1);
+      expect(realRepo.deliveryOutcomeFor(parkId)?.outcome).toBe("never-posted");
+      expect(realRepo.findUndelivered({ qitemId: parkId })).toHaveLength(1);
+
+      expect(setHumanField("jam", "binding.0", "unset", home).ok).toBe(true);
+
+      expect(realRepo.deliveryOutcomeFor(askId)).toBeNull();
+      expect(realRepo.findUndelivered({ qitemId: askId })).toHaveLength(0);
+      expect(realRepo.deliveryOutcomeFor(parkId)).toBeNull();
+      expect(realRepo.findUndelivered({ qitemId: parkId })).toHaveLength(0);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

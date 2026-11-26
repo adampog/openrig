@@ -21,6 +21,13 @@ import { RigSpecCodec as PodRigSpecCodec } from "../src/domain/rigspec-codec.js"
 import { PodRepository } from "../src/domain/pod-repository.js";
 import { RigNotFoundError } from "../src/domain/errors.js";
 import { createFullTestDb } from "./helpers/test-app.js";
+import { SeatPoolSlotsRepository, type SeatPoolSlotPhase } from "../src/domain/seat-pool-slots.js";
+import type { SeatPoolSpec } from "../src/domain/seat-pool-spec.js";
+import { seatSkillPaths } from "../src/domain/seat-skill-storage.js";
+import { prepareSeatLaunchAdditions } from "../src/domain/seat-launch-additions.js";
+import fs from "node:fs";
+import nodePath from "node:path";
+import os from "node:os";
 
 function setupDb(): Database.Database {
   const db = createFullTestDb();
@@ -241,6 +248,118 @@ describe("RigSpecExporter", () => {
     expect(result.valid).toBe(true);
   });
 
+  it("#3416 (3): exports a Claude seat's status line throttle, and none for a seat without one", () => {
+    const rig = rigRepo.createRig("throttle-export");
+    rigRepo.addNode(rig.id, "worker", { runtime: "claude-code", cwd: "/repo", statuslineThrottle: 30 });
+    rigRepo.addNode(rig.id, "other", { runtime: "claude-code", cwd: "/repo" });
+    const exported = exporter.exportRig(rig.id) as import("../src/domain/types.js").LegacyRigSpec;
+    expect(exported.nodes.find((n) => n.id === "worker")?.statuslineThrottle).toBe(30);
+    expect(exported.nodes.find((n) => n.id === "other")?.statuslineThrottle).toBeUndefined();
+    expect(RigSpecCodec.serialize(exported)).toContain("statusline_throttle: 30");
+  });
+
+  it("#3253: exports a seat's process limits; an unreadable stored one is left out of that seat only, named, and kept as stored", () => {
+    const rig = rigRepo.createRig("legacy-limits-export");
+    const node = rigRepo.addNode(rig.id, "worker", { runtime: "codex", cwd: "/repo", processLimits: { tasksMax: 512 } });
+    rigRepo.addNode(rig.id, "capped", { runtime: "codex", cwd: "/repo", processLimits: { tasksMax: 64 } });
+    rigRepo.addNode(rig.id, "other", { runtime: "codex", cwd: "/repo" });
+    const exported = exporter.exportRig(rig.id) as import("../src/domain/types.js").LegacyRigSpec;
+    expect(exported.nodes.find((n) => n.id === "worker")?.processLimits).toEqual({ tasksMax: 512 });
+    expect(exported.nodes.find((n) => n.id === "other")?.processLimits).toBeUndefined();
+    expect(exporter.processLimitsNotCarried(rig.id)).toEqual([]);
+    db.prepare("UPDATE nodes SET process_limits = ? WHERE id = ?").run("{not json", node.id);
+    const damaged = exporter.exportRig(rig.id) as import("../src/domain/types.js").LegacyRigSpec;
+    expect(damaged.nodes.map((n) => n.id).sort()).toEqual(["capped", "other", "worker"]);
+    const worker = damaged.nodes.find((n) => n.id === "worker")!;
+    expect(worker).toMatchObject({ runtime: "codex", cwd: "/repo" });
+    expect(worker.processLimits).toBeUndefined();
+    expect(damaged.nodes.find((n) => n.id === "capped")?.processLimits).toEqual({ tasksMax: 64 });
+    expect(damaged.nodes.find((n) => n.id === "other")?.processLimits).toBeUndefined();
+    expect(exporter.processLimitsNotCarried(rig.id)).toEqual(["worker"]);
+    expect(db.prepare("SELECT process_limits FROM nodes WHERE id = ?").get(node.id)).toEqual({ process_limits: "{not json" });
+  });
+
+  it("#3253: exports a legacy node's memory_max in bytes, alone and beside tasks_max, and reads it back exactly", () => {
+    const rig = rigRepo.createRig("legacy-memory-export");
+    rigRepo.addNode(rig.id, "memory", { runtime: "codex", cwd: "/repo", processLimits: { memoryMax: 4294967296 } });
+    rigRepo.addNode(rig.id, "both", { runtime: "codex", cwd: "/repo", processLimits: { tasksMax: 512, memoryMax: 1073741824 } });
+    const exported = exporter.exportRig(rig.id) as import("../src/domain/types.js").LegacyRigSpec;
+    expect(exported.nodes.find((n) => n.id === "memory")?.processLimits).toEqual({ memoryMax: 4294967296 });
+    expect(exported.nodes.find((n) => n.id === "both")?.processLimits).toEqual({ tasksMax: 512, memoryMax: 1073741824 });
+    const yaml = RigSpecCodec.serialize(exported);
+    expect(yaml).toContain("memory_max: 4294967296");
+    const parsed = RigSpecCodec.parse(yaml);
+    expect(RigSpecSchema.validate(parsed).valid).toBe(true);
+    expect(exporter.processLimitsNotCarried(rig.id)).toEqual([]);
+  });
+
+  it("exports launch_wrapper on legacy flat pi, codex and claude-code nodes, omits cleared/absent, and round-trips through codec/schema/reimport", () => {
+    const rig = rigRepo.createRig("legacy-wrapper-export");
+    const piArgv = ["mtn", "sandbox", "exec", "", "--pi-seat", "alpha", "--"];
+    const codexArgv = ["/usr/local/bin/codex-wrap", "--codex-seat", "beta", "--"];
+    rigRepo.addNode(rig.id, "orchestrator", {
+      runtime: "claude-code",
+      cwd: "/repo",
+    });
+    const piNode = rigRepo.addNode(rig.id, "pi-worker", {
+      runtime: "pi",
+      cwd: "/repo",
+      launchWrapper: piArgv,
+    });
+    const codexNode = rigRepo.addNode(rig.id, "codex-worker", {
+      runtime: "codex",
+      cwd: "/repo",
+      launchWrapper: codexArgv,
+    });
+    rigRepo.addNode(rig.id, "pi-cleared", {
+      runtime: "pi",
+      cwd: "/repo",
+      launchWrapper: [],
+    });
+
+    const claudeArgv = ["/usr/local/bin/claude-wrap", "--claude-seat", "gamma", "--"];
+    rigRepo.addNode(rig.id, "claude-worker", { runtime: "claude-code", cwd: "/repo", launchWrapper: claudeArgv });
+
+    const exported = exporter.exportRig(rig.id) as import("../src/domain/types.js").LegacyRigSpec;
+    expect(exported.nodes.find((n) => n.id === "claude-worker")?.launchWrapper).toEqual(claudeArgv);
+    expect(RigSpecSchema.normalize(RigSpecCodec.parse(RigSpecCodec.serialize(exported))).nodes.find((n) => n.id === "claude-worker")?.launchWrapper).toEqual(claudeArgv);
+    expect(exported.nodes.find((n) => n.id === "orchestrator")?.launchWrapper).toBeUndefined();
+    expect(exported.nodes.find((n) => n.id === "pi-worker")?.launchWrapper).toEqual(piArgv);
+    expect(exported.nodes.find((n) => n.id === "codex-worker")?.launchWrapper).toEqual(codexArgv);
+    expect(exported.nodes.find((n) => n.id === "pi-cleared")?.launchWrapper).toBeUndefined();
+
+    const yaml = RigSpecCodec.serialize(exported);
+    const parsed = RigSpecCodec.parse(yaml);
+    expect(RigSpecSchema.validate(parsed)).toEqual({ valid: true, errors: [] });
+    const reimportedSpec = RigSpecSchema.normalize(parsed);
+    expect(reimportedSpec.nodes.find((n) => n.id === "pi-worker")?.launchWrapper).toEqual(piArgv);
+    expect(reimportedSpec.nodes.find((n) => n.id === "codex-worker")?.launchWrapper).toEqual(codexArgv);
+    expect(reimportedSpec.nodes.find((n) => n.id === "orchestrator")?.launchWrapper).toBeUndefined();
+    expect(reimportedSpec.nodes.find((n) => n.id === "pi-cleared")?.launchWrapper).toBeUndefined();
+
+    // Re-materialize from normalized spec into DB and verify round-trip persistence
+    const reimportedRig = rigRepo.createRig("legacy-wrapper-reimported");
+    for (const specNode of reimportedSpec.nodes) {
+      rigRepo.addNode(reimportedRig.id, specNode.id, {
+        runtime: specNode.runtime,
+        cwd: specNode.cwd,
+        launchWrapper: specNode.launchWrapper,
+      });
+    }
+    const storedReimported = rigRepo.getRig(reimportedRig.id)!;
+    expect(storedReimported.nodes.find((n) => n.logicalId === "pi-worker")?.launchWrapper).toEqual(piArgv);
+    expect(storedReimported.nodes.find((n) => n.logicalId === "codex-worker")?.launchWrapper).toEqual(codexArgv);
+    expect(storedReimported.nodes.find((n) => n.logicalId === "orchestrator")?.launchWrapper).toBeUndefined();
+    expect(storedReimported.nodes.find((n) => n.logicalId === "pi-cleared")?.launchWrapper).toBeUndefined();
+
+    // Explicitly clearing stored wrappers omits launchWrapper on subsequent legacy export
+    rigRepo.setNodeLaunchWrapper(piNode.id, null);
+    rigRepo.setNodeLaunchWrapper(codexNode.id, null);
+    const exportedAfterClear = exporter.exportRig(rig.id) as import("../src/domain/types.js").LegacyRigSpec;
+    expect(exportedAfterClear.nodes.find((n) => n.id === "pi-worker")?.launchWrapper).toBeUndefined();
+    expect(exportedAfterClear.nodes.find((n) => n.id === "codex-worker")?.launchWrapper).toBeUndefined();
+  });
+
   it("constructor throws on mismatched db handles", () => {
     const otherDb = setupDb();
     const otherRepo = new RigRepository(otherDb);
@@ -286,12 +405,26 @@ describe("RigSpecExporter (pod-aware)", () => {
     const spec = exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec;
     expect(spec.version).toBe("0.2");
     expect(spec.workspace).toBeUndefined();
+    expect(spec.cultureFile).toBeUndefined();
+    expect(spec.startup).toBeUndefined();
     expect(spec.pods).toHaveLength(2);
     const devPod = spec.pods.find((p) => p.id === "dev")!;
     expect(devPod).toBeDefined();
     expect(devPod.members).toHaveLength(2);
     expect(devPod.members.map((m) => m.id).sort()).toEqual(["impl", "qa"]);
     expect(devPod.members[0]!.agentRef).toContain("agents/");
+  });
+
+  it("exports no culture_file key when rig has no startup layers record", () => {
+    const { rig } = seedPodRig();
+    // Rig created without setRigStartupLayers
+    const spec = exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec;
+    expect(spec.cultureFile).toBeUndefined();
+    expect(spec.startup).toBeUndefined();
+
+    const serialized = PodRigSpecCodec.serialize(spec);
+    expect(serialized).not.toContain("culture_file");
+    expect(serialized).not.toContain("startup:");
   });
 
   it("exports the persisted workspace declaration", () => {
@@ -315,6 +448,51 @@ describe("RigSpecExporter (pod-aware)", () => {
     expect(PodRigSpecSchema.normalize(parsed as Record<string, unknown>).workspace).toEqual(workspace);
   });
 
+  it("exports culture_file and rig-level startup block (issue #1631)", () => {
+    const { rig } = seedPodRig();
+    const startupBlock: import("../src/domain/types.js").StartupBlock = {
+      files: [
+        {
+          kind: "file",
+          path: "guidance/rig-start.md",
+          orientation: "role",
+          deliveryHint: "guidance_merge",
+          required: true,
+          appliesOn: ["fresh_start"],
+        },
+      ],
+      actions: [
+        {
+          type: "send_text",
+          value: "echo ready",
+          phase: "after_ready",
+          idempotent: true,
+          appliesOn: ["fresh_start", "restore"],
+        },
+      ],
+    };
+    rigRepo.setRigStartupLayers(rig.id, {
+      root: "/fixtures/rig-root",
+      cultureFile: "guidance/culture.md",
+      startup: startupBlock,
+    });
+
+    const spec = exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec;
+    expect(spec.cultureFile).toBe("guidance/culture.md");
+    expect(spec.startup).toEqual(startupBlock);
+
+    const serialized = PodRigSpecCodec.serialize(spec);
+    expect(serialized).toContain("culture_file: guidance/culture.md");
+    expect(serialized).toContain("guidance/rig-start.md");
+
+    const parsed = PodRigSpecCodec.parse(serialized);
+    const valRes = PodRigSpecSchema.validate(parsed);
+    expect(valRes.valid).toBe(true);
+    const normalized = PodRigSpecSchema.normalize(parsed as Record<string, unknown>);
+    expect(normalized.cultureFile).toBe("guidance/culture.md");
+    expect(normalized.startup).toEqual(startupBlock);
+  });
+
   it("pod-local edges use member-local ids", () => {
     const { rig } = seedPodRig();
     const spec = exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec;
@@ -322,6 +500,102 @@ describe("RigSpecExporter (pod-aware)", () => {
     expect(devPod.edges).toHaveLength(1);
     expect(devPod.edges[0]!.from).toBe("impl");
     expect(devPod.edges[0]!.to).toBe("qa");
+  });
+
+  it("#1631 round-trips exact member startup from its node recipe and keeps siblings unchanged", () => {
+    const { rig, n1, n2 } = seedPodRig();
+    const startup: import("../src/domain/types.js").StartupBlock = {
+      files: [{ kind: "file", path: "guidance/member.md", deliveryHint: "send_text", required: true, appliesOn: ["fresh_start"] }],
+      actions: [{ type: "send_text", value: "prepare", phase: "after_ready", appliesOn: ["fresh_start"], idempotent: true }],
+    };
+    const source = exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec;
+    source.pods.find(p => p.id === "dev")!.members.find(m => m.id === "impl")!.startup = startup;
+    rigRepo.setRigStartupLayers(rig.id, { root: "/fixtures/original" });
+    db.prepare("UPDATE nodes SET launch_recipe_json = ? WHERE id = ?").run(JSON.stringify({ version: 1, rigRoot: "/fixtures/original", rigSpec: source }), n1.id);
+    const exported = exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec;
+    const parsed = PodRigSpecCodec.parse(PodRigSpecCodec.serialize(exported));
+    expect(PodRigSpecSchema.validate(parsed).valid).toBe(true);
+    const normalized = PodRigSpecSchema.normalize(parsed as Record<string, unknown>);
+    expect(normalized.pods.find(p => p.id === "dev")!.members.find(m => m.id === "impl")!.startup).toEqual(startup);
+    expect(normalized.pods.find(p => p.id === "dev")!.members.find(m => m.id === "qa")!.startup).toBeUndefined();
+    expect(rigRepo.getNodeLaunchRecipe(n2.id)).toBeNull();
+  });
+
+  it("#1631 retains matching materialized member declarations before the first launch", () => {
+    const { rig, n1 } = seedPodRig();
+    const startup: import("../src/domain/types.js").StartupBlock = { files: [], actions: [{
+      type: "send_text", value: "orientation", phase: "after_ready", appliesOn: ["fresh_start"], idempotent: true,
+    }] };
+    const source = exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec;
+    source.pods.find(p => p.id === "dev")!.members.find(m => m.id === "impl")!.startup = startup;
+    rigRepo.setRigStartupLayers(rig.id, { root: "/fixtures/rig-root", materializedSources: [{ root: "/fixtures/rig-root", spec: source, nodeIds: [n1.id] }] });
+    const exported = exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec;
+    expect(exported.pods.find(p => p.id === "dev")!.members.find(m => m.id === "impl")!.startup).toEqual(startup);
+    expect(exporter.memberStartupNotCarried(rig.id)).not.toContainEqual(expect.objectContaining({ logicalId: "dev.impl" }));
+  });
+
+  it.each(["different root", "source missing", "wrong member", "malformed recipe", "ambiguous materializations"])("#1631 reports member startup provenance that cannot be represented: %s", (mode) => {
+    const { rig, n1 } = seedPodRig();
+    const source = exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec;
+    source.pods.find(p => p.id === "dev")!.members.find(m => m.id === "impl")!.startup = {
+      files: [{ kind: "file", path: "guidance/member.md", deliveryHint: "send_text", required: true, appliesOn: ["fresh_start"] }], actions: [],
+    };
+    if (mode === "wrong member") source.pods.find(p => p.id === "dev")!.members = source.pods.find(p => p.id === "dev")!.members.filter(m => m.id !== "impl");
+    rigRepo.setRigStartupLayers(rig.id, { root: "/fixtures/first", ...(mode === "ambiguous materializations" ? { materializedSources: [
+      { root: "/fixtures/first", spec: source, nodeIds: [n1.id] }, { root: "/fixtures/first", spec: source, nodeIds: [n1.id] },
+    ] } : {}) });
+    if (mode !== "source missing" && mode !== "ambiguous materializations") db.prepare("UPDATE nodes SET launch_recipe_json = ? WHERE id = ?").run(
+      mode === "malformed recipe" ? "{invalid" : JSON.stringify({ version: 1, rigRoot: mode === "different root" ? "/fixtures/second" : "/fixtures/first", rigSpec: source }), n1.id);
+    const exported = exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec;
+    expect(exported.pods.find(p => p.id === "dev")!.members.find(m => m.id === "impl")!.startup).toBeUndefined();
+    expect(exporter.memberStartupNotCarried(rig.id)).toContainEqual({ logicalId: "dev.impl", reason: mode === "different root" ? "different source root" : "source unavailable" });
+  });
+
+  it("#1631 reports a member-only legacy file when no export root was stored", () => {
+    const { rig, n1 } = seedPodRig();
+    const source = exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec;
+    source.pods.find(p => p.id === "dev")!.members.find(m => m.id === "impl")!.startup = {
+      files: [{ kind: "file", path: "guidance/member.md", deliveryHint: "send_text", required: true, appliesOn: ["fresh_start"] }], actions: [],
+    };
+    db.prepare("UPDATE nodes SET launch_recipe_json = ? WHERE id = ?").run(JSON.stringify({ version: 1, rigRoot: "/fixtures/member", rigSpec: source }), n1.id);
+    const exported = exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec;
+    expect(exported.pods.find(p => p.id === "dev")!.members.find(m => m.id === "impl")!.startup).toBeUndefined();
+    expect(rigRepo.getRigStartupLayers(rig.id)).toBeNull();
+    expect(exporter.memberStartupNotCarried(rig.id)).toContainEqual({ logicalId: "dev.impl", reason: "different source root" });
+  });
+
+  it("exports saved pod startup files by namespace, preserving their declared options", () => {
+    const { rig } = seedPodRig();
+    const plainPod = podRepo.createPod(rig.id, "hasOwnProperty", "No startup");
+    rigRepo.addNode(rig.id, "hasOwnProperty.reader", {
+      runtime: "codex", podId: plainPod.id, agentRef: "local:agents/reader", profile: "default", cwd: ".",
+    });
+    const files: import("../src/domain/types.js").StartupFile[] = [
+      {
+        kind: "file", path: "guidance/dev.md", orientation: "role", deliveryHint: "guidance_merge",
+        required: true, appliesOn: ["fresh_start"],
+      },
+      {
+        kind: "file", path: "guidance/optional.md", deliveryHint: "send_text",
+        required: false, appliesOn: ["restore"],
+      },
+    ];
+    rigRepo.setRigStartupLayers(rig.id, {
+      root: "/fixtures/rig-root",
+      podStartupFiles: { dev: files, arch: [], removed: files },
+    });
+
+    const spec = exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec;
+    expect(spec.pods.find((pod) => pod.id === "dev")?.startup).toEqual({ files, actions: [] });
+    expect(spec.pods.find((pod) => pod.id === "arch")?.startup).toBeUndefined();
+    expect(spec.pods.find((pod) => pod.id === "hasOwnProperty")?.startup).toBeUndefined();
+    expect(spec.pods.some((pod) => pod.id === "removed")).toBe(false);
+    expect(spec.startup).toBeUndefined();
+
+    const parsed = PodRigSpecCodec.parse(PodRigSpecCodec.serialize(spec));
+    expect(PodRigSpecSchema.validate(parsed).valid).toBe(true);
+    const normalized = PodRigSpecSchema.normalize(parsed as Record<string, unknown>);
+    expect(normalized.pods.find((pod) => pod.id === "dev")?.startup).toEqual({ files, actions: [] });
   });
 
   it("cross-pod edges use qualified podId.memberId", () => {
@@ -349,5 +623,249 @@ describe("RigSpecExporter (pod-aware)", () => {
     const parsed = PodRigSpecCodec.parse(yaml);
     const result = PodRigSpecSchema.validate(parsed);
     expect(result.valid).toBe(true);
+  });
+
+  it("#3253: round-trips process_limits through pod-aware export, serialize, parse and validate, and leaves an unreadable one out by its seat", () => {
+    const { rig, n2 } = seedPodRig();
+    rigRepo.setNodeProcessLimits(n2.id, { tasksMax: 512 });
+    const exported = exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec;
+    const devMembers = exported.pods.find((p) => p.id === "dev")!.members;
+    expect(devMembers.find((m) => m.id === "qa")?.processLimits).toEqual({ tasksMax: 512 });
+    expect(devMembers.find((m) => m.id === "impl")?.processLimits).toBeUndefined();
+    const yaml = PodRigSpecCodec.serialize(exported);
+    expect(yaml).toContain("tasks_max: 512");
+    const parsed = PodRigSpecCodec.parse(yaml);
+    expect(PodRigSpecSchema.validate(parsed).valid).toBe(true);
+    const normalized = PodRigSpecSchema.normalize(parsed as Record<string, unknown>);
+    expect(normalized.pods.find((p) => p.id === "dev")!.members.find((m) => m.id === "qa")?.processLimits).toEqual({ tasksMax: 512 });
+    db.prepare("UPDATE nodes SET process_limits = ? WHERE id = ?").run("{not json", n2.id);
+    const damaged = exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec;
+    const damagedDev = damaged.pods.find((p) => p.id === "dev")!.members;
+    expect(damagedDev.map((m) => m.id).sort()).toEqual(["impl", "qa"]);
+    expect(damagedDev.find((m) => m.id === "qa")).toMatchObject({ runtime: "codex", agentRef: "local:agents/qa", profile: "default" });
+    expect(damagedDev.find((m) => m.id === "qa")?.processLimits).toBeUndefined();
+    expect(damaged.pods.find((p) => p.id === "arch")!.members.map((m) => m.id)).toEqual(["reviewer"]);
+    expect(PodRigSpecSchema.validate(PodRigSpecCodec.parse(PodRigSpecCodec.serialize(damaged))).valid).toBe(true);
+    expect(exporter.processLimitsNotCarried(rig.id)).toEqual(["dev.qa"]);
+    expect(db.prepare("SELECT process_limits FROM nodes WHERE id = ?").get(n2.id)).toEqual({ process_limits: "{not json" });
+  });
+
+  it("#3253: round-trips a pod member's memory_max through export, serialize, parse and validate, in bytes", () => {
+    const { rig, n2 } = seedPodRig();
+    rigRepo.setNodeProcessLimits(n2.id, { tasksMax: 512, memoryMax: 4294967296 });
+    const exported = exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec;
+    expect(exported.pods.find((p) => p.id === "dev")!.members.find((m) => m.id === "qa")?.processLimits)
+      .toEqual({ tasksMax: 512, memoryMax: 4294967296 });
+    const yaml = PodRigSpecCodec.serialize(exported);
+    expect(yaml).toContain("tasks_max: 512");
+    expect(yaml).toContain("memory_max: 4294967296");
+    const parsed = PodRigSpecCodec.parse(yaml);
+    expect(PodRigSpecSchema.validate(parsed).valid).toBe(true);
+    const normalized = PodRigSpecSchema.normalize(parsed as Record<string, unknown>);
+    expect(normalized.pods.find((p) => p.id === "dev")!.members.find((m) => m.id === "qa")?.processLimits)
+      .toEqual({ tasksMax: 512, memoryMax: 4294967296 });
+  });
+
+  it("#2940: exports a seat's keep_alive as keep_alive: true and round-trips it; a seat without it exports no key", () => {
+    const { rig, n2 } = seedPodRig();
+    rigRepo.setNodeKeepAlive(n2.id, true);
+    const exported = exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec;
+    const devMembers = exported.pods.find((p) => p.id === "dev")!.members;
+    expect(devMembers.find((m) => m.id === "qa")?.keepAlive).toBe(true);
+    expect("keepAlive" in devMembers.find((m) => m.id === "impl")!).toBe(false);
+    const yaml = PodRigSpecCodec.serialize(exported);
+    expect(yaml.match(/keep_alive/g)).toEqual(["keep_alive"]);
+    expect(yaml).toContain("keep_alive: true");
+    const parsed = PodRigSpecCodec.parse(yaml);
+    expect(PodRigSpecSchema.validate(parsed).valid).toBe(true);
+    const normalized = PodRigSpecSchema.normalize(parsed as Record<string, unknown>);
+    expect(normalized.pods.find((p) => p.id === "dev")!.members.find((m) => m.id === "qa")?.keepAlive).toBe(true);
+    rigRepo.setNodeKeepAlive(n2.id, false);
+    expect(PodRigSpecCodec.serialize(exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec)).not.toContain("keep_alive");
+  });
+
+  // #2940: keep_alive is most-specific-wins, and a member can turn off what its agent spec turns on. The stored value is
+  // the resolved one, so the export carries the member's own `keep_alive: false` from its authored source: dropping it
+  // would let the agent spec turn the seat back on at the next `rig up`.
+  it("#2940: keeps a member's keep_alive: false override; a seat that declares nothing still exports no key", () => {
+    const rig = rigRepo.createRig("keep-off");
+    const devPod = podRepo.createPod(rig.id, "dev", "Dev");
+    const member = (id: string, keepAlive?: boolean) => ({ id, agentRef: "local:agents/qa", profile: "default", runtime: "codex", cwd: ".",
+      ...(keepAlive === undefined ? {} : { keepAlive }) });
+    const rigSpec = { version: "0.2", name: "keep-off", pods: [{ id: "dev", label: "Dev", members: [member("off", false), member("plain")] }], edges: [] };
+    for (const id of ["off", "plain"]) {
+      rigRepo.addNode(rig.id, `dev.${id}`, { runtime: "codex", podId: devPod.id, agentRef: "local:agents/qa", profile: "default", cwd: ".",
+        launchRecipe: { version: 1, rigRoot: "/tmp", rigSpec } as never });
+    }
+    const exported = exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec;
+    const members = exported.pods.find((p) => p.id === "dev")!.members;
+    expect(members.find((m) => m.id === "off")?.keepAlive).toBe(false);
+    expect("keepAlive" in members.find((m) => m.id === "plain")!).toBe(false);
+    const yaml = PodRigSpecCodec.serialize(exported);
+    expect(yaml.match(/keep_alive/g)).toEqual(["keep_alive"]);
+    const normalized = PodRigSpecSchema.normalize(PodRigSpecCodec.parse(yaml) as Record<string, unknown>);
+    expect(normalized.pods.find((p) => p.id === "dev")!.members.find((m) => m.id === "off")?.keepAlive).toBe(false);
+  });
+
+  it("exports selected launch_wrapper array for pi and codex pod members only and round-trips through codec/schema", () => {
+    const { rig, n2, devPod } = seedPodRig();
+    const nPi = rigRepo.addNode(rig.id, "dev.pi-seat", {
+      runtime: "pi",
+      podId: devPod.id,
+      agentRef: "local:agents/pi-seat",
+      profile: "default",
+      cwd: ".",
+      launchWrapper: ["rtk", "--pi-wrap"],
+    });
+    rigRepo.setNodeLaunchWrapper(n2.id, ["rtk", "--codex-wrap"]);
+
+    const exported = exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec;
+    const devMembers = exported.pods.find((p) => p.id === "dev")!.members;
+    expect(devMembers.find((m) => m.id === "impl")?.launchWrapper).toBeUndefined();
+    expect(devMembers.find((m) => m.id === "qa")?.launchWrapper).toEqual(["rtk", "--codex-wrap"]);
+    expect(devMembers.find((m) => m.id === "pi-seat")?.launchWrapper).toEqual(["rtk", "--pi-wrap"]);
+
+    const yaml = PodRigSpecCodec.serialize(exported);
+    const parsed = PodRigSpecCodec.parse(yaml);
+    expect(PodRigSpecSchema.validate(parsed).valid).toBe(true);
+    const normalized = PodRigSpecSchema.normalize(parsed as Record<string, unknown>);
+    const normalizedDev = normalized.pods.find((p) => p.id === "dev")!.members;
+    expect(normalizedDev.find((m) => m.id === "qa")?.launchWrapper).toEqual(["rtk", "--codex-wrap"]);
+    expect(normalizedDev.find((m) => m.id === "pi-seat")?.launchWrapper).toEqual(["rtk", "--pi-wrap"]);
+
+    // Explicitly cleared wrapper omits launchWrapper on export
+    rigRepo.setNodeLaunchWrapper(n2.id, null);
+    rigRepo.setNodeLaunchWrapper(nPi.id, null);
+    const exportedAfterClear = exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec;
+    const clearedMembers = exportedAfterClear.pods.find((p) => p.id === "dev")!.members;
+    expect(clearedMembers.find((m) => m.id === "qa")?.launchWrapper).toBeUndefined();
+    expect(clearedMembers.find((m) => m.id === "pi-seat")?.launchWrapper).toBeUndefined();
+  });
+
+  const POOL: SeatPoolSpec = { max: 4, min: 0, dispatchAfterSeconds: 60, idleGraceSeconds: 300, cooldownSeconds: 60,
+    dispatchTag: "overflow", cwdTemplate: null, drain: false };
+  const PHASES: SeatPoolSlotPhase[] = ["adding", "live", "draining", "drained"];
+
+  /** dev.impl is the model of a seat pool with one agent in each phase; dev.qa and arch.reviewer are ordinary members. */
+  function seedPool() {
+    const seeded = seedPodRig();
+    rigRepo.setNodePool(seeded.n1.id, { spec: POOL });
+    const slots = new SeatPoolSlotsRepository(db);
+    const agents = PHASES.map((phase, i) => {
+      const node = rigRepo.addNode(seeded.rig.id, `dev.impl-s${i + 1}`, { runtime: "claude-code", podId: seeded.devPod.id,
+        agentRef: "local:agents/impl", profile: "tdd", cwd: "." });
+      slots.insert({ modelNodeId: seeded.n1.id, slotNumber: i + 1, nodeId: node.id, phase, at: "2026-11-18T00:00:00.000Z" });
+      return node;
+    });
+    return { ...seeded, agents };
+  }
+
+  it("Exporting a pooled rig writes the model member with its pool block and writes no pool agent, in any phase including drained, as a member", () => {
+    const { rig, n1, agents } = seedPool();
+    const exported = exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec;
+    const dev = exported.pods.find((p) => p.id === "dev")!.members;
+    expect(dev.map((m) => m.id).sort()).toEqual(["impl", "qa"]);
+    expect(dev.find((m) => m.id === "impl")?.pool).toEqual(POOL);
+    expect(dev.find((m) => m.id === "qa")?.pool).toBeUndefined();
+    expect(exported.pods.find((p) => p.id === "arch")!.members.map((m) => m.id)).toEqual(["reviewer"]);
+    const yaml = PodRigSpecCodec.serialize(exported);
+    for (const agent of agents) expect(yaml).not.toContain(agent.logicalId.split(".")[1]!);
+    const parsed = PodRigSpecCodec.parse(yaml);
+    expect(PodRigSpecSchema.validate(parsed).valid).toBe(true);
+    const normalized = PodRigSpecSchema.normalize(parsed as Record<string, unknown>);
+    expect(normalized.pods.find((p) => p.id === "dev")!.members.find((m) => m.id === "impl")?.pool).toEqual(POOL);
+    // the export reads; the agents and their slots stay as they are
+    expect(new SeatPoolSlotsRepository(db).forModel(n1.id).map((s) => s.phase)).toEqual(PHASES);
+  });
+
+  it("The existing not-carried lines and header entries (member startup, auto mode, process limits, launch additions, MCP) never name a pool agent", () => {
+    const home = fs.mkdtempSync(nodePath.join(os.tmpdir(), "export-pool-not-carried-"));
+    const saved = process.env["OPENRIG_HOME"];
+    try {
+      process.env["OPENRIG_HOME"] = home;
+      const { rig, devPod, n1, agents } = seedPool();
+      // dev.ctl is an ordinary member with every defect a pool agent has, so each list below is shown to name it
+      const ctl = rigRepo.addNode(rig.id, "dev.ctl", { runtime: "claude-code", podId: devPod.id, agentRef: "local:agents/ctl", profile: "default", cwd: "." });
+      const mcpCtl = rigRepo.addNode(rig.id, "dev.ctl-mcp", { runtime: "claude-code", podId: devPod.id, agentRef: "local:agents/ctl", profile: "default",
+        cwd: ".", claudeMcp: "none" });
+      const mcpAgent = rigRepo.addNode(rig.id, "dev.impl-s5", { runtime: "claude-code", podId: devPod.id, agentRef: "local:agents/impl", profile: "tdd",
+        cwd: ".", claudeMcp: "none" });
+      new SeatPoolSlotsRepository(db).insert({ modelNodeId: n1.id, slotNumber: 5, nodeId: mcpAgent.id, phase: "drained",
+        at: "2026-11-18T00:00:00.000Z" });
+      for (const node of [ctl, ...agents]) {
+        db.prepare("UPDATE nodes SET process_limits = ?, claude_auto_mode_json = 'broken' WHERE id = ?").run("{not json", node.id);
+        const prompt = nodePath.join(home, `${node.logicalId}.md`);
+        fs.writeFileSync(prompt, "House rules.\n");
+        expect(prepareSeatLaunchAdditions(seatSkillPaths({ rigId: rig.id, logicalId: node.logicalId, runtime: "claude-code" }),
+          { appendSystemPromptFile: prompt }).ok).toBe(true);
+      }
+      // a runtime switch keeps the saved Claude choice, which the export names for the non-Claude seat
+      db.prepare("UPDATE nodes SET runtime = 'codex' WHERE id IN (?, ?)").run(mcpCtl.id, mcpAgent.id);
+
+      const poolAgents = new Set([...agents, mcpAgent].map((a) => a.logicalId));
+      const named = {
+        launchAdditions: exporter.launchAdditionsNotCarried(rig.id),
+        memberStartup: exporter.memberStartupNotCarried(rig.id).map((w) => w.logicalId),
+        claudeMcp: exporter.claudeMcpNotCarried(rig.id),
+        claudeAutoMode: exporter.claudeAutoModeNotCarried(rig.id),
+        processLimits: exporter.processLimitsNotCarried(rig.id),
+      };
+      expect(named.launchAdditions).toEqual(["dev.ctl"]);
+      expect(named.memberStartup).toEqual(expect.arrayContaining(["dev.ctl", "dev.ctl-mcp", "dev.impl"]));
+      expect(named.claudeMcp).toEqual(["dev.ctl-mcp"]);
+      expect(named.claudeAutoMode).toEqual(["dev.ctl"]);
+      expect(named.processLimits).toEqual(["dev.ctl"]);
+      for (const [list, seats] of Object.entries(named)) {
+        expect(seats.filter((seat) => poolAgents.has(seat)), list).toEqual([]);
+      }
+    } finally {
+      if (saved === undefined) delete process.env["OPENRIG_HOME"]; else process.env["OPENRIG_HOME"] = saved;
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("After the model node is deleted, its former pool agents export as ordinary members, with no pool block and no slot, and their edges are carried as any member's", () => {
+    const { rig, devPod, n1, n2, n3, agents } = seedPool();
+    rigRepo.addEdge(rig.id, agents[1]!.id, n2.id, "can_observe");
+    rigRepo.addEdge(rig.id, agents[0]!.id, n3.id, "escalates_to");
+    const slots = new SeatPoolSlotsRepository(db);
+    expect(exporter.poolEdgesNotCarried(rig.id)).toHaveLength(2);
+
+    rigRepo.deleteNode(n1.id);
+
+    // the model's slot rows go with its node; its agents stay as ordinary members
+    expect(slots.forModel(n1.id)).toEqual([]);
+    expect(slots.poolAgentNodeIds(rig.id)).toEqual([]);
+    const exported = exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec;
+    const dev = exported.pods.find((p) => p.id === "dev")!;
+    expect(dev.members.map((m) => m.id).sort()).toEqual(["impl-s1", "impl-s2", "impl-s3", "impl-s4", "qa"]);
+    expect(dev.members.every((m) => m.pool === undefined)).toBe(true);
+    expect(dev.edges.map((e) => `${e.from} ${e.kind} ${e.to}`)).toEqual(["impl-s2 can_observe qa"]);
+    expect(exported.edges.map((e) => `${e.from} ${e.kind} ${e.to}`)).toEqual(["dev.impl-s1 escalates_to arch.reviewer"]);
+    expect(exporter.poolEdgesNotCarried(rig.id)).toEqual([]);
+    expect(exporter.poolNotCarried(rig.id)).toEqual([]);
+    expect(exporter.memberStartupNotCarried(rig.id).map((w) => w.logicalId)).toEqual(
+      expect.arrayContaining(agents.map((a) => a.logicalId)));
+
+    // a model recreated under the same name doesn't take the former agents back: the export doesn't relink them
+    const recreated = rigRepo.addNode(rig.id, "dev.impl", { runtime: "claude-code", podId: devPod.id, agentRef: "local:agents/impl", profile: "tdd", cwd: "." });
+    rigRepo.setNodePool(recreated.id, { spec: POOL });
+    const again = (exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec).pods.find((p) => p.id === "dev")!.members;
+    expect(again.map((m) => m.id).sort()).toEqual(["impl", "impl-s1", "impl-s2", "impl-s3", "impl-s4", "qa"]);
+    expect(again.filter((m) => m.pool !== undefined).map((m) => m.id)).toEqual(["impl"]);
+    expect(slots.forModel(recreated.id)).toEqual([]);
+  });
+
+  it("exportedMemberFromNode gives one node's member as the rig export writes it, and an unpooled rig exports as before", () => {
+    const { rig, n1, n2 } = seedPodRig();
+    rigRepo.setNodeProcessLimits(n2.id, { tasksMax: 512 });
+    const before = exporter.exportRig(rig.id) as import("../src/domain/types.js").RigSpec;
+    const dev = before.pods.find((p) => p.id === "dev")!.members;
+    expect(exporter.exportedMemberFromNode(rig.id, n1.id)).toEqual(dev.find((m) => m.id === "impl"));
+    expect(exporter.exportedMemberFromNode(rig.id, n2.id)).toEqual(dev.find((m) => m.id === "qa"));
+    expect(dev.every((m) => m.pool === undefined)).toBe(true);
+    rigRepo.setNodePool(n1.id, { spec: POOL });
+    expect(exporter.exportedMemberFromNode(rig.id, n1.id).pool).toEqual(POOL);
+    expect(() => exporter.exportedMemberFromNode(rig.id, "no-such-node")).toThrow(/no-such-node/);
   });
 });

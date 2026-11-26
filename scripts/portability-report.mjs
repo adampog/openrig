@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 // Lists lines added by a change that contain values tied to one machine, network or account, so
-// the author can replace them with portable ones or keep them on purpose. Findings never fail it: a finding is a question, not a verdict. It exits 0
-// with or without findings and 2 on an operational error (bad argument, git failure).
+// the author can replace them with portable ones or keep them on purpose. A finding is a question, not a verdict: the default
+// exits 0 with or without findings, --strict exits 1 when findings exist, and 2 is an operational error (bad argument, git failure).
 //
 // What it looks for:
 //   1. Credentials: keys, tokens, passwords, key blocks.
@@ -17,10 +17,12 @@
 //   node scripts/portability-report.mjs --staged             # what is staged for the next commit
 //   add --out report.md to also write the report to a file
 //   add --locations-only to list file and line without quoting the matched text (for public CI output)
+//   add --strict to exit 1 when findings exist (the default stays advisory: exit 0 either way)
 
 import { execFileSync } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { writeFileSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export const CHECKS = [
   {
@@ -56,14 +58,21 @@ export function addedLines(diffText) {
   const lines = [];
   let file = null;
   let lineNumber = 0;
+  let remainingNewLines = 0;
   for (const raw of diffText.split("\n")) {
-    if (raw.startsWith("+++ ")) {
-      file = raw === "+++ /dev/null" ? null : raw.replace(/^\+\+\+ b\//, "");
-    } else if (raw.startsWith("@@")) {
-      lineNumber = Number(/\+(\d+)/.exec(raw)?.[1] ?? 0);
-    } else if (file && raw.startsWith("+")) {
+    if (remainingNewLines > 0 && raw.startsWith("+")) {
       lines.push({ file, line: lineNumber, text: raw.slice(1) });
       lineNumber += 1;
+      remainingNewLines -= 1;
+    } else if (remainingNewLines > 0 && raw.startsWith(" ")) {
+      lineNumber += 1;
+      remainingNewLines -= 1;
+    } else if (raw.startsWith("+++ ")) {
+      file = raw === "+++ /dev/null" ? null : raw.slice(4).split("\t", 1)[0].replace(/^b\//, "");
+    } else if (raw.startsWith("@@")) {
+      const hunk = /\+(\d+)(?:,(\d+))?/.exec(raw);
+      lineNumber = Number(hunk?.[1] ?? 0);
+      remainingNewLines = Number(hunk?.[2] ?? (hunk ? 1 : 0));
     }
   }
   return lines;
@@ -125,11 +134,12 @@ export function renderReport(findings, label, { locationsOnly = false } = {}) {
 }
 
 function parseArguments(argv) {
-  const options = { staged: false, locationsOnly: false };
+  const options = { staged: false, locationsOnly: false, strict: false };
   for (let index = 0; index < argv.length; index += 1) {
     const key = argv[index];
     if (key === "--staged") options.staged = true;
     else if (key === "--locations-only") options.locationsOnly = true;
+    else if (key === "--strict") options.strict = true;
     else if (["--from", "--to", "--out", "--repo"].includes(key)) options[key.slice(2)] = argv[++index];
     else throw new Error(`Unknown argument: ${key}`);
   }
@@ -154,16 +164,23 @@ export function main(argv = process.argv.slice(2)) {
     range = [`${from}..${to}`];
     label = `${from.slice(0, 8)}..${to.length > 12 ? to.slice(0, 8) : to}`;
   }
-  const diff = git(repo, ["diff", "-U0", "--no-color", "--diff-filter=ACMR", ...range]);
-  const report = renderReport(findPortabilityIssues(addedLines(diff)), label, {
+  const diff = git(repo, ["-c", "core.quotePath=false", "diff", "-U0", "--no-color", "--src-prefix=a/", "--dst-prefix=b/", "--diff-filter=ACMR", ...range]);
+  const findings = findPortabilityIssues(addedLines(diff));
+  const report = renderReport(findings, label, {
     locationsOnly: options.locationsOnly,
   });
   process.stdout.write(report);
   if (options.out) writeFileSync(options.out, report);
-  return 0;
+  return options.strict && findings.length > 0 ? 1 : 0;
 }
 
-if (import.meta.url === `file://${resolve(process.argv[1])}`) {
+function invokedDirectly() {
+  try {
+    return Boolean(process.argv[1]) && realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1]);
+  } catch { return false; }
+}
+
+if (invokedDirectly()) {
   try {
     process.exitCode = main();
   } catch (error) {

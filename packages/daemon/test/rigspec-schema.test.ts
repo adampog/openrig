@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { RigSpecSchema, LegacyRigSpecSchema } from "../src/domain/rigspec-schema.js";
+import { RigSpecSchema, LegacyRigSpecSchema, poolAdvisories } from "../src/domain/rigspec-schema.js";
+import { RigSpecCodec } from "../src/domain/rigspec-codec.js";
 
 const VALID_RIG = {
   version: "0.2",
@@ -37,6 +38,40 @@ const VALID_RIG = {
 };
 
 describe("RigSpec schema (pod-aware)", () => {
+  it.each([true, false, undefined])("round-trips default_onboarding_pack = %s", value => {
+    const raw = { ...VALID_RIG, ...(value === undefined ? {} : { default_onboarding_pack: value }) };
+    expect(RigSpecSchema.validate(raw).valid).toBe(true);
+    const yaml = RigSpecCodec.serialize(RigSpecSchema.normalize(raw));
+    if (value === undefined) expect(yaml).not.toContain("default_onboarding_pack");
+    else expect(RigSpecCodec.parse(yaml)).toHaveProperty("default_onboarding_pack", value);
+  });
+
+  it.each(["false", null, 0])("rejects non-boolean default_onboarding_pack = %s", value => {
+    const result = RigSpecSchema.validate({ ...VALID_RIG, default_onboarding_pack: value });
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContain("default_onboarding_pack: must be a boolean");
+  });
+
+  it.each(["model", "label"])("rejects non-string member %s values in canonical validation", field => {
+    for (const value of [null, 7, {}, [], true]) {
+      const rig = structuredClone(VALID_RIG);
+      (rig.pods[0]!.members[0] as Record<string, unknown>)[field] = value;
+      const result = RigSpecSchema.validate(rig);
+      expect(result.valid).toBe(false);
+      expect(result.errors).toContain(`pods[0].members[0].${field}: must be a string`);
+    }
+  });
+
+  it.each(["model", "label"])("keeps optional and string member %s values unchanged", field => {
+    for (const value of [undefined, "", "selected-value"]) {
+      const rig = structuredClone(VALID_RIG);
+      const member = rig.pods[0]!.members[0] as Record<string, unknown>;
+      if (value === undefined) delete member[field]; else member[field] = value;
+      expect(RigSpecSchema.validate(rig).valid).toBe(true);
+      expect(RigSpecSchema.normalize(rig).pods[0]!.members[0]![field as "model" | "label"]).toBe(value);
+    }
+  });
+
   // T1: valid rig with embedded pods passes validation
   it("valid rig with embedded pods passes validation", () => {
     const result = RigSpecSchema.validate(VALID_RIG);
@@ -122,6 +157,44 @@ describe("RigSpec schema (pod-aware)", () => {
     expect(normalized.pods[0]!.members[0]!.effort).toBeUndefined();
   });
 
+  it("advises on an unknown effort for a Pi member only; known levels and model suffixes stay quiet", () => {
+    const withPi = (extra: Record<string, unknown>) => {
+      const rig = structuredClone(VALID_RIG);
+      rig.pods[0]!.members.push({ id: "pi1", agent_ref: "local:agents/pi", profile: "default", runtime: "pi", cwd: ".", ...extra } as never);
+      return RigSpecSchema.validate(rig);
+    };
+    const quiet = withPi({ effort: "high" });
+    expect(quiet.valid).toBe(true);
+    expect((quiet.advisories ?? []).join(" ")).not.toMatch(/effort/);
+    const suffix = withPi({ model: "x/y:low", effort: "high" });
+    expect(suffix.valid).toBe(true);
+    expect((suffix.advisories ?? []).join(" ")).not.toMatch(/effort/);
+    const bad = withPi({ effort: "none" });
+    expect(bad.valid).toBe(true);
+    expect((bad.advisories ?? []).join(" ")).toMatch(/pods\[0\]\.members\[2\]\.effort: "none" isn't a level Pi is known to accept/);
+    expect((bad.advisories ?? []).join(" ")).toContain("the next managed continuation sends it anyway");
+    const flag = withPi({ effort: "--cwd" });
+    expect(flag.valid).toBe(true);
+    expect((flag.advisories ?? []).join(" ")).toMatch(/pods\[0\]\.members\[2\]\.effort: "--cwd" isn't a level Pi is known to accept \([^)]*\); a managed launch leaves it out/);
+    expect((flag.advisories ?? []).join(" ")).not.toContain("sends it anyway");
+    const codex = structuredClone(VALID_RIG);
+    (codex.pods[0]!.members[1] as Record<string, unknown>)["effort"] = "none";
+    expect(RigSpecSchema.validate(codex).advisories ?? []).toEqual([]);
+  });
+
+  it("advises on an unknown effort for a legacy Pi node only", () => {
+    const spec = (runtime: string, effort: string) => ({
+      schema_version: 1, name: "test", version: "1.0",
+      nodes: [{ id: "n", runtime, effort }], edges: [],
+    });
+    expect(LegacyRigSpecSchema.validate(spec("pi", "high")).advisories ?? []).toEqual([]);
+    const bad = LegacyRigSpecSchema.validate(spec("pi", "none"));
+    expect(bad.valid).toBe(true);
+    expect((bad.advisories ?? []).join(" ")).toMatch(/effort: "none" isn't a level Pi is known to accept/);
+    expect((LegacyRigSpecSchema.validate(spec("pi", "high --cwd")).advisories ?? []).join(" ")).toContain("a managed launch leaves it out");
+    expect(LegacyRigSpecSchema.validate(spec("codex", "none")).advisories ?? []).toEqual([]);
+  });
+
   it("rejects codex_config_profile on non-Codex members", () => {
     const rig = structuredClone(VALID_RIG);
     (rig.pods[0]!.members[0] as Record<string, unknown>)["codex_config_profile"] = "sysadmin";
@@ -193,6 +266,23 @@ describe("RigSpec schema (pod-aware)", () => {
     const result = RigSpecSchema.validate(rig);
     expect(result.valid).toBe(false);
     expect(result.errors[0]).toMatch(/duplicate member id "impl"/);
+  });
+
+  it("members in different pods that derive the same session name get a warning", () => {
+    const rig = structuredClone(VALID_RIG);
+    rig.pods[0]!.id = "dev-impl";
+    rig.pods[0]!.members[0]!.id = "main";
+    rig.pods[0]!.edges[0]!.to = "main";
+    rig.edges[0]!.from = "dev-impl.main";
+    rig.pods[1]!.id = "dev";
+    rig.pods[1]!.members[0]!.id = "impl-main";
+    rig.edges[0]!.to = "dev.impl-main";
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
+    expect(result.advisories).toEqual([
+      'pods[1].members[0].id: session name "dev-impl-main@dev-rig" is already used by member "dev-impl.main"',
+    ]);
   });
 
   // T9: dot in pod id or member id fails
@@ -588,5 +678,583 @@ describe("malformed topology stays a validation result", () => {
     const result = RigSpecSchema.validate({ ...VALID_RIG, pods: [null, VALID_RIG.pods[1]], edges: [{kind:"escalates_to",from:"absent.worker",to:"arch.reviewer"}] });
     expect(result.errors).toContain("pods[0]: must be an object");
     expect(result.errors).toContain('edges[0].from: "absent.worker" does not resolve to a pod member');
+  });
+});
+
+describe("a Claude member's own agent, prompt file and plugin folders (OPR.0.7.0.9)", () => {
+  const withFields = (index: number, fields: Record<string, unknown>) => {
+    const rig = structuredClone(VALID_RIG);
+    Object.assign(rig.pods[0]!.members[index] as Record<string, unknown>, fields);
+    return rig;
+  };
+
+  it("reads the three named settings on a Claude member, as paths beside the spec", () => {
+    const rig = withFields(0, { agent_file: "agents/reviewer.md", append_system_prompt_file: "prompts/house.md", plugin_dirs: ["plugins/review"] });
+    expect(RigSpecSchema.validate(rig).valid).toBe(true);
+    expect(RigSpecSchema.normalize(rig).pods[0]!.members[0]).toMatchObject({
+      agentFile: "agents/reviewer.md", appendSystemPromptFile: "prompts/house.md", pluginDirs: ["plugins/review"] });
+  });
+
+  it("takes an empty plugin_dirs as none", () => {
+    expect(RigSpecSchema.validate(withFields(0, { plugin_dirs: [] })).valid).toBe(true);
+  });
+
+  it("says why it can't take them: another runtime, a path outside the spec's folder, or a malformed list", () => {
+    const errors = (rig: unknown) => RigSpecSchema.validate(rig).errors.join(" | ");
+    expect(errors(withFields(1, { agent_file: "agents/reviewer.md" }))).toMatch(/members\[1\]\.agent_file: only for Claude members/);
+    expect(errors(withFields(0, { append_system_prompt_file: "/etc/prompt.md" }))).toMatch(/append_system_prompt_file: absolute paths are not allowed/);
+    expect(errors(withFields(0, { plugin_dirs: ["../outside"] }))).toMatch(/plugin_dirs\[0\]: path traversal/);
+    expect(errors(withFields(0, { plugin_dirs: "plugins/review" }))).toMatch(/plugin_dirs: must be a list/);
+    expect(errors(withFields(0, { plugin_dirs: ["a", "./a"] }))).toMatch(/plugin_dirs\[1\]: listed twice/);
+    expect(errors(withFields(0, { plugin_dirs: ["x/review", "y/review"] }))).toMatch(/plugin_dirs\[1\]: would be copied where plugin_dirs\[0\] is/);
+  });
+});
+
+describe("a Claude member's own plugin channels (#2044)", () => {
+  const withFields = (index: number, fields: Record<string, unknown>) => {
+    const rig = structuredClone(VALID_RIG);
+    Object.assign(rig.pods[0]!.members[index] as Record<string, unknown>, fields);
+    return rig;
+  };
+  const errors = (rig: unknown) => RigSpecSchema.validate(rig).errors.join(" | ");
+
+  it("reads plugin entries on a Claude member, in order, and the codec writes them back", () => {
+    const rig = withFields(0, { plugin_channels: ["plugin:example-channel@example", "plugin:a.b_c-1@market_place.2"] });
+    expect(RigSpecSchema.validate(rig)).toMatchObject({ valid: true, errors: [] });
+    const member = RigSpecSchema.normalize(rig).pods[0]!.members[0]!;
+    expect(member.pluginChannels).toEqual(["plugin:example-channel@example", "plugin:a.b_c-1@market_place.2"]);
+    const again = RigSpecSchema.normalize(RigSpecCodec.parse(RigSpecCodec.serialize(RigSpecSchema.normalize(rig))) as Record<string, unknown>);
+    expect(again.pods[0]!.members[0]!.pluginChannels).toEqual(member.pluginChannels);
+  });
+
+  it("takes an empty list, or no field, as none", () => {
+    expect(RigSpecSchema.validate(withFields(0, { plugin_channels: [] })).valid).toBe(true);
+    expect(RigSpecSchema.normalize(withFields(0, {})).pods[0]!.members[0]!.pluginChannels).toBeUndefined();
+    expect(RigSpecCodec.serialize(RigSpecSchema.normalize(withFields(0, { plugin_channels: [] })))).not.toContain("plugin_channels");
+  });
+
+  it("is only for Claude members", () => {
+    expect(errors(withFields(1, { plugin_channels: ["plugin:example-channel@example"] }))).toMatch(/members\[1\]\.plugin_channels: only for Claude members/);
+  });
+
+  it("refuses a server entry, a flag, a malformed entry, a non-list and a repeated entry, each by name", () => {
+    expect(errors(withFields(0, { plugin_channels: "plugin:example-channel@example" }))).toMatch(/plugin_channels: must be a list of plugin:<name>@<marketplace> entries/);
+    expect(errors(withFields(0, { plugin_channels: ["server:example"] }))).toMatch(/plugin_channels\[0\]: "server:example" is a server entry; only plugin:<name>@<marketplace> entries are supported/);
+    for (const bad of ["--dangerously-load-development-channels", "plugin:no-marketplace", "plugin:@market", "plugin:name@", "example",
+      "plugin:a@b --settings", "plugin:a@b;x", "plugin:a b@c", "", 7, null]) {
+      expect(errors(withFields(0, { plugin_channels: ["plugin:ok@market", bad] })), JSON.stringify(bad)).toMatch(/plugin_channels\[1\]: must be plugin:<name>@<marketplace>/);
+    }
+    expect(errors(withFields(0, { plugin_channels: ["plugin:a@b", "plugin:a@b"] }))).toMatch(/plugin_channels\[1\]: listed twice \("plugin:a@b"\)/);
+  });
+
+  it("warns about channels beside claude_mcp: none, keeps both settings, and accepts the spec", () => {
+    const rig = withFields(0, { plugin_channels: ["plugin:a@b"], claude_mcp: "none" });
+    const before = structuredClone(rig);
+    expect(RigSpecSchema.validate(rig)).toEqual({ valid: true, errors: [], advisories: [
+      'pods[0].members[0].plugin_channels: claude_mcp is "none", which starts Claude without MCP servers (plugin servers included), so no channel could register; remove claude_mcp: none to use the channels, or remove plugin_channels to keep the MCP opt-out',
+    ] });
+    expect(rig).toEqual(before);
+    expect(RigSpecSchema.normalize(rig).pods[0]!.members[0]).toMatchObject({ pluginChannels: ["plugin:a@b"], claudeMcp: "none" });
+  });
+
+  it.each([
+    { plugin_channels: [], claude_mcp: "none" },
+    { claude_mcp: "none" },
+    { plugin_channels: ["plugin:a@b"] },
+  ])("does not warn when channels and the MCP opt-out do not conflict: %j", fields => {
+    const result = RigSpecSchema.validate(withFields(0, fields));
+    expect(result).toMatchObject({ valid: true, errors: [] });
+    expect(result.advisories ?? []).toEqual([]);
+  });
+});
+
+describe("member launch_wrapper (#2328)", () => {
+  const withMember = (runtime: string, fields: Record<string, unknown>) => ({
+    version: "0.2",
+    name: "wrapper-rig",
+    pods: [
+      {
+        id: "dev",
+        label: "Dev",
+        members: [
+          {
+            id: "worker",
+            agent_ref: "local:agents/worker",
+            profile: "default",
+            runtime,
+            cwd: ".",
+            ...fields,
+          },
+        ],
+        edges: [],
+      },
+    ],
+    edges: [],
+  });
+
+  it.each(["pi", "codex", "claude-code", "synth"])("accepts literal argv with bare or absolute executable, empty non-executable args, spaces and metacharacters on %s", (runtime) => {
+    const argv = ["mtn", "sandbox", "exec", "", "--flag='quoted $VAR ; | &'", "--"];
+    const spec = withMember(runtime, { launch_wrapper: argv });
+    expect(RigSpecSchema.validate(spec)).toEqual({ valid: true, errors: [] });
+    const normalized = RigSpecSchema.normalize(spec);
+    expect(normalized.pods[0]!.members[0]!.launchWrapper).toEqual(argv);
+
+    const absArgv = ["/usr/local/bin/mtn-wrapper", "--seat", "miles"];
+    const absSpec = withMember(runtime, { launch_wrapper: absArgv });
+    expect(RigSpecSchema.validate(absSpec)).toEqual({ valid: true, errors: [] });
+    expect(RigSpecSchema.normalize(absSpec).pods[0]!.members[0]!.launchWrapper).toEqual(absArgv);
+
+    const dotSegmentArgv = ["/a/../b", "--flag"];
+    const dotSegmentSpec = withMember(runtime, { launch_wrapper: dotSegmentArgv });
+    expect(RigSpecSchema.validate(dotSegmentSpec)).toEqual({ valid: true, errors: [] });
+    expect(RigSpecSchema.normalize(dotSegmentSpec).pods[0]!.members[0]!.launchWrapper).toEqual(dotSegmentArgv);
+  });
+
+  it.each(["pi", "codex", "claude-code", "synth"])("accepts [] as explicit clear on %s and retains [] in normalize", (runtime) => {
+    const spec = withMember(runtime, { launch_wrapper: [] });
+    expect(RigSpecSchema.validate(spec)).toEqual({ valid: true, errors: [] });
+    const member = RigSpecSchema.normalize(spec).pods[0]!.members[0]!;
+    expect(member.launchWrapper).toEqual([]);
+  });
+
+  it("omits launchWrapper when launch_wrapper is absent", () => {
+    const spec = withMember("codex", {});
+    expect(RigSpecSchema.validate(spec)).toEqual({ valid: true, errors: [] });
+    const member = RigSpecSchema.normalize(spec).pods[0]!.members[0]!;
+    expect(member.launchWrapper).toBeUndefined();
+    expect("launchWrapper" in member).toBe(false);
+  });
+
+  it.each(["omp", "terminal", "stub", "openshell-claude"])("rejects launch_wrapper (including []) on unsupported runtime %s", (runtime) => {
+    for (const value of [["mtn", "--"], []]) {
+      const result = RigSpecSchema.validate(withMember(runtime, { launch_wrapper: value }));
+      expect(result.valid).toBe(false);
+      expect(result.errors.join(" ")).toMatch(/launch_wrapper.*(?:pi|codex)/i);
+    }
+  });
+
+  it("rejects launch_wrapper at rig or pod level", () => {
+    const rigLevel = { ...withMember("codex", {}), launch_wrapper: ["mtn"] };
+    expect(RigSpecSchema.validate(rigLevel).valid).toBe(false);
+    const podLevel = withMember("codex", {});
+    (podLevel.pods[0] as Record<string, unknown>)["launch_wrapper"] = ["mtn"];
+    expect(RigSpecSchema.validate(podLevel).valid).toBe(false);
+  });
+
+  it("rejects invalid launch_wrapper values (bad types, empty/relative executable, NUL/CR/LF, non-string elements)", () => {
+    const invalidValues: unknown[] = [
+      null,
+      "mtn --",
+      42,
+      true,
+      { executable: "mtn" },
+      [""],
+      ["   "],
+      ["", "--"],
+      ["./wrapper"],
+      ["../wrapper"],
+      ["bin/wrapper"],
+      ["~/wrapper"],
+      ["wrap\0per"],
+      ["wrap\nper"],
+      ["wrap\rper"],
+      ["mtn", "bad\0arg"],
+      ["mtn", "bad\narg"],
+      ["mtn", "bad\rarg"],
+      ["mtn", 123],
+      ["mtn", null],
+    ];
+    for (const badValue of invalidValues) {
+      const result = RigSpecSchema.validate(withMember("codex", { launch_wrapper: badValue }));
+      expect(result.valid, JSON.stringify(badValue)).toBe(false);
+      expect(result.errors.join(" "), JSON.stringify(badValue)).toContain("launch_wrapper");
+      expect(result.errors.join(" "), JSON.stringify(badValue)).not.toContain("unknown key");
+    }
+  });
+
+  it("exposes domain helper contracts for validation, stored parsing, and equality", async () => {
+    const { validateLaunchWrapper, parseStoredLaunchWrapper, sameLaunchWrapper } = await import("../src/domain/launch-wrapper.js");
+    expect(validateLaunchWrapper([])).toEqual([]);
+    expect(validateLaunchWrapper(["mtn", "", "--"])).toEqual(["mtn", "", "--"]);
+    expect(validateLaunchWrapper(["/a/../b", "--"])).toEqual(["/a/../b", "--"]);
+    expect(parseStoredLaunchWrapper(null)).toBeUndefined();
+    expect(parseStoredLaunchWrapper(undefined)).toBeUndefined();
+    expect(parseStoredLaunchWrapper('["mtn","--"]')).toEqual(["mtn", "--"]);
+    for (const invalidStored of ["", "not-json", "null", "[]", "{}", '"mtn"', '[""]', '["./rel"]', '["a\\nb"]', 123]) {
+      expect(() => parseStoredLaunchWrapper(invalidStored)).toThrow();
+    }
+    expect(sameLaunchWrapper(undefined, null)).toBe(true);
+    expect(sameLaunchWrapper([], null)).toBe(true);
+    expect(sameLaunchWrapper([], undefined)).toBe(true);
+    expect(sameLaunchWrapper([], [])).toBe(true);
+    expect(sameLaunchWrapper(["mtn", "--"], ["mtn", "--"])).toBe(true);
+    expect(sameLaunchWrapper(["mtn", "--"], ["mtn"])).toBe(false);
+    expect(sameLaunchWrapper(["mtn"], [])).toBe(false);
+    expect(sameLaunchWrapper(["mtn"], null)).toBe(false);
+  });
+});
+
+describe("legacy flat node launch_wrapper (#2328)", () => {
+  const withLegacyNode = (runtime: string, fields: Record<string, unknown>) => ({
+    schema_version: 1,
+    name: "legacy-wrapper-rig",
+    version: "1.0.0",
+    nodes: [
+      {
+        id: "worker",
+        runtime,
+        cwd: "/workspace",
+        ...fields,
+      },
+    ],
+    edges: [],
+  });
+
+  it.each(["pi", "codex", "claude-code"])("accepts literal argv with bare, absolute, or dot-segment executable, empty non-executable args, spaces and metacharacters on flat %s node", (runtime) => {
+    const argv = ["mtn", "sandbox", "exec", "", "--flag='quoted $VAR ; | &'", "--"];
+    const spec = withLegacyNode(runtime, { launch_wrapper: argv });
+    expect(LegacyRigSpecSchema.validate(spec)).toEqual({ valid: true, errors: [] });
+    const normalized = LegacyRigSpecSchema.normalize(spec);
+    expect(normalized.nodes[0]!.launchWrapper).toEqual(argv);
+
+    const absArgv = ["/usr/local/bin/mtn-wrapper", "--seat", "miles"];
+    const absSpec = withLegacyNode(runtime, { launch_wrapper: absArgv });
+    expect(LegacyRigSpecSchema.validate(absSpec)).toEqual({ valid: true, errors: [] });
+    expect(LegacyRigSpecSchema.normalize(absSpec).nodes[0]!.launchWrapper).toEqual(absArgv);
+
+    const dotSegmentArgv = ["/a/../b", "--flag"];
+    const dotSegmentSpec = withLegacyNode(runtime, { launch_wrapper: dotSegmentArgv });
+    expect(LegacyRigSpecSchema.validate(dotSegmentSpec)).toEqual({ valid: true, errors: [] });
+    expect(LegacyRigSpecSchema.normalize(dotSegmentSpec).nodes[0]!.launchWrapper).toEqual(dotSegmentArgv);
+  });
+
+  it.each(["pi", "codex", "claude-code"])("accepts [] as explicit clear on flat %s node and retains [] in normalize", (runtime) => {
+    const spec = withLegacyNode(runtime, { launch_wrapper: [] });
+    expect(LegacyRigSpecSchema.validate(spec)).toEqual({ valid: true, errors: [] });
+    const node = LegacyRigSpecSchema.normalize(spec).nodes[0]!;
+    expect(node.launchWrapper).toEqual([]);
+  });
+
+  it.each(["pi", "codex", "claude-code"])("omits launchWrapper when launch_wrapper is absent on flat %s node", (runtime) => {
+    const spec = withLegacyNode(runtime, {});
+    expect(LegacyRigSpecSchema.validate(spec)).toEqual({ valid: true, errors: [] });
+    const node = LegacyRigSpecSchema.normalize(spec).nodes[0]!;
+    expect(node.launchWrapper).toBeUndefined();
+    expect("launchWrapper" in node).toBe(false);
+  });
+
+  it.each(["omp", "terminal", "stub", "openshell-claude"])("rejects launch_wrapper (including []) on unsupported flat runtime %s", (runtime) => {
+    for (const value of [["mtn", "--"], []]) {
+      const result = LegacyRigSpecSchema.validate(withLegacyNode(runtime, { launch_wrapper: value }));
+      expect(result.valid).toBe(false);
+      expect(result.errors).toContain('nodes.worker.launch_wrapper: only valid when runtime is "pi", "codex", "claude-code" or a supported community harness');
+    }
+  });
+
+  it("rejects invalid launch_wrapper values on flat nodes (null, non-array, empty/relative executable, NUL/CR/LF, non-string elements)", () => {
+    const invalidValues: unknown[] = [
+      null,
+      "mtn --",
+      42,
+      true,
+      { executable: "mtn" },
+      [""],
+      ["   "],
+      ["", "--"],
+      ["./wrapper"],
+      ["../wrapper"],
+      ["bin/wrapper"],
+      ["wrap\0per"],
+      ["wrap\nper"],
+      ["wrap\rper"],
+      ["mtn", "bad\0arg"],
+      ["mtn", "bad\narg"],
+      ["mtn", "bad\rarg"],
+      ["mtn", 123],
+      ["mtn", null],
+    ];
+    for (const badValue of invalidValues) {
+      const result = LegacyRigSpecSchema.validate(withLegacyNode("codex", { launch_wrapper: badValue }));
+      expect(result.valid, JSON.stringify(badValue)).toBe(false);
+      expect(result.errors.join(" "), JSON.stringify(badValue)).toContain("nodes.worker.launch_wrapper");
+    }
+  });
+});
+
+describe("member process_limits (#3253)", () => {
+  const withMember = (fields: Record<string, unknown>, runtime = "codex") => ({
+    version: "0.2",
+    name: "limits-rig",
+    pods: [{
+      id: "dev",
+      label: "Dev",
+      members: [{ id: "worker", runtime, cwd: ".",
+        ...(runtime === "terminal" ? { agent_ref: "builtin:terminal", profile: "none" }
+          : { agent_ref: "local:agents/worker", profile: "default" }),
+        ...fields }],
+      edges: [],
+    }],
+    edges: [],
+  });
+
+  it.each(["codex", "claude-code", "pi", "terminal"])("accepts tasks_max on %s and normalizes it", (runtime) => {
+    const spec = withMember({ process_limits: { tasks_max: 256 } }, runtime);
+    expect(RigSpecSchema.validate(spec).errors).toEqual([]);
+    expect(RigSpecSchema.normalize(spec).pods[0]!.members[0]!.processLimits).toEqual({ tasksMax: 256 });
+  });
+
+  it("takes any positive count, with no floor for every runtime (systemd's own minimum is 1)", () => {
+    for (const tasksMax of [1, 2, 63]) {
+      const spec = withMember({ process_limits: { tasks_max: tasksMax } });
+      expect(RigSpecSchema.validate(spec).errors).toEqual([]);
+      expect(RigSpecSchema.normalize(spec).pods[0]!.members[0]!.processLimits).toEqual({ tasksMax });
+    }
+  });
+
+  it("keeps an absent key undefined and normalizes {} to an explicit clear", () => {
+    expect(RigSpecSchema.normalize(withMember({})).pods[0]!.members[0]!.processLimits).toBeUndefined();
+    const cleared = withMember({ process_limits: {} });
+    expect(RigSpecSchema.validate(cleared).valid).toBe(true);
+    expect(RigSpecSchema.normalize(cleared).pods[0]!.members[0]!.processLimits).toEqual({});
+  });
+
+  it.each(["codex", "claude-code", "pi", "terminal"])("accepts memory_max on %s and normalizes it to bytes", (runtime) => {
+    const spec = withMember({ process_limits: { memory_max: "4G" } }, runtime);
+    expect(RigSpecSchema.validate(spec).errors).toEqual([]);
+    expect(RigSpecSchema.normalize(spec).pods[0]!.members[0]!.processLimits).toEqual({ memoryMax: 4294967296 });
+  });
+
+  it("reads a memory_max size and the same number of bytes as one value", () => {
+    for (const value of ["512M", 536870912]) {
+      const spec = withMember({ process_limits: { memory_max: value } });
+      expect(RigSpecSchema.validate(spec).errors).toEqual([]);
+      expect(RigSpecSchema.normalize(spec).pods[0]!.members[0]!.processLimits).toEqual({ memoryMax: 536870912 });
+    }
+  });
+
+  it("takes both keys together", () => {
+    const spec = withMember({ process_limits: { tasks_max: 256, memory_max: "1G" } });
+    expect(RigSpecSchema.validate(spec).errors).toEqual([]);
+    expect(RigSpecSchema.normalize(spec).pods[0]!.members[0]!.processLimits).toEqual({ tasksMax: 256, memoryMax: 1073741824 });
+  });
+
+  it("takes memory_max from 1M (no floor: the probe decides the low end) to its top (2^53 - 2^20 bytes)", () => {
+    for (const [value, memoryMax] of [["1M", 1048576], [1048576, 1048576], ["15M", 15728640], [9007199253692416, 9007199253692416],
+      ["1T", 2 ** 40]] as const) {
+      const spec = withMember({ process_limits: { memory_max: value } });
+      expect(RigSpecSchema.validate(spec).errors).toEqual([]);
+      expect(RigSpecSchema.normalize(spec).pods[0]!.members[0]!.processLimits).toEqual({ memoryMax });
+    }
+  });
+
+  it.each([
+    [{ memory_max: 0 }, "process_limits.memory_max: must be an integer number of bytes or a size"],
+    [{ memory_max: -1073741824 }, "process_limits.memory_max: must be an integer number of bytes or a size"],
+    [{ memory_max: 1.5 }, "process_limits.memory_max: must be an integer number of bytes or a size"],
+    [{ memory_max: "1.5G" }, "process_limits.memory_max: must be an integer number of bytes or a size"],
+    [{ memory_max: "infinity" }, "process_limits.memory_max: infinity is not a limit"],
+    [{ memory_max: "50%" }, "process_limits.memory_max: a percentage is not accepted"],
+    [{ memory_max: "1X" }, "process_limits.memory_max: must be an integer number of bytes or a size"],
+    [{ memory_max: "1g" }, "process_limits.memory_max: must be an integer number of bytes or a size"],
+    [{ memory_max: "1P" }, "process_limits.memory_max: must be an integer number of bytes or a size"],
+    [{ memory_max: "" }, "process_limits.memory_max: must be an integer number of bytes or a size"],
+    [{ memory_max: "1048576" }, "process_limits.memory_max: a number of bytes is an integer, not a string"],
+    [{ memory_max: 16777216 + 4096 }, "process_limits.memory_max: must be a whole number of MiB"],
+    [{ memory_max: "16388K" }, "process_limits.memory_max: must be a whole number of MiB"],
+    [{ memory_max: "1K" }, "process_limits.memory_max: must be a whole number of MiB"],
+    [{ memory_max: 2 ** 53 }, "process_limits.memory_max: must be at most 9007199253692416 bytes"],
+    [{ memory_max: "8193T" }, "process_limits.memory_max: must be at most 9007199253692416 bytes"],
+    [{ tasks_max: 256, cpu_quota: "50%" }, "process_limits.cpu_quota: not supported"],
+    [{ tasks_max: 0 }, "process_limits.tasks_max: must be an integer from 1 to 4194304"],
+    [{ tasks_max: 4194305 }, "process_limits.tasks_max: must be an integer from 1 to 4194304"],
+    [{ tasks_max: 1.5 }, "process_limits.tasks_max: must be an integer from 1 to 4194304"],
+    [{ tasks_max: "512" }, "process_limits.tasks_max: must be an integer from 1 to 4194304"],
+    [512, "process_limits: must be a mapping"],
+    [[512], "process_limits: must be a mapping"],
+    [null, "process_limits: must be a mapping"],
+  ])("refuses %j by name", (value, message) => {
+    const result = RigSpecSchema.validate(withMember({ process_limits: value }));
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes(message)), result.errors.join("; ")).toBe(true);
+  });
+
+  it("accepts and refuses the same way on a legacy flat node", () => {
+    const legacy = (value: unknown) => ({
+      schema_version: 1, name: "flat", version: "1.0",
+      nodes: [{ id: "worker", runtime: "codex", process_limits: value }], edges: [],
+    });
+    expect(LegacyRigSpecSchema.validate(legacy({ tasks_max: 128 })).errors).toEqual([]);
+    expect(LegacyRigSpecSchema.normalize(legacy({ tasks_max: 128 })).nodes[0]!.processLimits).toEqual({ tasksMax: 128 });
+    expect(LegacyRigSpecSchema.validate(legacy({ memory_max: "1G" })).errors).toEqual([]);
+    expect(LegacyRigSpecSchema.normalize(legacy({ memory_max: "1G" })).nodes[0]!.processLimits).toEqual({ memoryMax: 1073741824 });
+    const refused = LegacyRigSpecSchema.validate(legacy({ cpu_quota: "50%" }));
+    expect(refused.errors.some((e) => e.includes("process_limits.cpu_quota: not supported"))).toBe(true);
+  });
+});
+
+describe("member keep_alive (#2940)", () => {
+  const withMember = (fields: Record<string, unknown>, runtime = "codex") => ({
+    version: "0.2",
+    name: "keep-rig",
+    pods: [{
+      id: "dev",
+      label: "Dev",
+      members: [{ id: "worker", runtime, cwd: ".",
+        ...(runtime === "terminal" ? { agent_ref: "builtin:terminal", profile: "none" }
+          : { agent_ref: "local:agents/worker", profile: "default" }),
+        ...fields }],
+      edges: [],
+    }],
+    edges: [],
+  });
+
+  it.each(["codex", "claude-code", "pi", "terminal"])("accepts keep_alive true and false on %s and normalizes it", (runtime) => {
+    for (const value of [true, false]) {
+      const spec = withMember({ keep_alive: value }, runtime);
+      expect(RigSpecSchema.validate(spec).errors).toEqual([]);
+      expect(RigSpecSchema.normalize(spec).pods[0]!.members[0]!.keepAlive).toBe(value);
+    }
+  });
+
+  it("keeps an absent key undefined, so the agent spec's lifecycle can decide", () => {
+    const member = RigSpecSchema.normalize(withMember({})).pods[0]!.members[0]!;
+    expect(member.keepAlive).toBeUndefined();
+    expect("keepAlive" in member).toBe(false);
+  });
+
+  it.each([["yes"], [1], [0], [null], [{ enabled: true }]])("refuses %j by name", (value) => {
+    const result = RigSpecSchema.validate(withMember({ keep_alive: value }));
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("keep_alive: must be true or false")), result.errors.join("; ")).toBe(true);
+  });
+
+  it("round-trips through the codec: true and false as written, absent stays absent", () => {
+    for (const value of [true, false]) {
+      const spec = RigSpecSchema.normalize(withMember({ keep_alive: value }));
+      const yaml = RigSpecCodec.serialize(spec);
+      expect(yaml).toContain(`keep_alive: ${value}`);
+      expect(RigSpecSchema.normalize(RigSpecCodec.parse(yaml) as Record<string, unknown>).pods[0]!.members[0]!.keepAlive).toBe(value);
+    }
+    expect(RigSpecCodec.serialize(RigSpecSchema.normalize(withMember({})))).not.toContain("keep_alive");
+  });
+});
+
+describe("member statusline_throttle (#3416 item 3)", () => {
+  const withMember = (fields: Record<string, unknown>, runtime = "claude-code") => ({
+    version: "0.2", name: "throttle-rig",
+    pods: [{ id: "dev", label: "Dev", members: [{ id: "worker", runtime, cwd: ".", agent_ref: "local:agents/worker", profile: "default", ...fields }], edges: [] }],
+    edges: [],
+  });
+
+  it("accepts whole seconds from 1 to 120 on a Claude member, keeps 0 as an explicit clear and an absent key undefined", () => {
+    for (const seconds of [1, 30, 120, 0]) {
+      const spec = withMember({ statusline_throttle: seconds });
+      expect(RigSpecSchema.validate(spec).errors).toEqual([]);
+      expect(RigSpecSchema.normalize(spec).pods[0]!.members[0]!.statuslineThrottle).toBe(seconds);
+    }
+    expect(RigSpecSchema.normalize(withMember({})).pods[0]!.members[0]!.statuslineThrottle).toBeUndefined();
+  });
+
+  it.each([121, -1, 2.5, "30", null])("refuses %j", (value) => {
+    expect(RigSpecSchema.validate(withMember({ statusline_throttle: value })).errors)
+      .toEqual(["pods[0].members[0].statusline_throttle must be 0 (off) or a whole number of seconds from 1 to 120"]);
+  });
+
+  it("refuses the key on a member that isn't Claude", () => {
+    expect(RigSpecSchema.validate(withMember({ statusline_throttle: 30 }, "codex")).errors)
+      .toContain('pods[0].members[0].statusline_throttle: only valid when runtime is "claude-code"');
+  });
+
+  it("round-trips through the spec text", () => {
+    const normalized = RigSpecSchema.normalize(withMember({ statusline_throttle: 45 }));
+    const again = RigSpecSchema.normalize(RigSpecCodec.parse(RigSpecCodec.serialize(normalized)) as Record<string, unknown>);
+    expect(again.pods[0]!.members[0]!.statuslineThrottle).toBe(45);
+  });
+});
+
+describe("member pool block (#3395 Piece 1)", () => {
+  const withPool = (pool: unknown) => ({
+    version: "0.2", name: "pool-rig",
+    pods: [{ id: "dev", label: "Dev", members: [
+      { id: "impl", runtime: "claude-code", cwd: ".", agent_ref: "local:agents/impl", profile: "default", pool },
+      { id: "qa", runtime: "codex", cwd: ".", agent_ref: "local:agents/qa", profile: "default" },
+    ], edges: [] }],
+    edges: [],
+  });
+  const member = (spec: Record<string, unknown>) => RigSpecSchema.normalize(spec).pods[0]!.members[0]!;
+
+  it("A block with only max loads with every other field at its default, and no advisory.", () => {
+    const spec = withPool({ max: 3 });
+    expect(RigSpecSchema.validate(spec)).toEqual({ valid: true, errors: [] });
+    expect(member(spec).pool).toEqual({
+      max: 3, min: 0, dispatchAfterSeconds: 60, idleGraceSeconds: 300, cooldownSeconds: 60,
+      dispatchTag: null, cwdTemplate: null, drain: false,
+    });
+    expect(member(spec).unusablePool).toBeUndefined();
+  });
+
+  it("`max: 0` and a `cwd_template` without `{slot}` validate with no advisory.", () => {
+    const spec = withPool({ max: 0, cwd_template: "/work/{rig}/shared" });
+    expect(RigSpecSchema.validate(spec)).toEqual({ valid: true, errors: [] });
+    expect(member(spec).pool).toMatchObject({ max: 0, cwdTemplate: "/work/{rig}/shared" });
+  });
+
+  it("`pool: {}` validates with no advisory and normalizes to the explicit clear; an absent key stays absent.", () => {
+    const spec = withPool({});
+    expect(RigSpecSchema.validate(spec)).toEqual({ valid: true, errors: [] });
+    expect(member(spec).pool).toBeNull();
+    expect(RigSpecSchema.normalize(spec).pods[0]!.members[1]!).not.toHaveProperty("pool");
+  });
+
+  it.each([
+    ["wrong type", { max: "3" }, "dev.impl pool.max: must be a whole number of 0 or more; pool not used"],
+    ["missing max", { min: 1 }, "dev.impl pool.max: required, a whole number of 0 or more; pool not used"],
+    ["out of bounds", { max: 3, idle_grace_s: -1 }, "dev.impl pool.idle_grace_s: must be a whole number of 0 or more; pool not used"],
+    ["a fraction", { max: 3, cooldown_s: 1.5 }, "dev.impl pool.cooldown_s: must be a whole number of 0 or more; pool not used"],
+    ["max < min", { max: 1, min: 2 }, "dev.impl pool.max: must be at least min (2); pool not used"],
+    ["a blank tag", { max: 3, dispatch_tag: " " }, "dev.impl pool.dispatch_tag: must be a non-empty tag; pool not used"],
+    ["a non-absolute cwd_template", { max: 3, cwd_template: "work/{slot}" }, "dev.impl pool.cwd_template: must be an absolute path; pool not used"],
+    ["an unknown placeholder", { max: 3, cwd_template: "/work/{user}/{slot}" }, "dev.impl pool.cwd_template: may use only the placeholders {rig} and {slot}; pool not used"],
+    ["a placeholder nested in another", { max: 3, cwd_template: "/work/{r{slot}ig}" }, "dev.impl pool.cwd_template: may use only the placeholders {rig} and {slot}; pool not used"],
+    ["a non-boolean drain", { max: 3, drain: "yes" }, "dev.impl pool.drain: must be true or false; pool not used"],
+    ["not a mapping", 3, "dev.impl pool: must be a mapping, e.g. { max: 3 } (use {} to clear a stored pool); pool not used"],
+  ])("Each bad field (wrong type, out of bounds, `max < min`, a non-absolute `cwd_template` or one with an unknown placeholder) raises `<member> pool.<field>: <reason>; pool not used`, drops the whole block, and the rig still loads with the spec `valid` (%s).", (_case, pool, advisory) => {
+    const spec = withPool(pool);
+    expect(RigSpecSchema.validate(spec)).toEqual({ valid: true, errors: [], advisories: [advisory] });
+    const normalized = RigSpecSchema.normalize(spec);
+    expect(normalized.pods[0]!.members[0]!.pool).toBeUndefined();
+    expect(normalized.pods[0]!.members[0]!.unusablePool).toEqual({ raw: pool });
+    expect(normalized.pods[0]!.members.map((m) => m.id)).toEqual(["impl", "qa"]);
+  });
+
+  it("A number JSON can't hold (`.inf`) is an advisory too, and the block is kept as JSON, where it reads `null`, still unusable.", () => {
+    const spec = withPool({ max: Infinity });
+    expect(RigSpecSchema.validate(spec)).toEqual({
+      valid: true, errors: [], advisories: ["dev.impl pool.max: must be a whole number of 0 or more; pool not used"],
+    });
+    const normalized = RigSpecSchema.normalize(spec).pods[0]!.members[0]!;
+    expect(normalized.pool).toBeUndefined();
+    expect(normalized.unusablePool).toEqual({ raw: { max: null } });
+  });
+
+  it("An unknown key inside `pool` raises an advisory, drops the whole block, and the rig loads with the spec `valid`.", () => {
+    const spec = withPool({ max: 3, adopt: ["dev.other"] });
+    expect(RigSpecSchema.validate(spec)).toEqual({
+      valid: true, errors: [],
+      advisories: ["dev.impl pool.adopt: unknown field; known fields are max, min, dispatch_after_s, idle_grace_s, cooldown_s, dispatch_tag, cwd_template, drain; pool not used"],
+    });
+    expect(member(spec).pool).toBeUndefined();
+    expect(member(spec).unusablePool).toEqual({ raw: { max: 3, adopt: ["dev.other"] } });
+  });
+
+  it("A block with several problems names each of them, and poolAdvisories reports exactly the pool's advisories.", () => {
+    const spec = withPool({ max: -1, drain: 1 });
+    const expected = [
+      "dev.impl pool.max: must be a whole number of 0 or more; pool not used",
+      "dev.impl pool.drain: must be true or false; pool not used",
+    ];
+    expect(RigSpecSchema.validate(spec).advisories).toEqual(expected);
+    expect(poolAdvisories(spec)).toEqual(expected);
+    expect(poolAdvisories(withPool({ max: 2 }))).toEqual([]);
   });
 });

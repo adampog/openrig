@@ -1,7 +1,7 @@
 # Agent Startup Guide
 
 Last validated: 2026-10-05, against main `9b88b118`
-Applies to: OpenRig 0.6.7
+Applies to: OpenRig 0.6.8
 
 This guide teaches you how to think about what goes into an agent's startup experience — what files to write, where to put them, and how the layering model delivers them. It is an authoring guide, not a schema reference. For field-level details, see `rig-spec.md` and `agent-spec.md`.
 
@@ -33,10 +33,82 @@ command. `rig ps --nodes` shows it under "Startup details (<seat>)", and
 `rig up` and `rig bundle install` print it as "Startup attention (<seat>)":
 "After resolving it in <session>, run: rig seat continue <session>".
 
+During a fresh team build, a seat can see `rosterState: "building"` in
+`rig whoami`. Once all declared seats and edges are recorded, OpenRig queues a
+roster-ready notice for each agent that started. The notice is information only:
+`rig whoami` now shows the current peers and routes, and the row needs no claim,
+file or follow-up. The agent can close it or leave it, and the stuck sweep files
+no finding about it, pending or claimed. Its wake is delivered like any other.
+The queue records the notice even when a wake cannot reach the seat; an
+unconfirmed notice appears as a launch warning. If an edge could not be recorded,
+the launch warning names it and no roster-ready notice is sent. Terminal-only seats are excluded.
+
 The attention codes that stop startup this way are `trust_gate`,
 `hook_trust_gate`, `update_gate`, `login_required`, `mcp_gate`,
-`bypass_consent_gate`, `codex_auth_refusal` and `codex_client_incompatible`.
+`bypass_consent_gate`, `claude_resume_selection_prompt`,
+`claude_gated_grants_gate`, `codex_auth_refusal` and `codex_client_incompatible`.
 They are recognized from each harness's English prompt text.
+`claude_gated_grants_gate` is Claude Code's workspace trust check that warns "This folder
+pre-approves N tool permissions" (from the folder's `.claude/settings.json`): OpenRig never
+answers it, not even with `recovery.auto_drive_provider_prompts`, because its default choice
+declines those permissions (or exits) and approving them is your call. With that setting on,
+when a Claude Code seat is resumed, the plain workspace trust prompt is answered only when its options are exactly "No, exit" and
+"Yes, I trust this folder": Claude Code 2.1.322 opens it on "No, exit", so OpenRig moves the
+selection down once and presses Enter only after it reads the focus on "Yes". Any other option
+set, a prompt drawn without a cursor or a focus that does not reach "Yes" gets no confirmation.
+A fresh launch still stops at the trust prompt for you to answer.
+
+## Continue a Codex fork whose child ID arrived late
+
+For a member with `session_source.mode: fork`, OpenRig waits for Codex's new
+child thread ID before sending its role and other startup prompts. It saves the
+ID and sends the role only for a verified child: the bound pane's foreground
+process forks the requested parent, and its own native record, matched to its
+start time, supplies the ID. This capture uses `runtime.readiness_timeout_seconds`
+(30 seconds by default, configurable from 1 to 600 seconds), as does the later
+readiness check. The two waits have separate budgets. A seat handover with
+`--source fork:<seat>` is different: its fork carries the conversation itself,
+and a missed ID capture leaves the ID pending rather than stopping the handover.
+
+If the ID is still unavailable, the seat reports `attention_required` and keeps
+its startup context pending. Wait for the child to finish starting, resolve any
+native prompt, then run `rig seat continue <seat>`. The continuation verifies
+that the bound pane is running a fork of the requested parent and reads the
+child's own native identity before delivering the saved context. It does not
+launch another fork or resume the parent. The parent ID is never saved as the
+child's resume token.
+
+An unavailable or conflicting identity leaves the context pending. Once prompt
+delivery has been attempted, it cannot be replayed by `continue`, including
+after a daemon restart: inspect `rig seat status <seat>` and the native pane
+before deciding how to recover an uncertain delivery.
+
+## After a restored seat's prompt
+
+A restore that stops at a prompt, such as Claude's resume selection, records the
+seat's restore outcome as `attention_required`. `rig seat continue` doesn't change
+that record: it only delivers pending startup context. While the record stands, it
+alone keeps the seat's lifecycle at `attention_required`, even with startup `ready`:
+`rig ps --nodes` shows LIFECYCLE `att`, `needsAttention` is true, and the seat counts
+in the rig's `attentionCount` and the TUI's attention totals.
+
+After a full restore of a Claude or Codex seat, answering the prompt is enough. When
+the seat's activity next turns to running or idle, or when the whole restore completes
+after the seat already reads running or idle, the daemon checks the live seat: its tmux
+session is alive, and the agent in its pane was started to resume the conversation the
+seat records. When the check passes, the restore outcome becomes `operator_recovered`, so
+the restore no longer makes the seat need attention. When the check fails, the restore
+outcome stays and the seat still needs attention. The check uses launch evidence; it
+does not prove which conversation is open now.
+
+`rig seat clear-attention <seat>` runs the same check on demand. When it fails, the
+command says which check failed, and `--reason` doesn't bypass it. If the seat records
+the wrong conversation and the agent in its pane was started with the right one, set it
+with `rig seat set-resume-token <seat> --token-stdin --reason <text>`, then run
+`clear-attention` again; a token the running agent wasn't started with fails the same
+check. After a restore of only some seats, or a community harness's assisted startup,
+`--reason "<what you saw>"` can acknowledge the outcome instead, once any startup text
+left in the input box is submitted (not sent again) and the seat has responded.
 
 ## Two Categories of Startup
 
@@ -152,7 +224,7 @@ Startup content is merged additively through layers. Each layer adds to what the
 4. Rig layer       — from the RigSpec's top-level startup block
 5. Pod layer       — from the pod's startup block
 6. Member layer    — from the member's startup block in the RigSpec
-7. Operator layer  — added by OpenRig: openrig-start.md and, on a fresh start, the onboarding pack
+7. Operator layer  — added by OpenRig: openrig-start.md, openrig-context-entry.md and, on a fresh start, the onboarding pack
 ```
 
 A member with a `starter_ref` gets that agent starter's files in front of the agent layer. Terminal seats
@@ -168,9 +240,11 @@ A member with a `starter_ref` gets that agent starter's files in front of the ag
 | Rig | Rig spec author | Rig-wide context for all agents | Project documentation |
 | Pod | Rig spec author | Pod-specific coordination context | Pod SOP, intra-pod workflow |
 | Member | Rig spec author | Individual member overrides | Member-specific instructions, cwd-specific context |
-| Operator | OpenRig system | System-injected runtime content | `openrig-start.md` (optional delivery); on a fresh start, `openrig-onboarding-01.md` and `-02.md` unless `onboarding.default_pack.enabled` is false |
+| Operator | OpenRig system | System-injected runtime content | `openrig-start.md` (optional delivery); `openrig-context-entry.md`, a pointer to the skills router, help and declared context, for every seat; on a fresh start, `openrig-onboarding-01.md` and `-02.md` when the RigSpec's `default_onboarding_pack` is `true`, or when it is omitted and the daemon's `onboarding.default_pack.enabled` is `true` |
 
 After the files, OpenRig sends a session-identity message (rig, pod, member, logical ID) once the seat is ready.
+
+Restore uses the seat's saved guidance selection, including its onboarding pages if selected at launch. An exact resume preserves the conversation and can put back missing guidance without sending it into the conversation again.
 
 ### Practical Guidance
 
@@ -189,7 +263,7 @@ After the files, OpenRig sends a session-identity message (rig, pod, member, log
 | Delivery Hint | When | How | Use For |
 |---------------|------|-----|---------|
 | `auto` | Depends on the file | Resolved per file: a `SKILL.md` (or content starting `# SKILL`) is `skill_install`, any other `.md` is `guidance_merge`, and any other file is `send_text` | Default — let OpenRig decide |
-| `guidance_merge` | Before harness boot | Merged as a managed block into `AGENTS.md` (Codex, Pi) or `CLAUDE.md` (Claude; `CLAUDE.local.md` with the rig's `managed_blocks: { claude-code: CLAUDE.local.md }`) | Role guidance, culture, project context |
+| `guidance_merge` | Before harness boot | Merged as a managed block into the repository `AGENTS.md` (Codex, OMP), a fresh Pi seat's own agent-directory `AGENTS.md` (see [Runtime Differences](#runtime-differences)), or `CLAUDE.md` (Claude; `CLAUDE.local.md` with the rig's `managed_blocks: { claude-code: CLAUDE.local.md }`). A fresh launch of Codex 0.164.0 or later can carry it as launch developer instructions instead (see [Codex guidance at launch](#codex-guidance-at-launch)) | Role guidance, culture, project context |
 | `skill_install` | Before harness boot | Copied to runtime's skill directory | Skills |
 | `send_text` | After harness is ready | Sent as text to agent's terminal via tmux | Boot-time grounding, identity hints, instructions to read skills |
 
@@ -215,7 +289,47 @@ seconds), for up to 30 seconds by default. Change the window with
 `rig config set runtime.readiness_timeout_seconds <1-600>` (or `OPENRIG_RUNTIME_READINESS_TIMEOUT_SECONDS`); it
 applies to the next launch. A recognized prompt (the attention codes above) ends the wait at once as
 `attention_required`. A timeout ends startup as `failed` ("Readiness timeout after Ns — harness did not become
-interactive"), and the post-launch files aren't sent.
+interactive"), and the post-launch files aren't sent. A Codex fork that the rig launches (a member with
+`session_source.mode: fork`, or an agent image's fork) is the exception: its timeout ends as `attention_required`,
+with its startup context kept for `rig seat continue` (see below). A seat handover's fork has its own readiness check.
+
+**Fresh Claude handovers.** `rig handover --source fresh` keeps the previous agent's scrollback. Before sending the
+handover context, OpenRig waits for the latest prompt inside Claude's complete input frame, and confirms that the
+process in the pane belongs to the new launch. A shell's `❯` prompt or echoed launch command is not enough, even
+with an old Claude header or input frame above it and Claude already running. A header alone or a partially drawn
+input frame also keeps the check pending. If the current screen or process cannot be read, or the process identity is unconfirmed, the handover keeps
+waiting within the readiness window and fails if that window expires. Old screen text or the `claude` process label
+alone cannot complete this check. A healthy agent can therefore remain unconfirmed while those observations are
+unavailable; inspect its pane before deciding how to recover. When the launch was already sent, the failure's
+guidance names that pane and the result carries `replacementStarted` and `successorPane`: the previous agent was
+already ended, the new one may be working there without being registered as the seat's occupant, and another
+handover or `rig seat launch <seat> --fresh --stop --reason <why>` ends it if it goes ahead.
+
+**Adopting the successor of a failed handover.** When a handover fails after its successor was launched in the
+respawned pane (the readiness window closed, the context packet didn't land, or the final binding step refused for a
+reason that can change), it records the attempt for a Claude Code successor whose launch named its session id, and its
+guidance leads with `rig seat handover <seat> --recover --reason <why>` and says not to retry the handover, which
+would end that successor. The recovery adopts the successor that is running there and keeps its conversation. It
+first proves, reading only, that the attempt still replaces the seat's current occupant and that the pane is the seat
+session's only pane, with exactly one foreground Claude that names the session id OpenRig generated for that launch,
+the same process in two samples, proven as the launch's readiness proves it (a `#!` wrapper that starts Claude without
+exec included, when the launch recorded its executable: a launch in a native Claude permission mode, `auto` or another
+mode the harness advertises). A classic launch records no executable, and the `floor` and `full_bypass` postures
+launch classically too. A wrapper whose Claude runs as `node cli.js` or under another name is then not proven; when a
+second sample, a few seconds later, finds the same foreground, the refusal says `--recover` can't prove it, and to run
+it again only once the pane shows a waiting wrapper has started Claude (a wrapper still starting, which the second
+sample sees exec Claude or start it, is proven). A
+`/clear` in the successor before the recovery is followed: the conversation it adopts is the one Claude's own session
+file for that process names, when it is newer than the process, even when that is the retiring occupant's conversation
+or a fork parent's. The result says so; a fork successor on its parent's or the retiring occupant's conversation is
+reported as no distinct fork (`forkId: "none"`, continuity `resumed`), and the parent seat is left as it was: both seats
+then name the same conversation, so restoring both opens it twice. Then it commits
+the handover with the occupant generation the attempt reserved, so the successor's identity hooks are accepted from
+then on. It types nothing into the pane, and a packet the failed handover didn't deliver is not delivered: the result
+says so, and a rebuild whose priming never arrived is recorded as fresh. Anything it can't prove, such as another
+conversation, two Claudes or a changed pane, refuses with `successor_identity_unproven` and changes nothing; an
+attempt that another occupant has replaced since is closed as `handover_attempt_superseded`. It adopts Claude Code
+successors only (`recover_runtime_unsupported` otherwise).
 
 **Claude submission check.** For each startup message to a Claude seat, OpenRig makes a bounded check that the prompt
 was submitted. When the capture can't tell, it records the submission as unverified and carries on. When it sees the
@@ -229,22 +343,183 @@ one wins, and it needs `idempotent: true`). With `authenticated`, a fresh launch
 and the seat answers it with `rig startup-proof submit --challenge-id <id> --answer <answer>`. `rig ps --nodes --full`
 shows the result in the ORIENTED column: `verified`, `missing`, `rejected` or `n-a`. A missing proof doesn't block startup.
 
-**After a failure.** Delivery, launch and action failures, and readiness timeouts, give `failed`. Every 30 seconds the
-context monitor marks a `failed` or `attention_required` seat `ready` once its pane reads ready, unless fresh context
-is still pending for `rig seat continue`. A seat that timed out can therefore read `ready` without having received its
+**After a failure.** Delivery, launch and action failures, and readiness timeouts other than a Codex fork's, give
+`failed`. Every 30 seconds the context monitor marks a `failed` or `attention_required` seat `ready` once its pane reads
+ready, unless its fresh or Codex fork context is still pending for `rig seat continue`. A seat that timed out can therefore read `ready` without having received its
 post-launch files. If it needs them, first look at what that occupant has done; then
 `rig seat launch <seat> --fresh --reason <text>` starts a blank conversation for the seat. If the occupant is still
 live, the command refuses with `session_live` unless you also pass `--stop`, which replaces that occupant deliberately.
+
+**Preview before replacing a seat.** `rig seat launch <seat> --fresh --plan` inspects the selected
+seat without starting tmux, stopping or launching a process, projecting startup files, or changing
+lifecycle/queue records. Add `--json` for structured output. `--fresh` is still required;
+`--reason` is optional for the preview and required when executing. Pass `--stop` to preview the
+intended replacement of a live managed occupant. Adopted and unmanaged occupants remain blocked.
+
+The plan identifies the target, current occupant, stop requirements, blockers, startup counts,
+and each sibling seat's unchanged effect. Siblings stay attached and untouched. Launch composes
+a new command through the runtime adapter using current settings; it does not replay a stored
+wrapper command. The seat's launch environment and managed executable selection still apply.
+The plan does not construct or display the launch command.
+
+A preview is a snapshot, not a reservation or a native-readiness check. Unreadable tmux produces
+`complete: false` and `launchable: null` (unknown), unless a known blocker already proves
+`launchable: false`. A successful preview exits 0, including blocked or incomplete plans; scripts
+must inspect `launchable === true` before deciding to execute. Request failures still exit nonzero.
+Execution always resolves and checks the current state again. An older daemon without the preview
+endpoint refuses the request; the CLI never falls back to executing a launch.
+
+### Change an existing seat's working directory
+
+Editing `cwd` in an already applied RigSpec doesn't update an existing seat's saved launch directory. Use `set-cwd` to
+save a new one for the seat's next launch:
+
+```sh
+rig seat set-cwd planning-lead@project \
+  --cwd /work/project/seats/planning-lead --reason "isolate planning"
+rig seat status planning-lead@project
+```
+
+**The path:** it must be absolute **on the daemon's host**. OpenRig creates a missing directory, resolves symlinks to
+its real path, and refuses a filesystem root.
+
+**What it saves:** the directory and a `node.cwd_changed` audit event (from, to, reason, operator), together, in one
+transaction. The seat's node, canonical address, queue, session history and skill selection stay as they are.
+`rig seat status` shows **Working directory for future launches** (`launch_cwd` in JSON). That's saved configuration,
+not where the running process is.
+
+**What it writes:** it creates the folder if it's missing, and writes nothing else there. The seat's next fresh launch or
+rebuild handover writes its startup files there, as launch does today.
+
+**`set-cwd`'s preflight policy:** before saving, it reads, without writing, the enumerated resource copies (including
+nested plugin files) and startup skills that launch would place in the new directory, at their actual destinations,
+as they are at that moment. It's a point-in-time check, not a global overwrite guarantee or protection against later
+changes; at adoption, launch applies its own policy. (The commit's re-check covers the saved startup configuration,
+not the destination's file contents.)
+- **Refused, with the protected paths named (`cwd_destination_conflict`):** a file there that an operator edited, an
+  unrecorded file with different content, or two sources for one destination. That's stricter than launch, which
+  overwrites an unrecorded differing file with a warning; the refusal is deliberate, while the occupant still runs.
+- **What to do:** use a clean destination, or move or merge those files, then retry.
+- **Not checked:** managed guidance blocks and native configuration merges keep the adapter's policy at launch, and
+  launch-owned files such as `.openrig/context-collector.cjs` are written by launch as always.
+- **A community harness** takes no startup files, so none are checked for it.
+
+**The running occupant keeps its current directory.** Adopt the new one with:
+- `rig seat launch <seat> --fresh --stop --reason <text>`, which starts a blank conversation; or
+- `rig handover <seat> --source rebuild --reason <text>`, which carries durable context.
+
+A rebuild lists the current recap, lineage lessons and restore packet as required
+priming. Superseded recaps are optional history, newest first. The briefing shows
+the newest `output.rebuild_recaps` paths (default 3) and their shared
+`recap-superseded/` folder when that pointer covers the complete history. Other
+layouts retain the full list. Set `rig config set output.rebuild_recaps 0` to
+always list every path; `OPENRIG_OUTPUT_REBUILD_RECAPS` overrides the setting.
+This changes only the briefing: the handover result still records every resolved
+artifact, and no recap file is removed.
+
+For Codex rebuilds, OpenRig also carries a complete supported native permission policy read from the live
+predecessor's own conversation and process, without adding fresh-launch grants. A later recorded seat permission
+or policy choice, or a differing declared successor profile, takes precedence. Missing, stale or unsupported observations keep the existing launch
+behaviour and are reported as unverified in the handover result; requested modes and profiles alone don't prove
+preservation. The result reports what was emitted, not native successor equivalence.
+
+**Adopt it promptly.** The saved directory doesn't move the running process, but background work can use it before
+adoption. Saved configuration isn't the live process's directory, and these examples aren't the only consumers. For a
+running Claude seat:
+- **Collector provisioning** writes `.openrig/context-collector.cjs` and merges `.claude/settings.local.json` in the
+  saved directory, under its existing preservation rules.
+- **Managed compaction,** manual (`POST /api/compaction/trigger`) or automatic, asks the seat to write its restore map
+  under it. That may be outside the seat's current workspace, so a seat without bypass permissions may meet a write
+  prompt.
+
+Adopting promptly is guidance. It doesn't protect against a poll or a compaction that runs before your next command.
+
+**Before adopting,** don't `rig down`/`rig up` or hand over by fork. Those resume the existing conversation in the
+saved directory, and Claude keeps conversations per project directory, so a resume there may not find it.
+Cross-directory resume hasn't been run natively; this is the order to follow. `rig seat restart --keep-conversation`
+(Codex) isn't adoption: it respawns in the directory it observes from the running process.
+
+**Failures:** a refusal, missing or malformed saved startup context, or an audit-write failure leaves the prior
+directory saved, and changes no seat, custody or startup file (a refusal may leave the new folder created). A concurrent configuration change is reported, not overwritten. A CLI timeout means the outcome is
+unknown; check `rig seat status` before retrying. Choosing the same directory again records no second event.
+
+**The old directory:** files there are left as they are, since other seats may still use them. The source RigSpec
+declaration isn't changed either; update it separately if a future recreation should use the new directory.
 
 ### The `applies_on` Field
 
 Each startup file and action specifies when it applies:
 - `fresh_start` — delivered when a new conversation starts: the first launch, `rig seat launch --fresh`,
   `rig seat continue`, and seats restored with `--fresh`
-- `restore` — delivered when a seat is restored, including a restore whose resume falls back to a fresh conversation
+- `restore` — delivered when a seat is restored without its earlier conversation: a restore whose resume falls back to a fresh conversation, or a retried start
 - Default: `[fresh_start, restore]` (both)
 
-Use this to avoid re-sending context that the agent already has from its resumed conversation. For example, a one-time project briefing might only apply on `fresh_start`, while identity grounding should apply on both.
+**An exact resume delivers neither.** When a restore reopens the seat's saved conversation (`rig up <rig> --existing` with a resume token), OpenRig types no startup actions and delivers no startup files, `restore` ones included: the conversation already has them, and typing them again would add turns to it. The one exception: the guidance file's managed blocks are brought up to date before the harness starts. A missing block is put back, except on an eligible Codex resume, where it goes with the resume instead (see [Codex guidance at launch](#codex-guidance-at-launch)), and a stale one is refreshed (see below).
+
+**A seat handover does the same put-back.** Before a fresh, fork or rebuild successor starts, the handover puts the seat's missing managed guidance blocks back in its guidance file from the saved startup context. That's the rig's Claude file (`CLAUDE.md`, or `CLAUDE.local.md` when the rig uses it) for Claude, and `AGENTS.md` for Codex, Pi and omp. So a seat rebuilt into a new working directory keeps its guidance.
+
+**A block you edited by hand is never overwritten.** OpenRig records what it last wrote in each managed block, so a launch, an exact resume, a handover or a runtime switch can refresh a block whose source file changed since. The record follows the file itself, so two links to one file share it. A block you've edited since OpenRig wrote it is left as you wrote it. The start's result names it (`guidance_block_edited`), and the seat is told in one line once it's ready, or in a handover's packet. A block OpenRig has no record of writing (any block written before these records were kept) that differs from its source works like this:
+- a launch replaces it, as launches always did, and names it (`guidance_block_refreshed_unrecorded`);
+- an exact resume or a handover leaves it, and names it as possibly stale (`guidance_block_may_be_stale`).
+
+**A file keeps one copy of each distinct block text, and tidying the copies never removes a text you wrote.**
+- **Touched markers:** a marker an editor or formatter rewrapped, with spaces or line breaks inside the comment, still reads as its block, and the next write puts it back in OpenRig's form.
+- **Collected copies:** a copy that repeats an earlier one exactly is removed. Beside a copy you edited, OpenRig's own unedited copies are removed too, and every different edited copy stays (`guidance_block_copies_removed`).
+- **A marker that lost its pair:** OpenRig can't tell where that block starts or ends, so it adds no copy beside it and names it (`guidance_block_markers_damaged`). Put back the missing marker or remove the partial block, and OpenRig's next write treats that block like any other. `rig package install` leaves such a file as it is, names it in its result (`notes`), and installs the rest. A marker without its pair beside a complete block is named too (`guidance_block_marker_unpaired`), and the block is written.
+
+An exact resume doesn't type anything into the resumed conversation. So there, the restore result names the block (`guidanceNotes`), but the seat isn't told.
+
+Use this to avoid re-sending context that a fresh conversation doesn't need twice. For example, a one-time project briefing might only apply on `fresh_start`, while identity grounding should apply on both, so a seat that comes back fresh gets it again.
+
+---
+
+## What a seat is set to, and what it's running
+
+A seat's settings can disagree with its running agent: what's saved for the next launch, what the running process
+actually uses, and what its conversation has already read are three separate things. OpenRig reports each one
+separately. Without live evidence it says unknown (or not verified), never the saved value. A saved change reaches the
+running seat only through the action in the last column.
+
+| What | Saved for the next launch | What the running seat has | How the running seat gets it |
+|---|---|---|---|
+| Model | `rig seat set-model` | `rig ps --nodes` shows the configured model beside the last observed one, or `UNKNOWN (<reason>)` | The next managed resume or successor launch |
+| Reasoning effort | `rig seat set-effort` | `rig seat effort <seat>`: requested, saved, sent at launch, and what the session recorded, which is not verified until it takes a turn | Its next managed continuation; nothing restarts |
+| Permissions | `rig seat set-permissions` (`--mode`, `--rules`, or for Codex `--codex-permissions` or `--codex-profile`), shown by `rig seat status` | What it launched with; a status read doesn't prove the running process enforces the selection | Its next managed launch or resume ([per-seat permission mode](getting-started.md#per-seat-permission-mode)) |
+| Working directory | `rig seat set-cwd`, shown by `rig seat status` as **Working directory for future launches** | The directory it started in | `rig seat launch --fresh --stop` (a blank conversation) or `rig handover --source rebuild` (durable context); [details](#change-an-existing-seats-working-directory) |
+| Runtime home (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`) of an existing seat | `rig seat record-runtime-home`, shown by `rig seat runtime-home` | The home it started with; whether a running process uses the recorded one isn't checked | Its next resume, restore or launch; [details](#record-where-an-existing-seats-conversation-lives) |
+| Launch wrapper (`launch_wrapper`) | Member `launch_wrapper` in `rig.yaml` (`pi`, `codex` and `claude-code` only; `launch_wrapper: []` clears, omitting retains on existing-seat apply; surfaced as `launchWrapper` in `rig ps --nodes --json` when set; no live `rig seat` edit verb) | The literal wrapper argv that prefixes the resolved Codex entry or Claude executable (preserving TTY stdio) or the resolved Pi child executable inside OpenRig's host runner (preserving RPC pipes and runner lifecycle) when that session launched; a configured prefix is not proof of isolation, tooling, memory or governance | Supported spec create/recreate/apply flow, then the seat's next managed launch, resume, restore or handover (fails closed when wrapper support is unavailable; never falls back to bare child launch; [details](rig-spec.md#launch-wrapper-runtime-pi-and-codex)) |
+| Process limits (`process_limits`) | Member `process_limits: { tasks_max: N, memory_max: <size> }` in `rig.yaml` (Linux/systemd hosts only; opt-in per seat and per key, no default; `{}` clears, omitting retains on existing-seat apply) | The task limit (`TasksMax=N`) and the memory limit (`MemoryMax=<bytes>`) it asked for, of the systemd user scope the seat's own pane starts in, outside the terminal server's scope; other seats, the daemon and the terminal server stay outside it | The seat's next fresh launch, relaunch, restore, resume, handover or runtime switch; a running seat is never moved. A fresh launch the host can't cap is not started and says why; a restore, resume, handover, runtime switch or restart in place goes ahead without the limit, with a warning ([details](rig-spec.md#process-limits-linuxsystemd)) |
+| Startup files and skills | The spec's startup files, skills and actions | What its conversation read when it started; editing a file afterwards doesn't reach it | A fresh launch or a handover delivers them again; for the running seat, send or walk the change (`rig walk <seat> --through <files>`) |
+| Guidance blocks (`CLAUDE.md`, `AGENTS.md`) | The seat's startup selection, which OpenRig merges into its guidance file as managed blocks at each start and restore | `rig seat status` **Guidance**: when OpenRig wrote each of its blocks, before or after the session's recorded startup finish (for a claimed session, when OpenRig recorded it). That's chronology, not what the agent has: the harness reads the file earlier in startup, Claude Code reloads it after `/compact` or `/clear`, Codex reads it at session start, and the agent can read it, or be sent it, at any time. OpenRig doesn't record what an agent read | Claude: its next compaction, `/clear` or restart. Codex: its next start. Without either, [tell it](#new-guidance-for-a-running-seat) |
+| Tools (MCP servers, plugins) | Selected fragments, merged into the harness's own config (`.mcp.json` for Claude, `config.toml` for Codex) | Unknown to OpenRig: registered isn't active, Claude asks before it uses a new server, and no OpenRig command reports which tools a running harness loaded | Check in the harness itself (Claude Code's `/mcp`); a running session may need a restart to pick up newly written config ([runtime config disclosure](#runtime-config-disclosure)) |
+
+### New guidance for a running seat
+
+There are three ways for a seat to pick up new guidance:
+
+1. **Tell it.** `rig send <seat> "Read <file>: <why>"`, or `rig walk <seat> --through <files>` for several. The seat's
+   interruption settings can hold a message; `rig send` may report `retained, not delivered`.
+2. **The refocus hook**, where the seat runs OpenRig's `openrig-core` hooks (**Refocus** in `rig seat status` shows whether
+   the hook has recorded it). The hook's content comes from `OPENRIG_REFOCUS_CONTENT_REF` (a `rig context get` address),
+   else `OPENRIG_REFOCUS_CONTENT_FILE`, else `refocus/REFOCUS.md` under `OPENRIG_HOME`, else the shipped default. After
+   compaction the hook waits for an eligible prompt. For managed Claude compaction it skips the acknowledgement boundary,
+   and other prompts can arrive first and be skipped while restore is pending. Claude can also refocus after the
+   conversation grows past the hook's size threshold.
+3. **Its guidance file, loaded again:** for Claude at its next compaction, `/clear` or start, for Codex at its next start.
+   **Guidance** in `rig seat status` shows which of OpenRig's blocks were written after the session's recorded startup finish.
+
+A file pointer leaves the read to the seat, under its own permission settings. `rig walk` reads the named files in the
+calling process and sends their contents. A seat whose harness asks before reading a file outside its project (its own
+`LEARNED.md` under the topology root, a plugin's skill) waits at that prompt until someone answers it, even though a hook
+could deliver an excerpt of the same file. Finding a file, a hook picking it up, and the agent reading and using it are
+separate facts.
+
+Per harness: Claude Code's and Codex's permission choices are in the setup reference
+([Claude Code](getting-started.md#claude-code-a-different-launch-flag),
+[Codex](getting-started.md#codex-select-sandbox-and-approvals-together)), Codex homes are
+[below](#separate-codex-homes-for-separate-installations), community harnesses' limits are in
+[their presets](community-harness-presets.md), and moving a live seat to the other runtime is in the
+[setup reference](getting-started.md#move-a-seat-to-the-other-runtime).
 
 ---
 
@@ -255,7 +530,9 @@ The AgentSpec and RigSpec allow declaring deterministic environment configuratio
 ### What the Spec Supports
 
 **Hooks** ship inside plugins: declare the plugin under `resources.plugins[]`. AgentSpec validation refuses
-`resources.hooks`.
+`resources.hooks`. OpenRig loads one plugin's hooks into a seat itself: the shipped `openrig-core` plugin, for a Claude seat
+that selects it (see [the refocus channel](refocus-channel.md#the-mechanism)). The folder a declared plugin is projected into
+is not one Claude Code or Codex loads, so a plugin of your own does not get its hooks run by that projection.
 
 **Runtime resources** (in `resources.runtime_resources`):
 ```yaml
@@ -282,6 +559,11 @@ Types are `send_text`, `slash_command` and `startup_proof` (see "Startup proof" 
 `idempotent` is required, and an action that isn't idempotent must not list `restore` in `applies_on`. Both phases
 run after the harness is ready: `after_files` (the default) after the post-launch files, then `after_ready`.
 
+**Don't rename a managed Claude seat.** OpenRig starts every Claude seat with `--name <session>`, on a fresh start and on
+every resume, and its own reads of the seat use that name: context usage and managed compaction read the status-line
+record Claude saves under it, and the input box is recognized by the name on its border. A startup `/rename` to another
+name breaks those reads until the next resume puts the session name back.
+
 ### Current Support Matrix
 
 | Capability | Status | Notes |
@@ -289,7 +571,7 @@ run after the harness is ready: `after_files` (the default) after the post-launc
 | Guidance file projection (`guidance_merge`) | **Supported** | Reliable. Primary delivery mechanism. |
 | Skill projection (`skill_install`) | **Supported** | Reliable. Skills are copied to workspace. |
 | `send_text` delivery after ready | **Supported** | Reliable. Requires harness to be ready. |
-| Hooks | **Through plugins** | Declare a plugin under `resources.plugins[]`; `resources.hooks` is refused. |
+| Hooks | **Through plugins, limited** | `resources.hooks` is refused. OpenRig loads the shipped `openrig-core` plugin's hooks into a Claude seat that selects it (Claude Code v2.1.280 or later); a plugin you declare under `resources.plugins[]` is projected, but its hooks are not loaded. |
 | Runtime resource projection | **Supported for recognized fragments** | `claude_settings_fragment`, `claude_mcp_fragment`, and `codex_config_fragment` are applied to provider config. Unknown types are copied to runtime extension directories. |
 | Permission configuration | **Native settings plus managed launch flags** | OpenRig launches Claude with `acceptEdits` and Codex with `workspace-write` unless an explicit supported selection changes them; a seat with no policy, selection or named Codex profile also gets the per-launch [team default](rig-spec.md#team-launch-defaults), and the `kernel` rig's seats get a wider operational default ([rig spec, "At launch"](rig-spec.md)). Neither is written to a settings file. Use [the first-user permission guide](getting-started.md#opt-in-permissive-operation) for opt-in and custom choices. |
 | MCP installation | **Supported for Claude fragments** | A selected `claude_mcp_fragment` is merged into the project's `.mcp.json`. Claude asks to approve new servers found there; that prompt stops startup as `mcp_gate` until someone answers it and runs `rig seat continue`. Otherwise use `/mcp` or `claude mcp add`, or describe the servers in startup files for the agent to configure. |
@@ -371,6 +653,127 @@ This separates provider files, not OS users or accounts. Project-local resources
 still use the selected project directory; shared project and system settings
 remain shared.
 
+### Record where an existing seat's conversation lives
+
+When an existing seat's conversation lives under a different runtime home from the one OpenRig has for it (after a
+recovery, say, or a move between homes), record that home so the seat's next resume or restore launches from it, with
+the same conversation and no successor:
+
+```bash
+rig seat runtime-home dev-impl@my-rig
+rig seat record-runtime-home dev-impl@my-rig --home /home/me/.codex-b \
+  --expect-occupant <generation> --expect-original <conversation id> --expect-revision <n> --reason "home after recovery"
+```
+
+`rig seat runtime-home` shows the home the next launch uses and where it comes from, with the seat's current occupant
+generation, its original conversation and the revision of its latest recorded home (0 when none), and prints the
+record command with those values. It works for Claude Code and Codex seats.
+
+- **What it's recorded against.** The occupant, original conversation and revision you read. If any of them changed
+  since, because a successor took the seat or someone else recorded a home, nothing is applied and the current values
+  are shown, so a replacement occupant is never changed by mistake.
+- **Retrying is safe.** Each recording has an operation id, generated and printed when you don't pass
+  `--operation-id`. If the result is unknown (a timeout, a lost connection or an unreadable answer), run the same
+  command with that id: it returns what was recorded, or records it once, even if the seat's runtime changed since. The
+  same id with a different request applies nothing.
+- **What changes.** Only the seat's home and an audit record (`seat.runtime_home_recorded`). No running process,
+  pane, login, credential, conversation, model, effort or cwd changes; nothing is copied, switched or launched.
+- **Where it's stored, and credentials.** In the place that decides the seat's home today, so credential handling
+  stays as it is. A seat on a home chosen by an account switch keeps that, with provider credentials still unset at
+  launch, and gets the new path. Any other seat gets its own `env:` value for the home variable, as a seat that declares
+  one in its spec has, and nothing is unset.
+- **What it says, and doesn't.** The result says whether the home exists and whether the original conversation's
+  record was found in it; a path it can't read leaves that unknown, never "not found". That doesn't show one copy of a conversation is fresher than another, and whether a running
+  process uses the home isn't checked (the result says `runningProcess: unverified`).
+- **Restore.** Snapshots carry each seat's recorded home. Reviewing a selected history shows the current record beside
+  the snapshot's, whether it was recorded for the selected conversation or another one, and which home the resume
+  uses (`uses`):
+  - the home recorded for the selected conversation, when the latest record is its own and the seat's home is still
+    that record's (the same path, set in the same place the record wrote it);
+  - the newest home recorded for the selected conversation, when a later record is for another one and the seat's home
+    is still that later record's. The resume writes it back as a new revision for the selected conversation before it
+    launches. It's put back, as a new revision, only when the launch is known to have been rolled back and the seat's
+    conversation is the one it had before: OpenRig undid the launch and its terminal is known to be gone (none was
+    created, or tmux confirmed the stop), or it stopped before starting one, so no session was registered and no resume
+    was sent. A terminal registered without a resume, a creation or stop tmux couldn't confirm, or a launch that failed
+    with an error isn't known to be undone, so the home stays. After a confirmed resume it stays, a Claude
+    conversation continued under a new id included, and when what the launch left isn't known it stays too and the
+    result says so;
+  - otherwise the seat's home as set, with no record revision for the selected conversation: when nothing was recorded,
+    when the home changed since the latest record (an account or runtime switch, say, including one that leaves the
+    same path coming from the rig's declaration), which isn't undone, or when no home was recorded for this
+    conversation.
+
+  The review also says whether the selected conversation's record is found in that home, as context. The result
+  names the home the resume was bound to and attempted, and whether OpenRig registered a terminal session for it
+  (`sessionRegistered`). That isn't the native resume: whether that ran and took is the result's `ok` and `code`. For a
+  written-back home, it says whether it was put back (`putBack`), or why not (`notPutBack`). A launch that fails with an
+  error returns `launch_error`, with the same home named and nothing put back, since what it left isn't known.
+
+  A recording made after the review, even to the same home, changes the review's revision, so a resume reviewed before
+  it doesn't run. Review again and decide.
+
+### Codex guidance at launch
+
+On a fresh launch of Codex 0.164.0 or later, OpenRig passes a seat's managed guidance (OpenRig's start file and the
+rig's and project's context, culture and SOP files) with the launch, as `-c developer_instructions=…`, instead of
+merging it into the repository `AGENTS.md`. Neither the tracked `AGENTS.md` nor the Codex home is written for it, and
+both still load as usual. The text opens: "OpenRig seat guidance for this session follows. Where it conflicts with
+AGENTS.md guidance in the repository or the Codex home, follow AGENTS.md."
+
+A launch value replaces a configured one, so this happens only when no Codex config layer OpenRig reads sets
+`developer_instructions`. OpenRig reads:
+
+- `/etc/codex/config.toml` and `/etc/codex/managed_config.toml`;
+- the Codex home's `config.toml`, profiles included, and the selected profile's `<profile>.config.toml`;
+- each `.codex/config.toml` from the seat's working directory up.
+
+The Codex home it reads is the seat's own (a `CODEX_HOME` in its `env:`, or a recorded account switch), else the
+daemon's `CODEX_HOME`, else `~/.codex`.
+
+The guidance still goes to the repository `AGENTS.md`, as before, when:
+
+- a layer OpenRig reads sets `developer_instructions`, or can't be read. A launch warning names the file;
+- the launch forks a conversation. Developer instructions on a fork haven't been tested;
+- the seat is restored and the restore starts a new conversation. A restore keeps the guidance file its launch
+  recorded, which for Codex is the repository `AGENTS.md`;
+- a handover successor starts (fresh, fork or rebuild). Its launch carries no guidance of its own, so the handover
+  first puts the seat's missing blocks back in the repository `AGENTS.md` from its saved startup context;
+- Codex is older than 0.164.0, or its version is unknown.
+
+A resume of the seat's own conversation, on a snapshot restore or `rig up --existing`, chooses as a fresh launch
+does: on Codex 0.164.0 or later with none configured, the guidance blocks the repository `AGENTS.md` doesn't hold go
+with the resume as `-c developer_instructions=…` instead of being put back in that file, and the guidance file its
+launch recorded isn't changed. A file that already holds blocks keeps them: a block OpenRig wrote whose source has
+changed is refreshed, and one edited by hand, or with no record of OpenRig writing it, is left as it is and named. A
+block whose source is gone or can't be read isn't sent, and the restore reports it as missing. A seat in a rig without
+pods starts its resumed conversation before its startup runs, so its missing blocks are still put back in the
+repository `AGENTS.md`. Whether Codex keeps the earlier session's developer instructions as well isn't documented
+by Codex; the text sent with the resume is the current one.
+
+A seat's role still arrives as startup text, and the seat-skills line, after the person's yes, still goes to
+`AGENTS.md`.
+
+A launch that carries developer instructions writes no new blocks to the repository `AGENTS.md`. But blocks an earlier
+handover or resume left there are refreshed from their sources, by the same rule as every other managed block. That
+matters because the launch text asks Codex to follow `AGENTS.md` where the two differ.
+
+**If your shell sets `CODEX_HOME`.** When neither the seat nor the daemon declares a `CODEX_HOME`, a seat's pane keeps
+its own, and OpenRig reads `~/.codex`. A `CODEX_HOME` that only your shell startup sets (in `~/.zshrc`, for example),
+with the daemon started without it, isn't seen. A `developer_instructions` set in that home is then replaced by the
+launch value for the session. To have it checked, declare that same absolute path as `CODEX_HOME` in the member's or
+rig's `env:` (see [Launch environment](rig-spec.md#launch-environment), "A seat's own account"). OpenRig then reads
+that home at the seat's next fresh launch, and a `developer_instructions` set there keeps the repository `AGENTS.md`.
+The seat keeps the same home and login.
+
+**What it doesn't cover.** OpenRig doesn't read Codex's packaged defaults, or MDM- or enterprise-managed settings. A
+`developer_instructions` set there may be replaced for the session. Legacy MDM-managed config ranks above launch flags,
+so it can override OpenRig's guidance, and the seat then gets none of it.
+
+**Not established.** The order Codex assembles developer instructions and `AGENTS.md` in, and how it settles every
+conflict, aren't established; the opening sentence asks it to follow `AGENTS.md`. The native behaviour was observed on
+Codex 0.164.0 alone, on fresh launches without tools.
+
 ### Runtime Differences
 
 **Claude Code:**
@@ -401,15 +804,148 @@ remain shared.
 - Can self-install dependencies from instructions but timer/recurring behavior is not reliably available
 
 **Pi and OMP:**
-- Read `AGENTS.md` in the working directory; guidance is merged there, added to Pi's own system prompt
+- Read `AGENTS.md` in the working directory, added to Pi's own system prompt. Pi also reads the one in its agent
+  directory: on a fresh launch, a Pi seat's guidance is merged there, under OpenRig's state, not into the
+  repository's. When that file or its directory is a link, the repository `AGENTS.md` is used instead. A restore keeps
+  the file the seat launched with. OMP keeps its guidance in the repository `AGENTS.md`
 - Selected skills are projected into the seat's own agent directory under OpenRig's state, not into a shared
   workspace folder
 
+For Pi tool-selection diagnosis and deliberate in-place recovery, see
+[Pi tool-selection recovery](pi-tool-selection-recovery.md). It distinguishes
+configured, currently intended, registered and active tools, including the TUI/RPC boundary.
+
 **Terminal seats** (`builtin:terminal`) get no agent or profile layers and no startup proof.
+
+### Claude compaction preparation directory
+
+Managed Claude compaction asks the seat to write a restore map before `/compact`. By default,
+OpenRig uses `<cwd>/.openrig/compaction/preparation/`, falling back to its instance home when
+that directory cannot be prepared. A filesystem write check cannot establish whether Claude's
+file-edit permissions allow the seat to write there.
+
+If the launch workspace is denied by Claude's permissions, select an absolute preparation root:
+
+```sh
+rig config set policies.claude_compaction.preparation_root /absolute/path/to/restore-maps
+```
+
+Grant the seat file-edit access to that root in its Claude configuration. OpenRig does not change
+Claude permissions; choose a directory outside any matching deny rule. The corresponding environment
+variable is `OPENRIG_POLICIES_CLAUDE_COMPACTION_PREPARATION_ROOT`.
+
+New manual and automatic attempts use `<root>/<session>/<attempt-id>/RESTORE-MAP.md`; an in-flight
+attempt keeps its original path through the post-compaction restore request. The root gets an
+exclusive `.gitignore` containing `*`, and the daemon publishes the marked `.tmp` file with an
+atomic rename. Use a dedicated root: a conflicting
+ignore file or an unwritable configured directory stops preparation with
+`preparation_directory_unavailable`, visible in `rig compact <session> --state`, without choosing
+another location. Fix the directory and explicitly retry. `--skip-map` still skips the map once.
+
+Reset with `rig config reset policies.claude_compaction.preparation_root` to restore the default.
+The setting applies to new attempts without restarting the daemon.
+
+The managed `/compact` command keeps its 600-character budget. When the selected map path or
+the attempt's compaction instruction does not fit, the existing restore request carries it;
+it never substitutes a newer preparation root or instruction. An explicitly selected root's
+published map is also named in that request when the path fit in `/compact`. The default root
+keeps the existing command/restore handoff. Under `--skip-map`, restore still recognizes an
+optional map completed at that attempt's path, or says that no map was required.
+
+The compaction preparation and command-submission tests cover manual and automatic attempts,
+long paths and instructions, settings changed during preparation, directory failures and
+late maps after cancellation or expiry. They use synthetic delivery and filesystem fixtures;
+they do not prove a live Claude session's permission choices or compaction behavior.
+
+### Codex compaction and sizing
+
+OpenRig's managed compaction is for Claude Code seats only, by design. That covers `rig compact`, the
+`policies.claude_compaction.*` automatic policy, and the watchdog jobs that the `managed-compaction` and
+`apprentice-handover` strategies create. A Codex seat compacts with Codex's own automatic compaction, and OpenRig
+leaves that to Codex.
+
+- `rig compact <session>` refuses a Codex seat: "not a Claude (claude-code) seat".
+- `rig compact-plan` lists a Codex seat as skipped (`codex_not_managed_by_claude_compact_in_place`).
+- The automatic policy never acts on a Codex seat.
+- A Codex member with `compaction_strategy: managed-compaction` or `apprentice-handover` gets no watchdog jobs.
+
+**What Codex compacts at.** Codex describes `model_auto_compact_token_limit` as the "token threshold that triggers
+automatic history compaction (unset uses model defaults)". Its configuration reference does not say what those
+defaults are, and the model catalog's `auto_compact_token_limit` is null for the models we checked in Codex 0.162.1.
+Measure a seat's own compactions before relying on an unset limit.
+
+**What window the model has.** `codex debug models` prints the catalog. Each model carries `context_window`,
+`max_context_window` and `effective_context_window_percent`. In Codex 0.162.1, `gpt-5.6-sol` has a `context_window`
+of 272000 at 95%, which is 258400. That is the `model_context_window` its rollout `token_count` events report.
+A limit only matters when it is below that effective window. Leave `model_context_window` alone: don't raise it toward
+`max_context_window` to avoid compaction. Set the limit instead.
+
+**Setting the limit for seats only.** Put `model_auto_compact_token_limit` in a Codex profile file,
+`$CODEX_HOME/<name>.config.toml` (`~/.codex/<name>.config.toml` when `CODEX_HOME` is unset), and name it on each
+Codex member that should use it:
+
+```toml
+# ~/.codex/seat-compaction.config.toml
+model_auto_compact_token_limit = 150000   # choose your own value
+```
+
+```yaml
+codex_config_profile: seat-compaction
+```
+
+OpenRig passes `-p seat-compaction` on that seat's fresh, fork and resume launches. Codex layers the profile file on
+top of the base user config, so only seats that name the profile see the lower limit. A Codex session started without
+that profile keeps the base `config.toml` in the same Codex home (`$CODEX_HOME/config.toml`, or `~/.codex/config.toml`
+when `CODEX_HOME` is unset). The `150000` is an example, not a recommendation.
+
+With the normal launch mode, `codex_config_profile` replaces OpenRig's explicit workspace-write sandbox flag, so the
+profile must set the sandbox and approvals you want. See
+[permission precedence and limits](getting-started.md#custom-settings-and-precedence), which also gives Codex's order
+of precedence between a profile, project settings and CLI overrides.
+
+**The trade-off.** Every model call carries the whole context so far, so a smaller context makes each call cheaper. The
+cost is that Codex compacts sooner and more often, so more of the conversation is carried as a summary instead of
+verbatim. A higher limit keeps more detail and makes each call larger.
+
+**Related keys.** These also shape compaction. This guide doesn't recommend values for them. See Codex's
+[configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference):
+
+| Key | What Codex says it does |
+|---|---|
+| `model_auto_compact_token_limit_scope` | `total` (the default) counts the full active context; `body_after_prefix` counts only growth after the carried compaction-window prefix. |
+| `compact_prompt` | Inline override for the history compaction prompt. |
+| `experimental_compact_prompt_file` | Loads the compaction prompt override from a file (experimental). |
+| `tool_output_token_limit` | Token budget for storing individual tool or function outputs in history. |
 
 When authoring startup content, note which instructions are runtime-specific. For example, an orchestrator that needs a monitoring loop should include instructions like: "If running Claude Code, use `/loop 3m` to periodically check rig health. If running Codex, check rig health at the start of each task cycle instead."
 
 ---
+
+## Files OpenRig writes into a project
+
+These are the files OpenRig writes into a seat's working directory, and what `rig down` does with each. Paths are
+relative to that directory.
+
+| Path | When OpenRig writes it | What `rig down` does |
+| --- | --- | --- |
+| Managed blocks in `CLAUDE.md` (or the rig's `managed_blocks` file, such as `CLAUDE.local.md`) or `AGENTS.md` | Each launch merges the seat's guidance blocks. A fresh Codex launch that takes developer instructions puts them in its launch text instead: in `AGENTS.md` it adds only the seat-skills line, after your yes, and refreshes blocks already there. A fresh Pi seat writes its own agent-directory `AGENTS.md` outside the project, except when that folder or file is a link: then its guidance stays in the repository `AGENTS.md`. | Removes OpenRig's blocks, current or legacy, and keeps everything else. When nothing else is left, it deletes the file if the file began with an OpenRig block, or held only blocks in an older format. A block-only file isn't proof that OpenRig created it. The seat-skills line is kept if you edited it. |
+| `.openrig/context-collector.cjs` | Claude seats, at launch. | Removes it while its bytes are still the shipped collector's; otherwise keeps it and says so. |
+| `.claude/settings.local.json` | Claude seats, at launch: OpenRig's status line and its activity hooks are merged in, separately. Your own status line is never replaced, but the activity hooks are still merged beside it. A file that doesn't parse gets neither. | Removes OpenRig's status line and hooks and keeps the file, even if `{}` is all that's left. |
+| `.claude/settings.local.json` fragments and `.mcp.json` | When a profile or spec declares `claude_settings_fragment` or `claude_mcp_fragment`. | Leaves the merged content in place. |
+| `.claude/agents/`, `.claude/plugins/<id>/`, `.claude/extensions/<id>/`; `.agents/<id>.yaml`, `.codex/plugins/<id>/`, `.agents/extensions/<id>/` | When the seat's projection includes subagents, plugins or runtime resources (Claude, then Codex). | Leaves them in place. |
+| `.claude/skills/<id>/`, `.agents/skills/<id>/` | Only for a seat without seat storage. New Claude and Codex seats keep their skills under `$OPENRIG_HOME/state/seats/`, outside the project. | Leaves them in place. |
+| The managed compaction preparation folder described in [Claude compaction preparation directory](#claude-compaction-preparation-directory), with its `.gitignore` of `*` and each attempt's `RESTORE-MAP.md` | Managed Claude compaction, unless a preparation root is configured elsewhere. | Leaves it in place. |
+| `.rigged-checkpoint-<session>-<digest>.md`, named for the seat: its session name made safe for a file name, then the first 8 hex characters of the SHA-256 of the exact name | A restore that didn't resume a seat's native conversation (by choice or not) and had a checkpoint to hand it. Seats restored into one folder each get their own file. | Leaves it in place. |
+
+`rig down` leaves a file alone while another seat still uses it: a running seat of the same rig, or any seat of
+another rig that isn't archived. That is decided file by file. A guidance file is kept while another seat's
+guidance targets the same file. The Claude settings and collector are kept while another Claude seat works in that
+directory. So another rig's Codex seat keeps `AGENTS.md` without keeping `CLAUDE.md` or the Claude settings. It
+removes `.openrig/` and `.claude/` only when they are empty.
+For the Claude settings and collector, a seat's directories are its saved folder and each folder a launch of it ran
+in, such as the folder of a `rig up <rig> --existing --cwd <dir>` restore. For a seat last started before OpenRig
+recorded where a launch runs, `rig down` cleans its saved folder and names the seat.
+`rig down --delete` does nothing more to project files. OpenRig doesn't edit your project's own `.gitignore`.
 
 ## Patterns and Anti-Patterns
 
@@ -457,6 +993,54 @@ The shipped kernel seats no longer project their role into shared guidance.
 Existing user files and legacy role blocks are left intact; this is not a cleanup
 of already-installed shared blocks. General user-authored guidance projection is
 unchanged.
+
+The other shipped agent specs that start a seat with `guidance/role.md` mark that
+file `orientation: role` too, so `rig queue whoami --json` reports their role and
+refocus names it. They never projected a role into shared guidance; their startup
+delivery is unchanged.
+
+**Removing a leftover shared role block by hand.** A kernel installed before 0.6.5
+may still hold one seat's old role in its working directory's `CLAUDE.md` (or the
+rig's configured `managed_blocks` file) or `AGENTS.md`. Upgrading doesn't remove it.
+`rig down` removes OpenRig's managed blocks from that file when no other running
+rig uses it, so it stays until then. To remove it sooner, by hand:
+
+1. Find the exact block: the lines from `<!-- BEGIN OpenRig MANAGED BLOCK: role -->`
+   through `<!-- END OpenRig MANAGED BLOCK: role -->` (in older files, `RIGGED`
+   instead of `OpenRig`). Only the block whose id is exactly `role`; leave
+   `rig-role`, other ids and everything outside the markers alone.
+2. Confirm each seat that shares that directory has its per-seat replacement:
+   `rig queue whoami --json` run in the seat reports `role.state` as `present`.
+   A seat started before it was upgraded still has the old content in its
+   conversation; restart it fresh if you want it to start from the per-seat role.
+3. Keep a copy of the file, remove only those lines, and compare the result with
+   the copy: nothing else in the file should differ.
+
+**The kernel's own folder.** A newly created default kernel works in
+`<workspace.root>/kernel`, beside your projects (`<workspace.root>/projects` by
+default) rather than above them. Claude reads `CLAUDE.md` from a seat's folder
+and from every folder above it, so a kernel working in the workspace root put its
+guidance into every Claude project seat below it. If that folder can't be made,
+the new kernel works in the workspace root, as before.
+
+A kernel that already exists keeps its folders, usually `workspace.root`.
+Upgrading moves no seat, changes no restored conversation and removes no file.
+To move an existing kernel yourself, if you want to:
+
+1. Save the new folder for each kernel seat with `rig seat set-cwd <seat> --cwd
+   <workspace.root>/kernel --reason <text>`, using the absolute path. It creates
+   the folder ([details](#change-an-existing-seats-working-directory)).
+2. Choose when each seat adopts it. A seat keeps its current folder until it
+   starts again, and the new start doesn't continue its current native
+   conversation: `rig seat launch <seat> --fresh --stop --reason <text>` starts a
+   blank one, and `rig handover <seat> --source rebuild --reason <text>` carries
+   durable context into a new one. Nothing does this for you.
+3. Tidy the old `<workspace.root>/CLAUDE.md` (or `AGENTS.md`) by hand, once no
+   running rig's seat still works in that folder: a seat there still reads those
+   blocks, and `rig down` checks the same before it removes them. Remove only
+   OpenRig's managed blocks, each from its `<!-- BEGIN OpenRig MANAGED BLOCK: … -->`
+   line through its `END` line, as in the steps above, and keep everything else,
+   including your own text. Don't move or delete the whole file.
 
 **Separate project context from role**
 

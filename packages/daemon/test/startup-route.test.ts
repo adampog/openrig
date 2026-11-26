@@ -3,7 +3,14 @@ import { createFullTestDb, createTestApp } from "./helpers/test-app.js";
 import { startupRevision } from "../src/routes/startup.js";
 import { defaultProbeRuntimes } from "../src/domain/kernel-boot.js";
 import { SeatLifecycleService } from "../src/domain/seat-lifecycle-service.js";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { verifyCodexPaneProcess, verifyPaneIdleShell } from "../src/domain/native-process-lineage.js";
+vi.mock("../src/domain/native-process-lineage.js", async (original) => {
+  const actual = await original<typeof import("../src/domain/native-process-lineage.js")>();
+  return { ...actual, verifyCodexPaneProcess: vi.fn(actual.verifyCodexPaneProcess), verifyPaneIdleShell: vi.fn(actual.verifyPaneIdleShell) };
+});
 vi.mock("../src/domain/kernel-boot.js", async (original) => ({ ...await original<typeof import("../src/domain/kernel-boot.js")>(), defaultProbeRuntimes: vi.fn(async () => ({ codex: "ok", claudeCode: "ok" })) }));
 
 describe("startup consent and effect boundary", () => {
@@ -37,6 +44,27 @@ describe("startup consent and effect boundary", () => {
     const second = await request();
     expect(await second.json()).toMatchObject({ ok: true, rigId: body.rigId, reused: true });
   });
+  it("prepares a new kernel in the workspace's own kernel folder, outside its projects", async () => {
+    const workspace = mkdtempSync(join(tmpdir(), "startup-kernel-ws-"));
+    const saved = process.env["OPENRIG_WORKSPACE_ROOT"];
+    process.env["OPENRIG_WORKSPACE_ROOT"] = workspace;
+    try {
+      setup = createTestApp(db, { podInstantiatorFsOps: { exists: existsSync, readFile: (path) => readFileSync(path, "utf8") } });
+      const response = await setup.app.request("/api/startup/kernel", { method: "POST",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runtime: "claude-code" }) });
+      const body = await response.json();
+      expect(body).toMatchObject({ ok: true, rigId: expect.any(String) });
+      // Every seat works in `<workspace.root>/kernel`, beside `<workspace.root>/projects` rather than above it, so the
+      // guidance a seat writes in its directory isn't read by project seats. Nothing else is written in the workspace.
+      const cwds = setup.rigRepo.getRig(body.rigId)!.nodes.map((node) => node.cwd);
+      expect(new Set(cwds)).toEqual(new Set([join(workspace, "kernel")]));
+      expect(statSync(join(workspace, "kernel")).isDirectory()).toBe(true);
+      expect(readdirSync(workspace)).toEqual(["kernel"]);
+    } finally {
+      if (saved === undefined) delete process.env["OPENRIG_WORKSPACE_ROOT"]; else process.env["OPENRIG_WORKSPACE_ROOT"] = saved;
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
   it("rejects a changed occupant or model before invoking fresh launch", async () => {
     const { rig, node } = seat(); const revision = startupRevision(db, node);
     db.prepare("UPDATE nodes SET model = ? WHERE id = ?").run("changed-model", node.id);
@@ -65,6 +93,111 @@ describe("startup consent and effect boundary", () => {
     expect(setup.sessionRegistry.getSessionsForRig(rig.id).map((s) => s.id)).toEqual([session.id]);
     const readback = await setup.app.request(`/api/startup/${rig.id}`);
     expect((await readback.json()).seats[0]).toMatchObject({ freshAllowed: false, prerequisite: expect.stringContaining("unauthenticated") });
+  });
+  it("shares one in-flight provider probe between concurrent reads and keeps a fresh probe on the start choice", async () => {
+    const { rig, node } = seat();
+    let settle!: () => void;
+    vi.mocked(defaultProbeRuntimes).mockClear().mockImplementationOnce(() => new Promise((resolve) => {
+      settle = () => resolve({ codex: "ok", claudeCode: "ok" });
+    }));
+    const reads = [setup.app.request(`/api/startup/${rig.id}`), setup.app.request(`/api/startup/${rig.id}`),
+      setup.app.request("/api/startup/prerequisites")];
+    await vi.waitFor(() => expect(settle).toBeTypeOf("function"));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(defaultProbeRuntimes).toHaveBeenCalledTimes(1);
+    settle();
+    const bodies = await Promise.all((await Promise.all(reads)).map((response) => response.json()));
+    expect(bodies[0].seats[0]).toMatchObject({ freshAllowed: true });
+    expect(bodies[1].seats[0]).toMatchObject({ freshAllowed: true });
+    expect(bodies[2]).toEqual({ codex: "ok", claudeCode: "ok" });
+    // Nothing is kept once the probe settles: the next read and the start choice each probe again.
+    await setup.app.request(`/api/startup/${rig.id}`);
+    expect(defaultProbeRuntimes).toHaveBeenCalledTimes(2);
+    vi.spyOn(SeatLifecycleService.prototype, "launchFresh").mockResolvedValue({ ok: true } as never);
+    await post(rig.id, startupRevision(db, node));
+    expect(defaultProbeRuntimes).toHaveBeenCalledTimes(3);
+  });
+  it("observes a rig's seats concurrently, a few at a time", async () => {
+    const rig = setup.rigRepo.createRig("wide");
+    for (let i = 0; i < 9; i++) setup.rigRepo.addNode(rig.id, `pod.seat${i}`, { runtime: "terminal" });
+    let inFlight = 0, peak = 0;
+    setup.tmuxAdapter.probeSession = vi.fn(async () => {
+      inFlight++; peak = Math.max(peak, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight--;
+      return { state: "absent" as const };
+    });
+    const body = await (await setup.app.request(`/api/startup/${rig.id}`)).json();
+    expect(body.seats).toHaveLength(9);
+    expect(body.seats.map((entry: { observed: { state: string } }) => entry.observed.state)).toEqual(Array(9).fill("stopped"));
+    expect(setup.tmuxAdapter.probeSession).toHaveBeenCalledTimes(9);
+    expect(peak).toBe(4);
+  });
+  describe("a seat whose pane command reads as a shell", () => {
+    function shellPane(runtime: "claude-code" | "codex", proven: boolean) {
+      const { rig, node } = seat();
+      db.prepare("UPDATE nodes SET runtime = ? WHERE id = ?").run(runtime, node.id);
+      vi.mocked(setup.tmuxAdapter.probeSession).mockResolvedValue({ state: "present" } as never);
+      setup.tmuxAdapter.listPanes = vi.fn(async () => [{ id: "%1", index: 0, cwd: "/p", width: 80, height: 24, active: true }]) as never;
+      setup.tmuxAdapter.getPaneCommand = vi.fn(async () => "sh");
+      setup.tmuxAdapter.capturePaneContent = vi.fn(async () => "booting wrapper...");
+      vi.mocked(verifyPaneIdleShell).mockResolvedValue(proven);
+      return rig;
+    }
+    async function observed(rigId: string) {
+      const response = await setup.app.request(`/api/startup/${rigId}`);
+      return (await response.json()).seats[0].observed as { state: string; detail: string };
+    }
+    it("does not call a Claude pane a returned shell when no idle shell is proven", async () => {
+      const seen = await observed(shellPane("claude-code", false).id);
+      expect(seen.state).toBe("attention_required");
+      expect(seen.detail).toBe("The pane shows a shell that is not a proven idle shell; a launch script may still be starting Claude.");
+    });
+    it("keeps the returned-to-shell wording when the idle shell is proven", async () => {
+      const seen = await observed(shellPane("claude-code", true).id);
+      expect(seen).toMatchObject({ state: "attention_required", detail: "The probe pane returned to a shell instead of staying inside the runtime." });
+    });
+  });
+  it("observes the current Codex sign-in chooser with the action the person can take", async () => {
+    const { rig } = seat();
+    setup.tmuxAdapter.probeSession = vi.fn(async () => ({ state: "present" } as never));
+    setup.tmuxAdapter.listPanes = vi.fn(async () => [{ id: "%1", index: 0, cwd: "/p", width: 80, height: 24, active: true }]) as never;
+    setup.tmuxAdapter.getPaneCommand = vi.fn(async () => "codex");
+    const frame = readFileSync(new URL("./fixtures/codex-first-login-0.171.0.txt", import.meta.url), "utf8");
+    setup.tmuxAdapter.capturePaneContent = vi.fn(async () => frame);
+    const response = await setup.app.request(`/api/startup/${rig.id}`);
+    expect((await response.json()).seats[0].observed).toMatchObject({ state: "attention_required",
+      detail: "Codex needs you to sign in or configure provider credentials. Open this seat's terminal and complete Codex's sign-in prompt." });
+    expect(setup.tmuxAdapter.sendKeys).not.toHaveBeenCalled();
+  });
+  it("re-probes a Codex status footer after the foreground process is verified", async () => {
+    setup = createTestApp(db, {
+      appDeps: {
+        listProcesses: async () => [
+          { pid: 900, ppid: 1, command: "/bin/zsh", pgid: 900, tpgid: 901, executableName: "zsh", startedAt: "Sat Jan  1 12:00:00 2000" },
+          { pid: 901, ppid: 900, command: "codex --model anthropic/claude-3.5-sonnet",
+            argv: ["codex", "--model", "anthropic/claude-3.5-sonnet"], pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:01 2000" },
+        ],
+      },
+    });
+    const { rig, node } = seat();
+    setup.tmuxAdapter.probeSession = vi.fn(async () => ({ state: "present" } as never));
+    setup.tmuxAdapter.listPanes = vi.fn(async () => [{ id: "%1", index: 0, cwd: "/p", width: 80, height: 24, active: true }]) as never;
+    setup.tmuxAdapter.getPaneCommand = vi.fn(async () => "zsh");
+    setup.tmuxAdapter.getPanePid = vi.fn(async () => 900);
+    let captures = 0;
+    setup.tmuxAdapter.capturePaneContent = vi.fn(async () => {
+      captures++;
+      if (captures === 1) return "  project2 · main\n› codex resume 019a136b-0000-7000-8000-000000000001";
+      return [
+        "› ",
+        "  Ready · Context 13% used · anthropic/claude-3.5-sonnet         ⚠ 2 warnings · f2 to view",
+      ].join("\n");
+    });
+
+    const response = await setup.app.request(`/api/startup/${rig.id}`);
+    expect((await response.json()).seats[0].observed).toMatchObject({ state: "running" });
+    expect(captures).toBe(2);
   });
   it("reports unavailable transport without authorizing fresh replacement", async () => {
     const { rig, node } = seat();

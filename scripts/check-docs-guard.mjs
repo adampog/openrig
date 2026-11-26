@@ -1,4 +1,6 @@
+import { existsSync, realpathSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 /**
  * Exact tracked docs paths allowed outside the three durable roots.
@@ -33,10 +35,9 @@ export function findBlockedDocsPaths(paths) {
 }
 
 export function listTrackedDocsPaths(exec = execFileSync) {
-  const output = exec("git", ["ls-files", "docs/**"], { encoding: "utf8" });
+  const output = exec("git", ["ls-files", "-z", "docs/**"], { encoding: "utf8" });
   return output
-    .split("\n")
-    .map((line) => line.trim())
+    .split("\0")
     .filter(Boolean);
 }
 
@@ -58,6 +59,6 @@ export function main() {
   process.exitCode = 1;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && existsSync(process.argv[1]) && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
   main();
 }

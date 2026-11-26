@@ -1,0 +1,429 @@
+import type { RunnerGrantIssuer, RunnerGrantLaunch } from "../domain/runner-grant-launch.js";
+import { randomUUID } from "node:crypto";
+import type { EnvironmentStartup } from "../domain/environment-startup.js";
+import type {
+  RuntimeAdapter,
+  InstalledResource,
+  NodeBinding,
+  ProjectionResult,
+  StartupDeliveryResult,
+  ReadinessResult,
+  ResolvedStartupFile,
+  HarnessLaunchResult,
+  ForkSource,
+} from "../domain/runtime-adapter.js";
+import type { ProjectionPlan } from "../domain/projection-planner.js";
+import type { TmuxAdapter } from "./tmux.js";
+import type { SeatLaunchEnvironment } from "../domain/seat-launch-environment.js";
+import { unsupportedCommunityRunnerLaunchWrapperMessage } from "../domain/launch-wrapper.js";
+import { isShellForeground } from "../domain/shell-classifier.js";
+import { isCommunityHarnessRuntime, loadCommunityHarnessPreset, communityHarnessesDir } from "../domain/community-harness-presets.js";
+import { communityHarnessOf } from "../domain/built-in-runtimes.js";
+import { launchResultRoot, newLaunchAttempt, waitForLaunchResult, type LaunchAttempt } from "../domain/community-harness-launch-result.js";
+import { writeFirstInput, type FirstInputPassed } from "../domain/community-harness-first-input.js";
+import type { CommunityHarnessPreset } from "../domain/community-harness-presets.js";
+import { dirname, join } from "node:path";
+import { randomBytes } from "node:crypto";
+import { shellQuote } from "./shell-quote.js";
+import { PiRuntimeAdapter } from "./pi-runtime-adapter.js";
+import { PiCommunityRuntimeAdapter } from "./pi-community-runtime-adapter.js";
+
+export interface CommunityHarnessAdapterDeps {
+  environmentStartup?: EnvironmentStartup;
+  runnerGrants?: RunnerGrantIssuer;
+  tmux: Pick<TmuxAdapter, "hasSession" | "getPaneCommand" | "sendShellCommand"> & Partial<Pick<TmuxAdapter, "capturePaneContent" | "listPanes">>;
+  seatLaunchEnvironment?: Pick<SeatLaunchEnvironment, "command" | "resolveLaunchWrapper">;
+  presetsDir?: () => string;
+  /** Where launch-result records go (tests); defaults to $OPENRIG_HOME/state/launch-results. */
+  launchResultRoot?: () => string;
+  /** How long to wait for a launcher's record (tests). */
+  launchResultWait?: { timeoutMs?: number; intervalMs?: number; sleep?: (ms: number) => Promise<void> };
+  /** The Pi adapter a `protocol: pi-rpc` preset runs through (its deps, with this preset's command). */
+  piAdapter?: PiRuntimeAdapter;
+}
+
+/**
+ * A community harness, launched from its installed preset (`domain/community-harness-presets.ts`). It types the preset's
+ * command into the seat's pane and is ready while the pane runs something other than a shell. That's readiness, not
+ * identity: a process alone doesn't prove which session it is. Ordinary presets project nothing and refuse fork.
+ * The maintained openshell-claude path delegates its optional environment operations to EnvironmentStartup. It resumes only a
+ * preset that declares `resume`. With `launch_result`, its launcher is told the conversation to reopen and reports what it
+ * did, and a conversation it says is gone is never replaced by a new one. With `names_conversation`, OpenRig names each new
+ * conversation and passes the saved name back on a resume. Nothing reports back, so a named seat's readiness is
+ * process-only: its saved name is unverified until something observes it.
+ */
+export class CommunityHarnessRuntimeAdapter implements RuntimeAdapter {
+  constructor(readonly runtime: string, private readonly deps: CommunityHarnessAdapterDeps) {}
+
+  get environment() { return this.runtime === "openshell-claude" ? this.deps.environmentStartup?.platform : undefined; }
+
+  private contained(): EnvironmentStartup | undefined {
+    if (this.runtime !== "openshell-claude") return undefined;
+    if (!this.deps.environmentStartup) throw new Error("OpenShell environment operations are unavailable; no host fallback was attempted");
+    return this.deps.environmentStartup;
+  }
+
+  async preflightEnvironmentStartup(binding: NodeBinding, opts: { resumeToken?: string; resumeType?: string; forkSource?: unknown }): Promise<void> {
+    await this.contained()?.preflight(binding, opts);
+  }
+
+  async prepareEnvironmentStartup(files: ResolvedStartupFile[], binding: NodeBinding): Promise<StartupDeliveryResult> {
+    const contained = this.contained();
+    if (!contained) return { delivered: 0, failed: files.map(file => ({ path: file.path, error: "Environment startup projection is unsupported" })) };
+    return contained.deliverStartup(files, binding);
+  }
+
+  async listInstalled(_binding: NodeBinding): Promise<InstalledResource[]> {
+    return [];
+  }
+
+  async project(plan: ProjectionPlan, _binding: NodeBinding): Promise<ProjectionResult> {
+    const contained = this.contained();
+    if (contained) return contained.project(plan, _binding);
+    const skipped = plan.entries.map(entry => entry.effectiveId);
+    return {
+      projected: [], skipped, failed: [],
+      ...(skipped.length ? { warnings: [`Community harness "${this.runtime}" places no resources; ${skipped.length} not placed: ${skipped.join(", ")}`] } : {}),
+    };
+  }
+
+  async deliverStartup(files: ResolvedStartupFile[], _binding: NodeBinding): Promise<StartupDeliveryResult> {
+    const contained = this.contained();
+    if (contained) return { delivered: files.length, failed: [] };
+    return {
+      delivered: 0, failed: [],
+      ...(files.length ? { warnings: [`Community harness "${this.runtime}" takes no startup files; ${files.length} not delivered: ${files.map(file => file.path).join(", ")}`] } : {}),
+    };
+  }
+
+  /** What a launch refuses before it starts anything, checked before a handover ends the predecessor: a contained harness
+   *  given a launch wrapper, or without its environment operations; a preset that doesn't load; a launch wrapper this seat
+   *  can't apply. Whether the harness's own command starts, signs in or gets ready is known only by launching it. */
+  async preflightLaunch(binding: NodeBinding): Promise<{ ok: true } | { ok: false; error: string }> {
+    if (this.contained()) return binding.launchWrapper?.length ? { ok: false, error: WRAPPER_UNAVAILABLE } : { ok: true };
+    const found = loadCommunityHarnessPreset(this.runtime, this.deps.presetsDir?.() ?? communityHarnessesDir());
+    if (!found.ok) return { ok: false, error: found.message };
+    const wrapper = this.resolveWrapper(binding, found.preset);
+    return wrapper.ok ? { ok: true } : wrapper;
+  }
+
+  /** The seat's launch wrapper as this preset applies it, or the refusal a launch makes before starting anything. */
+  private resolveWrapper(binding: NodeBinding, preset: CommunityHarnessPreset): { ok: true; resolved?: string[] } | { ok: false; error: string } {
+    if (!binding.launchWrapper?.length) return { ok: true };
+    if (!this.deps.seatLaunchEnvironment) return { ok: false, error: WRAPPER_UNAVAILABLE };
+    if (preset.runner && !preset.launchWrapper) return { ok: false, error: unsupportedCommunityRunnerLaunchWrapperMessage(this.runtime) };
+    try { return { ok: true, resolved: this.deps.seatLaunchEnvironment.resolveLaunchWrapper(binding.launchWrapper) }; }
+    catch { return { ok: false, error: WRAPPER_UNAVAILABLE }; }
+  }
+
+  async launchHarness(binding: NodeBinding, opts: { name: string; resumeToken?: string; resumeType?: string; forkSource?: ForkSource; firstInputText?: string; beforeNativeDispatch?: () => boolean }): Promise<HarnessLaunchResult> {
+    const contained = this.contained();
+    if (contained) {
+      if (binding.launchWrapper?.length) return { ok: false, error: WRAPPER_UNAVAILABLE };
+      return contained.launch(binding, opts, this.deps.tmux);
+    }
+    if (opts.forkSource) {
+      return { ok: false, error: `Fork is unsupported: community harness "${this.runtime}" is launch-only. Remove session_source for this member.` };
+    }
+    const found = loadCommunityHarnessPreset(this.runtime, this.deps.presetsDir?.() ?? communityHarnessesDir());
+    const resumeRef = opts.resumeToken?.trim();
+    // Only this harness's own conversation is ever handed to its launcher: a former runtime's id (a Codex thread, say) isn't.
+    if (resumeRef && found.ok && found.preset.resume && opts.resumeType !== `community:${this.runtime}`) {
+      return { ok: false, recovery: "retry_fresh",
+        error: `Resume isn't possible: the saved conversation is a "${opts.resumeType ?? "unknown"}" id, not one community harness "${this.runtime}" reported, so it isn't passed to its launcher. A new conversation starts only where the caller allows a fresh start; a restore stops and asks.` };
+    }
+    if (resumeRef && !(found.ok && found.preset.resume)) {
+      // A conversation id its launcher reported earlier doesn't make a launch-only harness resumable: say so, and let the
+      // caller start a new conversation as it did before (it never resumes one silently).
+      return found.ok && (found.preset.launchResult || found.preset.namesConversation)
+        ? { ok: false, recovery: "retry_fresh",
+          error: `Resume is unsupported: community harness "${this.runtime}" is launch-only, so its ${found.preset.launchResult ? "reported" : "named"} conversation isn't reopened. A new conversation starts only where the caller allows a fresh start; a restore stops and asks.` }
+        : { ok: false, error: `Resume is unsupported: community harness "${this.runtime}" is launch-only. No session was started.` };
+    }
+    if (!found.ok) return { ok: false, error: found.message };
+    const wrapper = this.resolveWrapper(binding, found.preset);
+    if (!wrapper.ok) return wrapper;
+    const resolvedWrapper = wrapper.resolved;
+    const session = binding.tmuxSession ?? opts.name;
+    let firstInput: FirstInputPassed | undefined;
+    try {
+      if (found.preset.firstInput && opts.firstInputText !== undefined) {
+        firstInput = writeFirstInput(session, opts.firstInputText,
+          this.deps.launchResultRoot ? join(dirname(this.deps.launchResultRoot()), "first-input") : undefined);
+      }
+    } catch (error) {
+      return { ok: false, error: `Couldn't prepare the first input for community harness "${this.runtime}": ${(error as Error).message}; nothing was started.` };
+    }
+    let launcherPrefix = found.preset.firstInput ? (firstInput
+      ? `/usr/bin/env OPENRIG_FIRST_INPUT=${shellQuote(firstInput.path)} `
+      : "/usr/bin/env -u OPENRIG_FIRST_INPUT ") : "";
+    // An opted-in launcher gets the seat's declared model, or none (an inherited value is cleared). Passed is what it was
+    // handed, not which model runs.
+    const model = found.preset.passesModel ? binding.model?.trim() || undefined : undefined;
+    if (found.preset.passesModel) launcherPrefix = model ? `/usr/bin/env OPENRIG_MODEL=${shellQuote(model)} ${launcherPrefix}` : `/usr/bin/env -u OPENRIG_MODEL ${launcherPrefix}`;
+    launcherPrefix = found.preset.runner && resolvedWrapper
+      ? `/usr/bin/env OPENRIG_LAUNCH_WRAPPER=${shellQuote(JSON.stringify(resolvedWrapper))} ${launcherPrefix}`
+      : `/usr/bin/env -u OPENRIG_LAUNCH_WRAPPER ${launcherPrefix}`;
+    // The first input counts as passed once typing began, as before. The model's dispatch is confirmed only by a send that
+    // succeeded, which a later failure of the launch doesn't undo; typing that began and then failed leaves it uncertain;
+    // a launch that failed before typing passed nothing.
+    let typed = false;
+    let sent = false;
+    const handed = () => ({ ...(firstInput ? { firstInput } : {}),
+      ...(model ? { modelInput: { model, dispatch: sent ? "confirmed" as const : "uncertain" as const } } : {}) });
+    // #2940: a caller's last read before native dispatch (a keep_alive relaunch's shutdown check, a restore's selection) is
+    // asked again right before each terminal write, ahead of the marker that says typing began; absent asks nothing.
+    const allowed = opts.beforeNativeDispatch;
+    const markTyped = firstInput || model ? () => { typed = true; } : undefined;
+    const beforeInput = allowed ? () => { if (!allowed()) throw new Error(withdrawnBeforeInput); markTyped?.(); } : markTyped;
+    try {
+      const result = await this.launchPreset(binding, session, found.preset, resumeRef, beforeInput,
+        model ? () => { sent = true; } : undefined, launcherPrefix, allowed);
+      return { ...result, ...(typed ? handed() : {}) };
+    } catch (error) {
+      if (!typed) throw error;
+      return { ok: false, ...handed(), error: `Community harness "${this.runtime}" launch is uncertain: ${(error as Error).message}` };
+    }
+  }
+
+  private async launchPreset(binding: NodeBinding, session: string, preset: CommunityHarnessPreset, resumeRef: string | undefined, beforeInput?: () => void,
+    onSent?: () => void, launcherPrefix = "", beforeNativeDispatch?: () => boolean): Promise<HarnessLaunchResult> {
+    if (preset.namesConversation) return this.launchNamed(binding, session, preset.command, resumeRef, beforeInput, onSent, launcherPrefix, beforeNativeDispatch);
+    let attempt: LaunchAttempt | undefined;
+    let authority: RunnerGrantLaunch | undefined;
+    let launchSucceeded = false;
+    // The record is optional: a folder that can't be made leaves the identity unavailable, and the harness still launches.
+    let storageNote: string | undefined;
+    if (preset.launchResult) {
+      try {
+        attempt = newLaunchAttempt(session, this.deps.launchResultRoot?.() ?? launchResultRoot());
+        launcherPrefix = `/usr/bin/env OPENRIG_LAUNCH_RESULT=${shellQuote(attempt.file)} OPENRIG_LAUNCH_ATTEMPT=${attempt.attempt}`
+          + `${resumeRef ? ` OPENRIG_RESUME_REF=${shellQuote(resumeRef)}` : ""} ${launcherPrefix}`;
+      } catch (error) {
+        // A resume needs its record: without it the launcher can't be told what to reopen, so nothing starts.
+        if (resumeRef) {
+          return { ok: false, error: `Couldn't resume community harness "${this.runtime}": its launch-result folder couldn't be made (${(error as Error).message}); nothing was started.` };
+        }
+        storageNote = `community harness "${this.runtime}": its launch identity is unavailable: its launch-result folder couldn't be made (${(error as Error).message})`;
+      }
+    }
+    const runId = attempt?.attempt ?? randomUUID();
+    let authorityUnavailable = false;
+    let dispatchedWithoutAuthority = false;
+    if (preset.runner) {
+      try { authority = await this.deps.runnerGrants?.(binding, this.runtime, runId, 1); }
+      catch { authorityUnavailable = true; }
+    }
+    try {
+      let command: string;
+      try {
+        command = this.deps.seatLaunchEnvironment
+          ? await this.deps.seatLaunchEnvironment.command(session, preset.command, { runtime: this.runtime, nodeId: binding.nodeId, launcherPrefix, ...(authority ? { generation: authority.generation } : {}),
+            ...(binding.launchWrapper?.length ? { failClosed: true, ...(!preset.runner ? { launchWrapper: binding.launchWrapper } : {}) } : {}) })
+          : launcherPrefix + preset.command;
+      } catch (error) {
+        if (!binding.launchWrapper?.length) throw error;
+        return { ok: false, error: "launch_wrapper unavailable; no agent started." };
+      }
+      const fallback = command;
+      if (authority) command = authority.wrap(command);
+      if (beforeNativeDispatch && !beforeNativeDispatch()) return withdrawn(this.runtime);
+      let sent = await this.deps.tmux.sendShellCommand(session, command, beforeInput, { stageIfLong: true, execInScript: true });
+      if (!sent.ok && sent.code === "launch_path_too_long" && authority && command !== fallback) {
+        // This result proves no input was dispatched. Retry only the same pre-grant command.
+        try { await authority.finish(false); } catch { /* optional cleanup cannot block the original launch */ }
+        authority = undefined; authorityUnavailable = true;
+        sent = await this.deps.tmux.sendShellCommand(session, fallback, beforeInput, { stageIfLong: true, execInScript: true });
+      }
+      if (sent.ok) {
+        try { authority?.dispatched(); }
+        catch {
+          try { await authority?.finish(false); } catch { /* preserve the already dispatched effect */ }
+          authority = undefined; authorityUnavailable = true; dispatchedWithoutAuthority = true;
+        }
+      }
+      if (!sent.ok) return { ok: false, error: `Couldn't start community harness "${this.runtime}": ${sent.message}` };
+      onSent?.();
+      // A runner reports its conversation in this record; without one, its seat needs a person rather than reading ready.
+      if (!attempt && storageNote && preset.runner) return { ok: false, recovery: "attention_required", error: storageNote };
+      if (!attempt) { launchSucceeded = true; return storageNote ? { ok: true, warnings: [storageNote] } : { ok: true }; }
+      const read = await waitForLaunchResult(attempt, this.runtime, { ...this.deps.launchResultWait, root: this.deps.launchResultRoot?.() ?? launchResultRoot() });
+      if (resumeRef) {
+        // A conversation that's gone is never replaced by a new one: nothing started, and the person decides.
+        if (!read.ok && "missing" in read) {
+          return { ok: false, missingConversation: true, error: `Couldn't resume community harness "${this.runtime}": conversation ${resumeRef}: ${read.reason}.` };
+        }
+        // Unconfirmed or different: the seat keeps the conversation it asked for, and the person decides. No retry.
+        if (!read.ok) {
+          return { ok: false, recovery: "attention_required", resumeUnproven: true,
+            error: `Community harness "${this.runtime}": resuming conversation ${resumeRef} isn't confirmed: ${read.reason}. The seat keeps conversation ${resumeRef}; nothing was restarted.` };
+        }
+        if (read.nativeRef !== resumeRef) {
+          return { ok: false, recovery: "attention_required", resumeMismatch: { opened: read.nativeRef },
+            error: `Community harness "${this.runtime}": asked to resume conversation ${resumeRef}, its launcher reports conversation ${read.nativeRef} instead. The seat keeps conversation ${resumeRef}, and OpenRig doesn't switch it to ${read.nativeRef}. Nothing was restarted.` };
+        }
+      }
+      if (read.ok) { launchSucceeded = true; return { ok: true, resumeToken: read.nativeRef, resumeType: `community:${this.runtime}`, resumeProvenance: "launcher",
+        ...(authority ? { activityGrantId: authority.grantId } : {}),
+        ...(authorityUnavailable ? { warnings: [dispatchedWithoutAuthority
+          ? "Native command dispatched; run-bound reporting could not be confirmed. Cleanup of its grant was attempted; nothing was replayed."
+          : "Run-bound reporting unavailable; using existing unbound install-token reporting."] } : {}) }; }
+      const unavailable = `community harness "${this.runtime}": its launch identity is unavailable: ${read.reason}`;
+      return preset.runner ? { ok: false, recovery: "attention_required", error: unavailable } : { ok: true, warnings: [unavailable] };
+
+    } finally {
+      try { await authority?.finish(launchSucceeded); } catch { /* optional reporting cannot change a native launch outcome */ }
+    }
+  }
+
+  /** OpenRig names the conversation: a new one gets a fresh name in OPENRIG_CONVERSATION, and a resume passes the saved name
+   *  in OPENRIG_RESUME_REF. Nothing reports back, so the name is recorded as passed, not observed, and readiness says only
+   *  that a process runs: a harness that hasn't yet found a gone conversation reads as ready. Never creating one on a
+   *  resume is the launcher's job; OpenRig never asks for a new conversation on a resume. */
+  private async launchNamed(binding: NodeBinding, session: string, preset: string, resumeRef: string | undefined, beforeInput?: () => void,
+    onSent?: () => void, launcherPrefix = "", beforeNativeDispatch?: () => boolean): Promise<HarnessLaunchResult> {
+    const name = resumeRef ?? conversationName(session);
+    launcherPrefix = `/usr/bin/env ${resumeRef ? "OPENRIG_RESUME_REF" : "OPENRIG_CONVERSATION"}=${shellQuote(name)} ${launcherPrefix}`;
+    let command: string;
+    try {
+      command = this.deps.seatLaunchEnvironment
+        ? await this.deps.seatLaunchEnvironment.command(session, preset, { runtime: this.runtime, nodeId: binding.nodeId, launcherPrefix,
+          ...(binding.launchWrapper?.length ? { launchWrapper: binding.launchWrapper, failClosed: true } : {}) })
+        : launcherPrefix + preset;
+    } catch (error) {
+      if (!binding.launchWrapper?.length) throw error;
+      return { ok: false, error: "launch_wrapper unavailable; no agent started." };
+    }
+    if (beforeNativeDispatch && !beforeNativeDispatch()) return withdrawn(this.runtime);
+    const sent = await this.deps.tmux.sendShellCommand(session, command, beforeInput, { stageIfLong: true, execInScript: true });
+    if (!sent.ok) return { ok: false, error: `Couldn't start community harness "${this.runtime}": ${sent.message}` };
+    onSent?.();
+    return { ok: true, resumeToken: name, resumeType: `community:${this.runtime}`, resumeProvenance: "passed" };
+  }
+
+  async checkReady(binding: NodeBinding): Promise<ReadinessResult> {
+    const session = binding.tmuxSession;
+    if (!session || !(await this.deps.tmux.hasSession(session))) {
+      return { ready: false, reason: "The seat's tmux session isn't there.", code: "session_missing" };
+    }
+    const contained = this.contained();
+    if (contained) return contained.checkReady(binding);
+    const command = await this.deps.tmux.getPaneCommand(session);
+    if (!command || isShellForeground(command)) {
+      return { ready: false, reason: `Community harness "${this.runtime}" isn't running: the pane is at a shell.`, code: "harness_not_running" };
+    }
+    return { ready: true };
+  }
+
+  /** Snapshot this launch's declaration before composing its first turn. */
+  firstInput(): boolean {
+    const found = loadCommunityHarnessPreset(this.runtime, this.deps.presetsDir?.() ?? communityHarnessesDir());
+    return found.ok && found.preset.firstInput;
+  }
+
+  /** Whether this launch's preset declares an OpenRig-aware runner, recorded on the session with the launch. */
+  runner(): boolean {
+    const found = loadCommunityHarnessPreset(this.runtime, this.deps.presetsDir?.() ?? communityHarnessesDir());
+    return found.ok && found.preset.runner;
+  }
+
+  /** A process running isn't proof that the startup paste was submitted. */
+  startupAssisted(): boolean {
+    const found = loadCommunityHarnessPreset(this.runtime, this.deps.presetsDir?.() ?? communityHarnessesDir());
+    return found.ok && found.preset.startupAssisted;
+  }
+}
+
+const withdrawnBeforeInput = "The launch was withdrawn before community harness input";
+const WRAPPER_UNAVAILABLE = "launch_wrapper unavailable; no agent started.";
+
+/** The community harness a launch with this adapter is for, with its preset's runner declaration read now: what a launch
+ *  records on its session (a start, a handover's successor), so a relaunch or restore resolves the same harness and its
+ *  activity follows the occupant as launched. Null for a built-in adapter. */
+export function launchedCommunityHarness(adapter: RuntimeAdapter): { app: string; runner: boolean | "pi-rpc" } | null {
+  // A protocol: pi-rpc preset runs under OpenRig's hosted Pi-protocol runner, and its launch records that protocol.
+  if (adapter instanceof PiCommunityRuntimeAdapter) return { app: adapter.runtime, runner: "pi-rpc" };
+  if (adapter instanceof CommunityHarnessRuntimeAdapter) return { app: adapter.runtime, runner: adapter.runner() };
+  return null;
+}
+
+/** #2940: the caller withdrew the launch while it was prepared (a grant, the seat's command): nothing was typed. */
+function withdrawn(runtime: string): HarnessLaunchResult {
+  return { ok: false, error: `The launch was withdrawn during community harness "${runtime}" preparation; no native command was sent.`, recovery: "attention_required" };
+}
+
+/** A new conversation's name: the seat's session name, made safe, and 8 random hex digits, at most 100 characters. */
+function conversationName(session: string): string {
+  const seat = session.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "seat";
+  return `openrig-${seat}-${randomBytes(4).toString("hex")}`;
+}
+
+/** Create the runtime adapter for an installed community harness preset. */
+export function createCommunityHarnessAdapter(
+  runtime: string,
+  deps: CommunityHarnessAdapterDeps,
+  piAdapter?: PiRuntimeAdapter,
+): RuntimeAdapter {
+  const found = loadCommunityHarnessPreset(runtime, deps.presetsDir?.() ?? communityHarnessesDir());
+  if (found.ok && found.preset.protocol === "pi-rpc") {
+    const pi = deps.piAdapter ?? piAdapter;
+    if (pi && typeof pi.getCommunityDeps === "function") {
+      return PiCommunityRuntimeAdapter.fromPiAdapter(pi, runtime, found.preset);
+    }
+    throw new Error(`Cannot initialize PiCommunityRuntimeAdapter for "${runtime}": Pi adapter is required`);
+  }
+  return new CommunityHarnessRuntimeAdapter(runtime, deps);
+}
+
+/**
+ * The runtime adapter map, extended with community harnesses: a runtime name that isn't built in resolves to an
+ * CommunityHarnessRuntimeAdapter (or PiCommunityRuntimeAdapter for pi-rpc harnesses) while its preset is installed.
+ * The built-in entries are returned as they are, and the map's own keys stay the built-ins.
+ */
+export function withCommunityHarnesses<T extends Record<string, RuntimeAdapter>>(builtIns: T, deps: CommunityHarnessAdapterDeps): T {
+  const piAdapter = (deps.piAdapter ?? (builtIns["pi"] instanceof PiRuntimeAdapter ? builtIns["pi"] : undefined)) as PiRuntimeAdapter | undefined;
+  const installed = (key: string | symbol): key is string =>
+    typeof key === "string" && !Object.hasOwn(builtIns, key) && isCommunityHarnessRuntime(key)
+      && loadCommunityHarnessPreset(key, deps.presetsDir?.() ?? communityHarnessesDir()).ok;
+  return new Proxy(builtIns, {
+    get: (target, key, receiver) => installed(key) ? createCommunityHarnessAdapter(key, deps, piAdapter) : Reflect.get(target, key, receiver),
+    has: (target, key) => Reflect.has(target, key) || installed(key),
+  });
+}
+
+/** The hidden key of a relaunch map's community-harness resolver; a symbol, so the map's own keys stay the built-ins. */
+const COMMUNITY_HARNESS_RESOLVER = Symbol("community-harness-resolver");
+
+/**
+ * The runtime adapter map for relaunches (restore, seat lifecycle): exactly the built-ins, plus a hidden resolver for a
+ * community harness. Only `seatAdapter`, given a seat's recorded selection, reaches that resolver, so a seat whose
+ * runtime merely matches an installed preset's name (a free-text self-attach) gets no adapter, as before.
+ */
+export function withCommunityHarnessResolver<T extends Record<string, RuntimeAdapter>>(builtIns: T, deps: CommunityHarnessAdapterDeps): T {
+  const piAdapter = (deps.piAdapter ?? (builtIns["pi"] instanceof PiRuntimeAdapter ? builtIns["pi"] : undefined)) as PiRuntimeAdapter | undefined;
+  Object.defineProperty(builtIns, COMMUNITY_HARNESS_RESOLVER, {
+    enumerable: false,
+    value: (runtime: string) => isCommunityHarnessRuntime(runtime) && loadCommunityHarnessPreset(runtime, deps.presetsDir?.() ?? communityHarnessesDir()).ok
+      ? createCommunityHarnessAdapter(runtime, deps, piAdapter) : undefined,
+  });
+  return builtIns;
+}
+
+/** The adapter an installed preset defines for `runtime`, whether or not a seat was launched for it yet. A runtime
+ *  switch stages a successor before the seat has ever run on the target, so `seatAdapter` (which requires the retained
+ *  selection to already name the harness) cannot answer for it. */
+export function communityHarnessAdapter(map: Record<string, RuntimeAdapter> | undefined, runtime: string | null | undefined): RuntimeAdapter | undefined {
+  if (!map || !runtime || !isCommunityHarnessRuntime(runtime)) return undefined;
+  const resolve = (map as Record<symbol, ((runtime: string) => RuntimeAdapter | undefined) | undefined>)[COMMUNITY_HARNESS_RESOLVER];
+  return resolve ? resolve(runtime) : undefined;
+}
+
+/** The adapter to relaunch a seat with: its runtime's built-in adapter, or, for a seat launched for a community
+ *  harness (`communityHarnessOf`), that harness's adapter while its preset is installed. */
+export function seatAdapter(map: Record<string, RuntimeAdapter> | undefined, runtime: string | null | undefined,
+  communityHarness: string | null | undefined): RuntimeAdapter | undefined {
+  if (!map || !runtime) return undefined;
+  if (Object.hasOwn(map, runtime)) return map[runtime];
+  const resolve = (map as Record<symbol, ((runtime: string) => RuntimeAdapter | undefined) | undefined>)[COMMUNITY_HARNESS_RESOLVER];
+  return communityHarnessOf(communityHarness, runtime) && resolve ? resolve(runtime) : undefined;
+}

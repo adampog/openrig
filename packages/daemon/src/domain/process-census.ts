@@ -1,6 +1,6 @@
 // OPR.0.5.3.10 — the ONE process census.
 //
-// The measured collapse (parent incident qitem-20260823031444-cec9cafb; live
+// The measured collapse (parent incident; live
 // slow-span sample: 171 resume_metadata.list_processes calls, mean 9.39s, max
 // 40.31s): every consumer that needed the process table spawned its own
 // `ps -Ao` — the model-divergence poll once PER SEAT, the snapshot refresher up
@@ -17,7 +17,7 @@
 import type { ProcessRow } from "./model-divergence/current-generation-record.js";
 
 export interface ProcessCensusOpts {
-  /** The underlying enumeration (default: the shared `ps -Ao` lister). */
+  /** The underlying enumeration (default: the shared process-table lister). */
   list?: () => Promise<ProcessRow[]>;
   /** Reuse window for a successful census. Default 2000ms. */
   freshnessMs?: number;
@@ -39,25 +39,33 @@ export class ProcessCensus {
     this.now = opts.now ?? Date.now;
   }
 
-  async list(): Promise<ProcessRow[]> {
-    if (this.lastRows && this.now() - this.lastAt <= this.freshnessMs) {
-      return this.lastRows;
+  /** `fresh`: start an enumeration now even when one is cached or running, for a caller that must see the table after
+   *  something it awaited; later callers share it. */
+  async list(opts: { fresh?: boolean } = {}): Promise<ProcessRow[]> {
+    if (!opts.fresh) {
+      if (this.lastRows && this.now() - this.lastAt <= this.freshnessMs) {
+        return this.lastRows;
+      }
+      if (this.inFlight) return this.inFlight;
     }
-    if (this.inFlight) return this.inFlight;
-    this.inFlight = this.listFn().then(
+    const run: Promise<ProcessRow[]> = this.listFn().then(
       (rows) => {
-        this.lastRows = rows;
-        this.lastAt = this.now();
-        this.inFlight = null;
+        // An enumeration a fresh one replaced still answers its own callers, but doesn't overwrite the newer one.
+        if (this.inFlight === run) {
+          this.lastRows = rows;
+          this.lastAt = this.now();
+          this.inFlight = null;
+        }
         return rows;
       },
       (err) => {
         // Honest failure: nothing cached, next call retries.
-        this.inFlight = null;
+        if (this.inFlight === run) this.inFlight = null;
         throw err;
       },
     );
-    return this.inFlight;
+    this.inFlight = run;
+    return run;
   }
 
   /** A CYCLE-SCOPED lister: at most one census underneath for the closure's

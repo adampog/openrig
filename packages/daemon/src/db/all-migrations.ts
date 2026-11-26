@@ -1,9 +1,82 @@
+import { networkBindingProvidersSchema } from "./migrations/191_network_binding_providers.js";
+import { nodeKeepAliveSchema } from "./migrations/181_node_keep_alive.js";
+import { sessionStopAttemptSchema } from "./migrations/180_session_stop_attempt.js";
+import { nodeProcessLimitsSchema } from "./migrations/173_node_process_limits.js";
+import { nodeStatuslineThrottleSchema } from "./migrations/176_node_statusline_throttle.js";
+import { seatPoolSchema } from "./migrations/178_seat_pool.js";
+import { remoteControlObservationsSchema } from "./migrations/179_remote_control_observations.js";
+import { queueRelayedAnswersSchema } from "./migrations/186_queue_relayed_answers.js";
+import { queueTransferStagingSchema } from "./migrations/190_queue_transfer_staging.js";
+import { workflowRunTitleSchema } from "./migrations/194_workflow_run_title.js";
+import { workflowStartOperationsSchema } from "./migrations/195_workflow_start_operations.js";
+import { queueItemEvidenceRefRootsSchema } from "./migrations/196_queue_item_evidence_ref_roots.js";
+import { queueItemsNativePermissionIndexSchema } from "./migrations/199_queue_items_native_permission_index.js";
+import { queueItemsBlockedOnIndexSchema } from "./migrations/182_queue_items_blocked_on_index.js";
+import { queueItemsScanIndexesSchema } from "./migrations/183_queue_items_scan_indexes.js";
+import { providerAccountRefsSchema } from "./migrations/187_provider_account_refs.js";
+import { providerAccountAssignmentsSchema } from "./migrations/188_provider_account_assignments.js";
+import { rigSeatSliceSchema } from "./migrations/189_rig_seat_slice.js";
+import { communityHarnessRuntimeSwitchesSchema } from "./migrations/179_community_harness_runtime_switches.js";
+import { networkRequestsSchema } from "./migrations/184_network_requests.js";
+
+import { sessionLaunchedCwdSchema } from "./migrations/174_session_launched_cwd.js";
+import { rigDeliveryDrainsSchema } from "./migrations/170_rig_delivery_drains.js";
+import { queueReturnRouteSchema } from "./migrations/172_queue_return_route.js";
+import { runBoundActivityGrantsSchema } from "./migrations/165_run_bound_activity_grants.js";
+import { nodeInputRouteSchema } from "./migrations/171_node_input_route.js";
+import { coreAppAccessSchema } from "./migrations/175_core_app_access.js";
+import { piAccountSwitchesSchema } from "./migrations/151_pi_account_switches.js";
+import { workflowInstanceSpecSchema } from "./migrations/152_workflow_instance_spec.js";
+import { eventsRetentionMarksSchema } from "./migrations/153_events_retention_marks.js";
+import { workflowInstanceRootObjectiveSchema } from "./migrations/154_workflow_instance_root_objective.js";
+import { queueErasureSchema } from "./migrations/155_queue_erasure.js";
+import { queueErasureLinkIndexesSchema } from "./migrations/156_queue_erasure_link_indexes.js";
+import { queueErasureBatchesSchema } from "./migrations/157_queue_erasure_batches.js";
+import { workflowBoundPodSchema } from "./migrations/177_workflow_bound_pod.js";
+import { queueInboxCheckinsSchema } from "./migrations/158_queue_inbox_checkins.js";
+import { queueItemsHandedOffFromIndexSchema } from "./migrations/159_queue_items_handed_off_from_index.js";
+import { networkBindingsSchema } from "./migrations/160_network_bindings.js";
+import { networkReceiptsSchema } from "./migrations/161_network_receipts.js";
+import { sessionAddressReadIndexesSchema } from "./migrations/162_session_address_read_indexes.js";
+import { networkInstallationsSchema } from "./migrations/163_network_installations.js";
+import { queueItemsReplyToIndexSchema } from "./migrations/164_queue_items_reply_to_index.js";
+import { queueListReadIndexesSchema } from "./migrations/166_queue_list_read_indexes.js";
+import { seatHandoverAttemptsSchema } from "./migrations/167_seat_handover_attempts.js";
+import { contextUsageOccupantGenerationSchema } from "./migrations/168_context_usage_occupant_generation.js";
+import { seatRuntimeHomeRecordsSchema } from "./migrations/169_seat_runtime_home_records.js";
+import { claudeAutoModeSchema } from "./migrations/171_claude_auto_mode.js";
+import { seatHookBridgeSchema } from "./migrations/171_seat_hook_bridge.js";
+import { seatColdStartsSchema } from "./migrations/185_seat_cold_starts.js";
+import { activityGrantsSchema } from "./migrations/143_activity_grants.js";
+import { environmentBindingsSchema } from "./migrations/144_environment_bindings.js";
+import { nodePermissionsToSchema } from "./migrations/145_node_permissions_to.js";
+import { nodeStartupGuidanceFileSchema } from "./migrations/146_node_startup_guidance_file.js";
+import { managedBlockWritesSchema } from "./migrations/147_managed_block_writes.js";
+import { outboxDispatchedIndexSchema } from "./migrations/148_outbox_dispatched_index.js";
+import { streamIntakeCursorSchema } from "./migrations/149_stream_intake_cursor.js";
+import { nodeLaunchWrapperSchema } from "./migrations/150_node_launch_wrapper.js";
+import { nodeAccountHomeSchema } from "./migrations/141_node_account_home.js";
+import { escalationTargetRefsSchema } from "./migrations/126_escalation_target_refs.js";
+import { claudeTokenReadingsSchema } from "./migrations/134_claude_token_readings.js";
 // The canonical ordered migration list. SINGLE SOURCE: the daemon boot path
 // (startup.ts) and any test/tool that needs a schema-faithful DB both migrate from THIS array,
 // so a reader DB is never seeded from a stale hand-copied subset (the perf-fixture-migration-parity
 // trap). Append new migrations to the END, in order.
 
+import { nodeClaudePermissionsSchema } from "./migrations/139_node_claude_permissions.js";
+import { identityPrincipalSchema } from "./migrations/140_identity_principal.js";
+import { sessionAgentRunnerSchema } from "./migrations/141_session_agent_runner.js";
+import { nodeClaudeMcpSchema } from "./migrations/142_node_claude_mcp.js";
+import { nodeCodexPermissionsSchema } from "./migrations/137_node_codex_permissions.js";
 import { coreSchema } from "./migrations/001_core_schema.js";
+import { terminalPolicySchema } from "./migrations/128_terminal_policy.js";
+import { streamDispositionsSchema } from "./migrations/129_stream_dispositions.js";
+import { streamSubscriptionsSchema } from "./migrations/130_stream_subscriptions.js";
+import { streamRetentionFloorSchema } from "./migrations/131_stream_retention_floor.js";
+import { seatRuntimeSwitchesSchema } from "./migrations/132_seat_runtime_switches.js";
+import { streamReaderActionsSchema } from "./migrations/133_stream_reader_actions.js";
+import { seatIdentityProcessEvidenceSchema } from "./migrations/135_seat_identity_process_evidence.js";
+import { nodeClaudeTokenRefSchema } from "./migrations/138_node_claude_token_ref.js";
 import { bindingsSessionsSchema } from "./migrations/002_bindings_sessions.js";
 import { eventsSchema } from "./migrations/003_events.js";
 import { snapshotsSchema } from "./migrations/004_snapshots.js";
@@ -57,6 +130,7 @@ import { workflowResumeSchema } from "./migrations/051_workflow_resume.js";
 import { workflowInstanceBoundRigSchema } from "./migrations/052_workflow_instance_bound_rig.js";
 import { sessionsNodeIdIndexSchema } from "./migrations/053_sessions_node_id_index.js";
 import { queueTransitionsArchiveSchema } from "./migrations/054_queue_transitions_archive.js";
+import { seatEnvSchema } from "./migrations/111_seat_env.js";
 import { nodePermissionPolicySchema } from "./migrations/055_node_permission_policy.js";
 import { rigPermissionPolicySchema } from "./migrations/056_rig_permission_policy.js";
 import { nodePolicyProvenanceSchema } from "./migrations/057_node_policy_provenance.js";
@@ -95,12 +169,38 @@ import { classificationIdentityProvenanceSchema } from "./migrations/089_classif
 import { humanReplyToSchema } from "./migrations/090_human_reply_to.js";
 import { humanQuestionsSchema } from "./migrations/091_human_questions.js";
 import { nodeEffortSchema } from "./migrations/092_node_effort.js";
+import { nodeEffortChoiceSchema } from "./migrations/104_node_effort_choice.js";
 import { usageSamplesLatestIndexesSchema } from "./migrations/094_usage_samples_latest_indexes.js";
 import type { Migration } from "./migrate.js";
 
 import { rigNonInterruptiveSchema } from "./migrations/095_rig_non_interruptive.js";
 import { rigInstallRootSchema } from "./migrations/096_rig_install_root.js";
 import { threadPartMapSchema } from "./migrations/097_thread_part_map.js";
+import { queueTransitionsQitemIdOrderSchema } from "./migrations/098_queue_transitions_qitem_id_order.js";
+import { queueItemsRecoveryTagsSchema } from "./migrations/099_queue_items_recovery_tags.js";
+import { typingGuardModesSchema } from "./migrations/100_typing_guard_modes.js";
+import { resumeRotationSchema } from "./migrations/101_claude_resume_rotation.js";
+import { sessionStopIntentSchema } from "./migrations/103_session_stop_intent.js";
+import { usageSamplesClientCostSchema } from "./migrations/105_usage_samples_client_cost.js";
+import { piUsageEntriesSchema } from "./migrations/107_pi_usage_entries.js";
+import { piUsageChargesSchema } from "./migrations/108_pi_usage_charges.js";
+import { modePostureCoexistSchema } from "./migrations/109_mode_posture_coexist.js";
+import { workflowInstanceScopeSchema } from "./migrations/110_workflow_instance_scope.js";
+import { queueTransitionsTsQitemSchema } from "./migrations/112_queue_transitions_ts_qitem.js";
+import { appliedLaunchDaemonOptOutSchema } from "./migrations/113_applied_launch_daemon_opt_out.js";
+import { sessionAgentAppSchema as sessionCommunityHarnessSchema } from "./migrations/114_session_agent_app.js";
+import { threadSeatMapChannelKeySchema } from "./migrations/115_thread_seat_map_channel_key.js";
+import { nodeLaunchRecipeSchema } from "./migrations/136_node_launch_recipe.js";
+import { queueItemWakeInputBoxSchema } from "./migrations/116_queue_item_wake_input_box.js";
+import { providerAccountReadingsSchema } from "./migrations/117_provider_account_readings.js";
+import { humanQuietWindowsSchema } from "./migrations/118_human_quiet_windows.js";
+import { seatIdentityPanePidSchema } from "./migrations/119_seat_identity_pane_pid.js";
+import { rigStartupLayersSchema } from "./migrations/121_rig_startup_layers.js";
+import { humanOperatingModesSchema } from "./migrations/122_human_operating_modes.js";
+import { queueDelegatedDecisionSchema } from "./migrations/123_queue_delegated_decision.js";
+import { contextUsageWatchdogUnitsSchema } from "./migrations/124_context_usage_watchdog_units.js";
+import { nodeAdvisorSchema } from "./migrations/125_node_advisor.js";
+import { operationCorrelationSchema } from "./migrations/127_operation_correlation.js";
 
 /** Ordered migrations; numbers may be reserved by independent changes. */
 
@@ -201,4 +301,103 @@ export const ALL_MIGRATIONS: Migration[] = [
   rigNonInterruptiveSchema,
   rigInstallRootSchema,
   threadPartMapSchema,
+  queueTransitionsQitemIdOrderSchema,
+  queueItemsRecoveryTagsSchema,
+  typingGuardModesSchema,
+  resumeRotationSchema,
+  sessionStopIntentSchema,
+  nodeEffortChoiceSchema,
+  usageSamplesClientCostSchema,
+  piUsageEntriesSchema,
+  piUsageChargesSchema,
+  modePostureCoexistSchema,
+  workflowInstanceScopeSchema,
+  seatEnvSchema,
+  queueTransitionsTsQitemSchema,
+  appliedLaunchDaemonOptOutSchema,
+  sessionCommunityHarnessSchema,
+  threadSeatMapChannelKeySchema,
+  queueItemWakeInputBoxSchema,
+  providerAccountReadingsSchema,
+  humanQuietWindowsSchema,
+  seatIdentityPanePidSchema,
+  rigStartupLayersSchema,
+  humanOperatingModesSchema,
+  queueDelegatedDecisionSchema,
+  contextUsageWatchdogUnitsSchema,
+  nodeAdvisorSchema,
+  escalationTargetRefsSchema,
+  operationCorrelationSchema,
+  terminalPolicySchema,
+  streamDispositionsSchema,
+  streamSubscriptionsSchema,
+  streamRetentionFloorSchema,
+  seatRuntimeSwitchesSchema,
+  streamReaderActionsSchema,
+  claudeTokenReadingsSchema,
+  seatIdentityProcessEvidenceSchema,
+  nodeLaunchRecipeSchema,
+  nodeClaudeTokenRefSchema,
+  nodeClaudePermissionsSchema,
+  nodeCodexPermissionsSchema,
+  identityPrincipalSchema,
+  sessionAgentRunnerSchema,
+  nodeAccountHomeSchema,
+  nodeClaudeMcpSchema,
+  activityGrantsSchema,
+  environmentBindingsSchema,
+  nodePermissionsToSchema,
+  nodeStartupGuidanceFileSchema,
+  managedBlockWritesSchema,
+  outboxDispatchedIndexSchema,
+  streamIntakeCursorSchema,
+  nodeLaunchWrapperSchema,
+  piAccountSwitchesSchema,
+  workflowInstanceSpecSchema,
+  eventsRetentionMarksSchema,
+  workflowInstanceRootObjectiveSchema,
+  queueErasureSchema,
+  queueErasureLinkIndexesSchema,
+  queueErasureBatchesSchema,
+  queueInboxCheckinsSchema,
+  queueItemsHandedOffFromIndexSchema,
+  networkBindingsSchema,
+  networkReceiptsSchema,
+  sessionAddressReadIndexesSchema,
+  networkInstallationsSchema,
+  queueItemsReplyToIndexSchema,
+  runBoundActivityGrantsSchema,
+  queueListReadIndexesSchema,
+  seatHandoverAttemptsSchema,
+  contextUsageOccupantGenerationSchema,
+  seatRuntimeHomeRecordsSchema,
+  rigDeliveryDrainsSchema,
+  claudeAutoModeSchema,
+  nodeInputRouteSchema,
+  queueReturnRouteSchema,
+  nodeProcessLimitsSchema,
+  seatHookBridgeSchema,
+  sessionLaunchedCwdSchema,
+  coreAppAccessSchema,
+  nodeStatuslineThrottleSchema,
+  workflowBoundPodSchema,
+  seatPoolSchema,
+  queueTransferStagingSchema,
+  remoteControlObservationsSchema,
+  seatColdStartsSchema,
+  sessionStopAttemptSchema,
+  nodeKeepAliveSchema,
+  queueItemsBlockedOnIndexSchema,
+  queueRelayedAnswersSchema,
+  queueItemsScanIndexesSchema,
+  providerAccountRefsSchema,
+  providerAccountAssignmentsSchema,
+  rigSeatSliceSchema,
+  communityHarnessRuntimeSwitchesSchema,
+  networkBindingProvidersSchema,
+  workflowRunTitleSchema,
+  workflowStartOperationsSchema,
+  networkRequestsSchema,
+  queueItemEvidenceRefRootsSchema,
+  queueItemsNativePermissionIndexSchema,
 ];

@@ -14,11 +14,21 @@ describe("Slice-11 config — first-class + honest unconfigured (item 5)", () =>
     fs.rmSync(home, { recursive: true, force: true });
   });
 
+  it("keeps human-row previews off by default and accepts an explicit choice", () => {
+    expect(staticReadiness(loadConfig(home), true, true).find(r => r.label === "human-row previews")?.detail).toBe("off");
+    saveConfig({ ...DEFAULT_CONFIG, unfurl: "on" }, home);
+    expect(loadConfig(home).unfurl).toBe("on");
+    expect(staticReadiness(loadConfig(home), true, true).find(r => r.label === "human-row previews")?.detail).toBe("on");
+    expect(() => saveConfig({ ...DEFAULT_CONFIG, unfurl: "bad" } as never, home)).toThrow(/unfurl must be on or off/);
+    expect(loadConfig(home).unfurl).toBe("on");
+  });
+
   it("loadConfig returns defaults when absent (no throw); inbound-dest first-class default", () => {
     expect(configFileExists(home)).toBe(false);
     const cfg = loadConfig(home);
     expect(cfg.enabled).toBe(false);
-    expect(cfg.inboundDestination).toBe("operator-agent@kernel");
+    // Unchosen: the host's default receiving agent, resolved when the connector starts.
+    expect(cfg.inboundDestination).toBe("default-receiver");
     expect(cfg).not.toHaveProperty("alertTag");
   });
 
@@ -63,15 +73,15 @@ describe("Slice-11 config — first-class + honest unconfigured (item 5)", () =>
   });
 
   it("#192: an entry field from a newer OpenRig loads (ignored, reported loudly) but is never saved", () => {
-    const newer = { ...DEFAULT_CONFIG, enabled: true, channel: "C0DEFAULT", channelMap: [{ match: "my-rig", channel: "C0EXAMPLE1", inbound: "lead@my-rig" }] };
+    const newer = { ...DEFAULT_CONFIG, enabled: true, channel: "C0DEFAULT", channelMap: [{ match: "my-rig", channel: "C0EXAMPLE1", policy: "mention-only" }] };
     fs.writeFileSync(path.join(home, "slack-connector.json"), JSON.stringify(newer));
     const cfg = loadConfig(home); // a downgrade keeps the connector loading
     expect(cfg.channelMap?.[0]?.channel).toBe("C0EXAMPLE1");
     const row = staticReadiness(cfg, true, true).find((r) => r.label === "channel-map")!;
     expect(row.ok).toBe(false);
-    expect(row.detail).toContain("IGNORED unsupported field(s) channelMap[0].inbound");
+    expect(row.detail).toContain("IGNORED unsupported field(s) channelMap[0].policy");
     const before = fs.readFileSync(path.join(home, "slack-connector.json"), "utf8");
-    expect(() => saveConfig(cfg, home)).toThrow(/channelMap\[0\] \('my-rig'\) has unsupported field\(s\) inbound: slack-connector\.json was written by a newer OpenRig version\. Upgrade OpenRig, or edit the file by hand/);
+    expect(() => saveConfig(cfg, home)).toThrow(/channelMap\[0\] \('my-rig'\) has unsupported field\(s\) policy: slack-connector\.json was written by a newer OpenRig version\. Upgrade OpenRig, or edit the file by hand/);
     expect(fs.readFileSync(path.join(home, "slack-connector.json"), "utf8")).toBe(before); // nothing lost
   });
 

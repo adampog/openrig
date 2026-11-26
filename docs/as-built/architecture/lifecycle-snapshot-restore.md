@@ -11,8 +11,8 @@ applies-when: |
   and the CLI restore-packet command work.
 siblings: [daemon-core.md, agent-spec-and-startup.md, transport-and-transcripts.md]
 prerequisite-reads: [../README.md, agent-spec-and-startup.md]
-last-verified-against-source: 2caac7dd1bb16585138a6f7c1dd8b1f0752c49f7
-last-updated: 2026-10-05
+last-verified-against-source: e8f0ab340db773392ec8be75b072d1c0f3068a50
+last-updated: 2026-10-08
 ---
 
 # Lifecycle — Snapshot, Restore, Continuity
@@ -22,7 +22,7 @@ The durable-state half of the core product loop:
 captures serialized rig state; restore replays it honestly (no silent
 fresh-fallback); restore-check is a separate read-only readiness probe.
 
-> Verified against source at main `2caac7dd1bb16585138a6f7c1dd8b1f0752c49f7`. Each count below sits beside the
+> Verified against source at main `e8f0ab340db773392ec8be75b072d1c0f3068a50`. Each count below sits beside the
 > command that produces it; run the command from the repository root to refresh
 > it.
 
@@ -37,8 +37,9 @@ All in `packages/daemon/src/domain/types.ts`. The spec/projection types live in
   `resumed`, `rebuilt`, `fresh`, `fresh-primed`, `awaiting-decision`,
   `failed`, `attention_required`, `operator_recovered`, `n-a`. The restore
   result itself, `RestoreNodeResult.status` (`types.ts:475`), has the same
-  values without `n-a`: **8**
+  values without `n-a`, plus `left_attached`: **9**
   (`grep -E '^  status: "resumed"' packages/daemon/src/domain/types.ts | grep -o '"[^"]*"' | wc -l`).
+  `left_attached` isn't a `NodeRestoreOutcome`; the inventory projects it as `n-a`.
   Where `restore-orchestrator.ts` sets each one:
   - `resumed` — `baseStatus = "resumed"` after a legacy resume (`:1030`); the
     status is returned only by `finishJoinedResume` (defined `:1320`, called
@@ -61,6 +62,10 @@ All in `packages/daemon/src/domain/types.ts`. The spec/projection types live in
     `:1292`, `:1300`).
   - `operator_recovered` — only from later reconciliation,
     `reconcileNodeRuntimeTruth` (`:1590`, event at `:1727`).
+  - `left_attached` — a seat joined with `rig attach` as an external CLI,
+    returned first in `restoreNodeWithCompensation`: nothing is launched and
+    its binding and claim stay as they were. It doesn't count against the
+    rollup, and its forecast in `restore-plan-preview.ts` is `leave-attached`.
 - **RestoreRigResult** (`types.ts:444`) — the rig-level rollup, **4** values
   (`grep '^export type RestoreRigResult' packages/daemon/src/domain/types.ts | grep -o '"[^"]*"' | wc -l`):
   `fully_restored`, `partially_restored`, `failed`, `not_attempted`.
@@ -68,10 +73,26 @@ All in `packages/daemon/src/domain/types.ts`. The spec/projection types live in
   first three; `not_attempted` is set when pre-restore validation fails
   (`:281`).
 - **SnapshotData** (`types.ts:351`) — the serialized snapshot payload. It has
-  **7** optional fields, kept optional so older snapshots still load
+  **8** optional fields, kept optional so older snapshots still load
   (`sed -n '/^export interface SnapshotData/,/^}/p' packages/daemon/src/domain/types.ts | grep -c '?:'`):
-  `activeSessionIdByNode?`, `activeOccupantsByNode?`, `topologyRoster?`,
-  `pods?`, `continuityStates?`, `nodeStartupContext?`, `envReceipt?`.
+  `activeSessionIdByNode?`, `activeOccupantsByNode?`, `periodicResumeSourcesByNode?`,
+  `topologyRoster?`, `pods?`, `continuityStates?`, `nodeStartupContext?`, `envReceipt?`.
+  Periodic snapshots retain a down agent's whole authoritative resume-source
+  session in `periodicResumeSourcesByNode`, without marking it running. A named
+  single-agent launch using automatic periodic selection can resume that exact
+  carried source; an explicit snapshot or whole-rig restore still asks about an
+  absent agent with resumable history. Tokenless and non-resume-policy agents
+  keep their existing fresh path. Only the node's newest session with a token
+  and `resume_if_possible` policy is carried; a current fresh-successor relation
+  must agree. Named launch rechecks the live newest session, resume policy and
+  fresh-successor relation under its lifecycle lease, before changing any seat
+  state; a source retired after capture stops and asks without launching.
+  Idle-shell carry advice uses automatic selection again, not an
+  explicit snapshot that disables carry. The selected source is shared by preflight and post-launch
+  restore; explicit reviewed-history selection keeps its existing checks.
+  Ranking, periodic cadence and `--fresh` are unchanged. Retention is best-effort
+  if the earlier-source lookup fails: capture still records current crash
+  insurance and logs that the resume sources were unavailable.
 - **NodeStartupSnapshot** (`types.ts:344`) — persisted restore replay input:
   classification-free projection entries, resolved startup files, startup
   actions, runtime.
@@ -79,7 +100,7 @@ All in `packages/daemon/src/domain/types.ts`. The spec/projection types live in
   restore replay seam: persists only entry identity + source metadata, NOT
   stale `classification`, `conflicts`, or `noOps` (Architecture Rule 10).
   Restore rebuilds each entry as `safe_projection` with empty `conflicts` and
-  `noOps` (`restore-orchestrator.ts:1170`, `:1175`, `:1176`).
+  `noOps` (`restore-orchestrator.ts:1177`, `:1182`, `:1183`).
 
 ## 2. Snapshot, restore, continuity domain services
 
@@ -97,8 +118,8 @@ All under `packages/daemon/src/domain/`:
   accept only snapshots that pass `isRestoreUsableSnapshotData` (`:250`).
 - `restore-orchestrator.ts` — resume, checkpoint delivery, startup replay,
   live continuity consultation, topology ordering (`computeRestorePlan`,
-  `:669`, ordering only `delegates_to` and `spawned_by` edges, `:71`, among
-  the roster's intended nodes, `:670`), and service boot gating before agent
+  `:676`, ordering only `delegates_to` and `spawned_by` edges, `:71`, among
+  the roster's intended nodes, `:677`), and service boot gating before agent
   restore (`serviceOrchestrator.boot`, `:331`).
 - `restore-preconditions.ts` — `validatePreRestore` (`:7`), the one
   pre-restore validation shared by restore and restore-check (§3, §5.1).
@@ -132,48 +153,57 @@ Restore behavior, each point checked in `restore-orchestrator.ts`:
 - Resolves each node's occupant from the snapshot's recorded active-occupant
   maps, not by picking the newest session row
   (`resolveActiveSnapshotSession`, `active-occupant.ts:74`, called at
-  `restore-orchestrator.ts:767` and `:964`). An ambiguous occupant fails the
+  `restore-orchestrator.ts:774` and `:971`). An ambiguous occupant fails the
   node loudly (`activeOccupantAmbiguityError`, `active-occupant.ts:97`).
 - Consults live `continuity_state`; preserves state when a node is already
   `restoring` (`:777–791` — `SELECT status FROM continuity_state …` at
   `:780`; if `status === "restoring"` the node is skipped with a warning and
   reported as `fresh`, `:783–785`; `degraded` only adds a warning).
 - Reuses the seat's durably bound tmux session name when the prior binding
-  has a usable one (`:840`), and otherwise falls back to the derived name
-  with a warning (`:869`).
+  has a usable one: a canonical or legacy name, or any other name that tmux
+  creates and finds as given and OpenRig's address readers read back
+  unchanged, such as an adopted seat's own session name
+  (`boundSessionNameProblem`, `session-name.ts`). Otherwise it launches the
+  derived name and says so before the launch, old name to planned name, with
+  the reason. A missing binding after the latest session's recorded
+  intentional exit is quiet; unclean/legacy missing bindings and incomplete
+  binding rows still warn.
 - Replays restore-safe startup using persisted startup context;
   prefilters missing optional artifacts into warnings; **hard-fails a node if
   a required startup file is missing** (`:1161` — status `"failed"`, error
   "Missing required startup files: …"). Before any mutation,
-  `validatePreRestore` (`restore-preconditions.ts:7`, called at
-  `restore-orchestrator.ts:271`) already blocks the whole restore when a node
-  that will consume replay is missing a required startup file
-  (`required_startup_file_missing`, `restore-preconditions.ts:151`; outcome
-  `pre_restore_validation_failed`, `restore-orchestrator.ts:291`). Its other
+  `validatePreRestore` (`restore-preconditions.ts:7`, called from
+  `RestoreOrchestrator.restore`) finds a node that will consume replay and is
+  missing a required startup file (`required_startup_file_missing`, or
+  `startup_owner_root_missing`). Restore holds only that node: it is not
+  launched and is reported `failed` ("Not launched: …" with the blocker's
+  message and remediation), and the rest of the rig restores. When every node
+  the restore would launch is held, or for any other blocker, the whole restore
+  stops before any mutation (outcome `pre_restore_validation_failed`). Its other
   blockers are `invalid_snapshot_data` (`restore-preconditions.ts:27`),
   `invalid_topology_roster` (`:78`), `checkpoint_missing_node_cwd` (`:91`),
-  `startup_owner_root_missing` (`:139`), `service_rig_root_missing` (`:187`)
-  and `service_compose_file_missing` (`:197`). The `/api/up` route returns
+  `service_rig_root_missing` (`:187`) and `service_compose_file_missing`
+  (`:197`). The `/api/up` route returns
   that outcome as HTTP 409 with `status: "not_attempted"`
   (`routes/up.ts:162`). A node that resumes its exact native session replays
   no startup files, actions, guidance or skills (`replayContained`,
-  `restore-orchestrator.ts:1107`); its saved Claude activity-hook selection
+  `restore-orchestrator.ts:1114`); its saved Claude activity-hook selection
   is reapplied before native resume. A skipped hook reapply adds a warning
   without changing the restore outcome.
 - Writes a **transcript boundary marker before re-launch**
-  (`writeBoundaryMarker`, `:893`, called before `launchNode` at `:904`) when
+  (`writeBoundaryMarker`, `:900`, called before `launchNode` at `:911`) when
   the transcript store is enabled.
 - Refuses to restore over live sessions (`:259–262` — `rig_not_stopped`: "Rig …
   has live sessions. Stop the rig with 'rig down' before restoring, or use the
   latest auto-pre-down snapshot."). A tmux probe that fails also blocks it
-  (`classifyRunningSessions`, `:605`).
+  (`classifyRunningSessions`, `:612`).
 - Checks that the harness actually resumed. The resume adapters judge the
   pane with `assessNativeResumeProbe` (`domain/native-resume-probe.ts:84`). A
   pod-aware resume counts as resumed only when startup reports `resumed`
   continuity or the launched session row carries the snapshot's resume type
   and token (`launchedSessionMatchesSnapshotResume`,
-  `restore-orchestrator.ts:1383`); a reported `fresh` continuity without that
-  proof rolls back to `awaiting-decision` (`:1221–1238`).
+  `restore-orchestrator.ts:1390`); a reported `fresh` continuity without that
+  proof rolls back to `awaiting-decision` (`:1228–1245`).
 - Saves a `rig up --non-interruptive` or `--no-non-interruptive` choice on
   the rig only after the live-session check and pre-restore validation pass
   (`:301`); see [adapters-and-runtimes.md](adapters-and-runtimes.md) for the
@@ -181,24 +211,24 @@ Restore behavior, each point checked in `restore-orchestrator.ts`:
 
 `launchNodeSubset` (`:392`) and `launchSingleNode` restore chosen seats rather
 than the whole rig; unlike a full restore, a failed tmux probe there proceeds
-with a `liveness_probe_unknown` warning (`:510`).
+with a `liveness_probe_unknown` warning (`:517`).
 
 **Restore-honesty rules** (texts in `architecture-rules-and-event-system.md`;
 cited here by number with the code that carries them):
 
 - Rule 7 — `RESTORE_POLICY_LEVEL`
   (`packages/daemon/src/domain/profile-resolver.ts:106`) orders the three
-  policies, and `resolveRestorePolicy` (`profile-resolver.ts:550`) rejects a
+  policies, and `resolveRestorePolicy` (`profile-resolver.ts:589`) rejects a
   profile or member value that broadens it.
 - Rule 14 — the outcome set is `RestoreNodeResult.status` (`types.ts:475`,
   §1); `rebuilt` is set only when a checkpoint is written
-  (`restore-orchestrator.ts:1090`).
+  (`restore-orchestrator.ts:1097`).
 - Rule 15 — in `restore-orchestrator.ts`, a `resume_if_possible` seat with a
   session but no token stops as `awaiting-decision` before launch unless
-  `--fresh` names it (`:805–824`); a failed resume kills the blank session
-  (`rollbackToZeroSession`, `:933`) and returns `awaiting-decision`
-  (`:1048`); pod-aware resume passes
-  `allowFreshFallback: !(isPodAware && resumeRequested)` (`:1217`). Fresh
+  `--fresh` names it (`:812–831`); a failed resume kills the blank session
+  (`rollbackToZeroSession`, `:940`) and returns `awaiting-decision`
+  (`:1055`); pod-aware resume passes
+  `allowFreshFallback: !(isPodAware && resumeRequested)` (`:1224`). Fresh
   launch is explicit: `rig up --existing <rig> --fresh <seats...>`
   (`packages/cli/src/commands/up.ts:99`). On a terminal, `rig up` asks
   yes or no for each `awaiting-decision` seat and re-posts with the accepted
@@ -219,6 +249,24 @@ cited here by number with the code that carries them):
   live sessions (`packages/daemon/src/domain/rig-teardown.ts:117`, capture
   at `:128`, after refreshing resume metadata at `:119`; an already-stopped
   rig returns at `:93–115` without one).
+- Before it closes the terminals, `rig down` lets each Claude Code or Codex
+  seat's agent exit through its own shutdown (#3901,
+  `RigTeardownOrchestrator.exitSeatRuntimes`, `domain/runtime-exit.ts`):
+  Claude Code gets TERM itself, not its pane's shell; Codex gets `/exit`
+  typed into its input box only while that box is empty with no prompt open,
+  and TERM otherwise. All seats go at once. Each waits up to 3 s for the
+  agent's exit, then sends KILL and waits up to 3 s again; the reads and
+  writes between take time of their own. Only sessions the stop below would
+  end are touched (`downDisposition`, shared with the kill loop), with the
+  stop's own proof: the pane's session id and tmux server (pid and start
+  time) read together, the seat's marker read by that id, and each signal and
+  typed input held to that session and server. The exit is read from the process table, never
+  from the pane. Closing the terminals still stops everything afterwards.
+  `--force` skips the step. The result's `runtimeExits` says, per seat, what
+  the step saw, with a sentence: `graceful` (its own shutdown, or no agent
+  left), `forced` (seen to end on a signal it doesn't handle, or on KILL) or
+  `unverified` (its end wasn't seen). Whether a terminal closed is the stop's
+  own result (`sessionsKilled`, `errors`).
 - `rig up <rig-name>`: a source with no `/` and no
   `.yaml`/`.yml`/`.rigbundle`/`.rigtopology` extension is a rig name
   (`packages/daemon/src/domain/up-command-router.ts:49–50`). The CLI refuses
@@ -240,6 +288,24 @@ cited here by number with the code that carries them):
   eligible (`routes/up.ts:137–146`). Otherwise it errors with code
   `no_snapshot` and guidance ("… current DB state is insufficient for
   rehydrate. Start fresh with: rig up <spec-path>", `routes/up.ts:118–123`).
+  Eligibility (`assessCurrentStateRehydrateEligibility`) is the one rule for
+  both fallbacks, `chooseRestoreSnapshot` (`rig up --existing`, daemon start)
+  and `POST /api/rigs/:id/up` (`rig start`), and restore-check reports it. A
+  seat with neither startup context nor a resume token blocks, unless its
+  current occupant resolves unambiguously, as the auto-rehydrate capture
+  resolves it, under `resume_if_possible`, and another seat is eligible. That
+  seat is listed in `awaitingDecision`: the capture keeps its row and null
+  token, and restore stops it as `awaiting-decision` before any launch while
+  the other seats resume from their own rows. Its result carries
+  `noStartupContext` and names no fresh launch, which would refuse without
+  startup context; the CLI doesn't offer one either. It names
+  `rig seat set-resume-token` only when that command records on this seat's
+  session: its lookup (`findResumeContextByName`, the newest row under the
+  name) returns the occupant's row, and the runtime has a token type
+  (`resumeTypeForRuntime`). Otherwise it names manual recovery alone. An
+  eligible agent seat whose current occupant has no token stops the same way,
+  so it is listed too, and `noSeatStarts` marks a rig where every seat would
+  wait.
 - Post-command handoff: `down` output includes the snapshot ID and
   `To restore: rig up <name>` (or `rig restore <snapshotId> --rig <rigId>`
   when the name is not unique); `up` output includes node statuses and an
@@ -256,31 +322,88 @@ cited here by number with the code that carries them):
 - **`rig seat continue <seat>`** — when a fresh launch stops at a native
   prompt before its startup context is delivered, the startup orchestrator
   fails it as `attention_required` and adds "run: rig seat continue
-  <session>" (`startup-orchestrator.ts:600`). The command
-  (`packages/cli/src/commands/seat.ts:633`) calls
-  `POST /api/seat/continue/:seatRef` (`routes/seat.ts:293`), which runs
-  `continueFreshStartup` (`seat-lifecycle-service.ts:395`): it re-checks the
+  <session>" (`startup-orchestrator.ts:822`). The command
+  (`packages/cli/src/commands/seat.ts:816`) calls
+  `POST /api/seat/continue/:seatRef` (`routes/seat.ts:367`), which runs
+  `continueStartup` (`seat-lifecycle-service.ts:723`): it re-checks the
   binding, pane and runtime, then delivers the pending context to the same
   conversation without relaunching. In a restore, a pod-aware seat in this
-  state reports `attention_required` (`restore-orchestrator.ts:1258`). See
+  state reports `attention_required` (`restore-orchestrator.ts:1265`). See
   [agent-spec-and-startup.md](agent-spec-and-startup.md) for the startup side.
 - **Per-seat startup decision** — `POST /api/startup/:rigId/:logicalId`
   (`routes/startup.ts:142`) takes `resume`, `start`, `fresh` or `continue`
   for one seat. `resume` captures an eligibility-checked `auto-rehydrate`
   snapshot when none exists and goes through `launchSingleNode`.
 - **Seat handover** — `rig seat handover <seat> --source
-  fresh|rebuild|fork:<id>|discovered:<id> --reason <reason> [--dry-run]`
+  fresh|rebuild|fork:<seat>|discovered:<id> --reason <reason> [--dry-run]`
   (the reason is required, dry run included; without it the command exits 2
   before contacting the daemon)
   (`packages/cli/src/commands/seat.ts:364`) calls
   `POST /api/seat/handover/:seatRef` (`routes/seat.ts:94`), which runs
   `SeatHandoverService.handover` (`seat-handover-service.ts:266`).
   `SuccessorSessionLauncher` (`successor-session-launcher.ts:92`) respawns
-  the same pane in place, so the session name stays the same. The fresh
+  the same pane in place, so the session name stays the same. Before the
+  respawn, the departing occupant exits through its own shutdown where it has
+  one (#3901: `terminatePaneInPlace` in `pane-cutover.ts`, then
+  `runtime-exit.ts`, the same exit `rig down` uses; also a kept-pane relaunch
+  and a runtime switch's retirement), read from the process table. Only then
+  is the pane's shell ended (HUP, then KILL), since the respawn needs a dead
+  pane. Another runtime, an agent that can't be identified, or an exit that
+  couldn't be checked (an unreadable process table or terminal, KILL withheld
+  because its check didn't hold) keeps the pane-level TERM then KILL, reported
+  forced;
+  the handover fails (`retiree_not_terminated`) only for an agent seen running
+  after its KILL, or when the pane's own end can't be established (its dead
+  state unreadable). The pane's terminal (session id and tmux server) is read
+  as the pane is resolved, and the destructive effects (the agent's signals,
+  typed input and the pane-level retirement signals) are held to it, though
+  setting remain-on-exit and the later respawn aren't: a pane seen in another session or on another
+  server is left alone (`guard_target_changed`). A later terminal read that
+  comes back unreadable isn't that: the agent's own signals and typed input
+  go only on a read that matches, and the pane-level signals go on with their
+  own checks (the delivery guard, the pane's pid). `sideEffects.departingProcess`
+  and `departingProcessDetail` say how the occupant ended. The fresh
   source delivers a daemon-built restore packet (`buildRestorePacket`,
   `seat-handover-service.ts:1151`), which is separate from the CLI
   `rig restore-packet` below. The rebuild source primes from the seat's
   durable chain (`buildRebuildPrimingChain`, `rebuild-priming-chain.ts:22`).
+- **Seat handover recovery** (#2985, #2861) — a handover that fails after
+  the in-place respawn with its Claude successor launched records the attempt
+  in `seat_handover_attempts` (migration 167; `seat-handover-attempts.ts`):
+  the generation it reserved, the pane, the session id it generated for
+  the launch and its frozen executable (a `#!` script or not, #2341).
+  `rig seat handover <seat> --recover --reason <reason>` calls
+  `POST /api/seat/handover/:seatRef/recover`, which runs
+  `SeatHandoverService.recover`: under the seat's lifecycle lease it checks
+  the attempt still replaces the current occupant, proves the session's only
+  pane holds exactly one foreground Claude naming that session id (two
+  samples, unchanged PID, with the launch's executable as readiness has it),
+  takes the conversation that process holds now from Claude's
+  `sessions/<pid>.json` (`readClaudePidSessionId`, as the resume refresher
+  does; a `/clear` rotates it, and the conversation title is not compared)
+  as the seat's resume target. Recovery also reads the fork parent's process
+  file, checking that its pane belongs to the parent session before and after
+  the read. This applies even when the conversation is the
+  retiring occupant's or a fork parent's (`recoveredConversation`: the result
+  says so, and a fork on its parent's conversation reports `forkId: "none"`,
+  not a distinct fork; the token is written to the successor's session row only,
+  so the parent's binding and process are untouched), then commits through the same `commit()` with
+  the reserved generation (rolled back if it doesn't register). A classic
+  launch (one not in a native Claude permission mode: the `floor` and
+  `full_bypass` postures included) records no executable, so a Claude a `#!`
+  wrapper starts without exec is proven only when it is itself one the proof
+  recognizes (`claude`, the native installer's version, Nix); as `node cli.js`
+  or a renamed binary it is not, and when the foreground runs the launch's
+  conversation with no such Claude (nor a native one whose executable path
+  this sample could not read), the refusal says `--recover` can't prove it
+  (to run it again only once the pane shows a waiting wrapper has started
+  Claude), but only when a second sample,
+  `UNPROVABLE_CONFIRM_MS` (3 s) later, finds the same foreground: a `#!`
+  wrapper in its start window has not yet exec'd or started its Claude.
+  The result and
+  `seat.handover_completed` carry `recoveredFrom`. Codes: 404
+  `no_handover_to_recover`, 409 `handover_attempt_superseded` and
+  `successor_identity_unproven`, 501 `recover_runtime_unsupported`.
 
 ## 5. Daemon-side restore-check and CLI restore-packet
 
@@ -380,6 +503,20 @@ daemon's `/api/transcripts/<session>/full`, `:156`), `read <packet-dir> [--json]
 (`:452`; validate against the v0 schema; non-mutating). Packet shape is the
 cross-runtime v0 standard — Claude Code and Codex transcripts both supported
 via runtime parsers + redaction (`packages/cli/src/restore-packet/`).
+
+### Shared history inspection
+
+`GET /api/startup/:rigId/nodes/:nodeId/history` lists captured histories for one durable node in the current, policy-ranked restore snapshot. `POST` to the same path plus `/validate` with exactly `{ "snapshotId": "…", "historySessionId": "…" }` rechecks one listed choice. Both routes use startup's terminal bearer authentication. The CLI exposes the same server decisions with `rig seat history --rig <rig-id> --node-id <node-id> --json`; pass both `--snapshot-id` and `--history-session-id` to validate. These calls perform no snapshot capture, token refresh, launch, or database write.
+
+The list includes captured Claude and Codex rows that the current restore policy and native resume adapter can structurally attempt. Codex requires an explicit `codex_id` and token; implicit `codex_last` cannot name a particular history. Claude accepts `claude_id` and `claude_name` with tokens. The server checks exact rig and node membership, the snapshot's intended roster and runtime, and the node's current occupant compatibility. A change to a sibling node does not retarget or invalidate this node's list. A changed or pruned snapshot, removed history row, same-name replacement node, ambiguous current occupant, or incompatible source is refused; validation never substitutes another history.
+
+`tokenState` (`present`, `stale`, or `unverified` for listed rows) describes the saved verification record and its age. Eligibility means a future launch may **attempt** native resume. A stored row can share a native token with another row, and neither listing nor validation proves that a native conversation still exists.
+
+### Selected history startup
+
+`GET /api/startup/:rigId/nodes/:nodeId?snapshotId=<listed-id>&historySessionId=<listed-id>` returns a read-only review for one listed choice: the selected row's forecast, current terminal observation, consumed launch setting sources (including a member permission envelope or Claude rules), and an opaque revision. The permission view uses restore's pure policy resolution: a readable custom policy's current launch posture can supersede its persisted cache, and a changed resolved decision requires re-review. It refuses a captured row whose native type/token, provenance, restore policy, or harness no longer agrees with the live registry row. The response contains no native token. `POST /api/startup/:rigId/nodes/:nodeId` accepts exactly `{ "action": "resume", "snapshotId": "…", "historySessionId": "…", "revision": "…" }`. Both routes require startup's terminal bearer token. The selected route accepts no fresh, continue, arbitrary token, or alternate target. Review does not capture a snapshot or prepare a provider. `rig seat history` also uses a strictly read-only daemon status check, so inspection does not remove stale daemon state.
+
+Apply revalidates the same current compatible source, durable node and saved launch settings after prerequisite and presence checks. The existing narrow restore engine carries that exact historical row through legacy and pod-aware native resume, with a second identity check at native dispatch after preparation. Before the new registry row is committed, selected startup also checks that no other attachment or running occupant claimed the node during terminal creation or pane observation; a collision leaves that claimant intact and reports the terminal outcome for inspection. An occupied or uncertain terminal blocks the attempt. No alternate history or fresh conversation is selected. The response projects exact typed references and outcome fields; only diagnostic text is redacted, so even a short native name cannot corrupt an ID. It names the selected source row and the newly registered result row when one exists; only the engine's joined native continuity proof produces success. If a change occurs after shell creation, the result reports a partial or uncertain attempt for inspection. The existing engine handles native prerequisites, compensation and proof. This surface adds no separate per-agent prelaunch probe; native checks remain at execution. Physical tmux cleanup still addresses sessions by name, so it cannot prove ownership against an external same-name replacement outside the selected registry guard.
 
 ## See also
 

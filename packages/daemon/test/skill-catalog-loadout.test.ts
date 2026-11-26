@@ -1,7 +1,8 @@
-import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { reconcileSkillLoadout, resolvePluginSkills, resolveSkillLoadout, type SkillLoadout } from "../src/domain/skill-catalog.js";
 
@@ -39,6 +40,188 @@ function commit(root: string): string {
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+type GitRead = "root" | "status" | "head" | "show" | "projection-root" | "check-ignore" | "ls-files";
+type GitFixtureMode = "normal" | "missing" | "error" | "hang" | "ignore-term";
+
+function treeBytes(root: string): unknown[] {
+  return readdirSync(root).sort().map((name) => {
+    const path = join(root, name), stat = lstatSync(path);
+    return [name, stat.mode, stat.isDirectory() ? treeBytes(path) : readFileSync(path).toString("base64")];
+  });
+}
+
+/** Runs the catalog or projection behind a supervisor so an unbounded sync Git cannot hang Vitest. */
+async function catalogWithSupervisedGit(f: ReturnType<typeof fixture>, mode: GitFixtureMode, site: GitRead, loadout?: SkillLoadout) {
+  const bin = join(f.root, "fake-bin");
+  mkdirSync(bin);
+  const callsPath = join(f.root, "git-calls.jsonl");
+  const pendingPath = join(f.root, "pending-git.json");
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8", timeout: 5000 }).trim();
+  const fakeGit = join(bin, "git");
+  if (mode !== "missing") {
+    writeFileSync(fakeGit, `#!${process.execPath}
+import { appendFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+const args = process.argv.slice(2);
+const command = args[2];
+const site = command === "rev-parse" ? args[3] === "HEAD" ? "head"
+  : args[1] === ${JSON.stringify(f.project)} ? "projection-root" : "root" : command;
+const record = { site, args, pid: process.pid, parentPid: process.ppid };
+appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(record) + "\\n");
+const mode = ${JSON.stringify(mode)};
+if (site === ${JSON.stringify(site)} && (mode === "hang" || mode === "ignore-term")) {
+  writeFileSync(${JSON.stringify(pendingPath)}, JSON.stringify(record));
+  // Git's ordinary status 1 means no match at these two sites. On timeout it means the child's TERM handler exited 1.
+  process.on("SIGTERM", () => {
+    if (mode === "hang") process.exit(site === "check-ignore" || site === "ls-files" ? 1 : 73);
+  });
+  setInterval(() => {}, 1000);
+} else if (site === ${JSON.stringify(site)} && ${JSON.stringify(mode)} === "error") {
+  process.stderr.write("fixture git refused " + site + "\\n");
+  process.exit(73);
+} else {
+  const result = spawnSync(${JSON.stringify(realGit)}, args, { encoding: "utf8", timeout: 5000 });
+  process.stdout.write(result.stdout ?? "");
+  process.stderr.write(result.stderr ?? "");
+  process.exit(result.status ?? 74);
+}
+`);
+    chmodSync(fakeGit, 0o700);
+  }
+  const worker = join(f.root, "catalog-worker.mjs");
+  const catalogModule = fileURLToPath(new URL("../dist/domain/skill-catalog.js", import.meta.url));
+  // The normal package tests import source; this supervised subprocess needs the same checkout's daemon build.
+  expect(existsSync(catalogModule), "build this worktree's daemon before running the supervised catalog cases").toBe(true);
+  const operation = loadout
+    ? `reconcileSkillLoadout(${JSON.stringify({ loadout, runtime: "codex", cwd: f.project, apply: true })})`
+    : `resolveSkillLoadout(${JSON.stringify({ catalogRoot: f.catalog, projectSkills: ["known", "committed-name"] })})`;
+  writeFileSync(worker, `import { reconcileSkillLoadout, resolveSkillLoadout } from ${JSON.stringify(pathToFileURL(catalogModule).href)};
+console.log(JSON.stringify(${operation}));
+`);
+  const env: NodeJS.ProcessEnv = {
+    PATH: bin, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR,
+    XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME, XDG_STATE_HOME: process.env.XDG_STATE_HOME,
+    XDG_DATA_HOME: process.env.XDG_DATA_HOME, XDG_CACHE_HOME: process.env.XDG_CACHE_HOME,
+    GIT_CONFIG_NOSYSTEM: "1", LANG: "C", NO_COLOR: "1",
+  };
+  const child = spawn(process.execPath, [worker], { env, stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "", stderr = "", supervisorExpired = false, cleanupError: string | null = null;
+  child.stdout.on("data", (bytes: Buffer) => { stdout += bytes; });
+  child.stderr.on("data", (bytes: Buffer) => { stderr += bytes; });
+  let emergency: ReturnType<typeof setTimeout> | undefined;
+  const supervisor = setTimeout(() => {
+    supervisorExpired = true;
+    try {
+      const pending = JSON.parse(readFileSync(pendingPath, "utf8")) as { pid: number; parentPid: number; site: string };
+      if (pending.parentPid !== child.pid || pending.site !== site || !Number.isInteger(pending.pid) || pending.pid <= 1) {
+        throw new Error("owned Git child identity did not match the supervised resolver");
+      }
+      // Only the direct fixture child recorded by our fake Git is signalled; its sync parent reaps it normally.
+      process.kill(pending.pid, "SIGKILL");
+    } catch (error) {
+      cleanupError = String(error);
+    }
+    emergency = setTimeout(() => { child.kill("SIGKILL"); }, 5000);
+  }, 15000);
+  let exit: { code: number | null; signal: NodeJS.Signals | null };
+  try {
+    exit = await new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code, signal) => resolve({ code, signal }));
+    });
+  } finally {
+    clearTimeout(supervisor);
+    if (emergency) clearTimeout(emergency);
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  }
+  const calls = existsSync(callsPath)
+    ? readFileSync(callsPath, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as { site: string; pid: number })
+    : [];
+  const childrenGone = calls.every(({ pid }) => {
+    try { process.kill(pid, 0); return false; }
+    catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+  });
+  const result: unknown = stdout.trim() ? JSON.parse(stdout) : null;
+  return { ...exit, stdout, stderr, supervisorExpired, cleanupError, childrenGone, calls, result };
+}
+
+describe.skipIf(process.platform === "win32")("catalog Git read deadlines with owned local processes", () => {
+  it("reads the catalog without refreshing stale Git index metadata", () => {
+    const f = fixture(["known"]);
+    writeSkill(f.catalog, "known");
+    commit(f.root);
+    const index = join(f.root, ".git", "index");
+    const before = readFileSync(index);
+    utimesSync(join(f.catalog, "known", "SKILL.md"), 1, 1);
+
+    expect(resolveSkillLoadout({ catalogRoot: f.catalog })).toMatchObject({ ok: true, loadout: { entries: [{ id: "known" }] } });
+    expect(readFileSync(index).equals(before)).toBe(true);
+  });
+
+  it.each([
+    ["normal", "show"], ["missing", "root"],
+    ...(["root", "status", "head", "show"] as const).map((site) => ["error", site] as const),
+    ...(["root", "status", "head", "show"] as const).map((site) => ["hang", site] as const),
+  ] as ReadonlyArray<readonly [GitFixtureMode, GitRead]>)("%s Git at %s finishes before external cleanup and keeps catalog/target state", async (mode, site) => {
+    const f = fixture([]);
+    writeSkill(f.catalog, "known");
+    writeSkill(f.catalog, "folder-alias", "committed-name");
+    const userFile = join(f.project, "operator-note");
+    writeFileSync(userFile, "keep this exact user content\n", { mode: 0o640 });
+    const revision = commit(f.root);
+    writeSkill(f.catalog, "folder-alias", "working-name", "# uncommitted rename\n");
+    const beforeCatalog = treeBytes(f.catalog), beforeTarget = treeBytes(f.project);
+    const beforeStatus = git(f.root, "status", "--porcelain=v1", "--", "skills");
+    const observed = await catalogWithSupervisedGit(f, mode, site);
+    expect(observed.cleanupError).toBeNull();
+    expect(observed.childrenGone, "the fixture Git children must be reaped before deleting scratch").toBe(true);
+    expect(treeBytes(f.catalog)).toEqual(beforeCatalog);
+    expect(treeBytes(f.project)).toEqual(beforeTarget);
+    expect(git(f.root, "status", "--porcelain=v1", "--", "skills")).toBe(beforeStatus);
+    expect(git(f.root, "rev-parse", "HEAD")).toBe(revision);
+    console.info("ISSUE161_GIT_READ", { mode, site, ...observed });
+    // This is a completion/failure contract, not a wall-clock performance assertion or an option-value check.
+    expect(observed.supervisorExpired, "catalog Git must end on its own deadline, before the outside supervisor cleans it up").toBe(false);
+    expect(observed).toMatchObject({ code: 0, signal: null });
+    expect(observed.stderr).toBe(mode === "error" && site !== "show" ? `fixture git refused ${site}\n` : "");
+    if (mode !== "missing") expect(observed.calls.some((call) => call.site === site)).toBe(true);
+    if (mode === "normal") {
+      expect(observed.result).toMatchObject({ ok: true, loadout: { catalogRevision: revision,
+        entries: [{ id: "known" }], skipped: [expect.objectContaining({ id: "committed-name", selectedBy: ["project"] })] } });
+    } else if (site === "show") {
+      // An unreadable committed name stays unknown, rather than pretending the selected old name is clean.
+      expect(observed.result).toMatchObject({ ok: false, errors: [{ code: "selected_skill_missing" }] });
+    } else {
+      expect(observed.result).toMatchObject({ ok: false, errors: [{ code: "catalog_unavailable" }] });
+      if (site === "root") expect(observed.result).toMatchObject({ errors: [expect.objectContaining({ message: expect.stringContaining("not inside a readable Git repository") })] });
+      if (mode === "error" && site !== "root") expect(observed.result).toMatchObject({ errors: [expect.objectContaining({ message: expect.stringContaining(`fixture git refused ${site}`) })] });
+    }
+  }, 30000);
+});
+
+describe.skipIf(process.platform === "win32")("skill projection Git deadlines", () => {
+  it.each(["projection-root", "check-ignore", "ls-files"] as const)("returns a failed projection without changing the checkout when %s ignores SIGTERM", async (site) => {
+    const f = fixture([]);
+    writeSkill(f.catalog, "known");
+    writeFileSync(join(f.project, "operator-note"), "keep this exact user content\n", { mode: 0o640 });
+    commit(f.root);
+    const selected = resolveSkillLoadout({ catalogRoot: f.catalog, projectSkills: ["known"] });
+    if (!selected.ok) throw new Error("expected the fixture catalog to resolve");
+    const before = treeBytes(f.project);
+    const observed = await catalogWithSupervisedGit(f, "ignore-term", site, selected.loadout);
+    expect(observed.calls.some((call) => call.site === site)).toBe(true);
+    expect(observed.cleanupError).toBeNull();
+    expect(observed.childrenGone).toBe(true);
+    expect(observed.supervisorExpired, "the projection must return before the outside supervisor cleans up Git").toBe(false);
+    expect(observed).toMatchObject({
+      code: 0,
+      signal: null,
+      result: { ok: false, applied: false, errors: [{ code: "git_exclusion_failed", message: expect.stringContaining("ETIMEDOUT") }] },
+    });
+    expect(treeBytes(f.project)).toEqual(before);
+  }, 30000);
 });
 
 describe("managed skill catalog and composable loadouts", () => {
@@ -90,18 +273,185 @@ describe("managed skill catalog and composable loadouts", () => {
     expect(result.loadout.entries.every((entry) => entry.sourceRoot === f.catalog)).toBe(true);
   });
 
-  it("refuses a dirty catalog revision and a missing selected identity without projecting", () => {
+  it("skips a skill with uncommitted content by itself, names it, and still projects its clean sibling", () => {
+    const f = fixture([]);
+    writeSkill(f.catalog, "known");
+    writeSkill(f.catalog, "edited");
+    const revision = commit(f.root);
+    writeFileSync(join(f.catalog, "edited", "SKILL.md"), "---\nname: edited\ndescription: Use when testing edited.\n---\n\n# work in progress\n");
+
+    const result = resolveSkillLoadout({ catalogRoot: f.catalog, projectSkills: ["known"] });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.loadout.catalogRevision).toBe(revision);
+    expect(result.loadout.entries.map((entry) => entry.id)).toEqual(["known"]);
+    expect(result.loadout.skipped).toEqual([{
+      id: "edited",
+      sourceDir: join(f.catalog, "edited"),
+      selectedBy: [],
+      message: `catalog_skill_skipped: 'edited' has uncommitted content at ${join(f.catalog, "edited")}; commit or restore it`,
+    }]);
+  });
+
+  it("fails only a selected dirty skill, naming who selected it, while the other selected skills resolve", () => {
+    const f = fixture(["known"]);
+    writeSkill(f.catalog, "known");
+    writeSkill(f.catalog, "edited");
+    commit(f.root);
+    writeFileSync(join(f.catalog, "edited", "notes.md"), "untracked work in progress\n");
+
+    const result = resolveSkillLoadout({ catalogRoot: f.catalog, projectSkills: ["edited"] });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.loadout.entries.map((entry) => [entry.id, entry.selectedBy])).toEqual([["known", ["system"]]]);
+    expect(result.loadout.skipped).toHaveLength(1);
+    expect(result.loadout.skipped![0]).toMatchObject({ id: "edited", selectedBy: ["project"] });
+    expect(result.loadout.skipped![0]!.message).toMatch(/^selected_skill_skipped: 'edited' \(selected by project\) has uncommitted content at .*edited; a copy already projected is kept as it was/);
+  });
+
+  it("keeps a clean catalog unchanged and still reports a missing selected identity", () => {
+    const f = fixture([]);
+    writeSkill(f.catalog, "known");
+    const revision = commit(f.root);
+    const clean = resolveSkillLoadout({ catalogRoot: f.catalog, projectSkills: ["known"] });
+    expect(clean.ok).toBe(true);
+    if (!clean.ok) return;
+    expect(clean.loadout.catalogRevision).toBe(revision);
+    expect(clean.loadout.skipped).toBeUndefined();
+
+    const missing = resolveSkillLoadout({ catalogRoot: f.catalog, projectSkills: ["absent"] });
+    expect(missing).toMatchObject({ ok: false, errors: [{ code: "selected_skill_missing" }] });
+  });
+
+  it("keeps uncommitted content in the catalog root catalog-wide, because catalog.yaml changes every selection", () => {
     const f = fixture([]);
     writeSkill(f.catalog, "known");
     commit(f.root);
-    writeFileSync(join(f.catalog, "known", "SKILL.md"), "dirty\n");
+    writeFileSync(join(f.catalog, "catalog.yaml"), "schema: openrig.skill-catalog/v1\nsystem: [known]\n");
     const dirty = resolveSkillLoadout({ catalogRoot: f.catalog, projectSkills: ["known"] });
     expect(dirty).toMatchObject({ ok: false, errors: [{ code: "catalog_unavailable" }] });
-    if (!dirty.ok) expect(dirty.errors[0]!.message).toMatch(/uncommitted/);
+    if (!dirty.ok) expect(dirty.errors[0]!.message).toContain(join(f.catalog, "catalog.yaml"));
+  });
 
-    git(f.root, "restore", "skills/known/SKILL.md");
-    const missing = resolveSkillLoadout({ catalogRoot: f.catalog, projectSkills: ["absent"] });
-    expect(missing).toMatchObject({ ok: false, errors: [{ code: "selected_skill_missing" }] });
+  it("ignores a dirty folder that is not a skill, and names a committed skill whose folder was deleted", () => {
+    const f = fixture([]);
+    writeSkill(f.catalog, "known");
+    writeSkill(f.catalog, "removed");
+    commit(f.root);
+    mkdirSync(join(f.catalog, "scratch"));
+    writeFileSync(join(f.catalog, "scratch", "draft.md"), "not a skill\n");
+    rmSync(join(f.catalog, "removed"), { recursive: true });
+
+    const result = resolveSkillLoadout({ catalogRoot: f.catalog, projectSkills: ["known", "removed"] });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.loadout.entries.map((entry) => entry.id)).toEqual(["known"]);
+    expect(result.loadout.skipped!.map((skip) => [skip.id, skip.selectedBy])).toEqual([["removed", ["project"]]]);
+  });
+
+  it("keeps a selected skill's projected copy while its catalog content is uncommitted, and refreshes it after commit", () => {
+    const f = fixture([]);
+    writeSkill(f.catalog, "known");
+    writeSkill(f.catalog, "edited");
+    commit(f.root);
+    const first = resolveSkillLoadout({ catalogRoot: f.catalog, projectSkills: ["known", "edited"] });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    expect(reconcileSkillLoadout({ loadout: first.loadout, runtime: "codex", cwd: f.project, apply: true }).ok).toBe(true);
+    const target = join(f.project, ".agents", "skills", "edited");
+    const projected = readFileSync(join(target, "SKILL.md"), "utf8");
+
+    writeFileSync(join(f.catalog, "edited", "SKILL.md"), "---\nname: edited\ndescription: Use when testing edited.\n---\n\n# draft\n");
+    const dirty = resolveSkillLoadout({ catalogRoot: f.catalog, projectSkills: ["known", "edited"] });
+    expect(dirty.ok).toBe(true);
+    if (!dirty.ok) return;
+    const kept = reconcileSkillLoadout({ loadout: dirty.loadout, runtime: "codex", cwd: f.project, apply: true });
+    expect(kept).toMatchObject({ ok: true, removed: [] });
+    expect(kept.receipts.find((receipt) => receipt.id === "edited")?.status).toBe("current");
+    expect(readFileSync(join(target, "SKILL.md"), "utf8")).toBe(projected);
+
+    commit(f.root);
+    const committed = resolveSkillLoadout({ catalogRoot: f.catalog, projectSkills: ["known", "edited"] });
+    expect(committed.ok).toBe(true);
+    if (!committed.ok) return;
+    expect(reconcileSkillLoadout({ loadout: committed.loadout, runtime: "codex", cwd: f.project, apply: true }).ok).toBe(true);
+    expect(readFileSync(join(target, "SKILL.md"), "utf8")).toContain("# draft");
+  });
+
+  it("projects the rest when a selected skill was never projected and is now uncommitted", () => {
+    const f = fixture([]);
+    writeSkill(f.catalog, "known");
+    writeSkill(f.catalog, "edited");
+    commit(f.root);
+    writeFileSync(join(f.catalog, "edited", "extra.md"), "untracked\n");
+    const dirty = resolveSkillLoadout({ catalogRoot: f.catalog, projectSkills: ["known", "edited"] });
+    expect(dirty.ok).toBe(true);
+    if (!dirty.ok) return;
+    const projection = reconcileSkillLoadout({ loadout: dirty.loadout, runtime: "codex", cwd: f.project, apply: true });
+    expect(projection.ok).toBe(true);
+    expect(existsSync(join(f.project, ".agents", "skills", "known", "SKILL.md"))).toBe(true);
+    expect(existsSync(join(f.project, ".agents", "skills", "edited"))).toBe(false);
+  });
+
+  it.each(["folder", "SKILL.md", "frontmatter name"] as const)(
+    "finds a dirty skill by its committed name after its %s is deleted or renamed, in a folder named otherwise",
+    (change) => {
+      const f = fixture([]);
+      writeSkill(f.catalog, "known");
+      writeSkill(f.catalog, "folder alias", "edited");
+      commit(f.root);
+      const dir = join(f.catalog, "folder alias");
+      if (change === "folder") rmSync(dir, { recursive: true });
+      else if (change === "SKILL.md") rmSync(join(dir, "SKILL.md"));
+      else writeSkill(f.catalog, "folder alias", "renamed");
+
+      const result = resolveSkillLoadout({ catalogRoot: f.catalog, projectSkills: ["known", "edited"] });
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.loadout.entries.map((entry) => entry.id)).toEqual(["known"]);
+      expect(result.loadout.skipped!.map((skip) => [skip.id, skip.sourceDir, skip.selectedBy])).toEqual([["edited", dir, ["project"]]]);
+    },
+  );
+
+  it("marks both skills dirty for a staged move between them, with spaces in the paths", () => {
+    const f = fixture([]);
+    writeSkill(f.catalog, "known");
+    writeSkill(f.catalog, "from skill", "from");
+    writeSkill(f.catalog, "to skill", "to");
+    writeFileSync(join(f.catalog, "from skill", "old name.md"), "helper\n");
+    commit(f.root);
+    git(f.root, "mv", "skills/from skill/old name.md", "skills/to skill/new name.md");
+
+    const result = resolveSkillLoadout({ catalogRoot: f.catalog, projectSkills: ["known", "from", "to"] });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.loadout.entries.map((entry) => entry.id)).toEqual(["known"]);
+    expect(result.loadout.skipped!.map((skip) => [skip.id, skip.sourceDir])).toEqual([
+      ["from", join(f.catalog, "from skill")],
+      ["to", join(f.catalog, "to skill")],
+    ]);
+  });
+
+  it("keeps one owner's selection and kept copy when another owner reconciles the same cwd", () => {
+    const f = fixture([]);
+    writeSkill(f.catalog, "known");
+    writeSkill(f.catalog, "edited");
+    commit(f.root);
+    const reconcile = (owner: string, topologySkills: string[]) => {
+      const resolved = resolveSkillLoadout({ catalogRoot: f.catalog, topologySkills });
+      if (!resolved.ok) throw new Error(JSON.stringify(resolved.errors));
+      return reconcileSkillLoadout({ loadout: resolved.loadout, runtime: "codex", cwd: f.project, topologyOwner: owner, apply: true });
+    };
+    expect(reconcile("a@rig", ["edited"]).ok).toBe(true);
+    const target = join(f.project, ".agents", "skills", "edited", "SKILL.md");
+    const projected = readFileSync(target, "utf8");
+
+    writeFileSync(join(f.catalog, "edited", "SKILL.md"), "---\nname: edited\ndescription: Use when testing edited.\n---\n\n# draft\n");
+    expect(reconcile("a@rig", ["edited"]).ok).toBe(true);
+    const other = reconcile("b@rig", ["known"]);
+    expect(other).toMatchObject({ ok: true, removed: [] });
+    expect(readFileSync(target, "utf8")).toBe(projected);
+    expect(JSON.parse(readFileSync(other.manifestPath, "utf8")).topologySelections).toEqual({ "a@rig": ["edited"], "b@rig": ["known"] });
   });
 
   it("reports duplicate catalog identities explicitly", () => {
@@ -607,6 +957,24 @@ describe("plugin skills in the managed loadout", () => {
     expect(resolvePluginSkills({ pluginId: "core", pluginRoot: plugin, runtime: "claude-code", pluginType: "codex" }).entries).toEqual([]);
   });
 
+  it.each(["claude-code", "codex"] as const)("loads a CRLF plugin skill with realistic multiline frontmatter for %s", (runtime) => {
+    const f = fixture([]);
+    const plugin = writePlugin(f.root, [".claude-plugin", ".codex-plugin"], ["applying-a-permission-policy"]);
+    const file = join(plugin, "skills", "applying-a-permission-policy", "SKILL.md");
+    const original = readFileSync(new URL("../assets/plugins/openrig-core/skills/applying-a-permission-policy/SKILL.md", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+    const resolve = () => resolvePluginSkills({ pluginId: "core", pluginRoot: plugin, runtime });
+    writeFileSync(file, original, "utf8");
+    expect(resolve().entries.map((entry) => entry.id)).toEqual(["applying-a-permission-policy"]);
+    writeFileSync(file, original.replace(/\n/g, "\r\n"), "utf8");
+    const crlf = resolve();
+    expect(crlf.warnings).toEqual([]);
+    expect(crlf.entries.map((entry) => entry.id)).toEqual(["applying-a-permission-policy"]);
+    const result = reconcileSkillLoadout({ loadout: loadoutOf(crlf.entries, f.root), runtime, cwd: f.project, topologyOwner: "seat-a", apply: true });
+    expect(result).toMatchObject({ ok: true, applied: true });
+    const harness = runtime === "codex" ? ".agents" : ".claude";
+    expect(readFileSync(join(f.project, harness, "skills", "applying-a-permission-policy", "SKILL.md"), "utf8")).toBe(original.replace(/\n/g, "\r\n"));
+  });
+
   it("skips a plugin skill it cannot copy exactly and says why", () => {
     const f = fixture([]);
     const plugin = writePlugin(f.root, [".claude-plugin"], ["good", "linked"]);
@@ -842,5 +1210,45 @@ describe("plugin skills in the managed loadout", () => {
     const result = resolvePluginSkills({ pluginId: "core", pluginRoot: plugin, runtime: "claude-code" });
     expect(result.entries).toEqual([]);
     expect(result.warnings).toEqual([expect.stringMatching(/^plugin_skill_skipped: plugin core skills at .*skills\.md/)]);
+  });
+});
+
+// #875 — a Claude team seat keeps its loadout in its own storage under the OpenRig home.
+describe("skill loadout kept outside the cwd", () => {
+  it("projects into the given location, records plugin-qualified names and leaves the checkout clean", () => {
+    const f = fixture();
+    writeSkill(f.catalog, "review");
+    writeSkill(f.catalog, "kickoff");
+    commit(f.root);
+    const seatRoot = join(f.root, "openrig-home", "state", "claude-seats", "dev-impl@rig");
+    const location = {
+      targetRoot: join(seatRoot, "plugin", "skills"),
+      manifestPath: join(seatRoot, "skill-loadout.json"),
+      qualifiedName: (id: string) => `openrig:${id}`,
+    };
+    const resolved = resolveSkillLoadout({ catalogRoot: f.catalog, topologySkills: ["review", "kickoff"] });
+    expect(resolved.ok).toBe(true);
+    if (!resolved.ok) return;
+
+    const applied = reconcileSkillLoadout({ loadout: resolved.loadout, runtime: "claude-code", cwd: f.project, apply: true, topologyOwner: "dev-impl@rig", location });
+    expect(applied.ok).toBe(true);
+    expect(applied.targetRoot).toBe(location.targetRoot);
+    expect(readFileSync(join(location.targetRoot, "review", "SKILL.md"), "utf8")).toContain("name: review");
+    const manifest = JSON.parse(readFileSync(location.manifestPath, "utf8")) as { skills: Array<{ id: string; qualifiedName?: string }> };
+    expect(manifest.skills.map((skill) => [skill.id, skill.qualifiedName])).toEqual([
+      ["kickoff", "openrig:kickoff"],
+      ["review", "openrig:review"],
+    ]);
+    expect(readdirSync(f.project)).toEqual([]);
+    expect(git(f.root, "status", "--porcelain", "--", "project")).toBe("");
+
+    const again = reconcileSkillLoadout({ loadout: resolved.loadout, runtime: "claude-code", cwd: f.project, apply: true, topologyOwner: "dev-impl@rig", location });
+    expect(again).toMatchObject({ ok: true, applied: false });
+
+    const narrowed = resolveSkillLoadout({ catalogRoot: f.catalog, topologySkills: ["review"] });
+    if (!narrowed.ok) throw new Error("narrowed loadout did not resolve");
+    const removed = reconcileSkillLoadout({ loadout: narrowed.loadout, runtime: "claude-code", cwd: f.project, apply: true, topologyOwner: "dev-impl@rig", location });
+    expect(removed.removed).toEqual(["kickoff"]);
+    expect(existsSync(join(location.targetRoot, "kickoff"))).toBe(false);
   });
 });

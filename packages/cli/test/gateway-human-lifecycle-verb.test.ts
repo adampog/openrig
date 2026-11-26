@@ -7,6 +7,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { createProgram } from "../src/index.js";
 import { gatewayCommand, daemonQueueRows, type HumanRowsLookup } from "../src/commands/gateway.js";
 import { humansDir, addHumanFragment, loadHumanRegistry } from "@openrig/daemon/gateway-human-registry";
+import { parse as parseYaml } from "yaml";
 
 // OPR.0.5.5.12 — `rig gateway human list|show|set|remove` verb wiring. Same harness as the
 // add-verb test: temp OPENRIG_HOME, real command end-to-end, fs effects asserted at source.
@@ -25,8 +26,7 @@ async function runAdd(name: string, extra: string[] = []): Promise<void> {
   ]);
 }
 
-/** The hand-authoring path (registry surface, not the verb) — how a second fragment
- *  legitimately comes to exist under A1. */
+/** A second person through the registry surface, without the verb. */
 function seedSecondHuman(name: string): void {
   const res = addHumanFragment({
     entityId: name,
@@ -131,6 +131,12 @@ describe("rig gateway human lifecycle verbs (S12)", () => {
     let body: unknown;
     let requests = 0;
     const server = createServer((req, res) => {
+      // `list` also reads the person's quiet hours; that route isn't under test here.
+      if (req.url === "/api/gateway/human/mike/quiet") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, window: null, state: { active: false, nextBoundary: null } }));
+        return;
+      }
       expect(req.url).toBe("/api/gateway/human/mike/readiness");
       requests++;
       res.writeHead(status, { "content-type": "application/json" });
@@ -182,9 +188,7 @@ describe("rig gateway human lifecycle verbs (S12)", () => {
     }
   });
 
-  it("A1 advisory receipt: with several hand-authored fragments list --json renders all + the one-human advisory", async () => {
-    // Fix-r1 F1: the SECOND human arrives by hand-authoring (the registry surface), never
-    // through the add verb — the verb is the single-human boundary.
+  it("with several people, list --json renders all of them, with no single-person advisory", async () => {
     seedSecondHuman("ana");
     logSpy.mockClear();
     const p = program();
@@ -192,8 +196,8 @@ describe("rig gateway human lifecycle verbs (S12)", () => {
     await p.parseAsync(["node", "rig", "gateway", "human", "list", "--json"]);
     const out = JSON.parse(logSpy.mock.calls.at(-1)![0] as string) as { ok: boolean; humans: unknown[]; advisory?: string };
     expect(out.ok).toBe(true);
-    expect(out.humans).toHaveLength(2); // honest display
-    expect(out.advisory).toContain("one configured human"); // never a management surface
+    expect(out.humans).toHaveLength(2);
+    expect(out).not.toHaveProperty("advisory");
   });
 
   it("show --json carries authored-vs-default provenance and the fragment path", async () => {
@@ -215,6 +219,89 @@ describe("rig gateway human lifecycle verbs (S12)", () => {
     const loaded = loadHumanRegistry(home);
     expect(loaded.ok).toBe(true);
     if (loaded.ok) expect(loaded.entities[0]!.prefs.deliveryClass).toBe("D");
+  });
+
+  it("set binding.<n> unset refuses primary removal when secondary bindings exist, then unsets secondary and sole primary with remainingBindings + note", async () => {
+    const addRes = addHumanFragment(
+      {
+        entityId: "ana",
+        class: "human",
+        displayName: "Ana",
+        address: "ana@external",
+        connectorBindings: [
+          { kind: "slack", connectorRef: "main", secretsRef: "vault://slack/ana-secret", role: "primary", handle: "U0ANA" },
+          { kind: "slack", connectorRef: "backup", secretsRef: "vault://slack/ana-backup-secret", role: "secondary" },
+        ],
+        prefs: { deliveryClass: "A" },
+      },
+      home,
+    );
+    expect(addRes.ok).toBe(true);
+
+    // 1. Refuse unsetting primary binding.0 while binding.1 remains
+    errSpy.mockClear();
+    const p1 = program();
+    p1.exitOverride();
+    await p1.parseAsync(["node", "rig", "gateway", "human", "set", "ana", "binding.0", "unset", "--reason", "try remove primary"]);
+    expect(process.exitCode).toBe(1);
+    const refusal = errSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(refusal).toContain("no replacement is chosen silently");
+    expect(refusal).toContain('To replace the primary, set binding.0 to the new primary spec: rig gateway human set ana binding.0 "<kind:connectorRef:secretsRef:primary[:handle=<id>]>"');
+    expect(refusal).toContain("To promote one of the other bindings (binding.1), first save that binding's full spec (kind:connectorRef:secretsRef:role[:handle=<id>]) from rig gateway human show ana --json, then unset that secondary slot, then find the primary's current slot in remainingBindings (or rig gateway human show ana --json, since unsetting a lower slot shifts the primary down) and set it to the saved spec with role primary (promotion replaces the former primary binding; its connector reference and inbound handle are not retained as a secondary).");
+    expect(refusal).toContain("To remove every binding, unset the secondary bindings first using their current slot indexes from remainingBindings or rig gateway human show ana, then finish at binding.0 (once all secondaries are gone, the primary is at binding.0).");
+    expect(refusal).not.toContain("--replace");
+
+    // 2. Unset secondary binding.1 -> succeeds, prints remainingBindings[0] = binding.0 and note without secrets
+    process.exitCode = undefined;
+    logSpy.mockClear();
+    const p2 = program();
+    p2.exitOverride();
+    await p2.parseAsync(["node", "rig", "gateway", "human", "set", "ana", "binding.1", "unset", "--reason", "drop backup binding"]);
+    expect(process.exitCode).toBeUndefined();
+    const out1Raw = logSpy.mock.calls.at(-1)![0] as string;
+    expect(out1Raw).not.toContain("ana-secret");
+    const out1 = JSON.parse(out1Raw) as {
+      ok: boolean;
+      entityId: string;
+      field: string;
+      receipt: { effect: string };
+      remainingBindings: Array<Record<string, unknown>>;
+      note: string;
+    };
+    expect(out1.ok).toBe(true);
+    expect(out1.entityId).toBe("ana");
+    expect(out1.field).toBe("binding.1");
+    expect(out1.receipt.effect).toBe("applied");
+    expect(out1.remainingBindings).toEqual([
+      { slot: "binding.0", kind: "slack", connectorRef: "main", role: "primary", handle: "U0ANA", inboundResolvable: true },
+    ]);
+    expect(out1.note).toContain("Remaining binding(s): binding.0: slack:main role=primary handle=U0ANA");
+    expect(out1.note).toContain("Binding slot indexes shift after removal");
+
+    // 3. Unset sole remaining primary binding.0 -> succeeds, leaves connectorBindings: []
+    logSpy.mockClear();
+    const p3 = program();
+    p3.exitOverride();
+    await p3.parseAsync(["node", "rig", "gateway", "human", "set", "ana", "binding.0", "unset", "--reason", "remove last binding"]);
+    expect(process.exitCode).toBeUndefined();
+    const out2 = JSON.parse(logSpy.mock.calls.at(-1)![0] as string) as {
+      ok: boolean;
+      remainingBindings: unknown[];
+      note: string;
+    };
+    expect(out2.ok).toBe(true);
+    expect(out2.remainingBindings).toEqual([]);
+    expect(out2.note).toContain("Remaining bindings: none");
+    expect(out2.note).toContain("Removing the last binding makes the current delivery episode inactive, so new missing-post findings stop (an already-open recovery item for an undelivered notice may remain)");
+    expect(out2.note).toContain("It does not answer, close or cancel open questions, cancel or reroute already-prepared deliveries, or retract anything a bridge has already accepted");
+
+    const loaded = loadHumanRegistry(home);
+    expect(loaded.ok).toBe(true);
+    if (loaded.ok) {
+      const ana = loaded.entities.find((e) => e.entityId === "ana")!;
+      expect(ana.connectorBindings).toEqual([]);
+      expect(ana.prefs.deliveryClass).toBe("A");
+    }
   });
 
   it("set with a bad enum exits 1 and names the allowed set", async () => {
@@ -255,28 +342,41 @@ describe("rig gateway human lifecycle verbs (S12)", () => {
     expect(existsSync(join(humansDir(home), "mike.yaml"))).toBe(true);
   });
 
-  // ── fix-r1 F1: the add verb IS the single-human boundary ──
+  // ── 0.7.3 participants: several people, organizations, groups, policy, shared channels and the default ──
 
-  it("F1: a second DISTINCT add REFUSES with teaching (existing human named, remove and hand-authoring pointed at) and writes ZERO fragment bytes", async () => {
-    const dirBefore = readdirSync(humansDir(home)).sort();
+  it("registers a second person in an organization and group as the default, and a shared channel; fragments keep v0.7.0's keys", async () => {
     const mikeBytes = readFileSync(join(humansDir(home), "mike.yaml"), "utf8");
+    const run = async (...args: string[]) => { const p = program(); p.exitOverride(); await p.parseAsync(["node", "rig", "gateway", ...args]); };
+    await run("org", "set", "acme", "--name", "Acme", "--policy", "Answer within a working day.");
+    await run("group", "set", "support", "--organization", "acme", "--name", "Support");
+    await run("human", "add", "ana", "--display-name", "Ana", "--binding", "slack:main:vault://slack/ana:primary",
+      "--delivery-class", "A", "--organization", "acme", "--group", "support", "--policy", "Ana approves refunds.", "--default");
+    await run("channel", "add", "acme-customers", "--display-name", "Acme customers", "--binding", "slack:main:vault://slack/bot:C0ACME",
+      "--organization", "acme");
+    expect(process.exitCode).toBeUndefined();
+    logSpy.mockClear();
+    await run("participants", "--json");
+    const out = JSON.parse(logSpy.mock.calls.at(-1)![0] as string) as { participants: Array<Record<string, any>>; default: { id: string } };
+    // Sorted by id, people and channels together.
+    expect(out.participants.map((p) => [p.id, p.kind])).toEqual([["acme-customers", "shared-channel"], ["ana", "person"], ["mike", "person"]]);
+    expect(out.default).toMatchObject({ id: "ana", source: "chosen" });
+    const ana = out.participants.find((p) => p.id === "ana")!;
+    expect(ana.policy.map((part: { source: string }) => part.source)).toEqual(["organization acme (Acme)", "participant"]);
+    // Nothing new went into a person's fragment: mike's is byte-identical, ana's carries v0.7.0's keys only.
+    expect(readFileSync(join(humansDir(home), "mike.yaml"), "utf8")).toBe(mikeBytes);
+    expect(Object.keys(parseYaml(readFileSync(join(humansDir(home), "ana.yaml"), "utf8")) as object).sort())
+      .toEqual(["address", "class", "connectorBindings", "displayName", "entityId", "prefs"]);
+  });
+
+  it("refuses a person in an organization that doesn't exist, before writing their fragment", async () => {
+    const dirBefore = readdirSync(humansDir(home)).sort();
     const p = program();
     p.exitOverride();
-    try { await p.parseAsync([
-      "node", "rig", "gateway", "human", "add", "ana",
-      "--display-name", "Ana",
-      "--binding", "slack:main:vault://slack/ana:primary",
-      "--delivery-class", "A",
-    ]); } catch { /* exitCode path */ }
+    try { await p.parseAsync(["node", "rig", "gateway", "human", "add", "ana", "--display-name", "Ana",
+      "--binding", "slack:main:vault://slack/ana:primary", "--delivery-class", "A", "--organization", "nope"]); } catch { /* exitCode path */ }
     expect(process.exitCode).toBe(1);
-    const err = errSpy.mock.calls.map((c) => String(c[0])).join("\n");
-    expect(err).toContain("mike");        // the existing human, named
-    expect(err).toContain("gateway human remove"); // how to register someone else
-    expect(err).not.toMatch(/\d+\.\d+\.\d+/);     // no promise of a release that manages several
-    expect(err).toContain("hand-author"); // the sanctioned several-fragment path
-    // Zero new fragment bytes: directory unchanged, existing fragment byte-identical.
+    expect(errSpy.mock.calls.map((c) => String(c[0])).join("\n")).toContain('no organization "nope"');
     expect(readdirSync(humansDir(home)).sort()).toEqual(dirBefore);
-    expect(readFileSync(join(humansDir(home), "mike.yaml"), "utf8")).toBe(mikeBytes);
   });
 
   it("F1 companion: re-add of the SAME human with --replace stays allowed (boundary blocks distinct humans only)", async () => {

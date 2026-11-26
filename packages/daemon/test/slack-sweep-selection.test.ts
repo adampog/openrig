@@ -9,11 +9,13 @@ import { EventBus } from "../src/domain/event-bus.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
 import { makeQueuePorts, seedBacklogAsHistory } from "../src/domain/gateway/slack/queue-access.js";
 import { SlackOutboundDriver } from "../src/domain/gateway/slack/outbound-driver.js";
+import { buildOutboundMessage } from "../src/domain/gateway/slack/message.js";
 import { SeenStore } from "../src/domain/gateway/slack/state-store.js";
 import { DispatchBuffer } from "../src/domain/gateway/dispatch-buffer.js";
 
 const registry = { ok: true as const, entities: [{ entityId: "human-owner", class: "human" as const,
-  displayName: "Owner", address: "human-owner@external", connectorBindings: [], prefs: {} }] };
+  displayName: "Owner", address: "human-owner@external",
+  connectorBindings: [{ kind: "slack", connectorRef: "primary", secretsRef: "unused", role: "primary" }], prefs: {} }] };
 const questions = [{ id: "continue", question: "Continue?", options: [{ id: "yes", label: "Yes" }, { id: "no", label: "No" }] }];
 
 describe("Slack sweep selection", () => {
@@ -91,9 +93,27 @@ describe("Slack sweep selection", () => {
     expect((await ports().listHumanAlerts({})).map(q => q.notificationKey)).toEqual([newer]);
   });
 
+  it("counts marked receipts for their exact episode without changing their kind", async () => {
+    // Given an active episode recorded as marked, not posted.
+    row("marked"); const key = notify("marked");
+    repo.update({ qitemId: "marked", actorSession: "daemon@kernel",
+      transitionNote: `slack-owner-notification-marked notification_key=${key} reason=identical-content kind=human-required message_ts=1.1` });
+    // When receipt readers select the episode.
+    expect(repo.transitionLog.getOwnerNotificationReceipt("marked", key)?.messageTs).toBe("1.1");
+    expect(repo.transitionLog.getOwnerNotificationReceipt("marked", `${key}0`)).toBeNull();
+    expect(repo.transitionLog.postedHumanAskIds()).toContain("marked");
+    expect(repo.transitionLog.activeOwnerNotificationEpisodes(true)).toMatchObject([{ qitemId: "marked", posted: true }]);
+    expect(await ports().listHumanAlerts({})).toEqual([]);
+    // Then a newer episode is still eligible.
+    const newer = notify("marked");
+    expect((await ports().listHumanAlerts({})).map((q) => q.notificationKey)).toEqual([newer]);
+  });
+
   it("keeps a legacy schema without owner classification quiet", async () => {
     row("legacy");
     for (const table of ["queue_transitions", "queue_transitions_archive"]) {
+      // The simulated pre-classification schema also predates its partial index.
+      db.exec(`DROP INDEX idx_${table}_owner_notification_qitem`);
       db.exec(`ALTER TABLE ${table} DROP COLUMN owner_notification_level; ALTER TABLE ${table} DROP COLUMN owner_notification_kind`);
     }
     repo = new QueueRepository(db, new EventBus(db), { loadHumanRegistry: () => registry });
@@ -107,12 +127,10 @@ describe("Slack sweep selection", () => {
     expect(await ports().listHumanAlerts({})).toEqual([]);
   });
 
-  it.each(["selection", "transition", "receipt", "row"])("propagates a thrown %s read instead of returning empty success", async (where) => {
+  it.each(["selection", "row"])("propagates a thrown %s read instead of returning empty success", async (where) => {
     row("unreadable"); notify("unreadable");
     const fail = () => { throw new Error("fixture read unavailable"); };
     if (where === "selection") vi.spyOn(db, "prepare").mockImplementation(fail);
-    if (where === "transition") vi.spyOn(repo.transitionLog, "latestOwnerNotificationForQitem").mockImplementation(fail);
-    if (where === "receipt") vi.spyOn(repo.transitionLog, "hasOwnerNotificationReceipt").mockImplementation(fail);
     if (where === "row") vi.spyOn(repo, "getById").mockImplementation(fail);
     await expect(ports().listHumanAlerts({})).rejects.toThrow("fixture read unavailable");
   });
@@ -151,5 +169,24 @@ describe("Slack sweep selection", () => {
     try { expect((await next.sweepOnce()).dispatched).toEqual([]); expect(dispatch).toHaveBeenCalledTimes(2); }
     finally { next.stop(); }
     expect(repo.transitionLog.hasOwnerNotificationReceipt("retry", key)).toBe(false);
+  });
+
+  it("#1013 — a gate parked on a human sweeps with state + gate tag, and its payload renders the question, not the packet", async () => {
+    row("gate", "blocked", "worker@rig");
+    db.prepare("UPDATE queue_items SET blocked_on='human-owner@kernel', tags=? WHERE qitem_id='gate'")
+      .run(JSON.stringify(["workflow", "gate", "workflow:mission"]));
+    db.prepare("UPDATE queue_items SET body=?, evidence_ref='https://example.invalid/plan.md' WHERE qitem_id='gate'").run(
+      "### Workflow gate: mission@1 step plan_signoff\n\nWorkflow instance: 01M4EXAMPLE\nContinuation: rig workflow project --instance 01M4EXAMPLE",
+    );
+    notify("gate");
+    const seen = new SeenStore(join(home, "seen"));
+    const dispatch = vi.fn(() => ({ ok: true as const, decisionId: "d" }));
+    expect((await new SlackOutboundDriver({ home, queue: ports(), seen, filter: {}, dispatch }).sweepOnce()).dispatched).toEqual(["gate"]);
+    const payload = dispatch.mock.calls[0]?.[2] as import("../src/domain/gateway/slack/outbound-driver.js").OutboundPostPayload;
+    expect(payload).toMatchObject({ state: "blocked", tags: ["workflow", "gate", "workflow:mission"], summary: "summary gate" });
+    const m = buildOutboundMessage(payload, { sourceLabel: "vm", evidenceLink: payload.evidenceRef! });
+    expect(m.text).toContain("*summary gate*");
+    expect(m.text).not.toContain("Workflow instance:");
+    expect(m.text).not.toContain("Continuation:");
   });
 });

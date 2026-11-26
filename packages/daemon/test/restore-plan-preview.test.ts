@@ -1,8 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { buildRestorePlanPreview, collectPreviewSessionRows, type PreviewSessionRow } from "../src/domain/restore-plan-preview.js";
+import { buildRestorePlanPreview, collectPreviewSessionRows, type PreviewSessionRow, type RestorePermissionSeat } from "../src/domain/restore-plan-preview.js";
 import type { RigWithRelations, Snapshot } from "../src/domain/types.js";
 import { createFullTestDb } from "./helpers/test-app.js";
 import { SessionRegistry } from "../src/domain/session-registry.js";
+import { planRestorePermission } from "../src/domain/permission-account.js";
 
 // OPR.0.4.3.20 FR-6 — restore-plan per-seat token state (read-only forecast).
 
@@ -34,6 +35,99 @@ const FRESH = "2026-07-02 11:59:00"; // 1 min ago (< 1h threshold)
 const OLD = "2026-07-02 10:00:00";   // 2h ago (> 1h threshold)
 
 describe("FR-6 restore-plan token state", () => {
+  it.each([
+    ["claude-code", "claude_id", false, "resume-original"],
+    ["claude-code", "claude_name", false, "resume-original"],
+    ["codex", "codex_id", false, "resume-original"],
+    ["codex", "codex_last", false, "resume-original"],
+    ["pi", "pi_session_file", false, "resume-original"],
+    ["omp", "omp_session_file", false, "resume-original"],
+    ["stub", "stub_id", false, "resume-original"],
+    ["stub", "stub_session", false, "resume-original"],
+    ["claude-code", "codex_id", false, "resume-original"],
+    ["codex", "claude_id", false, "resume-original"],
+    ["pi", "omp_session_file", false, "resume-original"],
+    ["omp", "pi_session_file", false, "resume-original"],
+    ["claude-code", "codex_id", true, "fresh-primed"],
+  ])("forecasts %s with %s and fresh=%s as %s", (runtime, resumeType, fresh, action) => {
+    const rig = rigWith([{ id: "n1", logicalId: "a", runtime }]);
+    const forecast = buildRestorePlanPreview(rig, null, [row("n1", { resumeType })], fresh ? ["a"] : undefined);
+    expect(forecast.nodes[0]!.intendedAction).toBe(action);
+  });
+
+  it.each([false, true])("saved startup mismatch refuses even with fresh=%s", (fresh) => {
+    const rig = rigWith([{ id: "n1", logicalId: "a", runtime: "claude-code" }]);
+    const rows = [row("n1", { resumeType: "codex_id" })];
+    const snapshot = { id: "snap", kind: "manual", createdAt: "now", data: {
+      sessions: rows, activeSessionIdByNode: { n1: "s-n1" },
+      nodeStartupContext: { n1: { runtime: "codex" } },
+    } } as unknown as Snapshot;
+    const result = buildRestorePlanPreview(rig, snapshot, rows, fresh ? ["a"] : undefined).nodes[0]!;
+    expect(result.intendedAction).toBe("awaiting-decision");
+    expect(result.reason).toBe("No session was started for this seat. Restore a snapshot whose saved startup runtime matches the seat's current runtime.");
+  });
+
+  it.each([undefined, null, { runtime: null }, { runtime: "claude-code" }])("does not refuse legacy token with missing, unknown, or matching startup context: %j", (context) => {
+    const rig = rigWith([{ id: "n1", logicalId: "a", runtime: "claude-code" }]);
+    const rows = [row("n1", { resumeType: "codex_id" })];
+    const snapshot = { id: "snap", kind: "manual", createdAt: "now", data: {
+      sessions: rows, activeSessionIdByNode: { n1: "s-n1" }, nodeStartupContext: { n1: context },
+    } } as unknown as Snapshot;
+    expect(buildRestorePlanPreview(rig, snapshot, rows).nodes[0]!.intendedAction).toBe("resume-original");
+  });
+
+  it.each([
+    [false, false, "tok"], [true, false, "tok"],
+    [false, true, "tok"], [true, true, "tok"],
+    [false, false, null], [true, false, null],
+    [false, true, null], [true, true, null],
+  ])("regrown snapshot history stays visible and mismatch is not fresh-able: fresh=%s legacy=%s token=%s", (fresh, legacy, token) => {
+    const rig = rigWith([{ id: "new-node", logicalId: "a", runtime: "codex" }]);
+    const rows = [row("old-node", { resumeToken: token })];
+    const data = {
+      nodes: [{ id: "old-node", logicalId: "a", runtime: "claude-code" }], sessions: rows,
+      nodeStartupContext: { "old-node": { runtime: "claude-code" } },
+      ...(legacy ? {} : { activeSessionIdByNode: { "old-node": "s-old-node" } }),
+    };
+    const snapshot = { id: "snap", kind: "manual", createdAt: "now", data } as unknown as Snapshot;
+    expect(buildRestorePlanPreview(rig, snapshot, rows, fresh ? ["a"] : undefined).nodes[0]).toMatchObject({
+      hasHistory: true, intendedAction: "awaiting-decision", freshRequired: false,
+    });
+  });
+
+  it.each([false, true])("same-ID mismatch does not suggest fresh for a missing token, fresh=%s", (fresh) => {
+    const rig = rigWith([{ id: "n1", logicalId: "a", runtime: "codex" }]);
+    const rows = [row("n1", { resumeToken: null })];
+    const snapshot = { id: "snap", kind: "manual", createdAt: "now", data: {
+      sessions: rows, nodeStartupContext: { n1: { runtime: "claude-code" } },
+    } } as unknown as Snapshot;
+    expect(buildRestorePlanPreview(rig, snapshot, rows, fresh ? ["a"] : undefined).nodes[0]).toMatchObject({
+      hasHistory: true, tokenState: "missing", intendedAction: "awaiting-decision", freshRequired: false,
+    });
+  });
+
+  it.each([false, true])("forecasts a seat joined with rig attach as an external CLI as leave-attached, as restore leaves it, with fresh=%s", (fresh) => {
+    const rig = {
+      rig: { id: "rig-1", name: "test-rig" },
+      nodes: [{ id: "n1", logicalId: "desk", runtime: "claude-code", binding: { attachmentType: "external_cli", externalSessionName: "desk-app@test-rig" } }],
+      edges: [],
+    } as unknown as RigWithRelations;
+    const node = buildRestorePlanPreview(rig, null, [row("n1", { resumeType: null, resumeToken: null })], fresh ? ["desk"] : undefined).nodes[0]!;
+    expect(node).toMatchObject({ intendedAction: "leave-attached", freshRequired: false });
+    expect(node.reason).toContain("rig unclaim desk-app@test-rig");
+    expect(node.runtimePrompt).toBeUndefined();
+  });
+
+  it("forecasts a seat whose stored kind is neither tmux nor external CLI on OpenRig's own path, as restore takes it today", () => {
+    const rig = {
+      rig: { id: "rig-1", name: "test-rig" },
+      nodes: [{ id: "n1", logicalId: "desk", runtime: "claude-code", binding: { attachmentType: "herdr", externalSessionName: null } }],
+      edges: [],
+    } as unknown as RigWithRelations;
+    const node = buildRestorePlanPreview(rig, null, [row("n1", { resumeType: null, resumeToken: null })]).nodes[0]!;
+    expect(node.intendedAction).not.toBe("leave-attached");
+  });
+
   it("presents a never-occupied current seat as new, without a history warning", () => {
     const rig = rigWith([{ id: "n1", logicalId: "a", runtime: "codex" }]);
     const result = buildRestorePlanPreview(rig, null, []).nodes[0]!;
@@ -65,6 +159,13 @@ describe("FR-6 restore-plan token state", () => {
     const p = buildRestorePlanPreview(rig, null, [row("n1", { resumeLastVerified: null, resumeLastProbeStatus: null })], undefined, NOW);
     expect(p.nodes[0]!.tokenState).toBe("unverified");
     expect(p.nodes[0]!.freshRequired).toBe(false);
+  });
+
+  it("degrades malformed saved verification metadata to unverified without changing valid token rules", () => {
+    const rig = rigWith([{ id: "n1", logicalId: "a", runtime: "codex" }]);
+    const malformed = buildRestorePlanPreview(rig, null, [row("n1", { resumeType: "codex_id",
+      resumeLastProbeStatus: "resumable", resumeLastVerified: 123 as never })]);
+    expect(malformed.nodes[0]).toMatchObject({ intendedAction: "resume-original", tokenState: "unverified" });
   });
 
   it("present: probe resumable + verified within the freshness threshold", () => {
@@ -152,5 +253,62 @@ describe("FR-6 live path — DB → collectPreviewSessionRows → plan state", (
     expect(p.nodes[0]!.tokenState).toBe("stale");
     expect(p.mutated).toBe(false);
     db.close();
+  });
+});
+
+describe("restore plan permission per seat", () => {
+  const snapshotOf = (nodes: Array<{ id: string; logicalId: string; runtime: string; podId: string | null }>, startup: Record<string, { runtime: string }>) =>
+    ({ id: "snap", kind: "manual", createdAt: "now", data: {
+      nodes, sessions: [row("n1")], activeSessionIdByNode: { n1: "s-n1" }, nodeStartupContext: startup,
+    } } as unknown as Snapshot);
+
+  it("asks for each seat restore launches, with the facts restore reads from the snapshot, and none for an attached seat", () => {
+    const rig = rigWith([{ id: "n1", logicalId: "dev.impl", runtime: "claude-code" }, { id: "n2", logicalId: "dev.qa", runtime: "codex" },
+      { id: "n3", logicalId: "dev.old", runtime: "claude-code" }]);
+    (rig.nodes[1] as unknown as { binding: unknown }).binding = { attachmentType: "external_cli", externalSessionName: "qa-cli", tmuxSession: null };
+    const snapshot = snapshotOf([{ id: "n1", logicalId: "dev.impl", runtime: "claude-code", podId: "pod-1" },
+      { id: "n2", logicalId: "dev.qa", runtime: "codex", podId: "pod-1" }, { id: "n3", logicalId: "dev.old", runtime: "claude-code", podId: null }],
+    { n1: { runtime: "codex" } });
+    const seen: RestorePermissionSeat[] = [];
+    const preview = buildRestorePlanPreview(rig, snapshot, [row("n1")], undefined, NOW, {}, undefined, (seat) => {
+      seen.push(seat);
+      return { basis: "unknown", runtime: seat.runtime, summary: `planned ${seat.logicalId}` };
+    });
+    // n1's saved startup context names Codex while it runs Claude now: restore stops for that decision before launch
+    // (restoreRuntimeCompatibilityError), so its seat carries restore's own reason, and the plan awaits the decision.
+    expect(preview.nodes[0]).toMatchObject({ intendedAction: "awaiting-decision" });
+    expect(seen).toEqual([
+      { nodeId: "n1", logicalId: "dev.impl", seat: "dev-impl@test-rig", runtime: "codex", podAware: true, startupContext: true,
+        runtimeError: "No session was started for this seat. Restore a snapshot whose saved startup runtime matches the seat's current runtime." },
+      { nodeId: "n3", logicalId: "dev.old", seat: "dev-old@test-rig", runtime: "claude-code", podAware: false, startupContext: false },
+    ]);
+    expect(preview.nodes.map((n) => n.permission?.summary)).toEqual(["planned dev.impl", undefined, "planned dev.old"]);
+  });
+
+  it("plans a live Claude seat whose saved startup runtime is Codex as unknown with restore's reason, beside its awaiting decision", () => {
+    const rig = rigWith([{ id: "n1", logicalId: "dev.impl", runtime: "claude-code" }]);
+    const snapshot = snapshotOf([{ id: "n1", logicalId: "dev.impl", runtime: "codex", podId: "pod-1" }], { n1: { runtime: "codex" } });
+    const db = createFullTestDb();
+    try {
+      // The same planner `rig up --existing --plan` passes; no explicit choice is stored for the seat.
+      const preview = buildRestorePlanPreview(rig, snapshot, [row("n1")], undefined, NOW, {}, undefined,
+        (seat) => planRestorePermission(db, { ...seat, restorePosture: () => "floor" }));
+      expect(preview.nodes[0]).toMatchObject({ intendedAction: "awaiting-decision", permission: { basis: "unknown" } });
+      expect(preview.nodes[0]!.permission!.summary).toContain("restore stops for a runtime decision before it starts this seat.");
+      expect(preview.nodes[0]!.permission!.summary).not.toContain("On restore");
+    } finally { db.close(); }
+  });
+
+  it("carries no permission when the caller doesn't plan one, so the other plan callers are unchanged", () => {
+    const rig = rigWith([{ id: "n1", logicalId: "dev.impl", runtime: "claude-code" }]);
+    const preview = buildRestorePlanPreview(rig, snapshotOf([{ id: "n1", logicalId: "dev.impl", runtime: "claude-code", podId: "pod-1" }], {}), [row("n1")], undefined, NOW);
+    expect(preview.nodes[0]).not.toHaveProperty("permission");
+  });
+
+  it("leaves the path facts unset for a seat no saved snapshot names", () => {
+    const rig = rigWith([{ id: "n1", logicalId: "dev.impl", runtime: "claude-code" }]);
+    const seen: RestorePermissionSeat[] = [];
+    buildRestorePlanPreview(rig, null, [row("n1")], undefined, NOW, {}, undefined, (seat) => { seen.push(seat); return { basis: "unknown", runtime: null, summary: "x" }; });
+    expect(seen).toEqual([{ nodeId: "n1", logicalId: "dev.impl", seat: "dev-impl@test-rig", runtime: "claude-code" }]);
   });
 });

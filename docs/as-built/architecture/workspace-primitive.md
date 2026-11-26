@@ -12,8 +12,8 @@ applies-when: |
   Project UI.
 siblings: [content-surfaces.md, daemon-core.md, ../ui/project-and-for-you.md]
 prerequisite-reads: [../README.md, daemon-core.md]
-last-verified-against-source: 2caac7dd1bb16585138a6f7c1dd8b1f0752c49f7
-last-updated: 2026-10-05
+last-verified-against-source: e8f0ab340db773392ec8be75b072d1c0f3068a50
+last-updated: 2026-10-08
 ---
 
 # Workspace Primitive — RigSpec.workspace, Migrations 038/039, Missions/Projects/Slices
@@ -26,7 +26,7 @@ through `whoami` / node-inventory and gate per-item repo scope. Alongside it, a
 the Project UI's mission / slice surfaces.
 
 > Paths are relative to `packages/daemon/src/` unless prefixed `packages/` or
-> `docs/`. Verified against source at main `2caac7dd1bb16585138a6f7c1dd8b1f0752c49f7`. Each count sits beside
+> `docs/`. Verified against source at main `e8f0ab340db773392ec8be75b072d1c0f3068a50`. Each count sits beside
 > the command that produces it; run the commands from the repository root.
 > The files / markdown / progress / steering surfaces are in the sibling
 > `content-surfaces.md`.
@@ -208,9 +208,9 @@ match; the filter is skipped when the column is absent.
 > `:114–120`); `createInputRefusal` `:128–141` (call `:136`), used by
 > `/create` `:490` and the self-forward create `:436`; handoff calls `:679`,
 > `:758` in handlers `:650`, `:732` (`/create` handler `:450`); ordering note
-> `:482–489`; inherited value `:676–677`, `domain/queue-repository.ts:1681`,
-> `:1858`; list filter `routes/queue.ts:906`,
-> `domain/queue-repository.ts:3226–3228`, CLI
+> `:482–489`; inherited value `:676–677`, `domain/queue-repository.ts:1691`,
+> `:1868`; list filter `routes/queue.ts:906`,
+> `domain/queue-repository.ts:3236–3238`, CLI
 > `packages/cli/src/commands/queue.ts:1143`; mounted `server.ts:784`.
 
 ## 2. Workspace HTTP route — frontmatter validator and doctor
@@ -387,14 +387,28 @@ that selects by mission. A slice's `qitemIds` come first from rows tagged
 project-scoped indexer only rows tagged `project:<id>` count, so untagged
 historical rows are not attributed to a selected project.
 
-> Source: `domain/slices/slice-indexer.ts:2–15` (contract + no new state),
-> `:238` (TTL), `:297–299` (`isReady`), `:331–336` (`invalidate`),
-> `:457–472` (`reconcileComposition`), `:476–521` (`readSliceLocations`;
-> first name wins `:478–483`; nested-vs-flat `:495–517`), `:61–88`
-> (`SliceRecord`: `missionId` `:65`, `slicePath` `:67`, `qitemIds` `:77`,
-> `proofPacket` `:81`), `:90–111` (`SliceListEntry`, which carries
-> `qitemCount` / `hasProofPacket` instead), `:865–875` and `:936–946` (queue
-> membership; project filter `:870`, `:942`); `domain/workspace/project-catalog.ts:132–138`
+The `GET /api/slices` response keeps that legacy `qitemCount` separate from
+`queueCounts`, eight current-state counts (or `null` when the listed
+mission/project scope cannot be resolved or catalog/candidate-root discovery is
+incomplete). `queueCounts` matches exact typed tags in one uncapped queue scan
+and is recomputed on every request; `?refresh` invalidates the separate listing
+cache, not a queue-count snapshot. A row may omit `project:` or `mission:` only
+when its remaining scope tokens identify exactly one physical slice with a
+resolved project and mission across the configured indexer roots and the
+catalog projects' missions roots. If catalog/project resolution or a candidate
+root cannot be read completely, counts stay `null` rather than treating unseen
+candidates as absent. Ambiguous matches count nowhere, including matches hidden
+by first-wins listing or a list filter. An explicit mismatched project or
+mission never counts. Physical candidates are used for counting only and do
+not change which slice is listed or served.
+
+> Source: `domain/slices/slice-indexer.ts` (read-only/no-new-state module
+> contract; `SliceRecord.qitemIds` / `SliceRecord.proofPacket`;
+> `DEFAULT_CACHE_TTL_MS`; `isReady()`; `invalidate()`;
+> `reconcileComposition()`; `readSliceLocations()`;
+> `observedQueueCounts()` physical-candidate matching and the shared queue
+> scan; `toListEntry()` / `matchQitems()` legacy membership);
+> `domain/workspace/project-catalog.ts:132–138`
 > (`belongsToProject`); startup `startup.ts:1705`, `:1718` (`OPENRIG_SLICES_ROOT`
 > first), `:1725–1730`, `:1743–1748`, proof-source watch `:1762–1765`
 > (`domain/proof/source-watch.ts:16`); default
@@ -433,7 +447,16 @@ handlers (`grep -c -E 'app\.(get|post)\(' packages/daemon/src/routes/slices.ts`)
   `?boundToWorkflow=<name>:<version>` lens narrows to slices bound to a
   workflow instance (400 `boundToWorkflow_invalid` without the colon). Each
   slice row carries `readiness`, and a `missions` sidecar carries authored
-  mission status and readiness. Rows sort by last activity, newest first.
+  mission status and readiness. The list row also keeps legacy `qitemCount`
+  separate from `queueCounts`: the latter has one count for each supported
+  queue state, or `null` when the row's project/mission scope is unresolved.
+  It counts rows whose exact typed tags match one physical slice with a
+  resolved project and mission across all configured roots. A missing
+  `project:` or `mission:` is accepted only when the remaining tags select
+  exactly one such candidate; ambiguous candidates count nowhere, even if
+  first-wins discovery or the status filter exposes only one
+  listed row. Explicit mismatched qualifiers never count. Counting does not
+  change list or filter behavior. Rows sort by last activity, newest first.
 - `POST /refresh` — drops the indexer caches, no daemon restart.
 - `GET /:name/proof-asset/*` — serves a proof asset from the slice's matched
   dogfood-evidence directory; rejects `..` (400); `Cache-Control: public,
@@ -576,7 +599,7 @@ through the `/project*` destinations; it does not call `/api/projects`
 - **Defensive column access:** `RigRepository` probes for `workspace_json`
   (`rig-repository.ts:185`, `:193`), node-inventory's own reads fall back to
   null on error (`node-inventory.ts:724`, `:796–798`), and the queue
-  repository detects `target_repo` (`queue-repository.ts:752`), so partial
+  repository detects `target_repo` (`queue-repository.ts:758`), so partial
   test fixtures don't crash. Migrations 038/039 ship separately so a fixture
   can apply only the half it needs (`038_workspace_primitive.ts:12–14`).
 - **Read-only projection, no new state for the tree:** SliceIndexer /

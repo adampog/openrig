@@ -18,7 +18,9 @@ describe("Claude transient startup composer", () => {
     expect(inspectStartupStagedText(composer("Press up to edit queued messages"), expected)).toBe("clear");
   });
 
-  it.each(["? for shortcuts", "paste again to expand", "paste again to expand  ◐ medium · /effort"])("keeps an exact expected placeholder staged under %s", footer => {
+  it.each(["? for shortcuts", "paste again to expand", "paste again to expand  ◐ medium · /effort", "paste again to expand                                     ● high · /effort",
+    "paste again to expand  Update available! Run: brew upgrade claude-code",
+    "paste again to expand  current: 2.1.326 · latest: 2.1.330 ✔ Update installed · Restart to update"])("keeps an exact expected placeholder staged under %s", footer => {
     const placeholder = "Press up to edit queued messages";
     expect(inspectStartupStagedText(composer(placeholder, footer), placeholder)).toBe("staged");
     expect(inspectStartupStagedText(composer("Press up\nto edit queued messages", footer), ` ${placeholder} `)).toBe("staged");
@@ -33,6 +35,7 @@ describe("Claude transient startup composer", () => {
     "paste again to expand  ordinary text · /effort", "paste again to expand  ❯ unfinished draft · /effort",
     "paste again to expand  medium · /effort", "paste again to expand  ◐ unknown · /effort",
     "paste again to expand  ◐ medium extra · /effort", "paste again to expand  ◐ medium · /effort trailing",
+    "paste again to expand  Update available!", "paste again to expand  ordinary text · Update available! Run: brew upgrade",
   ])("does not accept an approximate hint: %s", footer => {
     expect(inspectStartupStagedText(composer("", footer), expected)).toBe("unverified");
   });
@@ -64,9 +67,26 @@ describe("our own collapsed startup paste", () => {
     expect(startupOwnCollapsedPaste(pane, prompt)).toBe(true);
   });
 
+  // Claude Code 2.1.326 leaves the count off a paste with no newline (#2429).
+  it("recognizes a single-line paste's label without a count, and only for a single-line prompt", () => {
+    const line = `a single-line prompt ${"x".repeat(900)}`;
+    expect(startupOwnCollapsedPaste(composer("[Pasted text #1]"), line)).toBe(true);
+    expect(startupOwnCollapsedPaste(composer("[Pasted text #1]", "paste again to expand  12% until auto-compact"), line)).toBe(true);
+    expect(startupOwnCollapsedPaste(composer("[Pasted text #1 +1 lines]"), line)).toBe(false);
+  });
+
   it("counts a trailing newline, as Claude does", () => {
     expect(startupOwnCollapsedPaste(composer("[Pasted text #2 +29 lines]"), file)).toBe(true);
     expect(startupOwnCollapsedPaste(composer("[Pasted text #2 +28 lines]"), file)).toBe(false);
+  });
+
+  // A transcript above the composer can hold another harness's glyph (a quoted Codex line); the seat's
+  // runtime scopes the region so the last Claude prompt line is still read as ours. Without a runtime
+  // the union glyph walk stays ambiguous and keeps the unknown-runtime refusal.
+  it.each(["›", "»"])("reads a Claude seat's own paste with an earlier %s transcript line", glyph => {
+    const pane = `${glyph} an earlier line from another harness\n${composer("[Pasted text #1 +95 lines]")}`;
+    expect(startupOwnCollapsedPaste(pane, prompt, "claude-code")).toBe(true);
+    expect(startupOwnCollapsedPaste(pane, prompt)).toBe(false);
   });
 
   it.each([
@@ -78,5 +98,76 @@ describe("our own collapsed startup paste", () => {
 
   it.each([null, "", "\u276f [Pasted text #1 +95 lines]\n"])("needs a recognized composer: %j", pane => {
     expect(startupOwnCollapsedPaste(pane, prompt)).toBe(false);
+  });
+});
+
+describe("composer footers seen on healthy launches", () => {
+  it.each([
+    "-- INSERT -- ⏵⏵ auto mode on (shift+tab to cycle)",
+    "-- INSERT -- paste again to expand",
+    "-- INSERT -- paste again to expand  ◐ medium · /effort",
+    "paste again to expand                                     ● high · /effort",
+    "paste again to expand  ○ low · /effort",
+    "paste again to expand  ◐ xhigh · /effort",
+    "paste again to expand  ● max · /effort",
+    "-- INSERT --",
+    "⏵⏵ auto mode on (shift+tab to cy",
+    "-- INSERT -- ⏵⏵ accept edits on (shi",
+    "⏵⏵",
+  ])("recognizes the boundary under %j", footer => {
+    expect(inspectStartupStagedText(composer("", footer), expected)).toBe("clear");
+    expect(inspectStartupStagedText(composer(expected, footer), expected)).toBe("staged");
+  });
+
+  it.each(["-- INSERT -- later text", "INSERT", "-- NORMAL --", "Working…", ""])("still rejects the unrelated line %j", footer => {
+    expect(inspectStartupStagedText(composer("", footer), expected)).toBe("unverified");
+  });
+});
+
+describe("a rule and a mode-bar line inside the prompt text", () => {
+  // The prompt starts with a newline, then a rule, then a line that begins like a mode bar. Claude shows the text
+  // as typed, so these two lines sit inside the composer, above its real closing rule.
+  const prompt = "\n──────────\n⏵⏵ not a mode bar, part of the prompt";
+  const pane = (footer: string) => `❯ ${prompt}\n────────────────────\n  ${footer}\n`;
+
+  it.each(["? for shortcuts", "paste again to expand", "⏵⏵ accept edits on (shift+tab to cycle)", "-- INSERT -- ⏵⏵ auto mode on (shift+tab to cycle)"])(
+    "still reads the prompt as staged under the recognized footer %s", footer => {
+      expect(inspectStartupStagedText(pane(footer), prompt)).toBe("staged");
+    });
+
+  it.each(["-- NORMAL --", "Working…", "some other footer"])("stays unverified, never clear, under the unrecognized footer %j", footer => {
+    expect(inspectStartupStagedText(pane(footer), prompt)).toBe("unverified");
+  });
+
+  it("does not take a rule in the prompt for the closing rule when a mode-bar line follows it", () => {
+    const text = "first\n──────────\n⏸ plan mode on\nlast";
+    const frame = `❯ ${text}\n────────────────────\n  -- NORMAL --\n`;
+    expect(inspectStartupStagedText(frame, text)).toBe("unverified");
+  });
+});
+
+describe("Claude's startup composer with a person's own statusLine between the closing rule and the footer (#2798)", () => {
+  const STATUS = "  gpt-6.1-sol-fast · ctx 171.1k/872k (19.6%) · orchestrator";
+  const framed = (body: string, rows: string[], footer = "⏵⏵ bypass permissions on (shift+tab to cycle)") =>
+    `────────────────────\n❯ ${body}\n────────────────────\n${rows.join("\n")}\n  ${footer}\n`;
+
+  it("reads the staged prompt and the cleared box as without the statusLine", () => {
+    expect(inspectStartupStagedText(framed(expected, [STATUS]), expected, "claude-code")).toBe("staged");
+    expect(inspectStartupStagedText(framed("", [STATUS], "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"), expected, "claude-code")).toBe("clear");
+    expect(inspectStartupStagedText(framed(expected, []), expected, "claude-code")).toBe("staged");
+  });
+
+  it.each([
+    ["a selected choice behind a side border", ["│ ❯ 1. Yes │"]],
+    ["a numbered choice", ["  1. Yes"]],
+    ["a box corner", ["╭──────────────╮"]],
+    ["a blank row above a statusLine row", ["", STATUS]],
+  ])("keeps the composer unverified with %s where the statusLine goes", (_name, rows) => {
+    expect(inspectStartupStagedText(framed(expected, rows), expected, "claude-code")).toBe("unverified");
+  });
+
+  it("leaves other runtimes as they were: a row under the closing rule that is not a footer stays unverified", () => {
+    expect(inspectStartupStagedText(framed(expected, [STATUS]), expected)).toBe("unverified");
+    expect(inspectStartupStagedText(framed(expected, [STATUS]), expected, "codex")).toBe("unverified");
   });
 });

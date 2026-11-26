@@ -7,15 +7,82 @@ import type {
   ActivityValue,
   AdapterRungInventory,
   ArbitratedSeatState,
+  EvidenceRoute,
   EvidenceRungId,
   RungHealthEvent,
   RungTrust,
 } from "./activity-taxonomy.js";
-import { EVIDENCE_RUNG_RANK, runtimeRungInventory } from "./activity-taxonomy.js";
+import { COMMUNITY_HARNESS_RUNG_INVENTORY, COMMUNITY_RUNNER_RUNG_INVENTORY, EVIDENCE_RUNG_RANK, runtimeRungInventory } from "./activity-taxonomy.js";
+import { recordedRunner, sessionCommunityHarnessSelect, sessionCommunityRunnerSelect } from "./session-registry.js";
+import { hookPrecedes } from "./agent-activity-store.js";
+import type { SeatStructuralActivityService, StructuralObservation } from "./seat-structural-activity-service.js";
+import { DEFAULT_STRUCTURAL_STALE_MS } from "./seat-structural-activity-service.js";
+import { SettingsStore } from "./user-settings/settings-store.js";
+import { SeatIdentityStore } from "./seat-identity-store.js";
 
 /** Default polling cadence: 1Hz. The default silence window is 3s, so
- *  1Hz polling gives at-most ~1s freshness lag on the cached observation. */
+ *  1Hz polling gives at-most ~1s freshness lag on the cached observation (a slower cadence from
+ *  daemon.seat_poll_interval_ms adds to that lag and to the idle debounce, which counts ticks). */
 export const DEFAULT_POLL_INTERVAL_MS = 1000;
+/** daemon.seat_poll_interval_ms only slows the pollers down: below the default it would cost more CPU, not less. */
+export const MIN_SEAT_POLL_INTERVAL_MS = DEFAULT_POLL_INTERVAL_MS;
+/** The ceiling of daemon.seat_poll_interval_ms (the settings store's bound too). The structural observation and the proofs read from it (the Codex
+ *  working frame, node inventory, the idle-at-prompt fallback) expire after DEFAULT_STRUCTURAL_STALE_MS (5000 ms).
+ *  The sampler can hold a working-frame proof for about two intervals before the next one replaces it, so
+ *  2 x ceiling must stay below that expiry, with the rest as margin for event-loop lag. Separately, the single-flight
+ *  guard skips a tick that lands while a sweep runs, and the working-frame proof expires 5 s after the capture that
+ *  produced it, so a slower cadence leaves less room for slow tmux, not more: at 2000 ms a structural sweep slower
+ *  than about 2 s (about 3 s at the default) can let a working Codex seat briefly read idle. */
+export const MAX_SEAT_POLL_INTERVAL_MS = 2000;
+/** The setting behind the cadence: `daemon.seat_poll_interval_ms`, mapped from OPENRIG_SEAT_POLL_INTERVAL_MS. */
+export const SEAT_POLL_INTERVAL_KEY = "daemon.seat_poll_interval_ms";
+type ReadSeatPollSetting = () => { value: unknown; source?: string };
+/** The cadence of the seat-activity and structural-activity pollers, from the typed setting
+ *  `daemon.seat_poll_interval_ms` (config.json, or OPENRIG_SEAT_POLL_INTERVAL_MS; `rig config` shows it with its
+ *  source). STARTUP-ONLY: read once when the daemon starts; changing it takes a daemon restart. Each tick both read
+ *  tmux for the running seats (the sampler in one batch when it can, the structural poller by listing the windows and
+ *  capturing panes); on a large fleet those spawned tmux clients are a large share of the daemon's CPU, and a slower
+ *  cadence trades activity freshness for that load. Unset keeps the 1 s default. The settings store validates the
+ *  value: `rig config set` refuses one outside MIN..MAX, and an env value outside it is dropped with a warning on
+ *  stderr (the default is used). A value that still reaches here outside MIN..MAX (a hand-edited config.json the store
+ *  could not check) keeps the default, with a warning. */
+export function resolveSeatPollIntervalMs(
+  read: ReadSeatPollSetting = () => new SettingsStore().resolveOne(SEAT_POLL_INTERVAL_KEY as never),
+  warn: (message: string) => void = (message) => console.warn(message),
+): number {
+  let setting: { value: unknown; source?: string };
+  try {
+    setting = read();
+  } catch (err) {
+    warn(`[seat-activity] ${SEAT_POLL_INTERVAL_KEY} could not be read (${err instanceof Error ? err.message : String(err)});`
+      + ` using ${DEFAULT_POLL_INTERVAL_MS} ms`);
+    return DEFAULT_POLL_INTERVAL_MS;
+  }
+  const ms = Number(setting.value);
+  if (!Number.isSafeInteger(ms) || ms < MIN_SEAT_POLL_INTERVAL_MS || ms > MAX_SEAT_POLL_INTERVAL_MS) {
+    warn(`[seat-activity] ${SEAT_POLL_INTERVAL_KEY}=${JSON.stringify(setting.value)} is not a whole number of milliseconds`
+      + ` in ${MIN_SEAT_POLL_INTERVAL_MS}..${MAX_SEAT_POLL_INTERVAL_MS}; using ${DEFAULT_POLL_INTERVAL_MS} ms`);
+    return DEFAULT_POLL_INTERVAL_MS;
+  }
+  return ms;
+}
+/** Starts both seat pollers on the cadence of `daemon.seat_poll_interval_ms` (read once, here) and returns it. */
+export function startSeatPollers(
+  pollers: {
+    activity?: { start(db: Database.Database, intervalMs?: number): void };
+    structural?: { start(db: Database.Database, intervalMs?: number): void };
+  },
+  db: Database.Database,
+  read?: ReadSeatPollSetting,
+  warn?: (message: string) => void,
+): number {
+  const ms = resolveSeatPollIntervalMs(read, warn);
+  pollers.activity?.start(db, ms);
+  pollers.structural?.start(db, ms);
+  return ms;
+}
+/** Allow automatic review to settle before checking the visible human prompt. */
+export const PERMISSION_REQUEST_GRACE_MS = 3_000;
 
 /**
  * Slice 15 — daemon owner of the `terminal-active` primitive.
@@ -39,9 +106,20 @@ export interface SeatActivityServiceDeps {
   defaultWindowSeconds: number;
   eventBus?: EventBus;
   now?: () => Date;
-  /** S19: the self-report rung producer (Claude pid.json). Consulted per sweep for seats
-   *  whose declared inventory staffs self-report; absent = the rung is absent. */
+  /** Visible prompt observation: null means capture could not establish a state. */
+  permissionPromptReader?: (sessionName: string, runtime: string) => Promise<boolean | null>;
+  permissionPromptChanged?: (sessionName: string, confirmed: boolean, runtime: string) => void;
+  /** Claude pid.json, consulted for seats declaring self-report. */
   selfReportReader?: (sessionName: string, seatNodeId: string) => ActivityEvidence | null;
+  /** Existing bounded pane observations; only a fresh Codex working frame contributes activity. */
+  structuralActivity?: Pick<SeatStructuralActivityService, "getStructuralActivity">;
+  /** A runner seat's last recorded hook, restored when its inventory is declared with no hook evidence yet (after a
+   *  daemon restart). Null when nothing qualifies: another generation or session, or nothing recorded. */
+  restoreHookEvidence?: (seat: { seatNodeId: string; sessionName: string }, runtime: string) => ActivityEvidence | null;
+  /** The typed usage limit a seat still held when the daemon stopped, as the evidence its live report was, read when its
+   *  inventory is declared (after a restart). Null when none is in force; a throw means the store couldn't be read, or a limit
+   *  may be in force but its occupant can't be shown. */
+  restoreUsageLimitEvidence?: (seat: { seatNodeId: string; sessionName: string }, runtime: string) => ActivityEvidence | null;
 }
 
 export interface PollSeatOptions {
@@ -58,15 +136,28 @@ export class SeatActivityService {
   // seat-structural-activity-service (MUST-FIX 2). A slowed tmux can never accumulate
   // overlapping whole-fleet sweeps — at most one sweep's worth is ever in flight.
   private sweeping = false;
+  private samplingAuthorityWindowMs = SAMPLING_AUTHORITY_WINDOW_MS;
+  private readonly permissionPromptReader?: SeatActivityServiceDeps["permissionPromptReader"];
+  private readonly permissionPromptChanged?: SeatActivityServiceDeps["permissionPromptChanged"];
+  private readonly structuralActivity?: SeatActivityServiceDeps["structuralActivity"];
 
   private readonly selfReportReader: ((sessionName: string, seatNodeId: string) => ActivityEvidence | null) | null;
 
+  private readonly restoreHookEvidence: SeatActivityServiceDeps["restoreHookEvidence"] | null;
+
+  private readonly restoreUsageLimitEvidence: SeatActivityServiceDeps["restoreUsageLimitEvidence"] | null;
+
   constructor(deps: SeatActivityServiceDeps) {
+    this.permissionPromptReader = deps.permissionPromptReader;
+    this.permissionPromptChanged = deps.permissionPromptChanged;
+    this.structuralActivity = deps.structuralActivity;
     this.tmux = deps.tmux;
     this.defaultWindowSeconds = deps.defaultWindowSeconds;
     this.eventBus = deps.eventBus ?? null;
     this.now = deps.now ?? (() => new Date());
     this.selfReportReader = deps.selfReportReader ?? null;
+    this.restoreHookEvidence = deps.restoreHookEvidence ?? null;
+    this.restoreUsageLimitEvidence = deps.restoreUsageLimitEvidence ?? null;
   }
 
   /**
@@ -87,19 +178,29 @@ export class SeatActivityService {
     return this.observeSeat(paneId, opts, null);
   }
 
-  /** pollSeat with the sweep's batched read: the seat's timestamp comes from `batch` when it has one, and
-   *  only a seat missing from it is read per target, so a sweep costs one tmux spawn instead of one per seat. */
+  /** pollSeat with the sweep's batched read: the seat's timestamp comes from `batch` when it has one, so a sweep costs
+   *  one tmux spawn instead of one per seat. A seat missing from a batch that was read is not asked about by target:
+   *  its session is gone, or its value is the same malformed one a per-target read returns, and tmux 3.2a (Ubuntu
+   *  22.04's) exits its whole server when asked about a vanished target. Only with no batch is each seat read per target. */
   private async observeSeat(paneId: string, opts: PollSeatOptions | undefined, batch: Map<string, number> | null): Promise<SeatActivity | null> {
     const silenceWindowSeconds = opts?.silenceWindowSeconds ?? this.defaultWindowSeconds;
     let lastActivityEpochSeconds: number | null = batch?.get(paneId) ?? null;
-    if (lastActivityEpochSeconds === null) {
+    if (lastActivityEpochSeconds === null && batch === null) {
       try {
         lastActivityEpochSeconds = await this.tmux.readPaneLastActivity(paneId);
       } catch {
         lastActivityEpochSeconds = null;
       }
     }
-    if (lastActivityEpochSeconds === null) return null;
+    await this.pollPermissionPrompt(paneId);
+    if (lastActivityEpochSeconds === null) {
+      const seatNodeId = this.sessionToSeat.get(paneId);
+      const seat = seatNodeId ? this.ladder.get(seatNodeId) : undefined;
+      // The self-report is read, and retired, on every sweep, including one whose pane activity couldn't be read.
+      if (seat) this.consultSelfReport(paneId, seatNodeId!, seat);
+      if (seat) this.arbitrate(seat);
+      return null;
+    }
 
     const observedAt = this.now();
     const ageSeconds = observedAt.getTime() / 1000 - lastActivityEpochSeconds;
@@ -128,22 +229,157 @@ export class SeatActivityService {
     if (seatNodeId) {
       const seq = (this.samplerSeqBySession.get(paneId) ?? 0) + 1;
       this.samplerSeqBySession.set(paneId, seq);
+      const seat = this.ladder.get(seatNodeId);
+      let codexFrameWorking = false;
+      let codexFrameProofAt: string | undefined;
+      const frame = seat?.inventory?.runtime === "codex" && this.structuralActivity
+        ? this.structuralActivity.getStructuralActivity(paneId) : null;
+      if (seat?.inventory?.runtime === "codex" && this.structuralActivity) {
+        const capturedAt = frame ? Date.parse(frame.observedAt) : NaN;
+        const frameStarted = frame?.codexWorkingFrame ? Date.parse(frame.codexWorkingFrame.captureStartedAt) : NaN;
+        const proofAt = frame?.codexWorkingFrame ? Date.parse(frame.codexWorkingFrame.proofAt) : NaN;
+        const previousStarted = frame?.codexWorkingFrame?.previousCaptureStartedAt;
+        codexFrameWorking = frame !== null && frame?.state !== "attention" && Number.isFinite(capturedAt)
+          && Number.isFinite(frameStarted) && this.codexFrameQualifies(seat, frame!.codexWorkingFrame!.captureStartedAt, frame!.pane, "if-known")
+          && (previousStarted === undefined || Date.parse(previousStarted) >= seat.inventorySinceMs)
+          && Number.isFinite(proofAt) && proofAt <= capturedAt && proofAt <= observedAt.getTime()
+          && observedAt.getTime() - proofAt < DEFAULT_STRUCTURAL_STALE_MS && frameStarted <= proofAt;
+        if (codexFrameWorking) codexFrameProofAt = frame!.codexWorkingFrame!.proofAt;
+      }
+      const paneOverridesQuietWindow = codexFrameWorking && !isActiveWithinWindow;
       this.reportEvidence({
         seatNodeId,
         sessionName: paneId,
         rung: "window-sampling",
-        sourceId: "tmux:window-activity",
+        sourceId: paneOverridesQuietWindow ? "codex:working-frame-fallback" : "tmux:window-activity",
         seq,
-        observedAt: record.lastObservedAt,
-        activity: isActiveWithinWindow ? "working" : "idle-at-prompt",
+        observedAt: paneOverridesQuietWindow ? codexFrameProofAt! : record.lastObservedAt,
+        activity: isActiveWithinWindow || codexFrameWorking ? "working" : "idle-at-prompt",
       });
-      const seat = this.ladder.get(seatNodeId);
-      if (this.selfReportReader && seat?.inventory?.rungs.some((r) => r.rung === "self-report")) {
-        const evd = this.selfReportReader(paneId, seatNodeId);
-        if (evd) this.reportEvidence(evd); // null = unreadable ⇒ the rung simply stales
+      // #2515: a Codex choice prompt can be answered on screen with no hook after it. The same structural frame, under
+      // the working frame's boundary (captured after this seat's inventory began, and fresh), says whether a choice is
+      // showing (1) or the composer is complete and empty (0). Any other frame (a draft, work, an unrecognised screen)
+      // withdraws this source, so the prompt reads unknown again. A tracked tool approval keeps its own path.
+      if (seat?.inventory?.runtime === "codex" && this.structuralActivity) {
+        const prompt = frame && this.codexFrameQualifies(seat, frame.captureStartedAt, frame.pane, "required")
+          ? codexPromptObservation(frame, paneId) : null;
+        if (prompt) {
+          seat.structuralPrompt = { freshMs: Date.parse(frame!.checkedAt ?? frame!.observedAt),
+            startedMs: Date.parse(frame!.captureStartedAt!), pane: frame!.pane! };
+          this.reportEvidence({ seatNodeId, sessionName: paneId, rung: "needs-input-chrome", sourceId: CODEX_STRUCTURAL_PROMPT_SOURCE,
+            seq, observedAt: prompt.observedAt, needsInput: prompt.needsInput });
+        } else if (seat.sources.delete(CODEX_STRUCTURAL_PROMPT_SOURCE)) {
+          seat.structuralPrompt = undefined;
+          this.arbitrate(seat);
+        }
       }
+      if (seat) this.consultSelfReport(paneId, seatNodeId, seat);
     }
     return record;
+  }
+
+  /** The self-report rung, for a seat whose inventory staffs it. Unread on two sweeps running (no file for this seat,
+   *  unknown status), its last report retires, so the rungs below decide. One unread sweep, such as a file read
+   *  mid-write, keeps it. */
+  private consultSelfReport(paneId: string, seatNodeId: string, seat: SeatLadderState): void {
+    if (!this.selfReportReader || !seat.inventory?.rungs.some((r) => r.rung === "self-report")) return;
+    const evd = this.selfReportReader(paneId, seatNodeId);
+    seat.selfReportUnread = evd ? 0 : (seat.selfReportUnread ?? 0) + 1;
+    // A report read from another file (the verified PID's own file after a name match, say) replaces the earlier file's:
+    // its timestamps don't continue that file's, so an older one must still be admitted. One file's own order still holds.
+    if (evd && seat.sources.get(CLAUDE_SELF_REPORT_SOURCE)?.latest.sourceFile !== evd.sourceFile) seat.sources.delete(CLAUDE_SELF_REPORT_SOURCE);
+    if (evd) this.reportEvidence(evd);
+    else if (seat.selfReportUnread >= 2 && seat.sources.delete(CLAUDE_SELF_REPORT_SOURCE)) this.arbitrate(seat);
+  }
+
+  private async pollPermissionPrompt(sessionName: string, canCapture = true): Promise<void> {
+    const seatNodeId = this.sessionToSeat.get(sessionName);
+    const seat = seatNodeId ? this.ladder.get(seatNodeId) : undefined;
+    if (!seat || seat.retired || seat.permissionPolling) return;
+    const runtime = seat.inventory?.runtime ?? "codex";
+    const claude = runtime === "claude-code";
+    const nowMs = this.now().getTime();
+    const snapshot = [...seat.permissions].filter(([, request]) =>
+      (claude || nowMs - request.sinceMs >= PERMISSION_REQUEST_GRACE_MS) && nowMs >= request.nextCheckMs);
+    if (snapshot.length === 0) return;
+    const permissionRevision = seat.permissionRevision;
+    const occupant = seat.arbitrated.lastSwap;
+    const readStartedAt = this.now().toISOString();
+    seat.permissionPolling = true;
+    try {
+      const visible = canCapture && this.permissionPromptReader
+        ? await this.permissionPromptReader(sessionName, runtime).catch(() => null)
+        : null;
+      if (seat.retired || seat.sessionName !== sessionName || seat.arbitrated.lastSwap !== occupant) return;
+      if (visible === false && seat.permissionRevision !== permissionRevision) return;
+      let updated = false;
+      for (const [id, request] of snapshot) {
+        if (seat.permissions.get(id) !== request) continue;
+        // A screen does not identify which Claude actor owns a dialog. With overlapping actors, only a
+        // scoped batch or turn boundary can settle their unseen notifications.
+        request.seen ||= visible === true && (!claude || seat.permissions.size === 1);
+        request.confirmed = visible !== false || (claude && !request.seen);
+        request.nextCheckMs = this.now().getTime()
+          + (visible === false && this.now().getTime() - request.sinceMs >= 10_000 ? 5_000 : DEFAULT_POLL_INTERVAL_MS);
+        if (claude && !request.confirmed) seat.permissions.delete(id);
+        updated = true;
+      }
+      if (!updated) return;
+      seat.permissionReadStartedAt = readStartedAt;
+      this.reportPermissionObservation(seatNodeId!, seat, "needs-input-chrome", this.now().toISOString(),
+        !claude && visible === null ? "permission_request_unverified" : "permission_prompt");
+    } finally {
+      seat.permissionPolling = false;
+    }
+  }
+
+  /** A native Claude PostToolBatch resolves only this actor's earlier permission notifications. The route checks
+   *  the emitting occupant first. Missing actor attribution and unordered timestamps retain the pane/turn fallback. */
+  completeClaudeToolBatch(sessionName: string, hookAgentId: string | null, observedAt: string): boolean {
+    const seatNodeId = this.sessionToSeat.get(sessionName);
+    const seat = seatNodeId ? this.ladder.get(seatNodeId) : undefined;
+    if (!seat || seat.retired || seat.inventory?.runtime !== "claude-code") return false;
+    const completedAt = Date.parse(observedAt);
+    if (!Number.isFinite(completedAt)) return false;
+    // A notification may arrive after its completion, including when no request was observed yet.
+    seat.claudeToolBatches.set(hookAgentId, Math.max(completedAt, seat.claudeToolBatches.get(hookAgentId) ?? -Infinity));
+    let settled = false;
+    for (const [id, request] of seat.permissions) {
+      if (request.hookAgentId === undefined || request.hookAgentId !== hookAgentId
+          || !(Date.parse(request.observedAt) < completedAt)) continue;
+      seat.permissions.delete(id);
+      settled = true;
+    }
+    if (!settled) return false;
+    seat.permissionRevision++;
+    this.reportPermissionObservation(seatNodeId!, seat, "lifecycle-hooks", observedAt, "permission_prompt");
+    return true;
+  }
+
+  /** Whether this occupant's actor already completed a strictly later batch. Equal timestamps do not establish order. */
+  hasLaterClaudeToolBatch(sessionName: string, hookAgentId: string | null | undefined, observedAt: string): boolean {
+    if (hookAgentId === undefined) return false;
+    const seatNodeId = this.sessionToSeat.get(sessionName);
+    const seat = seatNodeId ? this.ladder.get(seatNodeId) : undefined;
+    if (!seat || seat.retired || seat.inventory?.runtime !== "claude-code") return false;
+    const completedAt = seat.claudeToolBatches.get(hookAgentId);
+    return completedAt !== undefined && Date.parse(observedAt) < completedAt;
+  }
+
+  private reportPermissionObservation(seatNodeId: string, seat: SeatLadderState, rung: EvidenceRungId,
+    observedAt: string, reason: string): void {
+    const runtime = seat.inventory?.runtime ?? "codex";
+    seat.permissionEvidence = { rung, observedAt };
+    const count = [...seat.permissions.values()].filter(request => request.confirmed).length;
+    if (runtime === "claude-code" && count === 0) {
+      for (const source of seat.sources.values()) {
+        if (source.latest.permissionRequest) source.latest = { ...source.latest, needsInput: undefined };
+      }
+    }
+    const sourceId = `${runtime}:permission-prompt`;
+    this.reportEvidence({ seatNodeId, sessionName: seat.sessionName, rung, sourceId,
+      seq: (seat.sources.get(sourceId)?.latest.seq ?? 0) + 1, observedAt,
+      needsInput: { count, reason: count ? reason : null } });
   }
 
   /**
@@ -167,8 +403,15 @@ export class SeatActivityService {
     if (!seat || seat.sessionName !== paneId) return;
     seat.retired = true;
     seat.sources.clear();
+    seat.permissions.clear();
+    seat.claudeToolBatches.clear();
+    seat.permissionEvidence = null;
+    seat.usageLimit = null;
+    seat.lastWorkAt = null;
+    seat.usageLimitRestored = false;
     seat.pendingIdle = null;
     seat.contradictionSinceMs = null;
+    seat.hooksContradicted = false;
     seat.promotion.clear();
     seat.trust.clear();
     seat.inventory = null;
@@ -190,14 +433,15 @@ export class SeatActivityService {
     try {
       const rows = db.prepare(`
         SELECT s.session_name as session_name, n.id as node_id, n.runtime as runtime,
-          COALESCE(b.attachment_type, 'tmux') as attachment_type
+          COALESCE(b.attachment_type, 'tmux') as attachment_type, ${sessionCommunityHarnessSelect(db)} as community_harness,
+          ${sessionCommunityRunnerSelect(db)} as community_runner
         FROM nodes n
         JOIN sessions s ON s.node_id = n.id
           AND s.id = (SELECT s2.id FROM sessions s2 WHERE s2.node_id = n.id ORDER BY s2.id DESC LIMIT 1)
         LEFT JOIN bindings b ON b.node_id = n.id
         WHERE s.status = 'running'
           AND s.session_name IS NOT NULL
-      `).all() as Array<{ session_name: string; node_id: string; runtime: string | null; attachment_type: string }>;
+      `).all() as Array<{ session_name: string; node_id: string; runtime: string | null; attachment_type: string; community_harness: string | null; community_runner: number | null }>;
       const tmuxRows = rows.filter((r) => r.attachment_type === "tmux");
       const liveTmux = new Set(tmuxRows.map((r) => r.session_name));
       for (const pane of this.latestByPaneId.keys()) {
@@ -217,25 +461,42 @@ export class SeatActivityService {
       // auto-declared from their runtime's inventory (claude authoritative standing,
       // codex hooks-at-trial, generic sampling floor) — production-complete without
       // touching the launch machinery.
+      const identities = new SeatIdentityStore(db);
       for (const r of tmuxRows) {
         const known = this.ladder.get(r.node_id);
-        if (!known || known.inventory === null || known.sessionName !== r.session_name) {
-          this.declareRungInventory(
-            { seatNodeId: r.node_id, sessionName: r.session_name },
-            runtimeRungInventory(r.runtime),
-          );
+        const inventory = runtimeRungInventory(r.runtime, r.community_harness, recordedRunner(r.community_runner));
+        // A replacement occupant can keep the seat's session name; its own recorded app selection (or none) decides.
+        // A plain and a runner launch of the same app read differently, so a change between them re-declares too.
+        const communityHarnessChanged = !!known && communityKind(known.inventory) !== communityKind(inventory);
+        if (!known || known.inventory === null || known.sessionName !== r.session_name || communityHarnessChanged) {
+          this.declareRungInventory({ seatNodeId: r.node_id, sessionName: r.session_name }, inventory);
+          this.restoreDurableHook({ seatNodeId: r.node_id, sessionName: r.session_name }, inventory, r.runtime);
+        }
+        // Once per current occupant, whichever path declared its inventory (a hook can arrive before the first sweep).
+        this.restoreUsageLimit({ seatNodeId: r.node_id, sessionName: r.session_name }, r.runtime);
+        if (r.runtime === "codex") {
+          // The occupant as OpenRig records it, from the identity reconciler's last verdict for this session: the
+          // binding's pane it checked, and the pane process it verified as this session's Codex there. It follows
+          // OpenRig's own in-place restart. No verdict (or a defensive read of a store without one) leaves both unknown.
+          const verdict = identities.getForNode(r.node_id);
+          const current = verdict?.sessionName === r.session_name ? verdict : null;
+          this.recordCodexOccupant(r.node_id, { paneId: current?.evidence.registeredPane ?? null,
+            pid: current?.verdict === "verified" && current.evidence.registeredPane ? current.evidence.observedPanePid ?? null : null });
         }
       }
 
-      // One tmux call reads every session's window activity for this tick; a seat missing from it (or no
-      // batch at all) falls back to its own read, exactly as before.
+      // One tmux call reads every session's window activity for this tick; only with no batch at all does each seat
+      // fall back to its own read, as before.
       let batch: Map<string, number> | null = null;
       if (tmuxRows.length > 0 && this.tmux.readAllSessionWindowActivity) {
         try { batch = await this.tmux.readAllSessionWindowActivity(); } catch { batch = null; }
       }
       // Best-effort: a single seat's failure does not crash the loop.
-      await Promise.all(tmuxRows.map(async (r) => {
-        try { await this.observeSeat(r.session_name, undefined, batch); } catch { /* swallow */ }
+      await Promise.all(rows.map(async (r) => {
+        try {
+          if (r.attachment_type === "tmux") await this.observeSeat(r.session_name, undefined, batch);
+          else await this.pollPermissionPrompt(r.session_name, false);
+        } catch { /* swallow */ }
       }));
     } finally {
       this.sweeping = false;
@@ -250,6 +511,7 @@ export class SeatActivityService {
    */
   start(db: Database.Database, intervalMs: number = DEFAULT_POLL_INTERVAL_MS): void {
     if (this.timer) return;
+    this.samplingAuthorityWindowMs = Math.max(SAMPLING_AUTHORITY_WINDOW_MS, intervalMs * 3);
     this.timer = setInterval(() => {
       void this.pollAllRunningTmuxSeats(db);
     }, intervalMs);
@@ -289,10 +551,22 @@ export class SeatActivityService {
     seat.retired = false;
     this.sessionToSeat.set(binding.sessionName, binding.seatNodeId);
     seat.inventory = inventory;
+    seat.inventorySinceMs = this.now().getTime();
+    // #2515: a new inventory is a new occupant boundary, so the copied prompt evidence from before it goes too.
+    seat.sources.delete(CODEX_STRUCTURAL_PROMPT_SOURCE);
+    seat.structuralPrompt = undefined;
     seat.trust.clear();
+    seat.hooksContradicted = false;
     for (const decl of inventory.rungs) seat.trust.set(decl.rung, decl.initialTrust);
     seat.promotion.clear();
     this.arbitrate(seat);
+  }
+
+  /** A Codex seat's occupant as OpenRig records it (#2515): its binding's pane and its verified pane process, or null
+   *  where unknown. The sweep refreshes it every tick; the next arbitration applies it. */
+  recordCodexOccupant(seatNodeId: string, occupant: { paneId: string | null; pid: number | null }): void {
+    const seat = this.ladder.get(seatNodeId);
+    if (seat) seat.occupant = occupant;
   }
 
   /** Adapters push rung evidence (hooks, self-report, chrome, sampling). Per-source
@@ -304,11 +578,75 @@ export class SeatActivityService {
     this.sessionToSeat.set(evidence.sessionName, evidence.seatNodeId);
     const prior = seat.sources.get(evidence.sourceId);
     if (prior && evidence.seq <= prior.latest.seq) return; // stale/reordered — dropped
+    // A durable source's posts can arrive out of their own order: an older boundary arriving later is dropped.
+    if (prior && this.durableBoundaries(seat, evidence.rung)
+        && hookPrecedes({ eventAt: evidence.observedAt, sourceSequence: evidence.sourceSequence },
+          { eventAt: prior.latest.observedAt, sourceSequence: prior.latest.sourceSequence })) return;
+    const runtime = seat.inventory?.runtime ?? "codex";
+    const claude = runtime === "claude-code";
+    const wasConfirmed = seat.arbitrated.needsInput.count > 0;
+    if (evidence.permissionRequest) {
+      const request = evidence.permissionRequest;
+      if (claude && this.hasLaterClaudeToolBatch(evidence.sessionName, request.hookAgentId, evidence.observedAt)) return;
+      const previousRequest = seat.permissions.get(request.id);
+      // Relay posts can arrive out of order. Keep the newer actor request so an older batch cannot settle it.
+      if (claude && previousRequest && Date.parse(evidence.observedAt) < Date.parse(previousRequest.observedAt)) return;
+      seat.permissionRevision++;
+      if (claude || !seat.permissions.has(request.id)) {
+        seat.permissions.set(request.id, { sinceMs: this.now().getTime(), observedAt: evidence.observedAt,
+          hookAgentId: request.hookAgentId, confirmed: claude, seen: false, nextCheckMs: 0 });
+      }
+    } else if ((evidence.rung === "lifecycle-hooks" && (evidence.activity === "idle-at-prompt" || evidence.permissionResolved
+        || (claude && evidence.needsInput?.count && evidence.needsInput.reason !== "permission_prompt")))
+        || (claude && seat.permissions.size === 0 && evidence.needsInput?.count && evidence.needsInput.reason !== "permission_prompt")) {
+      seat.permissions.clear();
+      seat.permissionEvidence = null;
+      seat.sources.delete(`${runtime}:permission-prompt`);
+    }
+    // A typed usage limit holds until a strictly newer turn starts: a working boundary from the hooks or the seat's own
+    // status. An idle prompt, a redraw or the limit's own menu is not a new turn. The rule holds in either arrival order:
+    // a limit older than a working boundary already seen never arms (relay posts can arrive out of order).
+    // Of two readable limits the newer one holds, so a late-arriving older report can't replace it (and a working boundary
+    // between them can't then end it); an unread placeholder from a restart gives way to any real one.
+    if (evidence.usageLimit) {
+      const held = seat.usageLimit;
+      const older = held !== null && !held.unread && Date.parse(evidence.observedAt) < Date.parse(held.observedAt);
+      if (!this.newerWorkSeen(seat, evidence.observedAt) && !older) {
+        seat.usageLimit = { rung: evidence.rung, observedAt: evidence.observedAt, resetsAt: evidence.usageLimit.resetsAt };
+      }
+    } else if (evidence.activity === "working" && (evidence.rung === "lifecycle-hooks" || evidence.rung === "self-report")) {
+      if (!seat.lastWorkAt || Date.parse(evidence.observedAt) > Date.parse(seat.lastWorkAt)) seat.lastWorkAt = evidence.observedAt;
+      if (seat.usageLimit && Date.parse(evidence.observedAt) > Date.parse(seat.usageLimit.observedAt)) seat.usageLimit = null;
+    }
     seat.sources.set(evidence.sourceId, {
       latest: evidence,
       latestActivity: evidence.activity !== undefined ? evidence : prior?.latestActivity ?? null,
     });
     this.measureTrialAgreement(seat, evidence);
+    this.arbitrate(seat);
+    // Recording another pending request must not hide an already confirmed
+    // outstanding prompt in the persisted activity consumer.
+    if (wasConfirmed && (evidence.permissionRequest || (claude && seat.permissions.size > 0 && evidence.rung === "lifecycle-hooks"
+        && evidence.activity === "working" && !evidence.permissionResolved))
+        && seat.arbitrated.needsInput.count > 0) {
+      this.permissionPromptChanged?.(seat.sessionName, true, runtime);
+    }
+    if (claude && evidence.permissionRequest) void this.pollPermissionPrompt(seat.sessionName).catch(() => {});
+  }
+
+  /** A person attested that the prompt this seat waited on is gone (`clear-attention --reason`): settle it here as a
+   *  resolving hook does, so the oracle, the wake ladder and the inventory agree with the cleared hook. A new permission
+   *  hook starts a new request, and each send still reads the pane. */
+  settlePermissionPrompt(sessionName: string): void {
+    const seatNodeId = this.sessionToSeat.get(sessionName);
+    const seat = seatNodeId ? this.ladder.get(seatNodeId) : undefined;
+    if (!seat || seat.retired) return;
+    seat.permissions.clear();
+    seat.permissionEvidence = null;
+    seat.sources.delete(`${seat.inventory?.runtime ?? "codex"}:permission-prompt`);
+    for (const source of seat.sources.values()) {
+      if (source.latest.needsInput?.count) source.latest = { ...source.latest, needsInput: undefined };
+    }
     this.arbitrate(seat);
   }
 
@@ -320,8 +658,14 @@ export class SeatActivityService {
     const seat = this.ladder.get(seatNodeId);
     if (!seat) return;
     seat.sources.clear();
+    seat.permissions.clear();
+    seat.claudeToolBatches.clear();
+    seat.permissionEvidence = null;
+    seat.usageLimit = null;
+    seat.lastWorkAt = null;
     seat.pendingIdle = null;
     seat.contradictionSinceMs = null;
+    seat.hooksContradicted = false;
     seat.promotion.clear();
     for (const rung of seat.trust.keys()) seat.trust.set(rung, "absent");
     seat.inventory = null;
@@ -331,6 +675,8 @@ export class SeatActivityService {
       activity: "unknown",
       needsInput: { count: 0, reason: null },
       needsInputEvidence: null,
+      backgroundWork: null, // a new occupant never inherits the old one's shell
+      usageLimit: null, // nor the old one's usage limit
       decidedBy: null,
       seq: seat.arbitrated.seq + 1, // the swap IS a visible event
       changedAt: at,
@@ -362,6 +708,24 @@ export class SeatActivityService {
     if (!seat) return null;
     this.arbitrate(seat); // lazy re-evaluation picks up time-based expiry/caps
     return seat.arbitrated;
+  }
+
+  /** This oracle's pane check of a Codex seat's hook-raised permission requests, for the readers that would otherwise
+   *  hold the raw request hook until the turn's next hook (the wake ladder, the send gate). "blocked" while a request is
+   *  on screen or its pane can't be read; "unknown" until a read lands at least the grace after `raisedAt`, the latest
+   *  request hook (a same-turn request keeps its earlier entry); then "clear" when that read found no prompt, and came
+   *  after `after` when given. Null when no request is tracked: the caller keeps its own hook reading. */
+  codexPermissionState(seatNodeId: string, raisedAt?: string | null, after?: string): "blocked" | "clear" | "unknown" | null {
+    const seat = this.ladder.get(seatNodeId);
+    if (!seat || seat.retired || (seat.inventory?.runtime ?? "codex") !== "codex" || seat.permissions.size === 0) return null;
+    const requests = [...seat.permissions.values()];
+    if (requests.some(request => request.confirmed)) return "blocked";
+    // When the last read's capture began: a refusal or request during a slow capture comes after what it saw.
+    const readAt = Date.parse(seat.permissionReadStartedAt ?? "");
+    const raised = Date.parse(raisedAt ?? "");
+    if (requests.some(request => request.nextCheckMs === 0) || !Number.isFinite(readAt)
+        || (Number.isFinite(raised) && readAt < raised + PERMISSION_REQUEST_GRACE_MS)) return "unknown";
+    return after !== undefined && !(readAt > Date.parse(after)) ? "unknown" : "clear";
   }
 
   /** Wait-after-seq read primitive (T1 seam, exposed not consumed here): resolves when
@@ -400,7 +764,16 @@ export class SeatActivityService {
         sessionName,
         retired: false,
         inventory: null,
+        inventorySinceMs: this.now().getTime(),
         sources: new Map(),
+        permissions: new Map(),
+        claudeToolBatches: new Map(),
+        permissionRevision: 0,
+        permissionPolling: false,
+        permissionEvidence: null,
+        usageLimit: null,
+        lastWorkAt: null,
+        usageLimitRestored: false,
         trust: new Map(),
         promotion: new Map(),
         contradictionSinceMs: null,
@@ -411,6 +784,8 @@ export class SeatActivityService {
           activity: "unknown",
           needsInput: { count: 0, reason: null },
           needsInputEvidence: null,
+          backgroundWork: null,
+          usageLimit: null,
           decidedBy: null,
           seq: 0,
           changedAt: this.now().toISOString(),
@@ -453,29 +828,34 @@ export class SeatActivityService {
   /** AM-2: a TRIAL rung's evidence is measured against the current authoritative
    *  CANDIDATE value (raw ladder decision, pre-debounce) — evidence against evidence,
    *  never against the debounced display. Enough agreements over at least the minimum
-   *  window promote the rung to authoritative, visibly. */
+   *  window promote the rung to authoritative, visibly.
+   *
+   *  Agreements are counted per relay route, because one event can be posted by more than one route; one route must
+   *  reach the bar on its own, over its own window. A disagreement from any route resets every route's run. */
   private measureTrialAgreement(seat: SeatLadderState, evidence: ActivityEvidence): void {
     if (evidence.activity === undefined) return;
     if (this.rungTrust(seat, evidence.rung) !== "trial") return;
     const authority = this.rawCandidate(seat, { excludeRung: evidence.rung });
     if (!authority || authority.activity === undefined) return;
-    const entry = seat.promotion.get(evidence.rung) ?? { agreements: 0, firstAgreementAtMs: null };
-    if (authority.activity === evidence.activity) {
-      entry.agreements += 1;
-      if (entry.firstAgreementAtMs === null) entry.firstAgreementAtMs = this.now().getTime();
-      const spanMs = this.now().getTime() - (entry.firstAgreementAtMs ?? 0);
-      if (entry.agreements >= RUNG_PROMOTION_AGREEMENT_COUNT && spanMs >= RUNG_PROMOTION_MIN_WINDOW_MS) {
-        seat.trust.set(evidence.rung, "authoritative");
-        this.emitRungHealth(seat, evidence.rung, evidence.sourceId, "trial", "authoritative",
-          `promoted: ${entry.agreements} agreeing observations over ${Math.round(spanMs / 60000)}min (threshold ${RUNG_PROMOTION_AGREEMENT_COUNT} over ${Math.round(RUNG_PROMOTION_MIN_WINDOW_MS / 60000)}min)`);
-        seat.promotion.delete(evidence.rung);
-        return;
-      }
-    } else {
-      entry.agreements = 0; // agreement must be consecutive within the measured window
-      entry.firstAgreementAtMs = null;
+    const routes = seat.promotion.get(evidence.rung) ?? new Map<EvidenceRoute | "untagged", PromotionRun>();
+    if (authority.activity !== evidence.activity) {
+      seat.promotion.delete(evidence.rung); // agreement must be consecutive within the measured window, on every route
+      return;
     }
-    seat.promotion.set(evidence.rung, entry);
+    const route = evidence.route ?? "untagged";
+    const entry = routes.get(route) ?? { agreements: 0, firstAgreementAtMs: null };
+    entry.agreements += 1;
+    if (entry.firstAgreementAtMs === null) entry.firstAgreementAtMs = this.now().getTime();
+    const spanMs = this.now().getTime() - entry.firstAgreementAtMs;
+    if (entry.agreements >= RUNG_PROMOTION_AGREEMENT_COUNT && spanMs >= RUNG_PROMOTION_MIN_WINDOW_MS) {
+      seat.trust.set(evidence.rung, "authoritative");
+      this.emitRungHealth(seat, evidence.rung, evidence.sourceId, "trial", "authoritative",
+        `promoted: ${entry.agreements} agreeing observations over ${Math.round(spanMs / 60000)}min (threshold ${RUNG_PROMOTION_AGREEMENT_COUNT} over ${Math.round(RUNG_PROMOTION_MIN_WINDOW_MS / 60000)}min)`);
+      seat.promotion.delete(evidence.rung);
+      return;
+    }
+    routes.set(route, entry);
+    seat.promotion.set(evidence.rung, routes);
   }
 
   /** The raw ladder decision for working/idle: highest authoritative rung with usable,
@@ -485,13 +865,103 @@ export class SeatActivityService {
     const nowMs = this.now().getTime();
     for (const rung of EVIDENCE_RUNG_RANK) {
       if (rung === opts.excludeRung) continue;
-      if (this.rungTrust(seat, rung) !== "authoritative") continue;
+      const trust = this.rungTrust(seat, rung);
+      if (trust !== "authoritative" && trust !== "positive-only") continue;
       const evd = this.latestByRung(seat, rung, "activity");
       if (!evd || evd.activity === undefined) continue;
-      if (rung === "lifecycle-hooks" && nowMs - Date.parse(evd.observedAt) > HOOK_AUTHORITY_WINDOW_MS) continue;
+      if (rung === "window-sampling" && nowMs - Date.parse(evd.observedAt) > this.samplingAuthorityWindowMs) continue;
+      // A working frame only overrides the quiet window while its proof is fresh, even if polling stops.
+      if (rung === "window-sampling" && evd.sourceId === "codex:working-frame-fallback"
+          && nowMs - Date.parse(evd.observedAt) >= DEFAULT_STRUCTURAL_STALE_MS) return { ...evd, activity: "idle-at-prompt" };
+      // A positive-only rung answers only "working"; its silence leaves the state to the rungs below, or unknown.
+      if (trust === "positive-only" && evd.activity !== "working") continue;
+      // A durable rung's idle or attention boundary holds; a bare working boundary still expires, then falls to the
+      // rungs below, so a turn whose end was lost can't read working forever.
+      // A runner's counted working beat lasts its own livenessSeconds instead (the runner contract §4).
+      if (rung === "lifecycle-hooks" && !(this.durableBoundaries(seat, rung) && (evd.activity !== "working"
+          || (this.latestByRung(seat, rung)?.needsInput?.count ?? 0) > 0))
+          && nowMs - Date.parse(evd.observedAt) > (evd.activity === "working" && evd.workingLivenessSeconds
+            ? evd.workingLivenessSeconds * 1000 : HOOK_AUTHORITY_WINDOW_MS)) continue;
+      // An idle boundary whose source promised to keep reporting holds for two reports. A source that goes quiet (a runner
+      // killed or out of memory) stops reading idle, but only when nothing is waiting on a person: attention holds.
+      if (rung === "lifecycle-hooks" && evd.activity === "idle-at-prompt" && evd.livenessSeconds
+          && (this.latestByRung(seat, rung)?.needsInput?.count ?? 0) === 0
+          && nowMs - Date.parse(evd.observedAt) > 2 * 1000 * evd.livenessSeconds) continue;
       return evd;
     }
     return null;
+  }
+
+  /** A runner seat declared with no hook evidence (after a daemon restart) takes its last recorded hook, so an idle seat
+   *  that posts nothing still reads idle. Its seq is 0: any live hook outranks it. The seat's own runtime reads the
+   *  record, as its live hooks are read: a community runner's inventory names no runtime of its own. */
+  private restoreDurableHook(seat: { seatNodeId: string; sessionName: string }, inventory: AdapterRungInventory,
+    seatRuntime: string | null): void {
+    if (!this.restoreHookEvidence || !inventory.rungs.some((r) => r.rung === "lifecycle-hooks" && r.durableBoundaries)) return;
+    const ladder = this.ladder.get(seat.seatNodeId);
+    if (!ladder || this.latestByRung(ladder, "lifecycle-hooks")) return;
+    let evidence: ActivityEvidence | null = null;
+    try { evidence = this.restoreHookEvidence(seat, seatRuntime ?? inventory.runtime); } catch { evidence = null; }
+    if (evidence && evidence.seatNodeId === seat.seatNodeId && evidence.sessionName === seat.sessionName
+        && evidence.rung === "lifecycle-hooks") this.reportEvidence({ ...evidence, seq: 0 });
+  }
+
+  /** After a daemon restart, a typed usage limit still in force holds again, as it did live. It's read once per seat,
+   *  whichever path declared its inventory, and held directly unless a strictly newer working boundary was already seen. A
+   *  store that can't be read, or a limit whose occupant can't be shown, leaves the seat unknown until a newer turn, never
+   *  working on an older report. Only Claude and Codex seats post a typed limit, and only they have a newer turn or a
+   *  banner to end that hold, so no other seat reads the store for one. */
+  private restoreUsageLimit(seat: { seatNodeId: string; sessionName: string }, seatRuntime: string | null): void {
+    const ladder = this.ladder.get(seat.seatNodeId);
+    if (!this.restoreUsageLimitEvidence || (seatRuntime !== "claude-code" && seatRuntime !== "codex") || !ladder
+        || ladder.retired || ladder.sessionName !== seat.sessionName || ladder.usageLimitRestored) return;
+    ladder.usageLimitRestored = true;
+    if (ladder.usageLimit) return; // a live limit already arrived
+    let evidence: ActivityEvidence | null;
+    try {
+      evidence = this.restoreUsageLimitEvidence(seat, seatRuntime);
+    } catch {
+      ladder.usageLimit = { rung: "lifecycle-hooks", observedAt: this.now().toISOString(), resetsAt: null, unread: true };
+      this.arbitrate(ladder);
+      return;
+    }
+    if (!evidence?.usageLimit || evidence.seatNodeId !== seat.seatNodeId || evidence.sessionName !== seat.sessionName) return;
+    // Held directly, as a live limit is, unless a strictly newer working boundary has already been seen; a newer idle hook
+    // isn't recovery. (Reporting it as seq-0 hook evidence would be dropped behind any live hook.)
+    if (this.newerWorkSeen(ladder, evidence.observedAt)) return;
+    ladder.usageLimit = { rung: evidence.rung, observedAt: evidence.observedAt, resetsAt: evidence.usageLimit.resetsAt };
+    this.arbitrate(ladder);
+  }
+
+  /** Whether the seat has already accepted a working boundary (hooks or its own status) strictly newer than `at`. */
+  private newerWorkSeen(seat: SeatLadderState, at: string): boolean {
+    return seat.lastWorkAt !== null && Date.parse(seat.lastWorkAt) > Date.parse(at);
+  }
+
+  /** A typed usage limit read outside the hook relay (Codex's banner, which the pane shows), held as a hook-rung limit is:
+   *  the seat reads unknown with the limit until a strictly newer turn starts. A seat already holding one keeps it: the
+   *  same limit is still showing. */
+  holdUsageLimit(sessionName: string, limit: { rung: EvidenceRungId; observedAt: string; resetsAt: string | null }): void {
+    const seatNodeId = this.sessionToSeat.get(sessionName);
+    const seat = seatNodeId ? this.ladder.get(seatNodeId) : undefined;
+    if (!seat || seat.retired || seat.sessionName !== sessionName || (seat.usageLimit && !seat.usageLimit.unread)) return;
+    seat.usageLimit = { rung: limit.rung, observedAt: limit.observedAt, resetsAt: limit.resetsAt };
+    this.arbitrate(seat);
+  }
+
+  /** A strictly newer observation that the limit is gone (Codex's banner no longer showing) ends the hold. */
+  releaseUsageLimit(sessionName: string, observedAt: string): void {
+    const seatNodeId = this.sessionToSeat.get(sessionName);
+    const seat = seatNodeId ? this.ladder.get(seatNodeId) : undefined;
+    if (!seat || seat.retired || seat.sessionName !== sessionName || !seat.usageLimit
+        || !(Date.parse(observedAt) > Date.parse(seat.usageLimit.observedAt))) return;
+    seat.usageLimit = null;
+    this.arbitrate(seat);
+  }
+
+  /** Whether the seat's declared inventory says this rung's last boundary holds until the next one. */
+  private durableBoundaries(seat: SeatLadderState, rung: EvidenceRungId): boolean {
+    return seat.inventory?.rungs.some((r) => r.rung === rung && r.durableBoundaries === true) ?? false;
   }
 
   private emitRungHealth(
@@ -526,7 +996,8 @@ export class SeatActivityService {
     const nowMs = this.now().getTime();
     const hookFresh = hook && hook.activity !== undefined
       && nowMs - Date.parse(hook.observedAt) <= HOOK_AUTHORITY_WINDOW_MS;
-    const contradicts = hookFresh && hook!.activity === "working"
+    const samplerFresh = sampler && nowMs - Date.parse(sampler.observedAt) <= this.samplingAuthorityWindowMs;
+    const contradicts = hookFresh && hook!.activity === "working" && samplerFresh
       && sampler?.activity === "idle-at-prompt"
       && this.rungTrust(seat, "window-sampling") === "authoritative";
     if (!contradicts) {
@@ -539,6 +1010,7 @@ export class SeatActivityService {
     }
     if (nowMs - seat.contradictionSinceMs > CROSS_RUNG_CONTRADICTION_WINDOW_MS) {
       seat.trust.set("lifecycle-hooks", "identity-only");
+      seat.hooksContradicted = true;
       seat.contradictionSinceMs = null;
       this.emitRungHealth(seat, "lifecycle-hooks", hook!.sourceId, "authoritative", "identity-only",
         `cross-rung contradiction: hook claims working while window-sampling sees idle-at-prompt beyond ${CROSS_RUNG_CONTRADICTION_WINDOW_MS / 1000}s — degraded to identity-only (a silently-dropping source can never stay authoritative)`);
@@ -566,8 +1038,36 @@ export class SeatActivityService {
    *  instantly. Chosen against our 1Hz/3s cadence: the 3s silence window already
    *  absorbs sub-3s lulls; the 2-tick arbitration debounce absorbs the
    *  window-boundary flap. */
+  /** #2500's boundary for a Codex structural frame, shared by the working frame and the prompt evidence: captured after
+   *  this seat's current inventory began, and, when the capture names its pane, from the occupant's own pane and process
+   *  (`recordCodexOccupant`). A respawn, a reused pane id or another pane under the same name differs from them.
+   *  "required" refuses a frame that doesn't name its pane, or a seat whose process OpenRig hasn't verified. */
+  private codexFrameQualifies(seat: SeatLadderState, startedAt: string | undefined, pane: StructuralObservation["pane"],
+    identity: "required" | "if-known"): boolean {
+    const started = startedAt ? Date.parse(startedAt) : NaN;
+    if (!Number.isFinite(started) || started < seat.inventorySinceMs) return false;
+    if (!pane) return identity !== "required";
+    return this.fromCodexOccupant(seat, pane, identity);
+  }
+
+  private fromCodexOccupant(seat: SeatLadderState, pane: { id: string; pid: number }, identity: "required" | "if-known"): boolean {
+    const occupant = seat.occupant;
+    if (occupant?.paneId && occupant.paneId !== pane.id) return false;
+    if (occupant?.pid != null) return occupant.pid === pane.pid;
+    return identity !== "required";
+  }
+
   private arbitrate(seat: SeatLadderState): void {
     this.checkContradiction(seat);
+    // #2515: the copied Codex prompt evidence holds only while its frame would: fresh, from this inventory, and from the
+    // occupant's pane and process. Read here, so a getter, a failed window read, a new inventory or a new occupant sees
+    // it expire too.
+    const prompt = seat.structuralPrompt;
+    if (prompt && (this.now().getTime() - prompt.freshMs >= DEFAULT_STRUCTURAL_STALE_MS || prompt.startedMs < seat.inventorySinceMs
+        || !this.fromCodexOccupant(seat, prompt.pane, "required"))) {
+      seat.sources.delete(CODEX_STRUCTURAL_PROMPT_SOURCE);
+      seat.structuralPrompt = undefined;
+    }
     const candidate = this.rawCandidate(seat);
     let nextActivity: ActivityValue = candidate?.activity ?? "unknown";
     let decidedBy: EvidenceRungId | null = candidate?.rung ?? null;
@@ -600,37 +1100,71 @@ export class SeatActivityService {
       }
     }
 
-    // needs-input: visible chrome outranks hook-carried evidence; hooks carry it when a
-    // PermissionRequest-class event fired and the next turn boundary clears it. NOT
-    // time-bounded like working/idle hook authority — an unanswered block persisting is
-    // exactly the founder-observed park cause and must stay visible.
-    // The answer records which evidence supplied it: a default zero (no authoritative rung
-    // reported needs-input) is not an observed clear.
+    // A typed usage limit ended the last turn and no newer turn has started: nothing older says what the seat does now,
+    // and a limit is neither work nor rest, so the seat reads unknown with the limit and its stated reset beside it.
+    // A limit that couldn't be read back after a restart (unread) says only that: unknown, with no limit to show.
+    // The hooks' contradiction demotion is about their working claims (checkContradiction); a typed limit they posted is a
+    // separate claim and still holds through it. A rung that was never authoritative doesn't hold one.
+    const limitRung = seat.usageLimit?.rung;
+    const held = seat.usageLimit && (seat.usageLimit.unread || this.rungTrust(seat, seat.usageLimit.rung) === "authoritative"
+      || (limitRung === "lifecycle-hooks" && seat.hooksContradicted === true))
+      ? seat.usageLimit : null;
+    const usageLimit = held && !held.unread ? { rung: held.rung, observedAt: held.observedAt, resetsAt: held.resetsAt } : null;
+    if (held) {
+      nextActivity = "unknown";
+      decidedBy = usageLimit ? held.rung : null;
+    }
+
+    // Codex permission hooks need probe confirmation after grace; Claude hooks latch
+    // attention until a seen prompt disappears or the same actor's tool batch completes. Unavailable capture fails safe.
+    // Other prompts retain their existing rung arbitration.
     const chrome = this.latestByRung(seat, "needs-input-chrome");
     const hooksEv = this.latestByRung(seat, "lifecycle-hooks");
     const selfEv = this.latestByRung(seat, "self-report");
+    // A known held limit outranks the seat's own status for needs-input, as its hook evidence does live: Claude's status
+    // reads "waiting" at the limit's own menu, which isn't a person's question. After a restart the limit is held with no
+    // hook evidence yet, so without this the menu read as needs-input. A limit that couldn't be read back (unread) leaves
+    // the status in charge, so a real question isn't hidden.
     const decider =
       chrome?.needsInput && this.rungTrust(seat, "needs-input-chrome") === "authoritative"
         ? chrome
         : hooksEv?.needsInput && this.rungTrust(seat, "lifecycle-hooks") === "authoritative"
           ? hooksEv
-          : selfEv?.needsInput && this.rungTrust(seat, "self-report") === "authoritative"
+          : selfEv?.needsInput && this.rungTrust(seat, "self-report") === "authoritative" && !usageLimit
             ? selfEv
             : null;
-    const needsInput: NeedsInputShape = decider?.needsInput ?? { count: 0, reason: null };
-    const needsInputEvidence = decider ? { rung: decider.rung, observedAt: decider.observedAt } : null;
+    const confirmedCount = [...seat.permissions.values()].filter(p => p.confirmed).length;
+    const permissionTracked = (seat.inventory?.runtime === "codex" || seat.inventory?.runtime === "claude-code")
+      && (seat.permissions.size > 0 || seat.permissionEvidence !== null);
+    const needsInput: NeedsInputShape = permissionTracked
+      ? { count: confirmedCount, reason: confirmedCount ? chrome?.needsInput?.reason ?? "permission_prompt" : null }
+      : decider?.needsInput ?? { count: 0, reason: null };
+    if (permissionTracked && Boolean(confirmedCount) !== Boolean(seat.arbitrated.needsInput.count)) {
+      this.permissionPromptChanged?.(seat.sessionName, Boolean(confirmedCount), seat.inventory!.runtime);
+    }
+    const needsInputEvidence = permissionTracked ? seat.permissionEvidence : decider ? { rung: decider.rung, observedAt: decider.observedAt } : null;
+    // #2661 (b): the latest self-report says a background shell outlives the turn. Kept beside activity (never an
+    // ActivityValue), anchored at the first observation of this shell so a consumer's grace cannot slide, and left
+    // out of `changed`: it moves no seq, wakes no waiter and restarts no waiting grace.
+    const backgroundWork = nextActivity === "idle-at-prompt" && selfEv?.backgroundWork
+      && this.rungTrust(seat, "self-report") === "authoritative"
+      ? { rung: selfEv.rung, observedAt: seat.arbitrated.backgroundWork?.observedAt ?? selfEv.observedAt }
+      : null;
 
     // Which rung answers is part of the answer: default zero → observed zero changes what
     // consumers may conclude, so it advances seq and pushes like a count change.
     const changed = nextActivity !== seat.arbitrated.activity
       || needsInput.count !== seat.arbitrated.needsInput.count
       || needsInput.reason !== seat.arbitrated.needsInput.reason
-      || (needsInputEvidence?.rung ?? null) !== (seat.arbitrated.needsInputEvidence?.rung ?? null);
+      || (needsInputEvidence?.rung ?? null) !== (seat.arbitrated.needsInputEvidence?.rung ?? null)
+      || (usageLimit?.observedAt ?? null) !== (seat.arbitrated.usageLimit?.observedAt ?? null);
     seat.arbitrated = {
       ...seat.arbitrated,
       activity: nextActivity,
       needsInput,
       needsInputEvidence,
+      backgroundWork,
+      usageLimit,
       decidedBy,
       seq: changed ? seat.arbitrated.seq + 1 : seat.arbitrated.seq,
       changedAt: changed ? this.now().toISOString() : seat.arbitrated.changedAt,
@@ -676,14 +1210,60 @@ interface NeedsInputShape {
   reason: string | null;
 }
 
+const CODEX_STRUCTURAL_PROMPT_SOURCE = "codex:structural-prompt";
+/** The Claude self-report rung's one source (`pid.json`, read by the sweep). */
+const CLAUDE_SELF_REPORT_SOURCE = "claude:pid-json";
+
+/** What a qualified Codex structural frame says about a prompt: a choice or permission prompt on screen (1), or a
+ *  complete empty composer (0), observed at the capture's start. Null for anything else. */
+function codexPromptObservation(frame: StructuralObservation, sessionName: string):
+  { observedAt: string; needsInput: NeedsInputShape } | null {
+  if (frame.state === "attention" && (frame.reason === "selection_prompt" || frame.reason === "permission_prompt")) {
+    return { observedAt: frame.captureStartedAt!, needsInput: { count: 1, reason: frame.reason } };
+  }
+  if (frame.idleFrame?.runtime === "codex" && frame.idleFrame.sessionName === sessionName) {
+    return { observedAt: frame.idleFrame.captureStartedAt, needsInput: { count: 0, reason: null } };
+  }
+  return null;
+}
+
+/** One relay route's consecutive agreements toward promoting a trial rung. */
+interface PromotionRun {
+  agreements: number;
+  firstAgreementAtMs: number | null;
+}
+
 interface SeatLadderState {
+  permissions: Map<string, { sinceMs: number; observedAt: string; hookAgentId?: string | null;
+    confirmed: boolean; seen: boolean; nextCheckMs: number }>;
+  claudeToolBatches: Map<string | null, number>;
+  permissionRevision: number;
+  permissionPolling: boolean;
+  permissionEvidence: ArbitratedSeatState["needsInputEvidence"];
+  /** The typed usage limit that ended the last turn, held until a newer turn starts (see reportEvidence). */
+  usageLimit: { rung: EvidenceRungId; observedAt: string; resetsAt: string | null; unread?: true } | null;
+  /** The newest working boundary accepted from the hooks or the seat's own status: a limit older than it never arms. */
+  lastWorkAt: string | null;
+  /** Whether the current occupant's held limit has been read back after a restart (once, whoever declared first). */
+  usageLimitRestored: boolean;
+  /** When the last applied pane read of the permission requests began; read only by `codexPermissionState`. */
+  permissionReadStartedAt?: string;
   sessionName: string;
   retired: boolean;
   inventory: AdapterRungInventory | null;
+  inventorySinceMs: number;
+  /** The Codex occupant's pane and process as OpenRig records them, refreshed by the sweep (#2515). */
+  occupant?: { paneId: string | null; pid: number | null };
+  /** What keeps the copied Codex prompt evidence valid where it's read: its frame's freshness, capture start and pane. */
+  structuralPrompt?: { freshMs: number; startedMs: number; pane: { id: string; pid: number } };
+  /** Sweeps in a row whose self-report read returned nothing. */
+  selfReportUnread?: number;
   sources: Map<string, { latest: ActivityEvidence; latestActivity: ActivityEvidence | null }>;
   trust: Map<EvidenceRungId, RungTrust>;
-  promotion: Map<EvidenceRungId, { agreements: number; firstAgreementAtMs: number | null }>;
+  promotion: Map<EvidenceRungId, Map<EvidenceRoute | "untagged", PromotionRun>>;
   contradictionSinceMs: number | null;
+  /** The hooks were demoted for contradicting the pane's idle (checkContradiction), until the next inventory or reset. */
+  hooksContradicted?: boolean;
   pendingIdle: { sinceMs: number; ticks: number; lastSeq: number } | null;
   waiters: SeatWaiter[];
   arbitrated: ArbitratedSeatState;
@@ -693,6 +1273,8 @@ interface SeatLadderState {
 // requires the numbers recorded; rationale in the GREEN commit + reference doc):
 /** Hook evidence older than this no longer decides working/idle (time-bounded authority). */
 export const HOOK_AUTHORITY_WINDOW_MS = 15_000;
+/** Sampling is refreshed once per second by default; old evidence must not be an oracle forever if polling stops. */
+export const SAMPLING_AUTHORITY_WINDOW_MS = 15_000;
 /** Persistent hook-vs-sampler contradiction beyond this window degrades the hook rung. */
 export const CROSS_RUNG_CONTRADICTION_WINDOW_MS = 10_000;
 /** Sampling-decided working→idle needs this many consecutive idle evaluations… */
@@ -703,3 +1285,8 @@ export const SAMPLING_IDLE_DEBOUNCE_CAP_MS = 2_500;
 export const RUNG_PROMOTION_AGREEMENT_COUNT = 50;
 /** …spread over at least this window of production time. */
 export const RUNG_PROMOTION_MIN_WINDOW_MS = 60 * 60 * 1000;
+
+/** Which community inventory a seat has, if any: the reconcile pass re-declares when this changes for a session. */
+function communityKind(inventory: unknown): "runner" | "plain" | null {
+  return inventory === COMMUNITY_RUNNER_RUNG_INVENTORY ? "runner" : inventory === COMMUNITY_HARNESS_RUNG_INVENTORY ? "plain" : null;
+}

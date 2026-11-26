@@ -4,18 +4,19 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import Database from "better-sqlite3";
 // OPR.0.5.6.24 F-14 + R2 repair — the parked-owner consumer contract.
-// Receipts are ROW-SIDE transitions written reserve-before-deliver; episode
-// state derives from the obligation row's transition log (durable under the
-// retention active-frontier invariant); failures land in the S01 ladder's
-// native lastNudgeResult vocabulary. The five R2 hard checks live in the
-// integration half below, each at its actual seam.
+// Current reminders do not depend on old attempt notes. Positive prompt refusal
+// and failure history remains available to the real wake-or-escalate ladder.
 import {
   makeParkedOwnerConsumerPolicy,
   makeRigAnchor,
   RESERVE_PREFIX,
   CLOSE_PREFIX,
+  DELIVERED_PREFIX,
+  ESCALATED_PREFIX,
   REFUSED_PREFIX,
   FAILED_PREFIX,
+  openPromptRefusals,
+  currentParkedOwnerNoInputFailure,
   NUDGE_FAIL_PREFIX,
   PARKED_OWNER_POLICY_NAME,
   type ParkedOwnerConsumerDeps,
@@ -28,6 +29,8 @@ import { migrate } from "../src/db/migrate.js";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 import { QueueRepository, isBlockerLive } from "../src/domain/queue-repository.js";
 import { EventBus } from "../src/domain/event-bus.js";
+import { WatchdogPolicyEngine } from "../src/domain/watchdog-policy-engine.js";
+import { makeWatchdogDeliver } from "../src/domain/watchdog-delivery.js";
 import { WatchdogHistoryLog } from "../src/domain/watchdog-history-log.js";
 import { WatchdogJobsRepository } from "../src/domain/watchdog-jobs-repository.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
@@ -82,6 +85,21 @@ class RowStore {
   nudges: Array<{ qitemId: string; result: string }> = [];
   openIds: (dest: string) => string[] = () => ROW_IDS;
   terminal = new Set<string>();
+  private clock = Date.parse("2026-10-11T00:00:00.000Z");
+  private nextId = 1;
+
+  /** One second per transition, so order never depends on the wall clock. */
+  private tick(): string { this.clock += 1000; return new Date(this.clock).toISOString(); }
+
+  /** Every row starts with a stated transition, as the repository writes one at creation. */
+  constructor() { for (const id of ROW_IDS) this.record(id, SEAT, "in-progress", "claimed"); }
+
+  /** A transition written by someone other than the consumer: a seat's note, or a state change. */
+  record(qitemId: string, actorSession: string, state: string, note = "note", ts = this.tick()): void {
+    const list = this.transitions.get(qitemId) ?? [];
+    list.push({ ts, transitionNote: note, actorSession, state, transitionId: this.nextId++ });
+    this.transitions.set(qitemId, list);
+  }
 
   deps(): ParkedOwnerConsumerDeps["rows"] {
     return {
@@ -89,7 +107,8 @@ class RowStore {
       appendNote: (q, note) => {
         if (this.terminal.has(q)) return { ok: false };
         const list = this.transitions.get(q) ?? [];
-        list.push({ ts: new Date().toISOString(), transitionNote: note });
+        // The consumer's own notes: system bookkeeping that keeps the row's state.
+        list.push({ ts: this.tick(), transitionNote: note, actorSession: "watchdog@system", state: list.at(-1)?.state ?? "in-progress", transitionId: this.nextId++ });
         this.transitions.set(q, list);
         this.appended.push({ qitemId: q, note });
         return { ok: true };
@@ -104,6 +123,7 @@ function makeDeps(
   seats: ParkedSeatDiagnosisView[],
   store: RowStore,
   history: WatchdogHistoryEntry[] = [],
+  occupantGeneration: (sessionName: string) => string | null = () => "gen-1",
 ): ParkedOwnerConsumerDeps {
   return {
     diagnoseRig: () => ({ seats }),
@@ -112,6 +132,7 @@ function makeDeps(
       countForJob: () => history.length,
     },
     rows: store.deps(),
+    occupantGeneration,
   };
 }
 
@@ -125,7 +146,9 @@ function sentHistory(input: {
     historyId: `h-${input.episodeKey}`,
     jobId: "job-poc-1",
     evaluatedAt: new Date().toISOString(),
-    outcome: "sent",
+    // As the engine records an attempt: only a delivered one reads sent.
+    outcome: (input.deliveryStatus ?? "ok") === "ok" ? "sent"
+      : input.deliveryReason?.startsWith("Refused:") && input.deliveryReason.includes("interactive prompt") ? "refused" : "failed",
     skipReason: null,
     deliveryTargetSession: SEAT,
     deliveryStatus: input.deliveryStatus ?? "ok",
@@ -172,8 +195,23 @@ describe("parked-owner-consumer policy — unit contract (OPR.0.5.6.24)", () => 
     expect(result.action).toBe("send");
     if (result.action !== "send") return;
     expect(result.message).toContain("wake-or-escalate");
+    expect(result.message).toContain("After a recorded delivery to this occupant");
+    expect(result.message).not.toContain("won't wake you again");
+    expect(result.message).toContain("for a claimed in-progress row, the wake-or-escalate ladder also retries a failed wake");
+    expect(result.message).not.toContain("handles a wake that failed to deliver");
+    expect(result.message).toContain("rig view show held");
     expect(result.message).not.toContain("S01");
     expect(result.message).not.toContain("OPR.0.5.5.1");
+  });
+
+  it("a no-longer-parked episode closure does not claim that its agent resumed", async () => {
+    const store = new RowStore();
+    await makeParkedOwnerConsumerPolicy(makeDeps([parkedSeat()],store)).evaluate(makeJob());
+    await makeParkedOwnerConsumerPolicy(makeDeps([parkedSeat({parked:false})],store)).evaluate(makeJob());
+    const closed = store.appended.filter(x => x.note.startsWith(CLOSE_PREFIX));
+    expect(closed.length).toBeGreaterThan(0);
+    expect(closed.every(x => x.note.includes("no longer observed parked"))).toBe(true);
+    expect(closed.some(x => x.note.includes("seat resumed"))).toBe(false);
   });
 
   it("B1 hard check: an obligation set closed between derive and the delivery boundary skips with the exact reason and ZERO reserve", async () => {
@@ -189,44 +227,177 @@ describe("parked-owner-consumer policy — unit contract (OPR.0.5.6.24)", () => 
   it("B1 terminal-race guard: a reserve refused by a terminal row skips with the same reason", async () => {
     const store = new RowStore();
     store.terminal.add(ROW_IDS[0]!);
-    store.openIds = () => ROW_IDS; // still listed by the reader, terminal at append
+    let reads = 0;
+    store.openIds = () => ++reads === 1 ? ROW_IDS : ROW_IDS.slice(1); // the fresh reread sees the primary row close
     const policy = makeParkedOwnerConsumerPolicy(makeDeps([parkedSeat()], store));
     const result = await policy.evaluate(makeJob());
     expect(result.action).toBe("skip");
     expect(JSON.stringify(result.notes)).toMatch(/obligation[-_]closed[-_]between[-_]derive[-_]and[-_]wake/);
   });
 
-  it("B4 hard check (at-most-once): crash after reserve, before any delivery record — a NEW policy instance over the same durable store does not re-send", async () => {
-    const store = new RowStore();
-    const first = makeParkedOwnerConsumerPolicy(makeDeps([parkedSeat()], store));
-    const sent = await first.evaluate(makeJob());
-    expect(sent.action).toBe("send"); // reserve is durably in `store`; delivery outcome never recorded (the crash)
-    const restarted = makeParkedOwnerConsumerPolicy(makeDeps([parkedSeat()], store));
-    const second = await restarted.evaluate(makeJob());
-    expect(second.action).toBe("skip");
-    expect(JSON.stringify(second.notes)).toMatch(/already[-_]woken/);
-    // Honesty: this proves at-most-once (no duplicate); the lost-wake arm is
-    // recoverable at the next episode and is NOT claimed as exactly-once.
-  });
+  describe("a repeat for the same set waits for a change in what the seat holds", () => {
+    // Each sent wake is reported delivered, as the engine records it; the next pass lands that on the row.
+    const harness = () => {
+      const store = new RowStore();
+      const history: WatchdogHistoryEntry[] = [];
+      let generation: string | null = "gen-1";
+      const wake = async (seat = parkedSeat()) => {
+        const result = await makeParkedOwnerConsumerPolicy(makeDeps([seat], store, history, () => generation)).evaluate(makeJob());
+        if (result.action === "send") history.unshift(sentHistory({ episodeKey: String(result.notes?.["episodeKey"]), primaryRow: String(result.notes?.["primaryRow"]) }));
+        return result;
+      };
+      const occupant = (next: string | null) => { generation = next; };
+      return { store, history, wake, occupant, resume: () => wake(parkedSeat({ parked: false })) };
+    };
+    const skippedWhy = (result: { notes?: Record<string, unknown> }) =>
+      ((result.notes?.["skippedSeats"] as Array<{ why: string }> | undefined) ?? []).map((s) => s.why);
 
-  it("episode: close-then-re-park earns an ordinal-bumped key; needsInput churn does not", async () => {
-    const store = new RowStore();
-    const policy = makeParkedOwnerConsumerPolicy(makeDeps([parkedSeat()], store));
-    const sent1 = await policy.evaluate(makeJob());
-    expect(sent1.action).toBe("send");
-    const key1 = String(sent1.notes?.["episodeKey"]);
-    // churn: same park, different needsInput reason — still already-woken
-    const churned = parkedSeat({ activity: { value: "idle-at-prompt", needsInput: { count: 1, reason: "permission prompt" } } });
-    expect((await makeParkedOwnerConsumerPolicy(makeDeps([churned], store)).evaluate(makeJob())).action).toBe("skip");
-    // resume: closes the episode durably
-    const closing = await makeParkedOwnerConsumerPolicy(makeDeps([parkedSeat({ parked: false })], store)).evaluate(makeJob());
-    expect(closing.action).toBe("skip");
-    expect(String((closing as { reason?: unknown }).reason)).toMatch(/episode[-_]ended/);
-    expect(store.appended.some((a) => a.note.startsWith(CLOSE_PREFIX))).toBe(true);
-    // re-park: new ordinal
-    const sent2 = await makeParkedOwnerConsumerPolicy(makeDeps([parkedSeat()], store)).evaluate(makeJob());
-    expect(sent2.action).toBe("send");
-    expect(String(sent2.notes?.["episodeKey"])).toBe(key1.replace(/#1$/, "#2"));
+    it("an unchanged repeat is skipped: the seat resumed and re-parked with nothing changed", async () => {
+      const { store, wake, resume } = harness();
+      expect((await wake()).action).toBe("send");
+      await resume();
+      expect(store.appended.some((a) => a.note.startsWith(DELIVERED_PREFIX))).toBe(true);
+      const repeat = await wake();
+      expect(repeat.action).toBe("skip");
+      expect(skippedWhy(repeat)).toEqual(["unchanged-since-last-wake"]);
+      expect(store.appended.filter((a) => a.note.startsWith(RESERVE_PREFIX))).toHaveLength(1);
+    });
+
+    it("another seat's note on the row isn't a change", async () => {
+      const { store, wake, resume } = harness();
+      await wake();
+      await resume();
+      store.record(ROW_IDS[1]!, SEAT2, "in-progress", "relay from another seat");
+      expect(skippedWhy(await wake())).toEqual(["unchanged-since-last-wake"]);
+    });
+
+    it("the seat's own note re-arms exactly one wake", async () => {
+      const { store, wake, resume } = harness();
+      await wake();
+      await resume();
+      store.record(ROW_IDS[2]!, SEAT, "in-progress", "progress note");
+      const second = await wake();
+      expect(second.action).toBe("send");
+      expect(String(second.notes?.["episodeKey"])).toContain("#");
+      await resume();
+      expect(skippedWhy(await wake())).toEqual(["unchanged-since-last-wake"]);
+    });
+
+    it("an owner note in the same millisecond as the reserve still re-arms, by transition order", async () => {
+      const { store, wake, resume } = harness();
+      const first = await wake();
+      const primary = String(first.notes?.["primaryRow"]);
+      const reserveTs = store.transitions.get(primary)!.find((t) => t.transitionNote?.startsWith(RESERVE_PREFIX))!.ts;
+      store.record(ROW_IDS[1]!, SEAT, "in-progress", "progress note", reserveTs);
+      await resume();
+      expect((await wake()).action).toBe("send");
+    });
+
+    it("a state change by anyone re-arms one wake", async () => {
+      const { store, wake, resume } = harness();
+      await wake();
+      await resume();
+      store.record(ROW_IDS[0]!, "queue@system", "pending", "auto-unparked");
+      const second = await wake();
+      expect(second.action).toBe("send");
+      expect(String(second.notes?.["episodeKey"])).toContain("#");
+    });
+
+    it("a new obligation set wakes as today", async () => {
+      const { store, wake, resume } = harness();
+      await wake();
+      await resume();
+      const extra = "qitem-d-0a1b2c3d";
+      store.openIds = () => [...ROW_IDS, extra];
+      const grown = parkedSeat({ obligations: { items: [...ROW_IDS, extra].map((qitemId) => ({ qitemId, state: "in-progress", summary: null })), held: [] } });
+      const result = await wake(grown);
+      expect(result.action).toBe("send");
+      expect(String(result.notes?.["episodeKey"])).toContain("#");
+    });
+
+    it("a row handed to a new owner (same set) gets the new owner's first wake", async () => {
+      const { wake, resume } = harness();
+      await wake();
+      await resume(); // the old owner's wake was delivered and its episode closed
+      const handedOver = parkedSeat({ sessionName: SEAT2 });
+      expect((await wake(handedOver)).action).toBe("send");
+    });
+
+    it("a fallback while the old owner's episode is still open gives the new owner its wake", async () => {
+      const { wake } = harness();
+      expect((await wake()).action).toBe("send"); // the old owner stays parked: its episode stays open
+      const handedOver = await wake(parkedSeat({ sessionName: SEAT2 }));
+      expect(handedOver.action).toBe("send");
+      expect(String(handedOver.notes?.["episodeKey"]).startsWith(`${SEAT2}|`)).toBe(true);
+    });
+
+    it("a new occupant at the same seat gets its first wake; the same occupant stays suppressed", async () => {
+      const { wake, resume, occupant } = harness();
+      await wake();
+      await resume();
+      expect(skippedWhy(await wake())).toEqual(["unchanged-since-last-wake"]);
+      occupant("gen-2"); // a handover, fresh launch or restore keeps the session name and writes nothing on the rows
+      await resume();
+      expect((await wake()).action).toBe("send");
+      await resume();
+      expect(skippedWhy(await wake())).toEqual(["unchanged-since-last-wake"]);
+    });
+
+    it("a new occupant isn't held by the previous occupant's open episode", async () => {
+      const { wake, occupant } = harness();
+      await wake();
+      occupant("gen-2");
+      expect((await wake()).action).toBe("send");
+    });
+
+    it("an unknown generation cannot prove the same occupant, so an open attempt does not veto a repeat", async () => {
+      const { store, wake, resume, occupant } = harness();
+      occupant(null);
+      await wake();
+      expect(store.appended.find((a) => a.note.startsWith(RESERVE_PREFIX))?.note).not.toContain("generation");
+      expect((await wake()).action).toBe("send");
+      await resume();
+      expect((await wake()).action).toBe("send");
+      await resume();
+      occupant("gen-1"); // a wake recorded without a generation doesn't count for a known occupant
+      expect((await wake()).action).toBe("send");
+    });
+
+    it("a reserve with no recorded delivery (a stop between reserve and delivery) isn't treated as delivered", async () => {
+      const { history, wake, resume } = harness();
+      await wake();
+      history.length = 0; // the engine never recorded a delivery
+      await resume();
+      expect((await wake()).action).toBe("send");
+    });
+
+    it("a set whose last wake failed or was refused isn't suppressed", async () => {
+      const refusal = `Refused: '${SEAT}' is at an interactive prompt (target_needs_input). No text was sent.`;
+      for (const reason of ["transport timeout after 5000ms", refusal]) {
+        const { history, wake, resume } = harness();
+        const first = await wake();
+        history[0] = sentHistory({ episodeKey: String(first.notes?.["episodeKey"]), primaryRow: String(first.notes?.["primaryRow"]), deliveryStatus: "failed", deliveryReason: reason });
+        await resume();
+        expect((await wake()).action).toBe("send");
+      }
+    });
+
+    it("a view without actor or state can't show a row unchanged, so the repeat is sent", async () => {
+      const { store, wake, resume } = harness();
+      await wake();
+      await resume();
+      store.transitions.get(ROW_IDS[0]!)!.push({ ts: "2026-10-11T23:59:59.000Z", transitionNote: "legacy note" });
+      expect((await wake()).action).toBe("send");
+    });
+
+    it("a state with no baseline state before the reserve counts as a change", async () => {
+      const { store, wake, resume } = harness();
+      store.transitions.set(ROW_IDS[1]!, [{ ts: "2026-10-10T23:59:59.000Z", transitionNote: "created" }]);
+      await wake();
+      await resume();
+      store.record(ROW_IDS[1]!, SEAT2, "pending", "state change by another seat");
+      expect((await wake()).action).toBe("send");
+    });
   });
 
   it("episode: an obligation-set change during one park earns its own wake (new idsHash)", async () => {
@@ -241,23 +412,6 @@ describe("parked-owner-consumer policy — unit contract (OPR.0.5.6.24)", () => 
     const second = await makeParkedOwnerConsumerPolicy(makeDeps([grown], store)).evaluate(makeJob());
     expect(second.action).toBe("send");
     expect(String(second.notes?.["idsHash"])).not.toBe(String(first.notes?.["idsHash"]));
-  });
-
-  it("starvation guard: a receipted seat is iterated past; the send targets the next eligible owner same-pass and names the pass-over", async () => {
-    const store = new RowStore();
-    await makeParkedOwnerConsumerPolicy(makeDeps([parkedSeat()], store)).evaluate(makeJob()); // receipt for SEAT
-    const seat2 = parkedSeat({
-      sessionName: SEAT2,
-      obligations: { items: [{ qitemId: "qitem-seat2-row-1", state: "in-progress", summary: null }], held: [] },
-    });
-    store.openIds = (dest) => (dest === SEAT2 ? ["qitem-seat2-row-1"] : ROW_IDS);
-    const result = await makeParkedOwnerConsumerPolicy(makeDeps([parkedSeat(), seat2], store)).evaluate(makeJob());
-    expect(result.action).toBe("send");
-    if (result.action !== "send") return;
-    expect(result.target.session).toBe(SEAT2);
-    const skipped = JSON.stringify(result.notes?.["skippedSeats"] ?? []);
-    expect(skipped).toContain(SEAT);
-    expect(skipped).toMatch(/already[-_]woken/);
   });
 
   it("cells: usage-limit defers to S16; indeterminate is not parked; empty union is honest", async () => {
@@ -280,7 +434,11 @@ describe("parked-owner-consumer policy — unit contract (OPR.0.5.6.24)", () => 
     // Refused delivery → the refused note; the cell reads from the row thereafter.
     const h1 = [sentHistory({ episodeKey: key, primaryRow: primary, deliveryStatus: "failed", deliveryReason: refusal })];
     const afterRefusal = await makeParkedOwnerConsumerPolicy(makeDeps([parkedSeat()], store, h1)).evaluate(makeJob());
-    expect(JSON.stringify(afterRefusal.notes)).toMatch(/destination[-_]refused[-_]interactive[-_]prompt/);
+    expect(afterRefusal.action).toBe("skip");
+    expect(JSON.stringify(afterRefusal.notes)).toContain("destination-refused-interactive-prompt");
+    expect(afterRefusal.notes?.["skippedSeats"]).toMatchObject([{ seat: SEAT, why: "destination-refused-interactive-prompt",
+      primaryRow: primary, obligations: ROW_IDS, episodeKey: key, refusalReason: expect.stringContaining(refusal) }]);
+    expect(openPromptRefusals(store.transitions.get(primary) ?? [])).toMatchObject([{ key, ids: ROW_IDS }]);
     expect(store.appended.some((a) => a.note.startsWith(REFUSED_PREFIX))).toBe(true);
     expect(store.nudges).toHaveLength(0);
     // Generic failure on a second store → FAILED note + ladder vocabulary; never mislabeled refused.
@@ -290,10 +448,21 @@ describe("parked-owner-consumer policy — unit contract (OPR.0.5.6.24)", () => 
     const primary2 = String(sent2.notes?.["primaryRow"]);
     const h2 = [sentHistory({ episodeKey: key2, primaryRow: primary2, deliveryStatus: "failed", deliveryReason: "transport timeout after 5000ms" })];
     const afterGeneric = await makeParkedOwnerConsumerPolicy(makeDeps([parkedSeat()], store2, h2)).evaluate(makeJob());
-    expect(JSON.stringify(afterGeneric.notes)).toMatch(/already[-_]woken/);
-    expect(JSON.stringify(afterGeneric.notes)).not.toMatch(/destination[-_]refused/);
+    expect(afterGeneric.action).toBe("send");
+    expect(openPromptRefusals(store2.transitions.get(primary2) ?? [])).toEqual([]);
     expect(store2.appended.some((a) => a.note.startsWith(FAILED_PREFIX))).toBe(true);
     expect(store2.nudges.some((n) => n.result.startsWith(NUDGE_FAIL_PREFIX))).toBe(true);
+  });
+
+  it("a newer uncertain input is not overwritten by an older failed attempt during reporting", async () => {
+    const store = new RowStore();
+    const first = await makeParkedOwnerConsumerPolicy(makeDeps([parkedSeat()], store)).evaluate(makeJob());
+    const key = String(first.notes?.["episodeKey"]), primary = String(first.notes?.["primaryRow"]);
+    const latest = sentHistory({ episodeKey: key, primaryRow: primary, deliveryStatus: "failed", deliveryReason: "Text write outcome unconfirmed" });
+    latest.evaluationNotes!["deliveryInputPhase"] = "attempted";
+    const older = sentHistory({ episodeKey: `${key}-old`, primaryRow: primary, deliveryStatus: "failed", deliveryReason: "transport unavailable" });
+    await makeParkedOwnerConsumerPolicy(makeDeps([parkedSeat()], store, [latest, older])).evaluate(makeJob());
+    expect(store.nudges).toEqual([{ qitemId: primary, result: "indeterminate: parked-owner wake delivery — Text write outcome unconfirmed" }]);
   });
 
   it("anchor + structural pins: stable per-rig tuple; arbitrated-only; no second scheduler", () => {
@@ -302,6 +471,17 @@ describe("parked-owner-consumer policy — unit contract (OPR.0.5.6.24)", () => 
     expect(src).toMatch(/diagnoseRigParked|RigParkedDiagnosis|diagnoseRig/);
     expect(src).not.toMatch(/AgentActivityStore|getLatestForNode|activity-relay|hook/);
     expect(src).not.toMatch(/setInterval|setTimeout|new\s+\w*Scheduler|cron/i);
+  });
+
+  it("parked owner rotation tries every current owner again without receipt-based starvation", async () => {
+    const store = new RowStore(); const history: WatchdogHistoryEntry[] = [];
+    for (const target of [SEAT, SEAT2, SEAT, SEAT2]) {
+      const result = await makeParkedOwnerConsumerPolicy(makeDeps([parkedSeat(), parkedSeat({ sessionName: SEAT2 })], store, history)).evaluate(makeJob());
+      expect(result.action).toBe("send");
+      if (result.action !== "send") return;
+      expect(result.target.session).toBe(target);
+      history.unshift({ ...sentHistory({ episodeKey: String(result.notes?.["episodeKey"]), primaryRow: String(result.notes?.["primaryRow"]) }), deliveryTargetSession: target, deliveryStatus: "failed" });
+    }
   });
 
   it("floor: a clean scan returns the quiet no-parked-owner skip and writes nothing", async () => {
@@ -336,7 +516,8 @@ describe("parked-owner-consumer — R2 integration hard checks (OPR.0.5.6.24)", 
 
   function realRows(): ParkedOwnerConsumerDeps["rows"] {
     return {
-      listTransitions: (q) => repo.listTransitions(q).map((t) => ({ ts: t.ts, transitionNote: t.transitionNote ?? null })),
+      // As startup.ts maps it.
+      listTransitions: (q) => repo.listTransitions(q).map((t) => ({ ts: t.ts, transitionNote: t.transitionNote ?? null, actorSession: t.actorSession, state: t.state, transitionId: t.transitionId })),
       appendNote: (q, note) => {
         const row = repo.getById(q);
         if (!row || !isBlockerLive(row.state)) return { ok: false };
@@ -349,7 +530,30 @@ describe("parked-owner-consumer — R2 integration hard checks (OPR.0.5.6.24)", 
     };
   }
 
-  it("B3 hard check: ordinary retention pruning (14d + keep-50) deletes the telemetry receipt while the ROW receipt keeps the episode deduplicated", async () => {
+  it("at the real seam: a recorded delivery waits for change, then the owner note re-arms it", async () => {
+    const qitemId = await mkClaimedRow();
+    const items = [{ qitemId, state: "in-progress", summary: null }];
+    const history: WatchdogHistoryEntry[] = [];
+    const run = async (parked: boolean) => {
+      const result = await makeParkedOwnerConsumerPolicy({
+        diagnoseRig: () => ({ seats: [parkedSeat({ parked, obligations: { items, held: [] } })] }),
+        history: { listForJob: (_j, l) => history.slice(0, l), countForJob: () => history.length },
+        rows: realRows(),
+        occupantGeneration: () => "gen-1",
+      }).evaluate(makeJob());
+      if (result.action === "send") history.unshift(sentHistory({ episodeKey: String(result.notes?.["episodeKey"]), primaryRow: qitemId }));
+      return result;
+    };
+    expect((await run(true)).action).toBe("send");
+    await run(false); // the delivery lands on the row, and the seat's turn closes the episode "(seat resumed)"
+    const repeat = await run(true);
+    expect(repeat.action).toBe("skip");
+    expect(JSON.stringify(repeat.notes)).toContain("unchanged-since-last-wake");
+    repo.update({ qitemId, actorSession: SEAT, transitionNote: "progress" }); // ordered by transition id, not its millisecond
+    expect((await run(true)).action).toBe("send");
+  });
+
+  it("retention pruning cannot turn a current obligation into an already-delivered no-op", async () => {
     const qitemId = await mkClaimedRow();
     const seat = parkedSeat({ obligations: { items: [{ qitemId, state: "in-progress", summary: null }], held: [] } });
     const log = new WatchdogHistoryLog(db);
@@ -378,10 +582,9 @@ describe("parked-owner-consumer — R2 integration hard checks (OPR.0.5.6.24)", 
     pruneWatchdogHistory(db, { nowIso: new Date().toISOString() });
     const remaining = log.listForJob(job.jobId, log.countForJob(job.jobId));
     expect(remaining.some((e) => e.evaluatedAt === old)).toBe(false); // telemetry receipt GONE
-    // The row receipt survives (active-frontier invariant) and still dedups:
+    // The row's old receipt survives, but no longer vetoes the current reminder:
     const again = await makeParkedOwnerConsumerPolicy(deps).evaluate(makeJob({ jobId: job.jobId }));
-    expect(again.action).toBe("skip");
-    expect(JSON.stringify(again.notes)).toMatch(/already[-_]woken/);
+    expect(again.action).toBe("send");
   });
 
   it("B2 hard check (real-persistence discriminator): consumer failure enters the ladder, SURVIVES the ladder's own generic overwrite, retries to cap, and reaches escalation", async () => {
@@ -444,6 +647,23 @@ describe("parked-owner-consumer — R2 integration hard checks (OPR.0.5.6.24)", 
     expect(joined).toMatch(/escalation-rung:|ladder-exhausted:/);
   });
 
+  it.each([{ count: 2, retained: true }, { count: 27, retained: false }])("rotation reaches all $count owners with retained=$retained across a bounded history", async ({ count, retained }) => {
+    const names = Array.from({ length: count }, (_, i) => `s${String(i).padStart(2, "0")}@${RIG}`);
+    const seats = await Promise.all(names.map(async sessionName => parkedSeat({ sessionName,
+      obligations: { items: [{ qitemId: await mkClaimedRow(sessionName), state: "in-progress", summary: null }], held: [] } })));
+    const jobs = new WatchdogJobsRepository(db), history = new WatchdogHistoryLog(db);
+    const job = jobs.register({ policy: PARKED_OWNER_POLICY_NAME, targetSession: makeRigAnchor(RIG), intervalSeconds: 120,
+      registeredBySession: SEAT, specYaml: "interval_seconds: 120\n" });
+    const policy = makeParkedOwnerConsumerPolicy({ diagnoseRig: () => ({ seats }), rows: realRows(), history,
+      occupantGeneration: () => null }); // unknown occupant never proves a prior ok reached this occupant
+    const targets: string[] = [];
+    const engine = new WatchdogPolicyEngine({ jobsRepo: jobs, historyLog: history, eventBus: new EventBus(db), additionalPolicies: [policy],
+      deliver: async ({ targetSession }) => { targets.push(targetSession); return retained ? { status: "retained" } : { status: "ok" }; } });
+    for (let i = 0; i < count + 1; i++) await engine.evaluate(jobs.getByIdOrThrow(job.jobId));
+    expect(targets).toEqual([...names, names[0]]);
+    if (retained) expect(history.listForJob(job.jobId, 1)[0]).toMatchObject({ outcome: "skipped", deliveryStatus: "retained" });
+  });
+
   it("late-rig hard check (born-armed): createRig arms the supervisor job in the same act, no restart", () => {
     const rigRepo = new RigRepository(db);
     const jobsRepo = new WatchdogJobsRepository(db);
@@ -464,5 +684,531 @@ describe("parked-owner-consumer — R2 integration hard checks (OPR.0.5.6.24)", 
       .prepare("SELECT job_id, target_session FROM watchdog_jobs WHERE policy = ? AND target_session = ?")
       .get(PARKED_OWNER_POLICY_NAME, makeRigAnchor("late-rig")) as { job_id: string } | undefined;
     expect(job).toBeDefined();
+  });
+});
+
+// #1933 — a seat that just handed work off, or just asked a person, has only started waiting. The first reminder
+// waits until its arbitrated waiting state has been unchanged for a grace; a seat still holding the work after it is
+// reminded as before, an unknown start keeps the reminder, and a seat at a prompt gets no grace.
+describe("a delivered reminder whose rows stay unclaimed reaches someone who can act, once", () => {
+  // The rows are pending (never claimed); each sent wake is recorded delivered, as the engine records it.
+  const unclaimedSeat = (state = "pending") => parkedSeat({
+    obligations: { items: ROW_IDS.map((qitemId) => ({ qitemId, state, summary: null })), held: [] },
+  });
+  type Escalation = { seat: string; qitemIds: string[]; deliveredAt: string; episodeKey: string };
+  const harness = (state = "pending", escalate: (input: Escalation) => Promise<string[]> = async () => [SEAT2]) => {
+    const store = new RowStore();
+    const history: WatchdogHistoryEntry[] = [];
+    const told: Escalation[] = [];
+    let now = Date.parse("2026-10-11T00:00:00.000Z");
+    const evaluate = async (seat: ParkedSeatDiagnosisView) => {
+      const result = await makeParkedOwnerConsumerPolicy({ ...makeDeps([seat], store, history), now: () => now,
+        escalateUnclaimed: async (input) => { told.push(input); return escalate(input); } }).evaluate(makeJob());
+      if (result.action === "send") history.unshift(sentHistory({ episodeKey: String(result.notes?.["episodeKey"]), primaryRow: String(result.notes?.["primaryRow"]) }));
+      return result;
+    };
+    return { store, told, advance: (ms: number) => { now += ms; },
+      wake: () => evaluate(unclaimedSeat(state)), resume: () => evaluate(parkedSeat({ parked: false })) };
+  };
+
+  it("escalates once when the delivered reminder is older than the bound and its rows are still pending", async () => {
+    const { store, told, advance, wake, resume } = harness();
+    const first = await wake();
+    expect(first.action).toBe("send");
+    await resume();
+    advance(14 * 60_000);
+    await wake();
+    expect(told).toHaveLength(0);
+    advance(2 * 60_000);
+    const repeat = await wake();
+    expect(repeat.action).toBe("skip");
+    expect(told).toEqual([{ seat: SEAT, qitemIds: ROW_IDS, episodeKey: String(first.notes?.["episodeKey"]),
+      deliveredAt: store.transitions.get(String(first.notes?.["primaryRow"]))!.find((t) => t.transitionNote?.startsWith(DELIVERED_PREFIX))!.ts }]);
+    expect(store.appended.filter((a) => a.note.startsWith(ESCALATED_PREFIX)).map((a) => a.note))
+      .toEqual([`${ESCALATED_PREFIX} ${String(first.notes?.["episodeKey"])} to ${SEAT2}`]);
+    // The seat itself isn't woken again, and its reminder isn't reopened.
+    expect(store.appended.filter((a) => a.note.startsWith(RESERVE_PREFIX))).toHaveLength(1);
+  });
+
+  it("doesn't escalate rows the seat claimed", async () => {
+    const { told, advance, wake, resume } = harness("in-progress");
+    await wake();
+    await resume();
+    advance(30 * 60_000);
+    await wake();
+    expect(told).toHaveLength(0);
+  });
+
+  const failureOf = (result: { notes?: Record<string, unknown> }) =>
+    ((result.notes?.["skippedSeats"] as Array<{ escalationFailure?: unknown }> | undefined) ?? []).map((s) => s.escalationFailure).filter(Boolean);
+
+  it("says in the pass's notes when no one can be resolved to tell, marks nothing escalated, and tries again later", async () => {
+    const noPerson = Object.assign(new Error("Workflow human fallback needs one registered human"), { code: "no_registered_person" });
+    const { store, told, advance, wake, resume } = harness("pending", async () => { throw noPerson; });
+    const first = await wake();
+    await resume();
+    advance(16 * 60_000);
+    const failed = await wake();
+    expect(failed.action).toBe("skip");
+    expect(failureOf(failed)).toEqual([{ episodeKey: String(first.notes?.["episodeKey"]), failure: "no_registered_person" }]);
+    expect(store.appended.filter((a) => a.note.startsWith(ESCALATED_PREFIX))).toHaveLength(0);
+    await wake();
+    expect(told).toHaveLength(2);
+  });
+
+  it("records exactly one escalation once a write that failed succeeds on a later pass", async () => {
+    let calls = 0;
+    const { store, advance, wake, resume } = harness("pending", async () => {
+      if (++calls === 1) throw new Error("SQLITE_BUSY: database is locked");
+      return [SEAT2];
+    });
+    await wake();
+    await resume();
+    advance(16 * 60_000);
+    expect(failureOf(await wake())).toEqual([expect.objectContaining({ failure: "Error" })]);
+    expect(failureOf(await wake())).toEqual([]);
+    await wake();
+    expect(calls).toBe(2);
+    expect(store.appended.filter((a) => a.note.startsWith(ESCALATED_PREFIX))).toHaveLength(1);
+  });
+
+  it("doesn't repeat the escalation on a later tick", async () => {
+    const { store, told, advance, wake, resume } = harness();
+    await wake();
+    await resume();
+    advance(16 * 60_000);
+    await wake();
+    advance(60 * 60_000);
+    await wake();
+    await wake();
+    expect(told).toHaveLength(1);
+    expect(store.appended.filter((a) => a.note.startsWith(ESCALATED_PREFIX))).toHaveLength(1);
+  });
+});
+
+describe("#1933: the first reminder waits a grace after the seat starts waiting", () => {
+  const NOW = Date.parse("2026-10-25T03:00:00.000Z");
+  const GRACE_MS = 5 * 60_000;
+  const waitingFor = (ms: number | null) => parkedSeat({
+    activity: { value: "idle-at-prompt", needsInput: { count: 0, reason: null }, ...(ms === null ? {} : { since: new Date(NOW - ms).toISOString() }) },
+  } as Partial<ParkedSeatDiagnosisView>);
+  const evaluate = (seat: ParkedSeatDiagnosisView, store = new RowStore()) =>
+    makeParkedOwnerConsumerPolicy({ ...makeDeps([seat], store), now: () => NOW } as ParkedOwnerConsumerDeps).evaluate(makeJob());
+
+  it("a seat that started waiting 30 s ago is not reminded on this tick, and nothing is reserved", async () => {
+    const store = new RowStore();
+    const ev = await evaluate(waitingFor(30_000), store);
+    expect(ev.action).toBe("skip");
+    expect((ev as { notes?: { skippedSeats?: unknown } }).notes?.skippedSeats).toEqual([{ seat: SEAT, why: "waiting-grace" }]);
+    expect(store.appended).toEqual([]);
+  });
+
+  it("a seat still idle with its rows after the grace is reminded as before", async () => {
+    const ev = await evaluate(waitingFor(GRACE_MS + 1_000));
+    expect(ev.action).toBe("send");
+    expect((ev as { target?: { session: string } }).target?.session).toBe(SEAT);
+  });
+
+  it("an unknown start of the wait assumes no grace: the reminder still goes", async () => {
+    expect((await evaluate(waitingFor(null))).action).toBe("send");
+  });
+
+  it("a seat stopped at a prompt 30 s ago is still attempted, so whoever can clear the prompt hears as soon as today", async () => {
+    const atPrompt = parkedSeat({
+      activity: { value: "idle-at-prompt", needsInput: { count: 1, reason: "selection_prompt" }, since: new Date(NOW - 30_000).toISOString() },
+    } as Partial<ParkedSeatDiagnosisView>);
+    expect((await evaluate(atPrompt)).action).toBe("send");
+  });
+
+  it("the grace reaches the consumer from the shipped diagnosis: the arbitrated state's last change is the start of the wait", async () => {
+    const { diagnoseRigParked } = await import("../src/domain/parked-query.js");
+    const seatState = (changedAt: string) => ({
+      seatNodeId: "node-1", activity: "idle-at-prompt" as const, needsInput: { count: 0, reason: null }, needsInputEvidence: null,
+      decidedBy: "lifecycle-hooks" as const, seq: 3, changedAt, rungs: [], lastSwap: null,
+    });
+    const diagnose = (changedAt: string) => diagnoseRigParked({
+      getSeatState: () => seatState(changedAt),
+      listOpenObligations: (_d, limit) => ({ rows: [{ qitemId: ROW_IDS[0]!, state: "in-progress" }], limit }),
+    }, [{ seatNodeId: "node-1", sessionName: SEAT }]);
+    const run = (changedAt: string) => makeParkedOwnerConsumerPolicy({
+      ...makeDeps([], new RowStore()), diagnoseRig: () => diagnose(changedAt) as never, now: () => NOW,
+    } as ParkedOwnerConsumerDeps).evaluate(makeJob());
+    expect((await run(new Date(NOW - 60_000).toISOString())).action).toBe("skip");
+    expect((await run(new Date(NOW - GRACE_MS - 1_000).toISOString())).action).toBe("send");
+  });
+});
+
+
+// #2661 (b) — the turn is over but a shell the owner started still runs: no parked reminder within the ceiling.
+describe("#2661: a live background shell defers the parked reminder up to its ceiling", () => {
+  const NOW = Date.parse("2026-11-07T12:00:00.000Z");
+  const CEILING_MS = 60 * 60_000;
+  const withShell = (ms: number, needsInput = 0) => parkedSeat({
+    activity: { value: "idle-at-prompt", needsInput: { count: needsInput, reason: needsInput ? "selection_prompt" : null },
+      since: new Date(NOW - 2 * CEILING_MS).toISOString(), backgroundWork: { observedAt: new Date(NOW - ms).toISOString() } },
+  } as Partial<ParkedSeatDiagnosisView>);
+  const evaluate = (seat: ParkedSeatDiagnosisView, store = new RowStore()) =>
+    makeParkedOwnerConsumerPolicy({ ...makeDeps([seat], store), now: () => NOW } as ParkedOwnerConsumerDeps).evaluate(makeJob());
+
+  it("a seat whose shell started 20 min ago is not reminded, and nothing is reserved", async () => {
+    const store = new RowStore();
+    const ev = await evaluate(withShell(20 * 60_000), store);
+    expect(ev.action).toBe("skip");
+    expect((ev as { notes?: { skippedSeats?: unknown } }).notes?.skippedSeats).toEqual([{ seat: SEAT, why: "background-shell" }]);
+    expect(store.appended).toEqual([]);
+  });
+
+  it("past the ceiling the reminder goes, and its evidence names the shell", async () => {
+    const ev = await evaluate(withShell(CEILING_MS + 60_000));
+    expect(ev.action).toBe("send");
+    expect((ev as { notes?: { evidence?: string } }).notes?.evidence).toBe("arbitrated-idle-at-prompt; background-shell-past-ceiling");
+  });
+
+  it("a seat at a prompt is still attempted, shell or not", async () => {
+    const ev = await evaluate(withShell(60_000, 1));
+    expect(ev.action).toBe("send");
+    expect((ev as { notes?: { evidence?: string } }).notes?.evidence).toBe("arbitrated-idle-at-prompt");
+  });
+
+  it("the shell reaches the consumer from the shipped diagnosis", async () => {
+    const { diagnoseRigParked } = await import("../src/domain/parked-query.js");
+    const diagnose = (shellAt: string | null) => diagnoseRigParked({
+      getSeatState: () => ({
+        seatNodeId: "node-1", activity: "idle-at-prompt" as const, needsInput: { count: 0, reason: null }, needsInputEvidence: null,
+        backgroundWork: shellAt ? { rung: "self-report" as const, observedAt: shellAt } : null,
+        decidedBy: "self-report" as const, seq: 3, changedAt: new Date(NOW - 2 * CEILING_MS).toISOString(), rungs: [], lastSwap: null,
+      }),
+      listOpenObligations: (_d, limit) => ({ rows: [{ qitemId: ROW_IDS[0]!, state: "in-progress" }], limit }),
+    }, [{ seatNodeId: "node-1", sessionName: SEAT }]);
+    const run = (shellAt: string | null) => makeParkedOwnerConsumerPolicy({
+      ...makeDeps([], new RowStore()), diagnoseRig: () => diagnose(shellAt) as never, now: () => NOW,
+    } as ParkedOwnerConsumerDeps).evaluate(makeJob());
+    expect((await run(new Date(NOW - 5 * 60_000).toISOString())).action).toBe("skip");
+    expect((await run(null)).action).toBe("send");
+  });
+});
+
+describe("parked reminders after a positive no-input quota rejection", () => {
+  const quotaState = "guard-revision-a:100:8192";
+  const failedQuota = (result: Awaited<ReturnType<ReturnType<typeof makeParkedOwnerConsumerPolicy>["evaluate"]>>, phase: string | undefined = "not_reached") => {
+    const entry = sentHistory({ episodeKey: String(result.notes?.["episodeKey"]), primaryRow: String(result.notes?.["primaryRow"]), deliveryStatus: "failed", deliveryReason: "Held-message quota is full; no input was written." });
+    entry.evaluationNotes = { ...entry.evaluationNotes, deliveryCode: "retained_quota_full", ...(phase ? { deliveryInputPhase: phase } : {}) };
+    return entry;
+  };
+  const policy = (store: RowStore, history: WatchdogHistoryEntry[], state = quotaState, terminal = false) =>
+    makeParkedOwnerConsumerPolicy({ ...makeDeps([parkedSeat()], store, history), retentionState: () => state, isTerminalSeat: () => terminal } as ParkedOwnerConsumerDeps);
+
+  it("bounds unchanged attempts AND row bookkeeping across restart and history pruning", async () => {
+    const store = new RowStore();
+    const first = await policy(store, []).evaluate(makeJob());
+    expect(first.action).toBe("send");
+    const history = [failedQuota(first)];
+    const next = await policy(store, history).evaluate(makeJob());
+    expect(next).toMatchObject({ action: "skip", notes: { skippedSeats: [{ seat: SEAT, why: "retention-quota-unchanged" }] } });
+    const writes = store.appended.length;
+    const nudges = store.nudges.length;
+    expect(store.nudges[0]?.result).toContain("retained_quota_full");
+    expect(store.nudges[0]?.result).toContain("not_reached");
+    for (let i = 0; i < 100; i++) {
+      expect((await policy(store, i < 50 ? history : []).evaluate(makeJob())).action).toBe("skip");
+    }
+    expect(store.appended).toHaveLength(writes);
+    expect(store.nudges).toHaveLength(nudges);
+    expect(nudges).toBe(1);
+  });
+
+  it.each(["quota-released", "guard-revision-b:off"])("rechecks admission when %s changes", async state => {
+    const store = new RowStore();
+    const first = await policy(store, []).evaluate(makeJob());
+    const history = [failedQuota(first)];
+    expect((await policy(store, history).evaluate(makeJob())).action).toBe("skip");
+    const retry = await policy(store, history, state).evaluate(makeJob());
+    expect(retry.action).toBe("send");
+    const delivered = sentHistory({ episodeKey: String(retry.notes?.["episodeKey"]), primaryRow: String(retry.notes?.["primaryRow"]) });
+    expect((await policy(store, [delivered, ...history], state).evaluate(makeJob())).action).toBe("skip");
+  });
+
+  it.each([undefined, "attempted", "written"])("does not turn phase %s into positive no-input admission", async phase => {
+    const store = new RowStore();
+    const first = await policy(store, []).evaluate(makeJob());
+    const entry = failedQuota(first, phase);
+    if (phase === undefined) delete entry.evaluationNotes!["deliveryInputPhase"];
+    expect((await policy(store, [entry]).evaluate(makeJob())).action).toBe("send");
+  });
+
+  it("leaves an ordinary transient failure retryable", async () => {
+    const store = new RowStore();
+    const first = await policy(store, []).evaluate(makeJob());
+    const entry = failedQuota(first);
+    delete entry.evaluationNotes!["deliveryCode"];
+    expect((await policy(store, [entry]).evaluate(makeJob())).action).toBe("send");
+  });
+
+  it("records terminal-only custody once without reserving recurring input attempts", async () => {
+    const store = new RowStore();
+    const first = await policy(store, [], quotaState, true).evaluate(makeJob());
+    expect(first).toMatchObject({ action: "skip", notes: { skippedSeats: [{ seat: SEAT, why: "terminal-seat" }] } });
+    expect(store.nudges).toHaveLength(1);
+    expect(store.nudges[0]?.result).toContain("failed:terminal-seat:");
+    expect(store.nudges[0]?.result).toContain("route it to an agent seat");
+    const writes = store.appended.length;
+    for (let i = 0; i < 100; i++) expect((await policy(store, [], quotaState, true).evaluate(makeJob())).action).toBe("skip");
+    expect(store.appended).toHaveLength(writes);
+    expect(store.nudges).toHaveLength(1);
+    expect((await policy(store, [], quotaState, false).evaluate(makeJob())).action).toBe("send");
+  });
+});
+
+
+describe("a queue-only seat and the parked-owner reminder (#3076)", () => {
+  const queueOnly = (store: RowStore, q: boolean, history: WatchdogHistoryEntry[] = [], generation = "gen-1") =>
+    makeParkedOwnerConsumerPolicy({ ...makeDeps([parkedSeat()], store, history, () => generation), isQueueOnlySeat: () => q } as ParkedOwnerConsumerDeps);
+
+  it("types nothing: its open rows are the reminder, held once per occupant with no nudge result, never a failure", async () => {
+    const store = new RowStore();
+    const first = await queueOnly(store, true).evaluate(makeJob());
+    expect(first).toMatchObject({ action: "skip", notes: { skippedSeats: [{ seat: SEAT, why: "queue-only-seat" }] } });
+    expect(store.appended).toHaveLength(1);
+    expect(store.appended[0]!.note).toMatch(/^parked-owner wake held: .*; code queue_only_seat; input not_reached;/);
+    expect(store.appended[0]!.note.startsWith(FAILED_PREFIX)).toBe(false);
+    expect(store.nudges).toEqual([]);
+    expect(currentParkedOwnerNoInputFailure(store.deps().listTransitions(store.appended[0]!.qitemId))).toBeNull();
+    for (let i = 0; i < 20; i++) expect((await queueOnly(store, true).evaluate(makeJob())).action).toBe("skip");
+    expect(store.appended).toHaveLength(1);
+    // A new occupant is told once more; nothing is typed to it either.
+    expect((await queueOnly(store, true, [], "gen-2").evaluate(makeJob())).action).toBe("skip");
+    expect(store.appended).toHaveLength(2);
+    expect(store.nudges).toEqual([]);
+    // Leaving queue-only, the reminder types as before.
+    expect((await queueOnly(store, false).evaluate(makeJob())).action).toBe("send");
+  });
+
+  it("through the engine, the held reminder is one history row and one event, not one per scan", async () => {
+    const db = new Database(":memory:");
+    try {
+      migrate(db, ALL_MIGRATIONS);
+      const jobs = new WatchdogJobsRepository(db), history = new WatchdogHistoryLog(db);
+      const job = jobs.register({ policy: PARKED_OWNER_POLICY_NAME, targetSession: makeRigAnchor(RIG), intervalSeconds: 120,
+        registeredBySession: SEAT, specYaml: "interval_seconds: 120\n" });
+      const store = new RowStore();
+      const policy = makeParkedOwnerConsumerPolicy({ ...makeDeps([parkedSeat()], store), history, isQueueOnlySeat: () => true });
+      const typed: string[] = [];
+      const engine = new WatchdogPolicyEngine({ jobsRepo: jobs, historyLog: history, eventBus: new EventBus(db), additionalPolicies: [policy],
+        deliver: async ({ targetSession }) => { typed.push(targetSession); return { status: "ok" }; } });
+      const events = () => (db.prepare("SELECT count(*) AS n FROM events WHERE type LIKE 'watchdog.evaluation_%'").get() as { n: number }).n;
+      for (let i = 0; i < 10; i++) await engine.evaluate(jobs.getByIdOrThrow(job.jobId));
+      expect(typed).toEqual([]);
+      expect(history.countForJob(job.jobId)).toBe(1);
+      expect(events()).toBe(1);
+      expect(store.appended).toHaveLength(1);
+    } finally { db.close(); }
+  });
+
+  it("a no-input failure recorded before the seat turned queue-only is superseded by the held note: no stuck-sweep finding", async () => {
+    const store = new RowStore();
+    await makeParkedOwnerConsumerPolicy({ ...makeDeps([parkedSeat()], store), isTerminalSeat: () => true }).evaluate(makeJob());
+    const row = store.appended[0]!.qitemId;
+    expect(currentParkedOwnerNoInputFailure(store.deps().listTransitions(row))).toMatchObject({ code: "terminal_seat" });
+    // The seat is now queue-only (and no longer bound to a terminal): its reminder is held, and the old refusal no longer
+    // says why input stopped, so the stuck sweep's parked-owner-no-input check finds nothing to report.
+    expect((await queueOnly(store, true).evaluate(makeJob())).action).toBe("skip");
+    expect(store.appended.at(-1)!.note.startsWith("parked-owner wake held:")).toBe(true);
+    expect(currentParkedOwnerNoInputFailure(store.deps().listTransitions(row))).toBeNull();
+  });
+
+  it("a bound terminal seat stays a terminal seat at queue-only: refused as one, never held", async () => {
+    const store = new RowStore();
+    const policy = makeParkedOwnerConsumerPolicy({ ...makeDeps([parkedSeat()], store), isQueueOnlySeat: () => true, isTerminalSeat: () => true });
+    expect(await policy.evaluate(makeJob())).toMatchObject({ action: "skip", notes: { skippedSeats: [{ seat: SEAT, why: "terminal-seat" }] } });
+    const notes = store.appended.map(({ note }) => note);
+    expect(notes.filter(n => n.startsWith(FAILED_PREFIX))).toEqual([expect.stringMatching(/; code terminal_seat; input not_reached;/)]);
+    expect(notes.some(n => n.startsWith("parked-owner wake held:"))).toBe(false);
+    expect(store.nudges.map(({ result }) => result)).toEqual([expect.stringMatching(/^failed:terminal-seat: /)]);
+  });
+
+  it("a reminder decided before the seat turned queue-only is held at delivery: no cold row, and on the row neither delivered nor failed", async () => {
+    const db = new Database(":memory:");
+    try {
+      migrate(db, ALL_MIGRATIONS);
+      const jobs = new WatchdogJobsRepository(db), history = new WatchdogHistoryLog(db);
+      const job = jobs.register({ policy: PARKED_OWNER_POLICY_NAME, targetSession: makeRigAnchor(RIG), intervalSeconds: 120,
+        registeredBySession: SEAT, specYaml: "interval_seconds: 120\n" });
+      const store = new RowStore();
+      // The policy still reads the seat as typed; by delivery its guard is at queue-only.
+      const level = { queueOnly: false };
+      const policy = makeParkedOwnerConsumerPolicy({ ...makeDeps([parkedSeat()], store), history, isQueueOnlySeat: () => level.queueOnly });
+      const typed: string[] = [];
+      const rows: string[] = [];
+      const deliver = makeWatchdogDeliver({ sessionTransport: { send: async (session: string) => { typed.push(session); return { ok: true }; } },
+        isQueueOnlySeat: () => true,
+        createQueueRow: async (row: { qitemId: string }) => { rows.push(row.qitemId); return { qitemId: row.qitemId, state: "pending" }; } } as never);
+      const engine = new WatchdogPolicyEngine({ jobsRepo: jobs, historyLog: history, eventBus: new EventBus(db), additionalPolicies: [policy], deliver });
+      await engine.evaluate(jobs.getByIdOrThrow(job.jobId));
+      expect(typed).toEqual([]);
+      expect(rows).toEqual([]);
+      expect(history.listForJob(job.jobId, 1)[0]).toMatchObject({ outcome: "skipped", deliveryStatus: "retained" });
+      level.queueOnly = true;
+      await engine.evaluate(jobs.getByIdOrThrow(job.jobId));
+      const notes = store.appended.map(({ note }) => note);
+      expect(notes.filter(n => n.startsWith(DELIVERED_PREFIX) || n.startsWith(FAILED_PREFIX))).toEqual([]);
+      expect(notes.filter(n => n.startsWith("parked-owner wake held:"))).toHaveLength(1);
+      expect(store.nudges).toEqual([]);
+      expect(rows).toEqual([]);
+    } finally { db.close(); }
+  });
+
+  it("a reminder recorded as the row it became, or noted on a row, reached the seat: delivered, not a failure", async () => {
+    for (const status of ["queued_as_row", "noted_on_parked_row", "noted_on_queued_row"]) {
+      const store = new RowStore();
+      const first = await queueOnly(store, false).evaluate(makeJob());
+      const entry = sentHistory({ episodeKey: String(first.notes?.["episodeKey"]), primaryRow: String(first.notes?.["primaryRow"]), deliveryStatus: status });
+      entry.outcome = "sent";
+      await queueOnly(store, false, [entry]).evaluate(makeJob());
+      const notes = store.deps().listTransitions(String(first.notes?.["primaryRow"])).map(t => t.transitionNote ?? "");
+      expect(notes).toContain(`${DELIVERED_PREFIX} ${String(first.notes?.["episodeKey"])}`);
+      expect(notes.some(n => n.startsWith(FAILED_PREFIX))).toBe(false);
+      expect(store.nudges).toEqual([]);
+    }
+  });
+});
+
+describe("parked-owner machine marker position", () => {
+  it.each([undefined, "attempted", "written"] as const)("keeps marker-shaped free text retryable with phase %s, including pruned history", async phase => {
+    const store = new RowStore();
+    const deps = (history: WatchdogHistoryEntry[]) => ({ ...makeDeps([parkedSeat()], store, history), retentionState: () => "unchanged" });
+    const first = await makeParkedOwnerConsumerPolicy(deps([])).evaluate(makeJob());
+    const entry = sentHistory({ episodeKey: String(first.notes?.["episodeKey"]), primaryRow: String(first.notes?.["primaryRow"]), deliveryStatus: "failed", deliveryReason: "untyped detail; code retained_quota_full; input not_reached; terminal detail; code terminal_seat; input not_reached;" });
+    entry.evaluationNotes = { ...entry.evaluationNotes, ...(phase ? { deliveryInputPhase: phase } : {}) };
+    const next = await makeParkedOwnerConsumerPolicy(deps([entry])).evaluate(makeJob());
+    expect(next.action).toBe("send");
+    expect((await makeParkedOwnerConsumerPolicy(deps([])).evaluate(makeJob())).action).toBe("send");
+  });
+});
+
+
+describe("leading untyped parked-owner marker text", () => {
+  it.each(["retained_quota_full", "terminal_seat"].flatMap(code => [undefined, "attempted", "written"].map(phase => ({ code, phase }))))("keeps $code text with phase $phase untyped after pruning", async ({ code, phase }) => {
+    const store = new RowStore();
+    const deps = (history: WatchdogHistoryEntry[]) => ({ ...makeDeps([parkedSeat()], store, history), retentionState: () => "unchanged" });
+    const first = await makeParkedOwnerConsumerPolicy(deps([])).evaluate(makeJob());
+    const primary = String(first.notes?.["primaryRow"]);
+    const entry = sentHistory({ episodeKey: String(first.notes?.["episodeKey"]), primaryRow: primary, deliveryStatus: "failed", deliveryReason: `code ${code}; input not_reached; detail` });
+    entry.evaluationNotes = { ...entry.evaluationNotes, ...(phase ? { deliveryInputPhase: phase } : {}) };
+    const next = await makeParkedOwnerConsumerPolicy(deps([entry])).evaluate(makeJob());
+    const transitions = store.transitions.get(primary)!;
+    const failed = transitions.findIndex(t => t.transitionNote?.startsWith(FAILED_PREFIX));
+    expect(failed).toBeGreaterThanOrEqual(0);
+    // Restore the durable failure before a subsequent reserve; history can disappear at that boundary.
+    const persisted = transitions.slice(0, failed + 1);
+    expect(currentParkedOwnerNoInputFailure(persisted)).toBeNull();
+    expect(next.action).toBe("send");
+    store.transitions.set(primary, persisted);
+    expect((await makeParkedOwnerConsumerPolicy(deps([])).evaluate(makeJob())).action).toBe("send");
+  });
+});
+
+// 0.7.18 rehearsal (#3318): with no operator seat, an alert about a seat's own prompt falls back to that seat. It is the
+// wake, not the content, so after the prompt cleared the parked check must not count it and wake the seat for nothing.
+describe("a wake escalation about the seat's own prompt is not that seat's work", () => {
+  let db: Database.Database;
+  let repo: QueueRepository;
+  const NOW = Date.parse("2026-11-16T23:30:00.000Z");
+
+  beforeEach(() => {
+    db = new Database(":memory:");
+    migrate(db, ALL_MIGRATIONS);
+    repo = new QueueRepository(db, new EventBus(db), { validateRig: () => true } as never);
+  });
+  afterEach(() => db.close());
+
+  const alert = async (destination: string, tags: string[]) =>
+    (await repo.create({ sourceSession: "sender@r", destinationSession: destination, body: "WAKE ESCALATION", tags, nudge: false })).qitemId;
+
+  // As startup wires the shipped diagnosis: the real repository's obligation face behind diagnoseRigParked.
+  const evaluate = async () => {
+    const { diagnoseRigParked } = await import("../src/domain/parked-query.js");
+    const diagnosis = diagnoseRigParked({
+      getSeatState: () => ({
+        seatNodeId: "node-1", activity: "idle-at-prompt" as const, needsInput: { count: 0, reason: null }, needsInputEvidence: null,
+        decidedBy: "lifecycle-hooks" as const, seq: 3, changedAt: new Date(NOW - 60 * 60_000).toISOString(), rungs: [], lastSwap: null,
+      }),
+      listOpenObligations: (dest, limit) => ({ rows: repo.listOpenObligations(dest, limit), limit }),
+    } as never, [{ seatNodeId: "node-1", sessionName: SEAT }]);
+    const rows: ParkedOwnerConsumerDeps["rows"] = {
+      listTransitions: (q) => repo.listTransitions(q).map((t) => ({ ts: t.ts, transitionNote: t.transitionNote ?? null, actorSession: t.actorSession, state: t.state, transitionId: t.transitionId })),
+      appendNote: (q, note) => { repo.update({ qitemId: q, actorSession: "watchdog@system", transitionNote: note }); return { ok: true }; },
+      recordNudgeResult: (q, result) => repo.recordNudgeAttempt(q, result),
+      listOpenIds: (dest) => repo.listOpenObligations(dest, 500).map((r) => r.qitemId),
+    };
+    const policy = makeParkedOwnerConsumerPolicy({ diagnoseRig: () => diagnosis as never, history: { listForJob: () => [], countForJob: () => 0 },
+      rows, occupantGeneration: () => "gen-1", now: () => NOW });
+    return { diagnosis, evaluation: await policy.evaluate(makeJob()) };
+  };
+
+  it("leaves the seat's own prompt alert out of its obligations, by either prompt tag, and keeps everything else", async () => {
+    const own = await alert(SEAT, ["wake-escalation", "wake-prompt-refusal", `prompt-destination:${SEAT}`]);
+    const ownChoice = await alert(SEAT, ["wake-escalation", "wake-prompt-refusal", `consumed-prompt-destination:${SEAT}`]);
+    // An alert about another seat's prompt, carried here, is this seat's to act on.
+    const other = await alert(SEAT, ["wake-escalation", "wake-prompt-refusal", `prompt-destination:${SEAT2}`]);
+    // Only a wake escalation is excluded: an ordinary row with the tag is still work.
+    const plain = await alert(SEAT, [`prompt-destination:${SEAT}`]);
+    // A row whose tags aren't JSON is read as before, not dropped and not a failed read.
+    const unreadable = await alert(SEAT, ["work"]);
+    db.prepare("UPDATE queue_items SET tags = 'not json' WHERE qitem_id = ?").run(unreadable);
+    // Valid JSON that isn't an array isn't a tag list any writer stores: the row is read as before, never hidden by its values.
+    const objectTags = await alert(SEAT, ["work"]);
+    db.prepare("UPDATE queue_items SET tags = ? WHERE qitem_id = ?")
+      .run(JSON.stringify({ a: "wake-escalation", b: `prompt-destination:${SEAT}` }), objectTags);
+
+    const ids = repo.listOpenObligations(SEAT, 500).map((r) => r.qitemId).sort();
+    expect(ids).toEqual([other, plain, unreadable, objectTags].sort());
+    expect(ids).not.toContain(own);
+    expect(ids).not.toContain(ownChoice);
+  });
+
+  it("a seat holding only its own prompt alert reads not parked and gets no reminder; real work beside it still does", async () => {
+    await alert(SEAT, ["wake-escalation", "wake-prompt-refusal", `prompt-destination:${SEAT}`]);
+    const first = await evaluate();
+    expect(first.diagnosis.seats[0]!.parked).toBe(false);
+    expect(first.diagnosis.seats[0]!.obligations.scope).toContain("excluding=unheld-own-prompt-alerts");
+    expect(first.evaluation.action).toBe("skip");
+
+    const work = (await repo.create({ sourceSession: "sender@r", destinationSession: SEAT, body: "obligation", nudge: false })).qitemId;
+    const second = await evaluate();
+    expect(second.evaluation.action).toBe("send");
+    expect((second.evaluation as { notes?: { obligations?: string[] } }).notes?.obligations).toEqual([work]);
+  });
+
+  // An alert its owner explicitly holds keeps that hold and its wake (the ladder retains both when the prompt clears), so a
+  // hold whose wake is gone still shows and still reads parked, as any held row does.
+  it("a self-alert its owner holds stays in the obligations, so a hold with no live wake still reads parked", async () => {
+    const held = await alert(SEAT, ["wake-escalation", "wake-prompt-refusal", `prompt-destination:${SEAT}`]);
+    db.prepare("UPDATE queue_items SET state = 'blocked' WHERE qitem_id = ?").run(held);
+    expect(repo.listOpenObligations(SEAT, 500).map((r) => r.qitemId)).toEqual([held]);
+
+    const { diagnosis } = await evaluate();
+    const seat = diagnosis.seats[0]!;
+    expect(seat.parked).toBe(true);
+    expect(seat.obligations.held.map((r) => r.qitemId)).toEqual([held]);
+    expect(seat.obligations.unhealthyHeldCount).toBe(1);
+  });
+});
+
+describe("#3315 a parked owner on a tmux server the daemon can't reach", () => {
+  it("reserves nothing and skips quietly while the server is gone, whatever else the seat reads as, and reminds after", async () => {
+    const store = new RowStore();
+    let gone = true;
+    const policy = (seat = parkedSeat()) => makeParkedOwnerConsumerPolicy({ ...makeDeps([seat], store),
+      terminalServerUnreachable: () => gone } as ParkedOwnerConsumerDeps);
+    for (let i = 0; i < 100; i++) {
+      expect(await policy().evaluate(makeJob())).toMatchObject({ action: "skip", reason: "terminal-server-unreachable" });
+    }
+    // A seat whose process went with the server reads indeterminate: still the quiet terminal skip, not a loud one.
+    expect(await policy(parkedSeat({ parked: "indeterminate" })).evaluate(makeJob()))
+      .toMatchObject({ action: "skip", reason: "terminal-server-unreachable" });
+    expect(store.appended).toEqual([]);
+    expect(store.nudges).toEqual([]);
+    gone = false;
+    expect((await policy().evaluate(makeJob())).action).toBe("send");
   });
 });

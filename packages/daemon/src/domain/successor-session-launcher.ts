@@ -1,14 +1,20 @@
+import { ActivityGrantStore } from "./activity-grants.js";
 import { ulid } from "ulid";
-import type { TmuxAdapter } from "../adapters/tmux.js";
+import { seatEnvLaunchVars, type SeatEnv } from "./seat-env.js";
+import { SEAT_NODE_ENV, SEAT_PROJECT_DIR_ENV } from "./claude-core-plugin-env.js";
+import type { PaneTerminal, TmuxAdapter } from "../adapters/tmux.js";
 import type { DiscoveryRepository } from "./discovery-repository.js";
 import type { RuntimeHint } from "./discovery-types.js";
 import type { RuntimeAdapter, NodeBinding, ReadinessResult, ForkSource } from "./runtime-adapter.js";
 import { isAttentionRequiredReadinessCode } from "./runtime-adapter.js";
+import { communityHarnessAdapter, launchedCommunityHarness } from "../adapters/community-harness-runtime-adapter.js";
 import type { AppliedLaunchObservation } from "./permission-drift.js";
 import type { TmuxOptionDefaultsApplier } from "./tmux-option-defaults.js";
 import { isShellForeground } from "./shell-classifier.js";
 import { resolveReadinessTimeoutMs } from "./readiness-timeout.js";
 import { SettingsStore } from "./user-settings/settings-store.js";
+import { terminatePaneInPlace, type PaneTerminationResult } from "./pane-cutover.js";
+import type { NativeProcessLister } from "./native-process-lineage.js";
 
 /**
  * OPR.0.4.3.04 — the explicit successor-creation seam for the seat-handover
@@ -49,29 +55,67 @@ export interface SuccessorNode {
   nonInterruptive?: boolean;
   kernelAuthority?: boolean;
   teamPermissionDefault?: boolean;
+  claudePermissions?: import("./claude-permission-rules.js").ClaudePermissionRules;
+  claudeAutoMode?: import("./claude-auto-mode.js").ClaudeAutoModeChoice;
+  claudeMcp?: import("./claude-mcp.js").ClaudeMcp;
+  codexPermissions?: import("./codex-member-permissions.js").CodexMemberPermissions;
   permissionMode?: string;
   /** 0.5.2-07 model fidelity: the seat's SPEC-pinned model (nodes.model). The successor is a continuity
    *  edge of the same seat, so its launch must READ THE SPEC — a launch path that drops it makes the
    *  running topology drift from the founder-designed one. Populated by the caller from node provenance;
    *  absent → the adapter emits no model flag (unchanged for legacy/unpinned seats). */
   model?: string | null;
-  /** #75: the seat's configured effort (nodes.effort). Carried to successor launch. */
+  /** #75: the seat's effort, from the shared resolver (OPR.0.7.0.7 seat-effort.ts). Carried to successor launch. */
   effort?: string | null;
+  /** The successor keeps the seat's session-scoped Claude Advisor. */
+  advisor?: string | null;
   /** 0.5.2-07 A4-profile: the seat's SPEC-pinned codex config profile (nodes.codex_config_profile).
    *  Same continuity rationale as model — populated by the caller from node provenance; absent → the
    *  adapter emits no -p flag (unchanged for legacy/unpinned seats). */
   codexConfigProfile?: string | null;
+  codexRebuildPermissions?: import("./codex-rebuild-permissions.js").CodexPermissionEnvelope;
+  /** The seat's declared launch environment (its rig's `env:` with the member's over it). The
+   *  successor is the same seat, so it gets the same environment; absent = none declared. */
+  seatEnv?: SeatEnv;
+  /** Set when the seat loads the openrig-core plugin: its launch project, handed to the successor as OPENRIG_SEAT_PROJECT_DIR
+   *  (and, for a Codex seat, with OPENRIG_NODE). */
+  seatProjectDir?: string;
+  /** OPR.0.7.0.9: the seat's own launch additions (copies in its seat storage), populated by the caller. The successor
+   *  is the same seat, so its launch passes them as an original launch does; absent = none. */
+  launchAdditions?: import("./seat-launch-additions.js").SeatLaunchAdditions;
+  launchWrapper?: readonly string[];
+}
+
+/** Slice 16: what a staged runtime-switch successor's launch adds to an ordinary successor launch. */
+export interface StagedLaunch {
+  canonicalSession: string;
+  /** Target materials (seat storage, projection, pre-launch files), before the harness starts; returns notes. */
+  prepare: (binding: NodeBinding, adapter: RuntimeAdapter) => Promise<string[]>;
+  binding?: Partial<Pick<NodeBinding, "seatSkillsRoot" | "claudeManagedBlockFile" | "runtimeSwitchFrom" | "accountHome" | "accountToken">>;
 }
 
 export type SuccessorLaunchResult =
   | {
       ok: true;
       discoveredId: string;
+      activityGrantId?: string;
       tmuxSession: string;
       tmuxPane: string;
       resumeToken?: string;
       resumeType?: string;
+      /** A community harness's conversation reported by its launcher, or named by OpenRig and passed to it. Absent for a
+       *  token read from the runtime itself (a built-in's, or Pi RPC's session file). */
+      resumeProvenance?: "launcher" | "passed";
+      /** The community harness this successor was launched for, with its preset's runner declaration at launch. */
+      communityHarness?: { app: string; runner: boolean | "pi-rpc" };
       appliedLaunch?: AppliedLaunchObservation;
+      /** The launch's frozen executable and whether it is a #! script (Claude managed launches, #2341). */
+      launchedExecutable?: { path: string; isScript: boolean };
+      /** How the departing occupant ended at the cutover: through its own shutdown (or nothing was left running), or by a
+       *  signal: one it doesn't handle, KILL after the window, or the pane-level stop when its own exit couldn't be
+       *  confirmed (#3901). `retireeExitDetail` says which, in a sentence. */
+      retireeExit: "graceful" | "forced";
+      retireeExitDetail?: string;
       /**
        * OPR.0.4.6.02 S1 — non-fatal tmux option-default warnings from the
        * fresh successor's launch (mouse/status/clipboard). Present only when
@@ -79,6 +123,8 @@ export type SuccessorLaunchResult =
        * shape stays byte-compatible with pre-02 successors.
        */
       warnings?: string[];
+      /** #3253: the handover went ahead without the seat's requested process limit (the request stays stored). */
+      processLimits?: import("../adapters/tmux.js").SeatProcessLimitsNotice;
     }
   | {
       ok: false;
@@ -87,6 +133,22 @@ export type SuccessorLaunchResult =
       message: string;
       /** True once the predecessor process has been replaced in its pane. */
       replacementStarted: boolean;
+      /** The pane the successor was being started in, once it is resolved (start_agent failures). */
+      tmuxPane?: string;
+      /** True when the harness launch was sent into the pane and only readiness failed (#2985): the successor may
+       * still come up there, and it is not adopted. */
+      successorLaunched?: boolean;
+      /** #2985: with successorLaunched, the resume token the launch generated (never logged), so a recovery can prove the
+       *  pane's process is exactly this launch, and how the retiree ended before it. */
+      resumeToken?: string;
+      resumeType?: string;
+      retireeExit?: "graceful" | "forced";
+      retireeExitDetail?: string;
+      launchedExecutable?: { path: string; isScript: boolean };
+      /** With successorLaunched, what the launch applied, so a recovery commits it with the successor's generation. */
+      appliedLaunch?: AppliedLaunchObservation;
+      /** #3253: the respawned pane went on without the seat's requested process limit before this failure. */
+      processLimits?: import("../adapters/tmux.js").SeatProcessLimitsNotice;
     };
 
 export class SuccessorSessionLauncher {
@@ -102,6 +164,7 @@ export class SuccessorSessionLauncher {
   private tmuxOptionDefaults: TmuxOptionDefaultsApplier | null;
   private exitPollMs: number;
   private exitTimeoutMs: number;
+  private listProcesses: NativeProcessLister | undefined;
 
   constructor(
     tmuxAdapter: TmuxAdapter,
@@ -129,6 +192,8 @@ export class SuccessorSessionLauncher {
       /** Cutover retiree-exit poll interval + total bounded timeout (per graceful/forced phase). */
       exitPollMs?: number;
       exitTimeoutMs?: number;
+      /** The process table the retiree's own exit is read from (tests); the OS's by default. */
+      listProcesses?: NativeProcessLister;
     } = {},
   ) {
     this.tmuxAdapter = tmuxAdapter;
@@ -143,6 +208,7 @@ export class SuccessorSessionLauncher {
     this.tmuxOptionDefaults = opts.tmuxOptionDefaults ?? null;
     this.exitPollMs = opts.exitPollMs ?? 100;
     this.exitTimeoutMs = opts.exitTimeoutMs ?? 3_000;
+    this.listProcesses = opts.listProcesses;
   }
 
   /**
@@ -180,6 +246,10 @@ export class SuccessorSessionLauncher {
       OPENRIG_RUNTIME: input.node.runtime ?? undefined,
       ...this.sessionEnv,
       ...(input.node.runtime ? this.runtimeSessionEnv[input.node.runtime] : undefined),
+      ...seatEnvLaunchVars(input.node.seatEnv ?? {}),
+      ...(input.node.seatProjectDir ? { [SEAT_PROJECT_DIR_ENV]: input.node.seatProjectDir } : {}),
+      // Selected Claude and Codex plugin hooks use this interpreter, as at launch (node-launcher.ts).
+      ...(input.node.seatProjectDir && (input.node.runtime === "codex" || input.node.runtime === "claude-code") ? { [SEAT_NODE_ENV]: process.execPath } : {}),
       OPENRIG_OCCUPANT_GENERATION: input.occupantGeneration ?? undefined,
     });
     const cwd = input.node.cwd ?? undefined;
@@ -210,14 +280,55 @@ export class SuccessorSessionLauncher {
       };
     }
 
+    const guardedTarget = this.tmuxAdapter.deliveryGuard?.maybeTarget(input.node.id);
+    if (this.tmuxAdapter.deliveryGuard && (guardedTarget?.session !== departingSession || guardedTarget.pane !== pane.id)) {
+      return { ok: false, code: "pane_unresolved", step: "resolve_pane", replacementStarted: false,
+        message: `The managed binding does not match pane "${pane.id}" of "${departingSession}"; no cutover was started.` };
+    }
+
+    // #3901: the pane's terminal (its session's immutable id and the tmux server), read as the pane is resolved, which
+    // the cutover's effects are then held to: a replaced server reuses names and pane ids for other terminals.
+    const terminal = this.tmuxAdapter.paneTerminal ? await this.tmuxAdapter.paneTerminal(pane.id) : undefined;
+    if (terminal && terminal.sessionName !== departingSession) {
+      return { ok: false, code: "pane_unresolved", step: "resolve_pane", replacementStarted: false,
+        message: `Pane "${pane.id}" is no longer in "${departingSession}"; no cutover was started.` };
+    }
+
+    const binding = successorBinding(input.node, departingSession, pane.id, cwd, input.occupantGeneration);
+    // The adapter is resolved before anything ends, and the launch uses exactly this one. With none, the launch would
+    // refuse after the retiree had ended; it refuses here instead, with the retiree untouched.
+    const adapter = this.adapterFor(input.node.runtime);
+    if (!adapter) return { ok: false, code: "successor_runtime_unsupported", step: "create_successor", message: noAdapter(input.node.runtime), replacementStarted: false };
+    let preflightWarnings: string[] = [];
+    if (adapter.preflightLaunch) {
+      try {
+        const checked = await adapter.preflightLaunch(binding);
+        if (!checked.ok) return { ok: false, code: "successor_preflight_failed", step: "create_successor",
+          message: checked.error, replacementStarted: false };
+        preflightWarnings = checked.warnings ?? [];
+      } catch (error) {
+        return { ok: false, code: "successor_preflight_failed", step: "create_successor",
+          message: `Successor launch preflight threw: ${error instanceof Error ? error.message : String(error)}`, replacementStarted: false };
+      }
+    }
+
+    // #3253: the seat's scope is checked before the retiree is ended, so the respawn after it reuses that check. The
+    // respawn runs in recovery mode: a limit never stops the handover after the retiree has ended (a scope failure late
+    // in the path ends in a structured warning, logged only once it has gone on). The request stays stored.
+    await this.tmuxAdapter.seatProcessLimitsRecoveryPlan?.(input.node.id);
+
     // 2. Terminate the retiree IN PLACE, then respawn the now-dead pane WITHOUT -k so native scrollback
     //    survives (respawn-pane -k CLEARS the pane history — verified on tmux 3.6a; that would defeat the
-    //    money-proof). The swap: set remain-on-exit so the pane survives the exit → graceful SIGTERM
-    //    ("exits in place"; also protects the provider session state the successor's resume depends on) →
-    //    bounded-timeout SIGKILL fallback (pinned degraded path) → respawn-pane (no -k) on the dead pane.
-    const terminated = await this.terminateRetiree(pane.id);
+    //    money-proof). The swap: set remain-on-exit so the pane survives the exit → the retiree's own exit
+    //    (#3901: Claude Code on TERM, Codex through /exit; also protects the provider session state the
+    //    successor's resume depends on) → bounded-timeout KILL fallback (pinned degraded path) → the pane's
+    //    shell ended → respawn-pane (no -k) on the dead pane.
+    const inputTarget = this.tmuxAdapter.deliveryGuard ? input.node.id : pane.id;
+    const terminated = await this.terminateRetiree(pane.id, inputTarget, input.node.runtime, terminal);
     if (!terminated.ok) {
-      return { ok: false, code: "retiree_not_terminated", step: "create_successor", message: terminated.message, replacementStarted: false };
+      // retiree_not_terminated: the retiree was seen still running after KILL (or its pane never ended). A pane seen in
+      // another tmux session or on another server (#3901) was left alone, and says so.
+      return { ok: false, code: terminated.code ?? "retiree_not_terminated", step: "create_successor", message: terminated.message, replacementStarted: false };
     }
     input.onReplacementStarted?.();
     // KI-14: the respawn command must be EXPLICIT. `respawn-pane` without a command re-runs the
@@ -226,7 +337,7 @@ export class SuccessorSessionLauncher {
     // <old-token>`), which is exactly how the 2026-08-22 wave's "fresh" successors booted 14-day-old
     // contexts. An explicit shell also resets the pane's respawn default, self-healing the pane.
     const blankShell = (await this.tmuxAdapter.getDefaultShell()) ?? "/bin/sh";
-    const respawned = await this.tmuxAdapter.respawnPane(pane.id, blankShell, { cwd, env });
+    const respawned = await this.tmuxAdapter.respawnPane(inputTarget, blankShell, { cwd, env, processLimitsMode: "recovery" });
     if (!respawned.ok) {
       return {
         ok: false,
@@ -241,6 +352,8 @@ export class SuccessorSessionLauncher {
     // or a loud refusal — never a launch driven into a resumed harness that then gets committed as a
     // fresh successor. One bounded retry absorbs the shell's spawn latency. On failure the seat is
     // preserved (unwind invariant: never killSession) and no discovery candidate exists yet.
+    // #3253: a failure from here on is after a respawn that may have gone on without the limit, so it carries the notice.
+    const limitsNotice = respawned.processLimits ? { processLimits: respawned.processLimits } : {};
     const blank = await this.verifyPaneIsBlankShell(pane.id, blankShell);
     if (!blank.ok) {
       return {
@@ -248,6 +361,7 @@ export class SuccessorSessionLauncher {
         code: "successor_pane_not_blank",
         step: "create_successor",
         replacementStarted: true,
+        ...limitsNotice,
         message: `Fresh successor pane "${pane.id}" of "${departingSession}" is running "${blank.observed ?? "unknown"}" instead of a blank shell — refusing to launch into a non-blank pane. The pane's start command likely bakes in a harness invocation; recreate the pane (or hand over with --source discovered:<id>) and retry.`,
       };
     }
@@ -260,11 +374,19 @@ export class SuccessorSessionLauncher {
     // 3. Route the successor through REAL runtime startup (launchHarness send-keys + readiness) so it
     //    becomes a LIVE, READY agent in the reused pane BEFORE it can be committed. UNWIND INVARIANT:
     //    on ANY launch/readiness failure we do NOT killSession the preserved seat — that would destroy
-    //    the retiree's recoverable state. We return the structured failure and leave the re-wakeable
-    //    shell in the pane; commit never runs, so the binding is not repointed.
-    const started = await this.startAgent(input.node, departingSession, pane.id, cwd, input.forkSource, input.occupantGeneration);
+    //    the retiree's recoverable state. We return the structured failure; commit never runs, so the binding is
+    //    not repointed. When the harness launch was already sent and only readiness failed, the pane is NOT left as
+    //    a bare shell: the successor may still come up there, unadopted (#2985). The failure says so, so the caller
+    //    can tell the operator that a retry would end it.
+    // A community harness's successor records the harness and its preset's runner declaration as launched (at commit).
+    const communityHarness = launchedCommunityHarness(adapter);
+    const started = await this.startAgent(input.node, departingSession, pane.id, cwd, input.forkSource, input.occupantGeneration, undefined, binding, adapter);
     if (!started.ok) {
-      return { ok: false, code: started.code, step: "start_agent", message: started.message, replacementStarted: true };
+      return { ok: false, code: started.code, step: "start_agent", message: started.message, replacementStarted: true,
+        tmuxPane: pane.id, ...limitsNotice, ...(started.launched ? { successorLaunched: true, retireeExit: terminated.path, retireeExitDetail: terminated.detail,
+          ...(started.resumeToken ? { resumeToken: started.resumeToken, resumeType: started.resumeType } : {}),
+          ...(started.launchedExecutable ? { launchedExecutable: started.launchedExecutable } : {}),
+          ...(started.appliedLaunch ? { appliedLaunch: started.appliedLaunch } : {}) } : {}) };
     }
 
     const discovered = this.discoveryRepo.upsertDiscoveredSession({
@@ -277,6 +399,7 @@ export class SuccessorSessionLauncher {
       cwd: input.node.cwd ?? undefined,
     });
 
+    const warnings = [...preflightWarnings, ...(respawned.warnings ?? [])];
     return {
       ok: true,
       discoveredId: discovered.id,
@@ -284,8 +407,75 @@ export class SuccessorSessionLauncher {
       tmuxPane: pane.id,
       resumeToken: started.resumeToken,
       resumeType: started.resumeType,
+      ...(started.resumeProvenance ? { resumeProvenance: started.resumeProvenance } : {}),
+      ...(communityHarness ? { communityHarness } : {}),
       appliedLaunch: started.appliedLaunch,
+      ...(started.launchedExecutable ? { launchedExecutable: started.launchedExecutable } : {}),
+      ...(started.activityGrantId ? { activityGrantId: started.activityGrantId } : {}),
+      retireeExit: terminated.path,
+      retireeExitDetail: terminated.detail,
+      ...(warnings.length ? { warnings } : {}),
+      ...limitsNotice,
     };
+  }
+
+  /**
+   * Slice 16 (from #1214 by Aschenbath): start a runtime switch's successor in its own staging session, beside the
+   * seat's current occupant, which keeps the seat. It carries the seat's canonical session name and a reserved
+   * generation; no session, binding or tenure is registered, so it has no authority until the switch commits. Its
+   * target materials are prepared first, then it is launched fresh (no native history crosses runtimes) and waited
+   * on until ready. The caller retires the staging session on any failure.
+   */
+  async stageSuccessor(input: {
+    node: SuccessorNode;
+    stagingSession: string;
+    canonicalSession: string;
+    occupantGeneration: string;
+    onPaneCreated: (pane: string) => void;
+    staged: Omit<StagedLaunch, "canonicalSession">;
+  }): Promise<{ ok: true; activityGrantId?: string; tmuxPane: string; resumeToken?: string; resumeType?: string; appliedLaunch?: AppliedLaunchObservation; notes?: string[];
+      /** #3253: the staged successor started without the seat's requested process limit (the request stays stored). */
+      processLimits?: import("../adapters/tmux.js").SeatProcessLimitsNotice }
+    | { ok: false; code: string; message: string;
+      /** #3253: the staging session went on without the seat's requested process limit before this failure. */
+      processLimits?: import("../adapters/tmux.js").SeatProcessLimitsNotice }> {
+    const env = compactEnv({
+      OPENRIG_NODE_ID: input.node.id,
+      OPENRIG_SESSION_NAME: input.canonicalSession,
+      OPENRIG_RUNTIME: input.node.runtime ?? undefined,
+      ...this.sessionEnv,
+      ...(input.node.runtime ? this.runtimeSessionEnv[input.node.runtime] : undefined),
+      ...seatEnvLaunchVars(input.node.seatEnv ?? {}),
+      ...(input.node.seatProjectDir ? { [SEAT_PROJECT_DIR_ENV]: input.node.seatProjectDir } : {}),
+      ...(input.node.seatProjectDir && (input.node.runtime === "codex" || input.node.runtime === "claude-code") ? { [SEAT_NODE_ENV]: process.execPath } : {}),
+      OPENRIG_OCCUPANT_GENERATION: input.occupantGeneration,
+    });
+    // #3253: the staging launch's own warning (a limit it went ahead without) reaches the switch's result, also when
+    // the successor then fails, a later step throwing included.
+    let limitsNotice: { processLimits?: import("../adapters/tmux.js").SeatProcessLimitsNotice } = {};
+    try {
+      const created = await this.tmuxAdapter.createSession(input.stagingSession, input.node.cwd ?? undefined, env,
+        { processLimitsMode: "recovery" });
+      if (!created.ok) return { ok: false, code: created.code ?? "successor_create_failed", message: created.message ?? "The staging session couldn't be created." };
+      if (created.processLimits) limitsNotice = { processLimits: created.processLimits };
+      const panes = await this.tmuxAdapter.listPanes(input.stagingSession);
+      if (panes.length !== 1) return { ok: false, code: "pane_unresolved", message: "The staging session should have exactly one new pane.", ...limitsNotice };
+      const pane = panes[0]!.id;
+      input.onPaneCreated(pane);
+      await this.tmuxOptionDefaults?.applyToFreshSession(input.stagingSession);
+      const shell = (await this.tmuxAdapter.getDefaultShell()) ?? "/bin/sh";
+      const blank = await this.verifyPaneIsBlankShell(pane, shell);
+      if (!blank.ok) {
+        return { ok: false, code: "successor_pane_not_blank", message: `The staging pane is running ${blank.observed ?? "an unknown command"}, not a blank shell; the target runtime wasn't started.`, ...limitsNotice };
+      }
+      const started = await this.startAgent(input.node, input.stagingSession, pane, input.node.cwd ?? undefined,
+        undefined, input.occupantGeneration, { ...input.staged, canonicalSession: input.canonicalSession });
+      if (!started.ok) return { ...started, ...limitsNotice };
+      const notes = [...(started.notes ?? []), ...(created.warnings ?? [])];
+      return { ...started, tmuxPane: pane, ...(notes.length ? { notes } : {}), ...limitsNotice };
+    } catch (err) {
+      return { ok: false, code: "successor_launch_failed", message: (err as Error).message, ...limitsNotice };
+    }
   }
 
   /**
@@ -302,15 +492,14 @@ export class SuccessorSessionLauncher {
     cwd: string | undefined,
     forkSource?: ForkSource,
     launchGeneration?: string | null,
-  ): Promise<{ ok: true; resumeToken?: string; resumeType?: string; appliedLaunch?: AppliedLaunchObservation } | { ok: false; code: string; message: string }> {
-    const adapter = node.runtime ? this.runtimeAdapters[node.runtime] : undefined;
-    if (!adapter) {
-      return {
-        ok: false,
-        code: "successor_runtime_unsupported",
-        message: `No runtime adapter for "${node.runtime ?? "unknown"}"; a live successor cannot be launched for this seat.`,
-      };
-    }
+    staged?: StagedLaunch,
+    preparedBinding?: NodeBinding,
+    /** The adapter a handover already resolved and preflighted; a staged switch resolves its target here. */
+    resolvedAdapter?: RuntimeAdapter,
+  ): Promise<{ ok: true; activityGrantId?: string; resumeToken?: string; resumeType?: string; resumeProvenance?: "launcher" | "passed"; appliedLaunch?: AppliedLaunchObservation; notes?: string[]; launchedExecutable?: { path: string; isScript: boolean } }
+    | { ok: false; code: string; message: string; launched?: true; resumeToken?: string; resumeType?: string; appliedLaunch?: AppliedLaunchObservation; launchedExecutable?: { path: string; isScript: boolean } }> {
+    const adapter = resolvedAdapter ?? this.adapterFor(node.runtime);
+    if (!adapter) return { ok: false, code: "successor_runtime_unsupported", message: noAdapter(node.runtime) };
 
     // Transient binding for the adapter launch/readiness probe — the successor
     // is unmanaged, so there is no persisted binding row (id/updatedAt are inert
@@ -319,35 +508,22 @@ export class SuccessorSessionLauncher {
     // edge of the same seat, so its launch must read the seat's spec, else the
     // running topology silently drifts from the founder-designed one at every
     // handover. (config profile is still a tracked follow-on.)
-    const binding: NodeBinding = {
-      id: "",
-      nodeId: node.id,
-      attachmentType: "tmux",
-      tmuxSession,
-      tmuxWindow: null,
-      tmuxPane,
-      cmuxWorkspace: null,
-      cmuxSurface: null,
-      updatedAt: "",
-      cwd: cwd ?? "",
-      launchGeneration: launchGeneration ?? undefined,
-      nonInterruptive: node.nonInterruptive,
-      kernelAuthority: node.kernelAuthority,
-      teamPermissionDefault: node.teamPermissionDefault,
-      // Seam B: continuity — the successor launches at the departing seat's posture.
-      ...(node.launchPosture ? { launchPosture: node.launchPosture } : {}),
-      ...(node.permissionMode ? { permissionMode: node.permissionMode } : {}),
-      // 0.5.2-07: the successor reads the seat's SPEC-pinned model (adapter emits -m/--model).
-      model: node.model ?? undefined,
-      // #75: the successor reads the seat's configured effort.
-      effort: node.effort ?? undefined,
-      // 0.5.2-07 A4-profile: the successor reads the seat's SPEC-pinned codex config profile (adapter emits -p).
-      codexConfigProfile: node.codexConfigProfile ?? undefined,
-    };
+    const binding = preparedBinding ?? successorBinding(node, tmuxSession, tmuxPane, cwd, launchGeneration, staged?.binding);
+
+    // Slice 16: a staged runtime-switch successor gets its target materials before its harness starts.
+    let notes: string[] | undefined;
+    if (staged) {
+      try { notes = await staged.prepare(binding, adapter); }
+      catch (err) {
+        return { ok: false, code: "successor_materials_failed", message: `The target runtime's materials couldn't be prepared: ${err instanceof Error ? err.message : String(err)}` };
+      }
+    }
 
     let launch: Awaited<ReturnType<RuntimeAdapter["launchHarness"]>>;
     try {
-      launch = await adapter.launchHarness(binding, { name: tmuxSession, ...(forkSource ? { forkSource } : {}) });
+      launch = await adapter.launchHarness(binding, staged
+        ? { name: staged.canonicalSession }
+        : { name: tmuxSession, ...(forkSource ? { forkSource } : { freshInPlace: true }) });
     } catch (err) {
       return { ok: false, code: "successor_launch_failed", message: `Successor harness launch threw: ${err instanceof Error ? err.message : String(err)}` };
     }
@@ -359,38 +535,61 @@ export class SuccessorSessionLauncher {
     // composer at commit with provenance "scrape" (B2, launched modes).
     let resumeToken: string | undefined;
     let resumeType: string | undefined;
+    let resumeProvenance: "launcher" | "passed" | undefined;
     const trimmed = launch.resumeToken?.trim();
     if (trimmed) {
       resumeToken = trimmed;
       resumeType = launch.resumeType;
+      resumeProvenance = launch.resumeProvenance;
     }
+    const launchedExecutable = launch.launchedExecutable ? { launchedExecutable: launch.launchedExecutable } : {};
+    const appliedLaunch = launch.appliedLaunch ? { appliedLaunch: launch.appliedLaunch } : {};
 
     // OPR.0.4.3.04 rev2 code-review fix — checkReady/waitForReady can THROW after
     // createSession already succeeded (adapter/socket/permission errors rethrow).
     // A thrown exception must NOT reject createSuccessor before its kill/unwind
     // runs (that would LEAK the unmanaged successor + surface an unstructured 500).
-    // Catch it here and return a STRUCTURED ok:false so the caller kills the
-    // just-created session (killBestEffort) and fails loudly at step=start_agent —
-    // exactly like a returned readiness failure.
+    // Catch it here and return a STRUCTURED ok:false so the caller fails loudly at
+    // step=start_agent, exactly like a returned readiness failure. Nothing kills the
+    // pane (unwind invariant above): the launched successor may still be running there.
+    const revokeRun = () => {
+      if (launch.activityGrantId) new ActivityGrantStore(this.discoveryRepo.db).revoke({ grantId: launch.activityGrantId }, "successor_readiness_failed");
+    };
     let readiness: ReadinessResult;
     try {
       readiness = await this.waitForReady(adapter, binding);
     } catch (err) {
+      revokeRun();
       return {
         ok: false,
         code: "successor_readiness_failed",
         message: `Successor readiness probe threw: ${err instanceof Error ? err.message : String(err)}`,
+        launched: true,
+        ...(resumeToken ? { resumeToken, resumeType } : {}),
+        ...appliedLaunch,
+        ...launchedExecutable,
       };
     }
     if (!readiness.ready) {
+      revokeRun();
       return {
         ok: false,
         code: isAttentionRequiredReadinessCode(readiness.code) ? "successor_attention_required" : "successor_not_ready",
         message: `Successor did not become a ready agent: ${readiness.reason ?? "readiness timeout"}`,
+        launched: true,
+        ...(resumeToken ? { resumeToken, resumeType } : {}),
+        ...appliedLaunch,
+        ...launchedExecutable,
       };
     }
 
-    return { ok: true, resumeToken, resumeType, appliedLaunch: launch.appliedLaunch };
+    return { ok: true, resumeToken, resumeType, ...(resumeProvenance ? { resumeProvenance } : {}), ...(launch.activityGrantId ? { activityGrantId: launch.activityGrantId } : {}), appliedLaunch: launch.appliedLaunch, ...launchedExecutable, ...(notes?.length ? { notes } : {}) };
+  }
+
+  /** A built-in runtime's adapter from the map; a community harness's from its installed preset. A handover of a seat with
+   *  no recorded harness selection launches its installed preset as before; what it launched is recorded at commit. */
+  private adapterFor(runtime: string | null): RuntimeAdapter | undefined {
+    return runtime ? (this.runtimeAdapters[runtime] ?? communityHarnessAdapter(this.runtimeAdapters, runtime)) : undefined;
   }
 
   /**
@@ -419,29 +618,17 @@ export class SuccessorSessionLauncher {
   }
 
   /**
-   * Cutover: terminate the retiree occupant in its pane so the successor can respawn into it WHILE
-   * PRESERVING scrollback. `setRemainOnExit(true)` FIRST (so the pane survives dead, not destroyed, on
-   * exit); graceful SIGTERM ("exits in place" — a clean exit also protects the provider session state the
-   * successor's resume depends on); a bounded-timeout SIGKILL is the pinned DEGRADED fallback. Returns
-   * which path terminated the retiree, or a failure if it never became dead (then commit never runs).
-   * (Graceful signal = SIGTERM as the desk-provisional default under build-ahead; dev-planner ratifies
-   * the exact graceful mechanism — SIGTERM vs a runtime-specific quit — at their resume.)
+   * Cutover: terminate the retiree occupant in its pane so the successor can respawn into it while
+   * preserving scrollback (the shared in-place cutover, pane-cutover.ts). Returns which path terminated
+   * the retiree, or a failure if it never became dead (then commit never runs).
+   * #3901: the graceful step is the runtime's own exit, measured natively (runtime-exit.ts): TERM to Claude Code itself
+   * (not to the pane's shell, which ignores it), `/exit` typed into an idle Codex with an empty input box. Another runtime,
+   * or an agent that can't be identified, keeps the pane-level TERM then KILL. The signals and typed input are held to
+   * `terminal`, the pane's terminal as it was resolved.
    */
-  private async terminateRetiree(
-    paneId: string,
-  ): Promise<{ ok: true; path: "graceful" | "forced" } | { ok: false; message: string }> {
-    const failures: string[] = [];
-    const remain = await this.tmuxAdapter.setRemainOnExit(paneId, true);
-    if (!remain.ok) failures.push(`remain-on-exit: ${remain.message}`);
-    const term = await this.tmuxAdapter.signalPaneProcess(paneId, "TERM");
-    if (!term.ok) failures.push(`TERM: ${term.message}`);
-    if (await this.waitPaneDead(paneId)) return { ok: true, path: "graceful" };
-    // Graceful window elapsed — force-kill (the pinned degraded path).
-    const kill = await this.tmuxAdapter.signalPaneProcess(paneId, "KILL");
-    if (!kill.ok) failures.push(`KILL: ${kill.message}`);
-    if (await this.waitPaneDead(paneId)) return { ok: true, path: "forced" };
-    const detail = failures.length > 0 ? ` Tmux failures: ${failures.join("; ")}.` : "";
-    return { ok: false, message: `Retiree in pane "${paneId}" did not exit after graceful TERM + forced KILL.${detail}` };
+  private async terminateRetiree(paneId: string, inputTarget: string, runtime: string | null, terminal: PaneTerminal | null | undefined): Promise<PaneTerminationResult> {
+    return terminatePaneInPlace(this.tmuxAdapter, paneId, { pollMs: this.exitPollMs, timeoutMs: this.exitTimeoutMs, sleep: this.sleep }, "Retiree", inputTarget,
+      { runtime, ...(this.listProcesses ? { listProcesses: this.listProcesses } : {}), ...(terminal !== undefined ? { terminal } : {}) });
   }
 
   /** KI-14: is the respawned pane's foreground a bare shell? A non-shell here means the pane booted
@@ -459,16 +646,6 @@ export class SuccessorSessionLauncher {
     return { ok: false, observed };
   }
 
-  /** Poll `isPaneDead` up to the bounded exit timeout (count-bounded so injected no-op sleeps stay fast). */
-  private async waitPaneDead(paneId: string): Promise<boolean> {
-    const maxPolls = Math.max(1, Math.ceil(this.exitTimeoutMs / this.exitPollMs));
-    for (let i = 0; i < maxPolls; i++) {
-      if (await this.tmuxAdapter.isPaneDead(paneId)) return true;
-      await this.sleep(this.exitPollMs);
-    }
-    return this.tmuxAdapter.isPaneDead(paneId);
-  }
-
   /**
    * Composer unwind for a successor that launched but failed downstream (context delivery or continuity
    * verify). CUTOVER INVARIANT: the successor occupies the retiree's PRESERVED pane, so cleanup NEVER
@@ -476,9 +653,52 @@ export class SuccessorSessionLauncher {
    * candidate vanished; the re-wakeable shell stays in the pane and the seat is recoverable from its
    * provider session file. (`tmuxSession` is retained for signature stability + call-site logging.)
    */
-  async cleanup(_tmuxSession: string, discoveredId: string | null): Promise<void> {
+  async cleanup(_tmuxSession: string, discoveredId: string | null, activityGrantId?: string): Promise<void> {
+    if (activityGrantId) new ActivityGrantStore(this.discoveryRepo.db).revoke({ grantId: activityGrantId }, "cutover_abandoned");
     if (discoveredId) this.discoveryRepo.markVanished([discoveredId]);
   }
+}
+
+function successorBinding(node: SuccessorNode, tmuxSession: string, tmuxPane: string, cwd: string | undefined,
+  launchGeneration?: string | null, bindingOverrides?: StagedLaunch["binding"]): NodeBinding {
+  return {
+      id: "",
+      nodeId: node.id,
+      attachmentType: "tmux",
+      tmuxSession,
+      tmuxWindow: null,
+      tmuxPane,
+      cmuxWorkspace: null,
+      cmuxSurface: null,
+      updatedAt: "",
+      cwd: cwd ?? "",
+      launchGeneration: launchGeneration ?? undefined,
+      nonInterruptive: node.nonInterruptive,
+      kernelAuthority: node.kernelAuthority,
+      teamPermissionDefault: node.teamPermissionDefault,
+      claudePermissions: node.claudePermissions,
+      claudeAutoMode: node.claudeAutoMode,
+      claudeMcp: node.runtime === "claude-code" ? node.claudeMcp : undefined,
+      codexPermissions: node.codexPermissions,
+      // Seam B: continuity — the successor launches at the departing seat's posture.
+      ...(node.launchPosture ? { launchPosture: node.launchPosture } : {}),
+      ...(node.permissionMode ? { permissionMode: node.permissionMode } : {}),
+      // 0.5.2-07: the successor reads the seat's SPEC-pinned model (adapter emits -m/--model).
+      model: node.model ?? undefined,
+      // #75: the successor reads the seat's resolved effort (saved choice, else authored).
+      effort: node.effort ?? undefined,
+      advisor: node.advisor ?? undefined,
+      // 0.5.2-07 A4-profile: the successor reads the seat's SPEC-pinned codex config profile (adapter emits -p).
+      codexConfigProfile: node.codexConfigProfile ?? undefined,
+      codexRebuildPermissions: node.codexRebuildPermissions,
+      ...(node.launchAdditions ? { launchAdditions: node.launchAdditions } : {}),
+      ...(node.launchWrapper?.length ? { launchWrapper: node.launchWrapper } : {}),
+      ...(bindingOverrides ?? {}),
+  };
+}
+
+function noAdapter(runtime: string | null): string {
+  return `No runtime adapter for "${runtime ?? "unknown"}"; a live successor cannot be launched for this seat.`;
 }
 
 function compactEnv(input: Record<string, string | undefined>): Record<string, string> {

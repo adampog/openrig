@@ -32,6 +32,9 @@ export type SameAccountOnNSeatsAnomaly = {
   evidence: string;
   asOf: string;
 };
+/** Historical: daemons before the seat account report emit it on every row with a null `accountId`. Kept so readers
+ *  still decode it; this daemon no longer emits it, because no applicable registry placement isn't evidence that a
+ *  seat has no usable account. */
 export type SeatWithNoAccountAnomaly = {
   kind: "seat_with_no_account";
   seat: string;
@@ -44,10 +47,16 @@ export type BindingAnomaly = SameAccountOnNSeatsAnomaly | SeatWithNoAccountAnoma
  * A `bindings[]` row — a discriminated bound/unbound union over the SAME locked §1 field names
  * (`accountId`, `seatSession`, `rigName`, `boundAt`, `bindingSource`, `anomalies`). A bound row
  * has a non-null `accountId` (+ `boundAt`/`bindingSource`); an unbound seat keeps the same field
- * names but `null` for the absent BINDING data and MUST carry a `seat_with_no_account` anomaly —
- * never a fabricated/sentinel account. Discriminant: `accountId` (string vs null).
+ * names but `null` for the absent BINDING data — never a fabricated/sentinel account.
+ * Discriminant: `accountId` (string vs null).
+ *
+ * The locked fields are the seat's Codex registry PLACEMENT (`rig auth seats set`): a null `accountId`
+ * means no registry row applies to this seat on this collection path, never that the seat has no usable
+ * account, so it carries no anomaly of its own. The additive fields say what the seat uses: what it's
+ * configured to use at its next launch, and what its launch and the provider observed, each unknown where
+ * nothing records it.
  */
-export type ProviderBinding =
+export type ProviderBinding = (
   | {
       accountId: string;
       seatSession: string;
@@ -62,11 +71,53 @@ export type ProviderBinding =
       rigName: string;
       boundAt: null;
       bindingSource: null;
-      // An unbound seat MUST carry a seat_with_no_account anomaly — enforced at the type
-      // level as a non-empty tuple whose first element is that anomaly, so the dishonest
-      // "unbound row with an empty/same-account-only anomaly list" cannot even compile.
-      anomalies: [SeatWithNoAccountAnomaly, ...BindingAnomaly[]];
-    };
+      // Empty from this daemon; an older one sends seat_with_no_account here.
+      anomalies: BindingAnomaly[];
+    }
+) & BindingSeatAccount;
+
+/** An observation nothing records yet, with the reason. Never filled from configuration or a label. */
+export interface UnknownSeatObservation {
+  state: "unknown";
+  reason: string;
+}
+
+/** Additive per-seat fields on a `bindings[]` row; optional so the sealed assembler's rows stay valid. */
+export interface BindingSeatAccount {
+  runtime?: string;
+  /** What the seat's next launch is configured to use: input, not proof of the running session's login. */
+  configured?: SeatAccountConfiguration;
+  /** The credential the seat's current process launched with. */
+  launched?: UnknownSeatObservation;
+  /** A provider-observed identity tied to this seat's launch. */
+  verified?: UnknownSeatObservation;
+  /** #3625: the rig's assignment for this seat's provider and this seat's last applied result. Claude and Codex seats. */
+  assignment?: SeatAssignment;
+}
+
+/** #3625: a seat against its rig's assignment (`rig provider assign`). Configuration and stored results only: an account
+ *  label here is the operator's name for a reference, never proof of the login a running session uses.
+ *  - follows: configured as the assigned account, or still as this assignment's apply left it;
+ *  - override: configured as its own choice of another account (kept by an apply, or changed since);
+ *  - not_applied: the rig has an assignment and the seat isn't on it yet (no result, or its last result didn't move it);
+ *  - no_assignment: the rig has no assignment for this provider. */
+export interface SeatAssignment {
+  provider: "claude" | "codex";
+  state: "follows" | "override" | "not_applied" | "no_assignment";
+  /** The rig's assignment: label, the reference it named, who asked and when. */
+  intended: { label: string; reference: string; requestedBy: string | null; at: string } | null;
+  /** The seat's last applied result, from any apply to its rig. */
+  /** `activity` is what the seat was doing when the apply reached it (as rig ps reads it), when recorded. */
+  applied: { kind: string; label: string; detail: string; at: string; recovery?: string; activity?: string } | null;
+  /** The seat's own choice, in words, when it's an override. */
+  override?: string;
+  /** Follows only as the apply of this label left its home: its configuration names no login, and the login active in
+   *  that home isn't read, so a later change there isn't seen. */
+  asApplied?: true;
+  /** The assigned label has been removed from this daemon's accounts. The seat is compared only with what an apply left
+   *  it (follows) or not (not_applied), since there's no reference to compare its configuration with. */
+  referenceMissing?: true;
+}
 
 export type SignalSourceClass =
   | "provider_structured_read"
@@ -127,11 +178,48 @@ export type PrecheckReason =
   | "target_needs_reauth" // target authState === "needs_reauth"
   | "target_auth_unknown" // target authState === "unknown" — fails closed, NOT relabeled as re-auth
   | "signal_unknown_or_stale"
-  | "rebind_unsupported_for_runtime";
+  | "rebind_unsupported_for_runtime"
+  | "seat_restart_refused" // the seat's in-place restart plan refused, so nothing would change
+  | "seat_name_shared" // the seat's name now reaches another seat than the one an assignment selected, or no seat
+  | "target_not_in_seat_home" // no login by that name is saved in the Codex home the seat runs on
+  | "token_file_required" // a Claude seat moves to a token file (--token-file), or back to its stored login (--stored-login)
+  | "invalid_token_reference" // the label or the token file's path can't be a seat's reference
+  | "token_file_unusable" // the token file wouldn't give Claude a token: missing, empty, not a file or unreadable
+  | "credential_outranks_token" // a cloud provider, API key, auth token or apiKeyHelper would win over the seat's token
+  | "conversation_not_resumable"; // a stopped seat's next launch wouldn't resume its conversation
 
-export type PrecheckResult = { safe: true } | { safe: false; reasons: PrecheckReason[] };
+/** A seat on the same Codex home, as the in-place restart reports it (its `PeerReport`). Declared here rather than
+ *  imported, so the provider types don't import the restart module and its tmux dependencies. */
+export interface SeatPeer {
+  logicalId: string;
+  sessionName: string | null;
+  home: "same" | "different" | "unknown";
+  effect: string;
+}
 
-export type SwitchOutcome = "succeeded" | "rebind_in_progress" | "failed_safely";
+/** What a seat-aware precheck saw: the Codex home the seat runs on, what the seat is doing, and its peers on that home. */
+export interface SeatSwitchView {
+  home: string;
+  activity: string;
+  peers: SeatPeer[];
+}
+
+/** What a Claude seat's precheck saw: the reference it would get, and what the precedence check read and couldn't read. */
+export interface ClaudeSwitchView {
+  credentialKind?: "api-key";
+  label: string;
+  tokenFile: string | null;
+  checked: string[];
+  notChecked: string[];
+  /** A move back to the stored login: the token the seat would still use instead, and where it comes from. */
+  instead?: string;
+}
+
+export type PrecheckResult =
+  | { safe: true; seat?: SeatSwitchView; claude?: ClaudeSwitchView }
+  | { safe: false; reasons: PrecheckReason[]; message?: string; seat?: SeatSwitchView; claude?: ClaudeSwitchView };
+
+export type SwitchOutcome = "succeeded" | "rebind_in_progress" | "failed_safely" | "unknown";
 
 /** The whole four-block read model, emitted by `rig provider status --json`. */
 export interface FourBlockReadModel {
@@ -143,4 +231,162 @@ export interface FourBlockReadModel {
    *  row per (host, provider) aggregated from the seat-sourced signal rows. Optional so the
    *  sealed assembler stays untouched; the collect layer always populates it. */
   hostUsage?: HostUsageRow[];
+  /** Slice 01 (OPR.0.7.0.1) — observed usage windows by allowance identity, ADDITIVE and present
+   *  only while `provider.usage_windows` is on. Read from memory; never probed by a read. */
+  usage?: ProviderUsageAllowance[];
+  /** Slice 01 — each live seat's CONFIGURED account and its source, kept apart from observed allowances
+   *  (never linked to a usage row). ADDITIVE and present only while `provider.usage_windows` is on. */
+  seatAccounts?: SeatConfiguredAccount[];
+}
+
+/** Slice 01 — where a seat's account configuration comes from. A registry row is metadata: it doesn't prove
+ *  which login a running session uses. A default login is whatever the seat's home held at its launch: the seat's
+ *  own home when its `env:` declares one (`homeFrom` names where; optional, so older readers keep accepting the
+ *  record), else the daemon's. A Claude seat's own token reference (`claude_token`, `rig provider switch --seat`) is the
+ *  operator's label for a credential file its next launch reads, not an account the provider observed. */
+export type SeatAccountConfiguration =
+  | { source: "registry"; profileRef: string; recordedAt: string; profileSaved: boolean | null }
+  | { source: "claude_token"; label: string; kind?: "api-key"; note: string }
+  | { source: "default_login"; home: string | null; homeNote: string; homeFrom?: "member" | "rig" | "account-switch" }
+  | { source: "unknown"; reason: string };
+
+export interface SeatConfiguredAccount {
+  seatSession: string;
+  rigName: string;
+  runtime: string;
+  configured: SeatAccountConfiguration;
+  /** A registry row that exists but isn't applied or doesn't match (stale after a runtime change, another
+   *  runtime in its column, or a profile not saved on this host). */
+  registryNotes?: string[];
+  /** A home the seat's `env:` declares that isn't an absolute path, so it isn't used: the seat resolves as if
+   *  it declared none. Reported, never refused. */
+  ignoredHome?: { from: "member" | "rig" | "account-switch"; variable: string; value: string };
+  /** Always unlinked: nothing supported links a configured account to an observed allowance. */
+  allowance: { linked: false; reason: string };
+  /** What this seat itself was observed reporting. Claude: its own status-line samples, and the seats whose
+   *  fresh readings disagree with it (possibly a different login, never a verdict). `withheld` when several
+   *  seats share this session name, so samples keyed by it can't be attributed to one seat. */
+  observed?: { windowsSampled?: boolean; lastSampledAt?: string; differsFrom?: string[]; withheld?: true; note?: string };
+  /** #3625: the seat against its rig's assignment, as on its `bindings[]` row. */
+  assignment?: SeatAssignment;
+}
+
+/** Slice 01 — allowance identity: the usage answer's accountId, else the workspace account/read
+ *  reports, else unresolved; with the bucket (limitId). Email and plan are labels, never identity. */
+export interface UsageAllowanceIdentity {
+  accountId: string | null;
+  workspaceId: string | null;
+  limitId: string;
+  email: string | null;
+  planType: string | null;
+  source: "account/rateLimits/read accountId" | "account/read workspace routing" | "unresolved";
+}
+
+/** Slice 01 — a Claude allowance's identity: the organisation and email `claude auth status` reports, with the
+ *  bucket (the status line's windows cover all models). Claude reports no per-account id, and members of one
+ *  organisation have their own limits, so the email is part of the identity here (unlike Codex). */
+export interface ClaudeUsageIdentity {
+  orgId: string | null;
+  limitId: string;
+  email: string | null;
+  /** Labels only, never part of the key. */
+  orgName: string | null;
+  subscriptionType: string | null;
+  source: "claude auth status orgId and email" | "unresolved";
+}
+
+export interface ClaudeTokenIdentity {
+  source: "configured credential label";
+  credentialLabel: string;
+  credentialRef: string;
+  limitId: string;
+}
+export interface ClaudeTokenProbe {
+  warnings?: string[];
+  exitCode: number | null;
+  requestOutcome: "completed" | "failed" | "unknown";
+  cliVersion: string | null;
+  status: string | null;
+  overageStatus: string | null;
+  overageDisabledReason: string | null;
+  isUsingOverage: boolean | null;
+}
+
+export interface UsageWindowRow {
+  status?: string;
+  /** The provider-native window name (Codex: primary / secondary). */
+  window: string;
+  durationMins: number | null;
+  usedPercent: number | null;
+  /** 100 − usedPercent: a percentage; the provider reports no absolute amount. */
+  remainingPercent: number | null;
+  resetsAt: string | null;
+  /** When the native read answered (Claude: the status line's own time for the sample): freshness ages from this. */
+  observedAt: string;
+  /** Claude: the seat whose status-line sample this window is. */
+  seatSession?: string;
+  /** Claude: other seats whose fresh readings of this window disagree (a reset more than 60 s apart), with their own
+   *  numbers, so which login is where can be read from the row. Present only when they disagree. */
+  disagreeingSeats?: Array<{ seatSession: string; usedPercent: number; resetsAt: string | null; observedAt: string }>;
+  level: "ok" | "nearing" | "exhausted" | "unknown";
+  levelReason?: string;
+  freshness: "fresh" | "stale" | "unavailable";
+  freshnessReason?: string;
+  /** Present when this window's reset has passed since its reading: planning, never a reading. It changes nothing
+   *  measured (used %, level, freshness, availability), and a newer reading replaces it. */
+  expectation?: { expectedFullSince: string; note: string };
+}
+
+/** Slice 01: whether an account's sign-in is usable, read only from the evidence a refresh already holds, apart
+ *  from usage. `unknown` is neither usable nor unusable, and nothing decides on it. Ages from `at`; a daemon restart
+ *  forgets it, as it forgets the refresh outcome. */
+export interface SignInFact {
+  state: "usable" | "needs_sign_in" | "unknown";
+  evidence: string;
+  /** The refresh the evidence comes from; null when there is none. */
+  at: string | null;
+}
+
+export interface UsageRefreshOutcome {
+  at: string;
+  outcome: "ok" | "failed";
+  reason?: string;
+  detail?: string;
+}
+
+export interface ProviderUsageAllowance {
+  probe?: ClaudeTokenProbe;
+  provider: ProviderKind;
+  /** Null only for the explicit row of a source never read since the daemon started. */
+  identity: UsageAllowanceIdentity | ClaudeUsageIdentity | ClaudeTokenIdentity | null;
+  source: { kind: "codex_app_server" | "claude_statusline_samples" | "claude_token_probe"; host: "local" };
+  observedAt: string | null;
+  /** Seat links are not observed by this read. */
+  seats: "unknown";
+  windows: UsageWindowRow[];
+  /** The bucket's provider-reported limit evidence (Codex `rateLimitReachedType`), shown once. */
+  limitEvidence: string | null;
+  /** False when this row came from an earlier read than the latest one (kept; the latest read didn't match it;
+   *  its windows read stale: a later read exists). */
+  latestFromSource: boolean;
+  lastRefresh: UsageRefreshOutcome | null;
+  currentAvailability: "known" | "unknown";
+  unavailableReason?: string;
+  /** Present on a row kept from before the daemon restarted: historical, never current. */
+  retained?: "before_restart";
+  /** Whether this row's readings are linked to an account: a resolved provider identity, or unknown. */
+  accountHistory?: "linked" | "unknown";
+  /** The most recent time this allowance was observed exhausted (stored, so it survives a restart), or null. */
+  lastObservedExhausted?: { at: string; window: string | null; evidence: string } | null;
+  /** On an inactive account's row: OpenRig doesn't record which saved profile was active at its read. */
+  savedProfile?: "not linked";
+  /** The sign-in fact for this row's login. Optional: an older daemon's rows don't carry it. */
+  signIn?: SignInFact;
+  /** Claude: how the identity and the windows were joined (identity as of a refresh; windows from seats' samples at
+   *  their own times; not proven to be the same login). */
+  identityNote?: string;
+  /** Present on an unresolved observation: never matched, merged or replaced; kept from the most recent reads. */
+  unresolved?: { note: string; keptReads: number; droppedReads: number };
+  /** Present when rig auth profiles exist: this read covers only the login active in the daemon's CODEX_HOME. */
+  savedProfiles?: { names: string[]; note: string };
 }

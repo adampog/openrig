@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { ConfigStore, VALID_KEYS, type ResolvedSetting, type ValidKey } from "../config-store.js";
+import { ConfigStore, ENV_MAP, VALID_KEYS, type ResolvedSetting, type ValidKey } from "../config-store.js";
 import { initWorkspaceCommand } from "./config-init-workspace.js";
 
 function formatRow(key: string, value: unknown): string {
@@ -10,8 +10,42 @@ function summarizeSettings(store: ConfigStore): Record<ValidKey, ResolvedSetting
   return store.resolveAllWithSource();
 }
 
+interface ContextPressureFallbackInfo {
+  effectiveValue: number;
+  explanation: string;
+}
+
+/**
+ * Returns fallback explanation and effective default value if setting/resetting a context-pressure
+ * key caused an inverted threshold pair to be rejected and fall back to 95/99 defaults in this shell.
+ * Returns null if no pair rejection occurred.
+ */
+function getContextPressureFallbackInfo(store: ConfigStore, key: string): ContextPressureFallbackInfo | null {
+  if (key !== "health.context_pressure.warning_percent" && key !== "health.context_pressure.critical_percent") {
+    return null;
+  }
+  const state = store.resolveContextPressurePolicyState();
+  if (!state.rejectedPair) {
+    return null;
+  }
+
+  const warnKey = "health.context_pressure.warning_percent" as const;
+  const critKey = "health.context_pressure.critical_percent" as const;
+  const envSources: string[] = [];
+  if (state.warning.source === "env") {
+    envSources.push(`${ENV_MAP[warnKey].primary}=${state.warning.value}`);
+  }
+  if (state.critical.source === "env") {
+    envSources.push(`${ENV_MAP[critKey].primary}=${state.critical.value}`);
+  }
+  const envDetails = envSources.length > 0 ? ` from ${envSources.join(", ")}` : "";
+  const explanation = `; inverted pair ${state.rejectedPair.warning}/${state.rejectedPair.critical}${envDetails} falls back to 95/99 defaults in this shell`;
+  const effectiveValue = key === warnKey ? 95 : 99;
+  return { effectiveValue, explanation };
+}
+
 // These settings remain boot-only; capture interval/line settings reload live.
-const BOOT_ONLY_KEYS = ["daemon.port", "daemon.host", "db.path"];
+const BOOT_ONLY_KEYS = ["daemon.port", "daemon.host", "daemon.db_conflict", "daemon.seat_poll_interval_ms", "daemon.identity_poll_interval_ms", "db.path", "terminal.tmux_server"];
 const BOOT_ONLY_PREFIXES = ["transcripts.enabled", "transcripts.path"];
 
 function isBootOnlyKey(key: string): boolean {
@@ -55,7 +89,9 @@ Examples:
   rig config init-workspace                  # scaffold a repo-ready project workspace
 
 Keys:
-  daemon.*               port, host
+  daemon.*               port, host, seat_poll_interval_ms (startup-only seat-pollers cadence, 1000–2000; default 1000),
+                         identity_poll_interval_ms (startup-only identity-reconciler cadence, 5000–30000; default 5000),
+                         start_readiness_wait_seconds (how long a start waits for its child's readiness, in seconds; default 180)
   db.path
   transcripts.*          enabled, path, lines, poll_interval_seconds
                          (lines/poll_interval set scrollback CAPTURE depth + cadence.
@@ -69,14 +105,20 @@ Keys:
   topology.root          the topology tree root (instance altitude at its top; default $OPENRIG_HOME/topology)
   context.root           addressable context library for 'rig context add' (default $OPENRIG_HOME/context)
   context.system_world   default System World, replacement manifest path, or disabled
+  specs.builtins_visible show built-ins in spec inventory (default true)
   skills.root            versioned skill catalog (default $OPENRIG_HOME/skills)
+  skills.router_line.enabled  the person's yes to the seat-skills line (one line plus OpenRig's markers) in AGENTS.md / CLAUDE.md (default false)
   onboarding.default_pack.enabled  deliver the two-part fresh-seat mental-model pack (default on)
   health.context_pressure.*        context-pressure warning/critical percentages (defaults 95/99)
   files.allowlist        name:/abs/path,name:/abs/path
   progress.scan_roots    name:/abs/path,name:/abs/path
-  ui.timezone            TUI IANA timezone (default America/Los_Angeles; reopen TUI after changing)
+  ui.timezone            IANA timezone for the TUI's times, the Feed's included (default America/Los_Angeles; reopen TUI after changing)
   ui.enabled             serve the web UI and its terminal WebSocket (default off; restart the daemon)
+  ui.topology_remote_seats  TUI topology: read a remote rig's seats through this daemon inside a reachable
+                         http-transport host, instead of the rig ps pointer (default off; reopen the TUI after changing)
   ui.preview.*           refresh_interval_seconds, max_pins, default_lines
+  ui.terminal.max_live_terminals
+                         cap on simultaneously-live web-client terminals (effective default 2)
   recovery.*             auto_drive_provider_prompts, provider_auth_env_allowlist
   agents.*               advisor_session, operator_session
   feed.subscriptions.*   action_required, approvals, shipped, progress, audit_log
@@ -93,11 +135,62 @@ Keys:
   queue.*                pickup_stall_threshold_minutes (S04 pickup-receipt stall threshold),
                          stuck_sweep_interval_seconds, stuck_sweep_unclaimed_age_minutes (S02 standing stuck sweep),
                          wake_retry_interval_seconds, wake_retry_cap, wake_unconfirmed_window_minutes,
-                         wake_swap_grace_seconds (S01 wake-or-escalate ladder)
-  retention.*            enabled, transitions_days, watchdog_days,
+                         wake_swap_grace_seconds (S01 wake-or-escalate ladder),
+                         wake_human_rung (always | explicit-only — post agent-to-agent escalations to a person;
+                           explicit-only posts rows addressed to a person; other agent work stays visible,
+                           permission prompts still reach a person,
+                           choice prompts follow this setting; unavailable human delivery stays a visible row;
+                           an unreadable registry does not suppress eligibility; delivery still needs a ready route)
+  retention.*            enabled, transitions_days, watchdog_days, usage_samples_days,
                          watchdog_keep_per_job, batch_size
+  retention.events_days  delete the history-only event types (views, snapshots, watchdog firings, queue events) older
+                         than N days; 0 keeps them (default). Removed events no longer replay from /api/events, leave
+                         the telemetry export, the log and the feed, and can't be brought back. Read at the next sweep
+                         (daily and at daemon start)
+  retention.closed_content_days  remove the content of closed queue work (done, canceled, denied, handed-off) N
+                         days after it closed; the row stays, without content. 0 keeps it (default). Can't be undone
+  retention.closed_metadata_days  delete closed queue rows N days after they closed, keeping only their ids so a retry
+                         can't recreate them. 0 keeps them (default). Both read at the next sweep; "rig queue erase
+                         --routine --apply" runs them now
+  retention.erasure_ledger  an absolute file where queue erasure appends each erased id and its action, one JSON
+                         line each, before it commits them; keep it outside backups and replay it with "rig queue
+                         erase --ids <file> --apply" after a restore. Empty keeps no ledger (default)
   launch.non_interruptive  accept harness first-launch warnings at full bypass for new rigs (default off)
+  launch.codex_login_shell  defer to Codex's own login-shell setting in managed Codex seats (default off)
+                         Off adds allow_login_shell=false: tool commands inherit the seat's environment, so plain rig
+                         works wherever OpenRig is installed. Inherited setup isn't re-run per command: setup only in
+                         login or rc files (including a tmux default-command that isn't a login shell) and shell
+                         functions or aliases may be absent. On omits that override; it doesn't force login shells,
+                         and a login file that sets PATH outright can then hide rig. Applies at each seat's next
+                         launch; a restart in place keeps the running choice.
+  terminal.inherit_tmux_environment  inherit stored tmux global values for new agents and successors (default off)
+                         POSIX launches otherwise start from daemon + seat environment, preserving shell startup.
+                         Turn on for custom setups that intentionally rely on tmux globals. Running agents are unchanged.
+                         If the scoped boundary is unavailable, launch continues with its previous environment and a diagnostic.
+  terminal.fixed_geometry  use 90x27 web geometry while subscribed (default off; other viewers share the pinned size)
   terminal.status_bar    show the inner tmux status bar on launch (default off)
+  terminal.tmux_server   inherit the launching server, or isolated per OpenRig home (restart required)
+  terminal.history_limit rows of tmux scrollback per pane in the ~/.tmux.conf block rig setup writes (2000-1000000; default 10000).
+                         To keep more: rig config set terminal.history_limit 50000, then rig setup. A running tmux server keeps
+                         its old limit until it restarts or you run tmux source-file ~/.tmux.conf; before tmux 3.7 that changes new panes only
+  output.compact         short default output for queue writes, queue show, queue transitions and whoami peers (default off)
+                         --full opts out: queue transitions returns the full log, queue show the complete record, and whoami the complete payload, not its usual identity projection. whoami --all-peers keeps that projection with every peer
+  output.whoami_peers    with output.compact on, how many peers rig whoami --json lists, edge peers first; --all-peers lists all (default 8)
+  output.rebuild_recaps  superseded recap paths previewed in rebuild briefings (default 3; 0 lists all)
+  bundle.services_enabled Service-backed bundle packing, preview and target installs (default off)
+  provider.usage_windows Codex and Claude usage windows in rig provider status (Codex read on request; Claude from its seats' status lines) (default off)
+  provider.selected      the providers chosen at rig setup --providers (claude, codex or claude,codex); kernel boot uses only these (default empty: every signed-in provider)
+  usage.pi_cost_facts    Pi seats report model-priced cost from their persisted session entries to rig usage cost (default off)
+  usage.pi_openrouter_charge  with usage.pi_cost_facts on, Pi seats look up OpenRouter's actual charge for their requests, shown beside the estimate (default off; changes take effect when a Pi seat next launches or resumes; earlier outcomes stay visible)
+  transport.verify_input_box  with --verify, a send to a Claude Code or Codex seat (also queue wakes) reads verified only when the seat was proven idle before the paste and its input box showed the exact text before Enter and was empty after it, on the same pane process; a busy or unknown seat, and anything else, reads unconfirmed, not failed. Reporting only (default off)
+  transport.local_user_guard  on a Mac, the CLI refuses a local daemon whose reported user, checked with ps, isn't yours; an explicit OPENRIG_URL skips the check. A mitigation for reaching the wrong daemon, not authentication (default off)
+  transport.draft_delivery  deliver (default): a rig send or work notice to a seat whose prompt holds a person's draft goes through: the message is pasted at the current cursor into the draft (normally its end), then Enter is sent to submit the combined input, and the send's result says whether that was confirmed. OpenRig can't read every prompt layout: where it doesn't detect the draft, the result doesn't mention it, and refuse doesn't stop the send. refuse: such a send is refused, and a work notice retried once the prompt is clear, where OpenRig detects the draft. A draft found only by reading the input box may leave that retry waiting for the seat's next activity change or the stuck sweep, rather than the moment the draft clears. Either way, menus and permission prompts are refused, a per-seat typing guard still holds, managed compaction waits for an empty prompt, and a send with --wait-for-idle still waits
+  decisions.enabled      typed decisions (OpenRouter + Jev) for the consumers in decisions.consumers, with OPENROUTER_API_KEY from the
+                         rig process that runs them; off makes no provider calls (default off). rig project decisions status shows the state
+  decisions.consumers    comma-separated consumers that may call (supported: stream; default none). An unknown name makes no calls
+  decisions.template_dir absolute folder of <name>.yaml templates that replace the shipped ones (default empty: shipped templates only)
+  acp.to                 the seat (member@rig) that receives tasks from rig acp serve when it isn't given --to, as when an ACP app
+                         starts it from the ACP registry (default empty: none, so nothing is sent until one is set)
 
 Precedence: CLI flag > environment variable > config file > default`)
     .action((opts: { json?: boolean; withSource?: boolean }) => {
@@ -143,7 +236,9 @@ Precedence: CLI flag > environment variable > config file > default`)
           console.log(JSON.stringify(store.resolveWithSource(key), null, 2));
           return;
         }
-        if (opts.showSource) {
+        // `--with-source` is the parent command's flag; commander accepts it on
+        // either side of `get`, and it asks for the same line as `--show-source`.
+        if (opts.showSource || cmd.opts<{ withSource?: boolean }>().withSource) {
           const r = store.resolveWithSource(key);
           console.log(`${r.value}\t(source: ${r.source})`);
           return;
@@ -162,10 +257,23 @@ Precedence: CLI flag > environment variable > config file > default`)
     .action(async (key: string, value: string) => {
       try {
         store.set(key, value);
-        console.log(`${key} = ${store.get(key)}`);
+        const resolved = store.resolveWithSource(key);
+        const fallbackInfo = getContextPressureFallbackInfo(store, key);
+        if (fallbackInfo) {
+          console.log(`${key} file override saved; effective value ${fallbackInfo.effectiveValue} (source: default${fallbackInfo.explanation})`);
+        } else {
+          console.log(resolved.source === "env"
+            ? `${key} = ${resolved.value} (source: env; file override saved but masked)`
+            : resolved.source === "default"
+              ? `${key} file override saved; effective value ${resolved.value} (source: default)`
+              : `${key} = ${resolved.value}`);
+        }
         // SWEEP-c: boot-only key + running daemon = stale-until-restart; say so loudly.
         if (isBootOnlyKey(key) && (await probeDaemonRunning())) {
-          console.error(`note: '${key}' is read at daemon BOOT — the running daemon keeps its current value; this takes effect on the next daemon restart (rig daemon stop && rig daemon start).`);
+          console.error(resolved.source === "env"
+            ? `note: '${key}' is read at daemon BOOT — the running daemon keeps its current value; the saved value remains masked after restart while the environment override is set.`
+            : `note: '${key}' is read at daemon BOOT — the running daemon keeps its current value; this takes effect on the next daemon restart (rig daemon stop && rig daemon start).`);
+          if (key === "terminal.tmux_server") console.error("note: surviving sessions keep their previous server until deliberately stopped; rig terminal status shows the effective selection and any pending migration.");
         }
       } catch (err) {
         console.error((err as Error).message);
@@ -180,9 +288,27 @@ Precedence: CLI flag > environment variable > config file > default`)
       try {
         store.reset(key);
         if (key) {
-          console.log(`${key} reset to default (${store.get(key)}).`);
+          const resolved = store.resolveWithSource(key);
+          const fallbackInfo = getContextPressureFallbackInfo(store, key);
+          if (fallbackInfo) {
+            console.log(`${key} file override cleared; effective value ${fallbackInfo.effectiveValue} (source: default${fallbackInfo.explanation}).`);
+          } else {
+            console.log(resolved.source === "env"
+              ? `${key} file override cleared; effective value ${resolved.value} (source: env; default: ${resolved.defaultValue}).`
+              : `${key} reset to default (${resolved.value}).`);
+          }
         } else {
-          console.log("Config reset to defaults.");
+          let envKeys: string[] = [];
+          try {
+            envKeys = Object.entries(store.resolveAllWithSource())
+              .filter(([, resolved]) => resolved.source === "env")
+              .map(([name]) => name);
+          } catch (err) {
+            console.error(`note: could not read effective configuration after reset: ${(err as Error).message}`);
+          }
+          console.log(envKeys.length
+            ? `Config reset to defaults, except where the environment overrides them: ${envKeys.join(", ")}.`
+            : "Config reset to defaults.");
         }
       } catch (err) {
         console.error((err as Error).message);

@@ -4,6 +4,77 @@ import { DaemonClient } from "../client.js";
 import { getDaemonStatus, getDaemonUrl, type LifecycleDeps , daemonStatusGuard} from "../daemon-lifecycle.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
+import { resolveRigHandle } from "../rig-handle.js";
+import { shellQuote } from "../cross-host-executor.js";
+import { resolveIdentitySource } from "./whoami.js";
+
+interface DownOptions {
+  delete?: boolean;
+  force?: boolean;
+  snapshot?: boolean;
+  yes?: boolean;
+  json?: boolean;
+  host?: string;
+}
+
+interface DownDeps extends StatusDeps {
+  promptYesNo?: (question: string) => Promise<boolean>;
+}
+
+interface OwnRigWarning {
+  fact: string;
+  consequence: string;
+  action: string;
+}
+
+async function confirmOwnRig(
+  rigId: string,
+  opts: DownOptions,
+  deps: DownDeps,
+  readIdentity: (path: string) => Promise<unknown>,
+): Promise<OwnRigWarning | false | undefined> {
+  const source = resolveIdentitySource({});
+  if (!source) return;
+  // A local session name can identify a different seat on the selected host.
+  if (opts.host && !source.nodeId) return;
+  const params = new URLSearchParams(source.nodeId ? { nodeId: source.nodeId } : { sessionName: source.sessionName! });
+  params.set("compact", "1");
+  let caller: { identity?: { rigId?: string; attachmentType?: string } } | undefined;
+  try { caller = await readIdentity(`/api/whoami?${params}`) as typeof caller; }
+  catch { return; } // An unresolved caller is not proof of membership; keep the existing teardown path.
+  if (caller?.identity?.rigId !== rigId) return;
+
+  const warning: OwnRigWarning = {
+    fact: `Your current seat belongs to rig ${rigId}.`,
+    consequence: caller.identity.attachmentType === "external_cli"
+      ? "OpenRig doesn't stop externally attached sessions. This stops the rig's managed sessions and their work."
+      : "This ends your own session and stops the rig's other managed seats and their work. OpenRig doesn't stop externally attached sessions.",
+    action: ["rig", "down", shellQuote(rigId), "--yes", ...(opts.delete ? ["--delete"] : []),
+      ...(opts.force ? ["--force"] : []), ...(opts.snapshot ? ["--snapshot"] : []),
+      ...(opts.json ? ["--json"] : []), ...(opts.host ? ["--host", shellQuote(opts.host)] : [])].join(" "),
+  };
+  if (!opts.json) console.error(`Warning: ${warning.fact} ${warning.consequence}`);
+  if (opts.yes) return warning;
+
+  if (deps.promptYesNo || (process.stdin.isTTY && process.stderr.isTTY)) {
+    const question = `${opts.json ? `${warning.fact} ${warning.consequence}\n` : ""}Stop this rig? [y/N] `;
+    let accepted: boolean;
+    if (deps.promptYesNo) accepted = await deps.promptYesNo(question);
+    else {
+      const { createInterface } = await import("node:readline");
+      const rl = createInterface({ input: process.stdin, output: process.stderr });
+      accepted = await new Promise<boolean>(resolve => {
+        rl.once("close", () => resolve(false));
+        rl.question(question, answer => { resolve(/^y(es)?$/i.test(answer.trim())); rl.close(); });
+      });
+    }
+    if (accepted) return warning;
+  }
+  if (opts.json) console.log(JSON.stringify({ rigId, error: { code: "own_rig_confirmation_required", ...warning } }));
+  else console.error(`Nothing stopped. To proceed: ${warning.action}`);
+  process.exitCode = 1;
+  return false;
+}
 
 interface TeardownResult {
   rigId: string;
@@ -13,6 +84,22 @@ interface TeardownResult {
   deleteBlocked: boolean;
   alreadyStopped: boolean;
   errors: string[];
+  /** Team skill files kept in seats' own storage: edited, or never recorded as OpenRig's. */
+  keptSkills?: string[];
+  /** Managed guidance blocks a person edited, kept in their file as `<file>: <block id>`. */
+  keptGuidance?: string[];
+  /** Files in a Claude seat's cwd that keep OpenRig's additions because down couldn't safely change them, as `<file>: <why>`. */
+  keptFiles?: string[];
+  /** Claude seats whose latest launch recorded no folder (one started before launches recorded it), as
+   *  `<session>: <saved folder>`: down can't tell whether it ran somewhere else. */
+  launchFolderUnrecorded?: string[];
+  /** Seats joined with `rig attach` as an external CLI, which OpenRig doesn't stop. */
+  leftRunning?: string[];
+  paneOnly?: string[];
+  released?: string[];
+  /** #3901: what the step before the terminals close saw of each Claude Code or Codex seat's agent (absent from older
+   *  daemons and with --force). Whether a terminal then closed is `sessionsKilled` and `errors`. */
+  runtimeExits?: Array<{ session: string; path: "graceful" | "forced" | "unverified"; detail: string }>;
 }
 
 interface DownAgentEntry {
@@ -31,8 +118,10 @@ async function showAgentsBeforeDown(rigId: string, readInventory: () => Promise<
     const inventory = await readInventory();
     if (Array.isArray(inventory) && inventory.every(n => n && typeof n.nodeKind === "string"
       && typeof n.logicalId === "string" && (n.sessionStatus === null || typeof n.sessionStatus === "string"))) {
-      const agents = (inventory as DownAgentEntry[]).filter(n => n.nodeKind === "agent"
-        && ["running", "idle", "unknown"].includes(n.sessionStatus ?? ""));
+      const live = (inventory as DownAgentEntry[]).filter(n => ["running", "idle", "unknown"].includes(n.sessionStatus ?? ""));
+      const agents = live.filter(n => n.nodeKind === "agent");
+      // A terminal member isn't an agent, but stopping the rig ends its session too.
+      const terminals = live.filter(n => n.nodeKind !== "agent").map(n => n.canonicalSessionName || n.logicalId);
       facts = agents.length === 0 ? "no agent sessions reported live" : "recorded agent sessions: " + agents.map(n => {
         // A running process or an assigned queue row does not prove work in progress.
         // Prefer the daemon's arbitrated activity; older daemons expose agentActivity.
@@ -44,6 +133,7 @@ async function showAgentsBeforeDown(rigId: string, readInventory: () => Promise<
         const work = ["working", "idle", "needs-input"].includes(activity ?? "") ? activity : "unknown";
         return `${n.canonicalSessionName || n.logicalId} (activity: ${work})`;
       }).join(", ");
+      if (terminals.length > 0) facts += `; terminal sessions: ${terminals.join(", ")}`;
     }
   } catch { /* Unavailable inventory is an unknown fact, never a teardown gate. */ }
   console.error(`Before stopping ${rigId}: ${facts}.`);
@@ -51,103 +141,42 @@ async function showAgentsBeforeDown(rigId: string, readInventory: () => Promise<
 
 const LONG_RUNNING_TIMEOUT_MS = 45_000;
 
-interface RigSummaryEntry {
-  id: string;
-  name: string;
-  archivedAt?: string | null;
-  lifecycleState?: string;
-}
-
-/**
- * Outcome of resolving a `rig down <rig>` handle (name OR id) to a concrete id.
- * The destructive teardown only ever runs on a `resolved`/`passthrough` id;
- * `ambiguous`/`not_found` halt BEFORE any `/api/down` POST.
- */
-type HandleResolution =
-  | { kind: "resolved"; id: string }
-  | { kind: "ambiguous"; name: string; ids: string[] }
-  | { kind: "not_found"; handle: string }
-  // Summary unavailable (non-200 / fetch error): fall back to today's id-only
-  // behavior - POST the raw handle as the id and let the daemon resolve it by
-  // exact id (404 if absent). Safe: the daemon matches a single exact id, so a
-  // name posted this way cannot tear down the wrong rig.
-  | { kind: "passthrough"; handle: string };
-
-/**
- * Resolve a `rig down` handle (rig name OR id) to a concrete rig id, mirroring
- * the `/api/rigs/summary` path `rig up` uses. Resolution is a PRE-STEP: the
- * existing teardown + guards downstream are unchanged; this only maps the
- * handle to an id.
- *
- * Safety order (destructive-op):
- *  1. id-exact-match FIRST, across ALL rigs incl. archived - an id is unique, so
- *     it is never ambiguous, and an archived rig's id must still reach the
- *     canonical teardown id path (AC-2 unchanged).
- *  2. else name-filter over ACTIVE (non-archived) rigs only:
- *     - exactly 1 active match -> resolve to that id;
- *     - >1 active matches      -> AMBIGUOUS: halt, never guess (load-bearing AC-3);
- *     - 0 active matches       -> NOT_FOUND: halt, honest error (AC-4).
- *
- * `/api/rigs/summary` defaults to ACTIVE-only and exposes `archivedAt`; we fetch
- * with `includeArchived=true` so an archived id still id-matches, then filter
- * names to active. So an active+archived same-name pair is NOT ambiguous (only
- * the active candidate counts), and an archived-only name does not resolve by
- * name (use the id, or the archive path).
- */
-async function resolveRigHandle(client: DaemonClient, handle: string): Promise<HandleResolution> {
-  let summaries: RigSummaryEntry[];
-  try {
-    // includeArchived=true so an archived rig's id still id-matches below
-    // (preserving today's `rig down <id>` path); names are filtered to active.
-    const res = await client.get<RigSummaryEntry[]>("/api/rigs/summary?includeArchived=true");
-    if (res.status !== 200 || !Array.isArray(res.data)) {
-      return { kind: "passthrough", handle };
-    }
-    summaries = res.data;
-  } catch {
-    return { kind: "passthrough", handle };
-  }
-
-  // 1. id-exact-match first, across ALL rigs incl. archived (AC-2: down by id,
-  //    unchanged; ids are never ambiguous; archived ids still reach teardown).
-  if (summaries.some((r) => r.id === handle)) {
-    return { kind: "resolved", id: handle };
-  }
-
-  // 2. name-filter over ACTIVE (non-archived) rigs only, symmetric with `up`.
-  const activeNameMatches = summaries.filter((r) => r.name === handle && r.archivedAt == null);
-  if (activeNameMatches.length === 1) {
-    return { kind: "resolved", id: activeNameMatches[0]!.id };
-  }
-  if (activeNameMatches.length > 1) {
-    return { kind: "ambiguous", name: handle, ids: activeNameMatches.map((r) => r.id) };
-  }
-  return { kind: "not_found", handle };
-}
-
 /**
  * `rig down <rig>` - tear down a rig by name or id.
  * @param depsOverride - injectable deps for testing
  * @returns Commander command
  */
-export function downCommand(depsOverride?: StatusDeps): Command {
+export function downCommand(depsOverride?: DownDeps): Command {
   const cmd = new Command("down").description("Tear down a rig")
     .addHelpText("after", `
-rig down stops every agent in the rig: their sessions end, and any work in progress stops with them.
+rig down stops every agent OpenRig started in the rig: their sessions end, and any work in progress stops
+with them. For a community harness only its pane stops: its own processes may keep running, and rig down
+names it. A session OpenRig didn't start (adopted, bound, reconciled, or a person's own session joined with
+rig attach --self from a tmux pane) is never ended: rig down releases its seat, as rig unclaim does, and
+names it. A seat joined with rig attach as an external CLI, outside tmux, is never stopped, and rig down
+lists it as not stopped. It keeps its claim, unless --delete removes the rig record, and the claim with it.
 Before running it, check who is working (rig ps --nodes --rig <rig>) and that the person asked for it;
 don't stop a team you didn't start unless asked. OpenRig snapshots the rig first (best-effort), and
 rig up <rig> --existing brings it back, resuming each seat's conversation where its harness allows. With
---delete the rig record is removed too, so it can't be brought back that way.`);
+--delete the rig record is removed too, so it can't be brought back that way.
+Once no live seat uses a working folder, rig down also takes back what OpenRig added there: its
+guidance blocks, and in a Claude seat's folder the status line, activity hooks and context collector.
+It keeps and lists an edited skills-line block, edited team skill files, and settings or a collector
+that don't match what OpenRig wrote or that another seat shares by a link. Any other guidance block
+goes even if someone edited it. rig up <rig> --existing puts the guidance back.
+When your resolved seat belongs to this rig, confirm before stopping it. Without a terminal,
+the command warns and exits without stopping; re-run with --yes to confirm explicitly.`);
   const getDepsF = () => depsOverride ?? { lifecycleDeps: realDeps(), clientFactory: (url: string) => new DaemonClient(url) };
 
   cmd
     .argument("<rig>", "Rig name or id to tear down")
     .option("--delete", "Delete rig record after stopping")
-    .option("--force", "Kill sessions immediately")
+    .option("--force", "Close the seats' terminals at once, without first letting each agent exit through its own shutdown")
     .option("--snapshot", "Take snapshot before teardown")
+    .option("--yes", "Confirm stopping the rig your current seat belongs to")
     .option("--json", "JSON output for agents")
     .option("--host <id>", "Run on a remote host declared in ~/.openrig/hosts.yaml")
-    .action(async (rigHandle: string, opts: { delete?: boolean; force?: boolean; snapshot?: boolean; json?: boolean; host?: string }) => {
+    .action(async (rigHandle: string, opts: DownOptions) => {
       // OPR.0.4.6.MH1 FR-2: selected-host routing — explicit --host wins;
       // else the persisted selection feeds the SHIPPED --host path; no
       // selection = today exactly.
@@ -169,9 +198,14 @@ rig up <rig> --existing brings it back, resuming each seat's conversation where 
             return inventory.ok ? inventory.data : undefined;
           });
         }
+        const warning = await confirmOwnRig(rigIdResult.rigId, opts, deps, async path => {
+          const identity = await runRemoteHttpOp(opts.host!, "GET", path, undefined, deps, { timeoutMs: 2_000 });
+          return identity.ok ? identity.data : undefined;
+        });
+        if (warning === false) return;
         const result = await runRemoteHttpOp(opts.host, "POST", `/api/down`, { rigId: rigIdResult.rigId, delete: opts.delete, force: opts.force, snapshot: opts.snapshot }, deps, opts);
         if (opts.json) {
-          console.log(JSON.stringify(result));
+          console.log(JSON.stringify(warning ? { ...result, warning } : result));
           if (!result.ok) process.exitCode = 1;
         } else if (result.ok) {
           console.log(JSON.stringify(result.data, null, 2));
@@ -238,6 +272,11 @@ rig up <rig> --existing brings it back, resuming each seat's conversation where 
         });
       }
 
+      const warning = await confirmOwnRig(rigId, opts, deps, async path => {
+        const identity = await client.get<unknown>(path, { timeoutMs: 2_000 });
+        return identity.status === 200 ? identity.data : undefined;
+      });
+      if (warning === false) return;
       const res = await client.post<TeardownResult | { error: string }>("/api/down", {
         rigId,
         delete: opts.delete ?? false,
@@ -246,7 +285,7 @@ rig up <rig> --existing brings it back, resuming each seat's conversation where 
       }, { timeoutMs: LONG_RUNNING_TIMEOUT_MS });
 
       if (opts.json) {
-        console.log(JSON.stringify(res.data));
+        console.log(JSON.stringify(warning ? { ...res.data, warning } : res.data));
         if (res.status >= 400) {
           process.exitCode = 2;
         } else {
@@ -266,6 +305,43 @@ rig up <rig> --existing brings it back, resuming each seat's conversation where 
       }
 
       const result = res.data as TeardownResult;
+      // OPR.0.7.0.13: say what was kept and why, whatever else happened.
+      if (result.keptSkills && result.keptSkills.length > 0) {
+        console.log(`Kept ${result.keptSkills.length} team skill file(s) in the seats' own storage: edited, or not recorded as OpenRig's:`);
+        for (const file of result.keptSkills) console.log(`  ${file}`);
+      }
+      if (result.keptGuidance && result.keptGuidance.length > 0) {
+        console.log(`Kept ${result.keptGuidance.length} edited OpenRig block(s) in guidance files; remove them by hand if you don't want them:`);
+        for (const block of result.keptGuidance) console.log(`  ${block}`);
+      }
+      if (result.keptFiles && result.keptFiles.length > 0) {
+        console.log(`Kept ${result.keptFiles.length} file(s) that still hold OpenRig's additions; check them by hand:`);
+        for (const file of result.keptFiles) console.log(`  ${file}`);
+      }
+      if (result.launchFolderUnrecorded && result.launchFolderUnrecorded.length > 0) {
+        console.log(`The launch folder was not recorded for ${result.launchFolderUnrecorded.length} Claude seat(s). Only saved and recorded folders can be checked automatically; if one was started elsewhere (rig up --existing --cwd), check that folder's .claude/settings.local.json and .openrig by hand:`);
+        for (const seat of result.launchFolderUnrecorded) console.log(`  ${seat}`);
+      }
+
+      if (result.leftRunning && result.leftRunning.length > 0) {
+        console.log(`Not stopped: ${result.leftRunning.join(", ")}. Joined with rig attach as an external CLI, which OpenRig doesn't stop or check.`);
+      }
+      if (result.released && result.released.length > 0) {
+        console.log(`Released, not stopped: ${result.released.join(", ")}. OpenRig didn't start these sessions (joined with rig attach --self, adopted, bound or reconciled), so each is left running as its owner's; the seat is no longer bound to it.`);
+      }
+      if (result.paneOnly && result.paneOnly.length > 0) {
+        console.log(`Pane stopped: ${result.paneOnly.join(", ")}. A community harness's own processes may keep running after its pane; see its preset's limits.`);
+      }
+      // #3901: what the step before the terminals close saw of each agent. Whether its terminal then closed is the stop's
+      // own result, below (the count and any warning).
+      const exitedOwn = (result.runtimeExits ?? []).filter((exit) => exit.path === "graceful");
+      if (exitedOwn.length > 0) console.log(`Exited through its own shutdown, or had already exited: ${exitedOwn.map((exit) => exit.session).join(", ")}.`);
+      for (const exit of (result.runtimeExits ?? []).filter((entry) => entry.path === "forced")) {
+        console.log(`Stopped without its own shutdown: ${exit.session}. ${exit.detail}`);
+      }
+      for (const exit of (result.runtimeExits ?? []).filter((entry) => entry.path === "unverified")) {
+        console.log(`Agent's exit not confirmed: ${exit.session}. ${exit.detail}`);
+      }
 
       // Exit code: errors first, then deleted, then alreadyStopped
       if (result.errors.length > 0) {
@@ -297,7 +373,7 @@ rig up <rig> --existing brings it back, resuming each seat's conversation where 
         const rigName = (res.data as Record<string, unknown>)["rigName"] as string | undefined;
         const isUniqueName = (res.data as Record<string, unknown>)["isUniqueName"] as boolean | undefined;
         if (rigName && isUniqueName !== false) {
-          console.log(`To restore: rig up ${rigName}`);
+          console.log(`To restore: rig up ${shellQuote(rigName)} --existing`);
         } else {
           console.log(`To restore: rig restore ${result.snapshotId} --rig ${rigId}`);
         }

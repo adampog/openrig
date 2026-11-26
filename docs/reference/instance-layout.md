@@ -79,6 +79,11 @@ Missing or malformed selections fail; absence is never inferred as disablement.
 `rig context work-install --json` reports the effective state, source, manifest,
 context selectors, and skills. With `--runtime`, its managed skill loadout then
 combines System World, topology, and Project World selectors with provenance.
+The catalog is a Git checkout. A skill folder with uncommitted or untracked content is
+skipped by itself and named. With `--runtime`, work-install reports selected skips with
+exit 1. It inspects by default; `--apply-skills` projects the remaining clean skills while
+keeping any previously projected copy of the skipped skill. An uncommitted change directly
+in the catalog root, such as `catalog.yaml`, still makes the whole catalog unavailable.
 
 For a pre-0.5.9 home, use the `openrig-upgrade` skill's
 `migrate-telemetry-state-0.5.9.mjs` helper as an Agent-Operated Migration. Its
@@ -104,6 +109,17 @@ runtime reads for compatibility. Treat the two-home state as an explicit
 limitation: use the live spec-library commands to determine where a spec is
 served from, and do not infer convergence merely because the canonical
 directory exists.
+
+The spec library scans the built-in specs, `$OPENRIG_HOME/specs` and, when
+present, that legacy library. At any depth below them it skips directories
+named `.git`, `.worktrees`, `node_modules`, `dist`, `build`, `.turbo` and
+`.next`, which usually hold build output or dependencies (`SKIP_DIRS` in
+`packages/daemon/src/domain/spec-library-service.ts`). A spec inside one of
+them, such as `specs/build/rig.yaml`, isn't listed, and nothing reports that it
+was skipped. To list it, rename its directory and run `rig specs sync`.
+`rig specs add <directory>` copies a directory under its own name, so adding a
+directory named `build` doesn't help. `rig up <path-to-rig.yaml>` still launches
+a spec by its path, without the library.
 
 Config updates publish a complete replacement file atomically where directory
 permissions and the filesystem allow it. On POSIX systems, replacement preserves

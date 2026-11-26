@@ -13,6 +13,7 @@ import type Database from "better-sqlite3";
 import { createDb } from "../src/db/connection.js";
 import { migrate } from "../src/db/migrate.js";
 import { coreSchema } from "../src/db/migrations/001_core_schema.js";
+import { rigArchiveSchema } from "../src/db/migrations/042_rig_archive.js";
 import { bindingsSessionsSchema } from "../src/db/migrations/002_bindings_sessions.js";
 import { eventsSchema } from "../src/db/migrations/003_events.js";
 import { streamItemsSchema } from "../src/db/migrations/023_stream_items.js";
@@ -24,6 +25,8 @@ import { EventBus } from "../src/domain/event-bus.js";
 import { AgentActivityStore } from "../src/domain/agent-activity-store.js";
 import { SliceIndexer } from "../src/domain/slices/slice-indexer.js";
 import { ReviewGatherer } from "../src/domain/review/gather.js";
+import { QueueRepository } from "../src/domain/queue-repository.js";
+import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 import { reviewRoutes } from "../src/routes/review.js";
 import {
   makeFixtureWorkspace,
@@ -68,7 +71,7 @@ describe("GET /api/review/*", () => {
     db = createDb(":memory:");
     migrate(db, [
       coreSchema,
-      bindingsSessionsSchema,
+      bindingsSessionsSchema, rigArchiveSchema,
       eventsSchema,
       streamItemsSchema,
       queueItemsSchema,
@@ -144,6 +147,25 @@ describe("GET /api/review/*", () => {
       { kind: "image", src: "proof/phone-journey.png", caption: "phone-journey.png" },
     ]);
     expect(body.delivered.proofDirPath).toBe("release-t/slices/20-green/proof");
+  });
+
+  it("reads a CRLF-saved slice README frontmatter like its LF twin (the slice id survives Windows line endings)", async () => {
+    const dir = writeFixtureSlice(ws, "release-t", "22-crlf", { id: "OPR.T.22", intent: "Words." });
+    const readme = `${dir}/README.md`;
+    fs.writeFileSync(readme, fs.readFileSync(readme, "utf8").replace(/\n/g, "\r\n"));
+
+    const slice = await (await app.request("/api/review/slice/22-crlf")).json();
+    expect(slice.sliceId).toBe("OPR.T.22");
+  });
+
+  it("reads a CRLF-saved mission README frontmatter like its LF twin (mission id and title survive Windows line endings)", async () => {
+    const dir = writeFixtureSlice(ws, "release-t", "23-in-crlf-mission", {});
+    const missionDir = path.dirname(path.dirname(dir));
+    fs.writeFileSync(`${missionDir}/README.md`, "---\r\nid: OPR.M.T\r\ntitle: Crlf mission\r\n---\r\n\r\n# M\r\n");
+
+    const mission = await (await app.request("/api/review/mission/release-t")).json();
+    expect(mission.missionId).toBe("OPR.M.T");
+    expect(mission.title).toBe("Crlf mission");
   });
 
   it("routes a claimed-PASS ungated slice into confirm-faithful (regime 2), items stay missing", async () => {
@@ -314,7 +336,7 @@ describe("GET /api/review/rig (OPR.0.4.4.22)", () => {
     db = createDb(":memory:");
     migrate(db, [
       coreSchema,
-      bindingsSessionsSchema,
+      bindingsSessionsSchema, rigArchiveSchema,
       eventsSchema,
       streamItemsSchema,
       queueItemsSchema,
@@ -396,12 +418,81 @@ describe("GET /api/review/rig (OPR.0.4.4.22)", () => {
     expect(body.settled[0]).toMatchObject({ fromSession: "driver@r", toSession: "qa@r" });
   });
 
+  it("counts only open rows as held, and in-progress work decides doing over a newer park (#2129)", async () => {
+    // The issue's repro: R1 blocked on another row, R2 claimed and in progress, R3 handed off to the next seat.
+    insert({ id: "q-r1", dest: "worker@r", state: "blocked", tags: ["slice:20-x"], summary: "R1 waiting on R0" });
+    db.prepare("UPDATE queue_items SET blocked_on = 'q-r0' WHERE qitem_id = 'q-r1'").run();
+    insert({ id: "q-r2", dest: "worker@r", tags: ["slice:20-x"], summary: "R2 being built", tsUpdated: "2026-07-04T11:00:00.000Z" });
+    insert({ id: "q-r3", dest: "worker@r", state: "handed-off", tags: ["slice:20-x"], summary: "R3 now with the next seat" });
+
+    const body = await (await app.request("/api/review/rig")).json();
+    const row = body.agents.rows.find((r: { sessionName: string }) => r.sessionName === "worker@r");
+    expect(row).toMatchObject({ doing: "R2 being built", holdsCount: 2 });
+    expect(row.stateGlyph).not.toBe("parked");
+  });
+
+  it("a seat whose only slice row today was handed off holds nothing and isn't parked on that row (#2129)", async () => {
+    // A closed row can keep its old blocked_on; it is neither held work nor a park.
+    insert({ id: "q-gone", dest: "passer@r", state: "handed-off", tags: ["slice:20-x"], summary: "handed to qa" });
+    db.prepare("UPDATE queue_items SET blocked_on = 'external:old-gate' WHERE qitem_id = 'q-gone'").run();
+
+    const body = await (await app.request("/api/review/rig")).json();
+    const row = body.agents.rows.find((r: { sessionName: string }) => r.sessionName === "passer@r");
+    expect(row).toMatchObject({ holdsCount: 0, doing: "no tracked work item" });
+    expect(row.stateGlyph).not.toBe("parked");
+  });
+
   it("keeps human-routed qitems in NEEDS YOU without turning the human seat into an AGENTS row", async () => {
     insert({ id: "q-human", dest: "human-review@kernel", tags: ["slice:20-x"], summary: "approve the demo", tier: "human-gate", state: "pending" });
 
     const body = await (await app.request("/api/review/rig")).json();
     expect(body.needsYou.items.some((i: { qitemId: string | null }) => i.qitemId === "q-human")).toBe(true);
     expect(body.agents.rows.some((r: { sessionName: string }) => r.sessionName === "human-review@kernel")).toBe(false);
+  });
+
+  it("keeps asks to and parks on a person in NEEDS YOU, and never a shared channel's row", async () => {
+    // The production wiring: the queue's own person and shared-channel facts.
+    const queueDb = createDb();
+    migrate(queueDb, ALL_MIGRATIONS);
+    const sarah = { entityId: "sarah", class: "human" as const, displayName: "Sarah", address: "sarah@external",
+      connectorBindings: [{ kind: "slack" as const, connectorRef: "primary", secretsRef: "env:SLACK_BOT_TOKEN", role: "primary" as const, handle: "USARAH" }],
+      prefs: { deliveryClass: "A" as const } };
+    const queue = new QueueRepository(queueDb, new EventBus(queueDb), { validateRig: () => true,
+      loadHumanRegistry: () => ({ ok: true, entities: [sarah] }), sharedChannels: () => [{ address: "support@external" }] });
+    const gatherer = new ReviewGatherer({ db, indexer: new SliceIndexer({ slicesRoot: ws.root, additionalSliceRoots: [], dogfoodEvidenceRoot: null, db }),
+      gitRepoPath: null, now: () => NOW,
+      participants: { isPerson: (a) => queue.isPersonAddress(a), isSharedChannel: (a) => queue.isSharedChannel(a) } });
+    const people = new Hono();
+    people.use("*", async (c, next) => { c.set("reviewGatherer" as never, gatherer); await next(); });
+    people.route("/api/review", reviewRoutes());
+
+    insert({ id: "q-ask", dest: "sarah@external", tags: ["slice:20-x"], summary: "approve the demo", state: "pending" });
+    insert({ id: "q-park", dest: "planner@r", state: "blocked", tags: ["slice:20-x"], summary: "waiting on sarah" });
+    db.prepare("UPDATE queue_items SET blocked_on = 'sarah@host' WHERE qitem_id = 'q-park'").run(); // a registered alias
+    insert({ id: "q-channel", dest: "support@external", tags: ["slice:20-x"], summary: "release notes posted", state: "pending" });
+    insert({ id: "q-channel-park", dest: "writer@r", state: "blocked", tags: ["slice:20-x"], summary: "waiting on the channel" });
+    db.prepare("UPDATE queue_items SET blocked_on = 'support@external' WHERE qitem_id = 'q-channel-park'").run();
+    // A human-gate tier doesn't make a channel's row a decision either.
+    insert({ id: "q-channel-gate", dest: "support@external", tags: ["slice:20-x"], summary: "post the cut", tier: "human-gate", state: "pending" });
+    insert({ id: "q-channel-gate-park", dest: "editor@r", state: "blocked", tags: ["slice:20-x"], summary: "waiting on the channel", tier: "human-gate" });
+    db.prepare("UPDATE queue_items SET blocked_on = 'support@external' WHERE qitem_id = 'q-channel-gate-park'").run();
+    insert({ id: "q-gate", dest: "qa@r", state: "blocked", tags: ["slice:20-x"], summary: "waiting on the external gate" });
+    db.prepare("UPDATE queue_items SET blocked_on = 'external:qa-pass' WHERE qitem_id = 'q-gate'").run();
+    insert({ id: "q-legacy", dest: "human-review@kernel", tags: ["slice:20-x"], summary: "approve the cut", state: "pending" });
+
+    const body = await (await people.request("/api/review/rig")).json();
+    const needs = body.needsYou.items.map((i: { qitemId: string | null; leg?: string }) => [i.qitemId, i.leg]);
+    expect(needs).toEqual(expect.arrayContaining([["q-ask", "human-routed"], ["q-park", "park-on-human"], ["q-legacy", "human-routed"]]));
+    // A shared channel takes correspondence; a typed external: gate is not a person.
+    for (const id of ["q-channel", "q-channel-park", "q-channel-gate", "q-channel-gate-park", "q-gate"]) expect(needs.some(([needed]: [string]) => needed === id)).toBe(false);
+    const sessions = body.agents.rows.map((r: { sessionName: string }) => r.sessionName);
+    for (const address of ["sarah@external", "support@external", "human-review@kernel"]) expect(sessions).not.toContain(address);
+    expect(sessions).toEqual(expect.arrayContaining(["planner@r", "writer@r", "qa@r"]));
+
+    writeFixtureSlice(ws, "release-t", "20-x", { intent: "i", prd: false });
+    const slice = await (await people.request("/api/review/slice/20-x")).json();
+    expect(slice.needsYou.items.map((i: { qitemId: string | null }) => i.qitemId).sort()).toEqual(["q-ask", "q-legacy", "q-park"]);
+    queueDb.close();
   });
 
   it("recently-holding: an agent whose slice-tagged item closed TODAY appears with 'no tracked work item'", async () => {
@@ -484,6 +575,33 @@ describe("GET /api/review/rig (OPR.0.4.4.22)", () => {
     expect(body.settledProvenance).toContain("0 handoffs today");
   });
 
+  it.each([
+    { runtime: "claude-code", newer: "running", older: "unknown", glyph: "active" },
+    { runtime: "claude-code", newer: "unknown", older: "idle", glyph: "unknown" },
+    { runtime: "codex", newer: "running", older: "idle", glyph: "idle" },
+  ] as const)("review telemetry keeps $runtime ordering when $older arrives after newer $newer", async ({ runtime, newer, older, glyph }) => {
+    insert({ id: "q-order", dest: "driver@r", tags: ["slice:20-x"], summary: "tracked work" });
+    db.prepare("INSERT INTO rigs (id, name) VALUES ('rig-order', 'rig-order')").run();
+    db.prepare("INSERT INTO nodes (id, rig_id, logical_id, runtime) VALUES ('node-order', 'rig-order', 'driver', ?)").run(runtime);
+    db.prepare("INSERT INTO sessions (id, node_id, session_name, status) VALUES ('sess-order', 'node-order', 'driver@r', 'running')").run();
+    const eventBus = new EventBus(db);
+    for (const [index, state] of [newer, older].entries()) {
+      eventBus.emit({ type: "agent.activity", rigId: "rig-order", nodeId: "node-order", sessionName: "driver@r", runtime,
+        activity: { state, reason: state === "unknown" ? "usage_limit" : state, evidenceSource: "runtime_hook", evidence: null,
+          rawEvent: state === "unknown" ? "StopFailure" : state === "running" ? "UserPromptSubmit" : "Stop",
+          sampledAt: NOW, eventAt: new Date(Date.parse(NOW) - (index + 1) * 1000).toISOString() } });
+    }
+    const indexer = new SliceIndexer({ slicesRoot: ws.root, additionalSliceRoots: [], dogfoodEvidenceRoot: null, db });
+    const activityStore = new AgentActivityStore({ db, eventBus, now: () => new Date(NOW) });
+    const gatherer = new ReviewGatherer({ db, indexer, gitRepoPath: null, activityStore, now: () => NOW });
+    const activityApp = new Hono();
+    activityApp.use("*", async (c, next) => { c.set("reviewGatherer" as never, gatherer); await next(); });
+    activityApp.route("/api/review", reviewRoutes());
+    const body = await (await activityApp.request("/api/review/rig")).json();
+    expect(body.agents.rows.find((row: { sessionName: string }) => row.sessionName === "driver@r"))
+      .toMatchObject({ runtime, stateGlyph: glyph });
+  });
+
   it("idempotent: two requests over unchanged inputs return byte-identical bodies", async () => {
     insert({ id: "q-1", dest: "a@r", tags: ["slice:s"], summary: "s" });
     const a = await (await app.request("/api/review/rig")).text();
@@ -551,7 +669,7 @@ describe("qitem-ccf87c0d — composeMission MEMBERSHIP-scan load contract", () =
   it("one composeMission over 40 indexed slices executes <= 4 membership queue scans AND composes all 40 ledger entries", () => {
     const db = createDb();
     migrate(db, [
-      coreSchema, bindingsSessionsSchema, eventsSchema, streamItemsSchema,
+      coreSchema, bindingsSessionsSchema, rigArchiveSchema, eventsSchema, streamItemsSchema,
       queueItemsSchema, queueTransitionsSchema, missionControlActionsSchema,
       queueItemSummarySchema,
     ]);

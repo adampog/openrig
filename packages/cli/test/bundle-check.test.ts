@@ -5,6 +5,7 @@ import path from "node:path";
 import { Command } from "commander";
 import { checkBundleFolder } from "../src/lib/bundle-check.js";
 import { bundleCommand } from "../src/commands/bundle.js";
+import { readDeclaredConfigurations, resolveConfiguration } from "../src/lib/bundle-configuration.js";
 import type { StatusDeps } from "../src/commands/status.js";
 
 const SPEC = `version: "0.2"
@@ -48,14 +49,36 @@ describe("advisory bundle check", () => {
   });
 
 
+  it("reports a README directory instead of treating it as a readable document", async () => {
+    fs.rmSync(path.join(root, "README.md")); fs.mkdirSync(path.join(root, "README.md"));
+    const result = await checkBundleFolder(root);
+    expect(result.checks).toContainEqual(expect.objectContaining({ ruleId: "readme_in_docs", status: "finding" }));
+    expect(result.checks).toContainEqual(expect.objectContaining({ ruleId: "referenced_files", status: "finding", reason: "Declared file is a directory, expected a file.", path: "README.md" }));
+  });
+
   it("checks startup paths relative to the declaring local agent", async () => {
     const dir = path.join(root, "agent"); fs.mkdirSync(dir);
     fs.writeFileSync(path.join(root, "rig.yaml"), SPEC.replace("builtin:terminal", "local:agent").replace("runtime: terminal", "runtime: codex").replace("profile: none", "profile: default"));
-    fs.writeFileSync(path.join(dir, "agent.yaml"), 'name: fixture\nversion: "1.0"\nstartup:\n  files:\n    - path: context.md\nprofiles:\n  default: {}\n');
+    fs.mkdirSync(path.join(dir, "skill"));
+    fs.writeFileSync(path.join(dir, "agent.yaml"), 'name: fixture\nversion: "1.0"\nresources:\n  skills:\n    - {id: fixture, path: skill}\nstartup:\n  files:\n    - path: context.md\nprofiles:\n  default: {}\n');
     fs.writeFileSync(path.join(dir, "context.md"), "Context");
     expect((await checkBundleFolder(root)).checks.filter(c => c.status === "finding")).toEqual([]);
     fs.rmSync(path.join(dir, "context.md"));
     expect((await checkBundleFolder(root)).checks).toEqual(expect.arrayContaining([expect.objectContaining({ ruleId: "referenced_files", status: "finding", path: "agent/context.md" })]));
+    fs.mkdirSync(path.join(dir, "context.md"));
+    expect((await checkBundleFolder(root)).checks).toEqual(expect.arrayContaining([expect.objectContaining({ ruleId: "referenced_files", status: "finding", reason: "Declared file is a directory, expected a file.", path: "agent/context.md" })]));
+  });
+
+  it("leaves an openrig-home: plugin to the host and still checks a bundle-relative plugin path", async () => {
+    const dir = path.join(root, "agent"); fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(root, "rig.yaml"), SPEC.replace("builtin:terminal", "local:agent").replace("runtime: terminal", "runtime: codex").replace("profile: none", "profile: default"));
+    const manifest = (pluginPath: string) => `name: fixture\nversion: "1.0"\nresources:\n  plugins:\n    - id: openrig-core\n      source:\n        kind: local\n        path: "${pluginPath}"\nprofiles:\n  default:\n    uses:\n      plugins: [openrig-core]\n`;
+    fs.writeFileSync(path.join(dir, "agent.yaml"), manifest("openrig-home:plugins/openrig-core"));
+    const hostResolved = (await checkBundleFolder(root)).checks;
+    expect(hostResolved.filter(c => c.status === "finding")).toEqual([]);
+    expect(hostResolved).toContainEqual(expect.objectContaining({ ruleId: "host_resources", status: "not_checked", path: "agent" }));
+    fs.writeFileSync(path.join(dir, "agent.yaml"), manifest("plugins/missing"));
+    expect((await checkBundleFolder(root)).checks).toContainEqual(expect.objectContaining({ ruleId: "referenced_files", status: "finding", path: "agent/plugins/missing" }));
   });
 
   it("command does not resolve a daemon, create a bundle, or invoke preflight", async () => {
@@ -94,5 +117,25 @@ presets:
     expect((await checkBundleFolder(root)).checks).toContainEqual(expect.objectContaining({ ruleId: "configurations", status: "pass" }));
     fs.writeFileSync(path.join(root, "configurations.yaml"), config.replace("recommended: authored", "recommended: alternate"));
     expect((await checkBundleFolder(root)).checks).toContainEqual(expect.objectContaining({ ruleId: "configurations", status: "finding" }));
+  });
+
+  it("reports schema-invalid preset and runtime names even when mappings resolve", async () => {
+    const config = `schema: openrig.bundle-configurations/v1
+recommended: authored
+seats:
+  infra.observer: { runtimes: { terminal: none, codex: default } }
+presets:
+  authored: { infra.observer: terminal }
+`;
+    const check = async (text: string) => {
+      fs.writeFileSync(path.join(root, "configurations.yaml"), text);
+      return (await checkBundleFolder(root)).checks.find(c => c.ruleId === "configurations")?.status;
+    };
+    expect(await check(config)).toBe("pass");
+    expect(await check(config.replaceAll("authored", "Authored"))).toBe("finding");
+    expect(await check(config.replace("codex: default", "Codex: default"))).toBe("finding");
+    fs.writeFileSync(path.join(root, "configurations.yaml"), config.replaceAll("authored", "Authored"));
+    const declared = readDeclaredConfigurations(root)!;
+    expect(resolveConfiguration(declared, { "infra.observer": "terminal" }, { preset: "Authored" }).mapping).toEqual({ "infra.observer": "terminal" });
   });
 });

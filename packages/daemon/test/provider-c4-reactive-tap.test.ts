@@ -292,6 +292,13 @@ describe("Slice-04 C4 — production reactive activity tap", () => {
     expect(model.signals[0]?.usedPercent).toBeUndefined();
   });
 
+  it("doesn't attribute a Codex seat with its own CODEX_HOME to the daemon home's registry account", async () => {
+    const fx = fixture();
+    fx.db.prepare("UPDATE nodes SET env_json = ? WHERE id = ?").run(JSON.stringify({ CODEX_HOME: "/homes/impl" }), fx.nodeId);
+    recordToken(fx, "rate_limit");
+    expect((await fx.service.getReadModel()).signals).toEqual([]);
+  });
+
   it("binds classification to the event class only — a rawSubtype/reason token is not a producer", async () => {
     const fx = fixture();
     // The interruption token sits only in the (relay tool_name) rawSubtype and the derived
@@ -351,7 +358,7 @@ describe("Slice-04 C4 — production reactive activity tap", () => {
     expect(signals.filter((signal) => signal.sourceClass === "provider_event")).toEqual([]);
   });
 
-  it("does not relabel a generic PermissionRequest/needs_input block as provider exhaustion", async () => {
+  it("keeps a pending PermissionRequest out of provider exhaustion signals", async () => {
     const fx = fixture();
     const result = fx.store.recordHookEvent({
       runtime: "codex",
@@ -361,7 +368,7 @@ describe("Slice-04 C4 — production reactive activity tap", () => {
       occurredAt: EVENT_AT,
     });
     expect(result.ok).toBe(true);
-    if (result.ok) expect(result.activity.state).toBe("needs_input");
+    if (result.ok) expect(result.activity).toMatchObject({ state: "unknown", reason: "permission_request_pending" });
     expect((await fx.service.getReadModel()).signals).toEqual([]);
   });
 
@@ -458,7 +465,7 @@ describe("Slice-04 C4 correction — public-altitude eligibility gate + producer
       agentActivityStore: testApp.agentActivityStore,
       warn: (message: string) => warnings.push(message),
     });
-    return { app: testApp.app, service, warnings };
+    return { app: testApp.app, service, warnings, db };
   }
 
   async function postHook(
@@ -498,6 +505,22 @@ describe("Slice-04 C4 correction — public-altitude eligibility gate + producer
       staleAfter: STALE_AFTER,
       automationUse: "allow_switch_decision",
     }]);
+  });
+
+  // An adopted seat (rig adopt, reconcile-session, attach --self): its process keeps carrying the launch-time
+  // generation after a no-launch adoption minted a newer tenure. Its rows stay resolved and actionable; a launch after
+  // the adoption makes them a prior tenure's, refused at the tap.
+  it("an adopted seat's launch-time generation through the public hook path yields one actionable row until a launch replaces it", async () => {
+    const fx = publicFixture();
+    const tenure = fx.db.prepare(
+      "INSERT INTO occupant_tenures (id, node_id, generation_ordinal, generation_uuid, kind, native_session_id_at_boot) VALUES (?, ?, ?, ?, ?, ?)",
+    );
+    tenure.run("tenure-node-1-adopt", "node-1", 2, "gen-uuid-node-1-adopt", "adopt", null);
+    expect((await postHook(fx.app, { runtime: "codex", hookEvent: "rate_limit" })).status).toBe(200);
+    expect(reactiveRows(await fx.service.getReadModel())).toHaveLength(1);
+
+    tenure.run("tenure-node-1-fresh", "node-1", 3, "gen-uuid-node-1-fresh", "fresh", "boot-fresh");
+    expect(reactiveRows(await fx.service.getReadModel())).toEqual([]);
   });
 
   // W2a tap follow-on — explicit per-path absence. The unresolved observation remains non-actionable

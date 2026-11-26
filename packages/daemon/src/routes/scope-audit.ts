@@ -9,9 +9,11 @@ import {
   deriveMissionDependencyGraph,
   type MissionDependencyGraph,
   type ScopeAuditResult,
+  SLICE_DIRECTORY_NAME,
 } from "../domain/scope/scope-audit.js";
 import type { SliceIndexer } from "../domain/slices/slice-indexer.js";
 import { NOTES_FILE_PRECEDENCE, resolveNodeFile, resolveNotesFile } from "../domain/scope/node-file.js";
+import { isPathInsideRoot } from "../domain/cwd-resolution.js";
 
 function extractFrontmatterRaw(content: string): string | null {
   if (!content.startsWith("---")) return null;
@@ -69,11 +71,17 @@ function buildAuditDependencyGraph(missionName: string, missionDir: string): Mis
       if (!match) continue;
       const frontmatter = readNodeFrontmatter(path.join(root, entry.name));
       const status = typeof frontmatter.status === "string" ? frontmatter.status.toLowerCase() : "";
+      const stage = typeof frontmatter.stage === "string" ? frontmatter.stage.toLowerCase() : "";
+      const isExitedOrDelivered = status === "done"
+        || status.startsWith("shipped")
+        || status.startsWith("closed")
+        || stage === "superseded"
+        || stage === "retired";
       slices.push({
         id: nodeId(frontmatter),
         name: entry.name,
         dependsOn: frontmatter.depends_on,
-        active: bucket === "slices" && !status.startsWith("closed") && !status.startsWith("shipped"),
+        active: bucket === "slices" && !isExitedOrDelivered,
         ordinal: Number(match[1]),
       });
     }
@@ -126,6 +134,34 @@ function shadowedNodeFileFinding(dir: string, level: "mission" | "slice"): Audit
   };
 }
 
+/**
+ * Advisory-only: another mission has a slice folder of the same name. The slice list and the routes that
+ * find a slice by name keep one slice per name, so the others are hidden there with no sign they exist.
+ * Twin of the CLI's finding of the same name.
+ */
+function sharedSliceNameFinding(missionsRoot: string, missionName: string, sliceName: string): {
+  kind: "slice_name_shared"; severity: "low"; path: string; message: string; remediation: string;
+} | null {
+  let others: string[];
+  try {
+    others = fs.readdirSync(missionsRoot, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && !e.name.startsWith(".") && e.name !== missionName
+        && fs.statSync(path.join(missionsRoot, e.name, "slices", sliceName), { throwIfNoEntry: false })?.isDirectory() === true)
+      .map((e) => e.name)
+      .sort();
+  } catch {
+    return null;
+  }
+  if (others.length === 0) return null;
+  return {
+    kind: "slice_name_shared",
+    severity: "low",
+    path: path.join(missionsRoot, missionName, "slices", sliceName),
+    message: `Mission ${others.join(", ")} also ${others.length === 1 ? "has" : "have"} a slice named "${sliceName}". The slice list (GET /api/slices) and the routes that find a slice by name keep one slice per name, so all but one of these slices are hidden there.`,
+    remediation: "Rename one of the slice folders so each slice name is unique across missions. Advisory only — nothing is blocked.",
+  };
+}
+
 export function scopeAuditRoutes(): Hono {
   const app = new Hono();
 
@@ -145,11 +181,20 @@ export function scopeAuditRoutes(): Hono {
 
     const missionsRoot = indexer.slicesRoot;
     const missionDir = path.join(missionsRoot, missionName);
+    // Content-surfaces discipline (parity with scope-approve.ts): the joined
+    // mission target must stay INSIDE the slices root. This is a lexical,
+    // separator-safe containment check: a name that leaves the root (`..`,
+    // `../outside`) is reported as not found, never read. An absolute or
+    // dot-prefixed name keeps today's meaning — `path.join` keeps it under the
+    // root — and a root that is itself `/` or a drive root is not over-refused.
+    if (!isPathInsideRoot(missionDir, missionsRoot)) {
+      return c.json({ error: "mission_not_found", mission: missionName }, 404);
+    }
     if (!fs.existsSync(missionDir)) {
       return c.json({ error: "mission_not_found", mission: missionName }, 404);
     }
 
-    // qitem-43d69e17 — ONE audit request is ONE composite operation: the
+    // ONE audit request is ONE composite operation: the
     // per-slice indexer.get() walk below shares ONE membership batch
     // (pre-scope: each uncached get built its own 2-scan batch — 2N total
     // queue scans, 80 at 40 slices). Handler body is fully synchronous.
@@ -270,7 +315,7 @@ export function scopeAuditRoutes(): Hono {
               : null,
           });
 
-          if (!/^\d{2}-/.test(entry)) {
+          if (!SLICE_DIRECTORY_NAME.test(entry)) {
             sliceResult.findings.push({
               kind: "id_convention_violation",
               severity: "high",
@@ -287,6 +332,8 @@ export function scopeAuditRoutes(): Hono {
       for (const sr of sliceResults) {
         const shadow = shadowedNodeFileFinding(path.join(slicesDir, sr.name), "slice");
         if (shadow) sr.result.findings.push(shadow);
+        const shared = sharedSliceNameFinding(missionsRoot, missionName, sr.name);
+        if (shared) sr.result.findings.push(shared);
       }
 
       const allFindings = [

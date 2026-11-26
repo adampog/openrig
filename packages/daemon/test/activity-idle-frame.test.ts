@@ -1,0 +1,211 @@
+import { readFileSync } from "node:fs";
+import { describe, expect, it } from "vitest";
+import { SeatStructuralActivityService } from "../src/domain/seat-structural-activity-service.js";
+import { readSeatBeforePaste } from "../src/domain/session-transport.js";
+import { attachAgentActivity } from "../src/domain/node-inventory.js";
+import { SeatActivityService } from "../src/domain/seat-activity-service.js";
+import { createFullTestDb } from "./helpers/test-app.js";
+import { RigRepository } from "../src/domain/rig-repository.js";
+import { SessionRegistry } from "../src/domain/session-registry.js";
+
+const NODE = "fixture-node";
+const NOW = new Date("2026-10-19T13:00:00Z");
+const oldIdle = { state: "idle", reason: "stop_hook", evidenceSource: "runtime_hook", sampledAt: "2026-10-19T12:59:00Z", evidence: null };
+// Recorded Claude Code 2.1.296 and Codex 0.160.0 frames; busy/streaming cases below
+// edit a status row. These prove the bounded reader layouts, not native activity.
+const CNAME = "review-r1@sample-rig";
+const cframe = readFileSync(new URL("./fixtures/input-box/claude-code-2.1.296/openrig-seat-accept-edits-idle.txt", import.meta.url), "utf8");
+const codexFrame = readFileSync(new URL("./fixtures/input-box/codex-0.160.0/after-enter-15s.J.txt", import.meta.url), "utf8");
+const codexCompleted = readFileSync(new URL("./fixtures/input-box/codex-0.167.0/completed.txt", import.meta.url), "utf8");
+const codexWorking = readFileSync(new URL("./fixtures/input-box/codex-0.167.0/working.txt", import.meta.url), "utf8");
+const busyFrame = cframe.replace(/^✻ Churned for 4s · done 5:24 PM$/m, "✻ Working… (3s · thinking)");
+async function adapterFold(frame: string, opts: { age?: number; sourceName?: string; sourceRuntime?: "claude-code" | "codex"; runtime?: string; hook?: object | null; lastWriteAge?: number; motion?: boolean } = {}) {
+  const capturedAt = new Date(NOW.getTime() - (opts.age ?? 0));
+  let clock = capturedAt;
+  const svc = new SeatStructuralActivityService({ capturePaneContent: async () => frame } as never, () => clock);
+  const obs = await svc.pollSeat(opts.sourceName ?? CNAME, undefined, opts.sourceRuntime ?? "claude-code");
+  clock = NOW;
+  const out = await attachAgentActivity([{ canonicalSessionName: CNAME, nodeId: NODE, runtime: opts.runtime ?? opts.sourceRuntime ?? "claude-code", attachmentType: "tmux", logicalId: "dev.impl" }] as never, {
+    now: NOW, tmuxAdapter: { hasSession: async () => true } as never,
+    activityStore: { getLatestForNode: () => opts.hook === undefined ? oldIdle : opts.hook } as never,
+    structuralActivity: { getStructuralActivity: () => svc.getStructuralActivity(opts.sourceName ?? CNAME) },
+    seatActivity: { getSeatActivity: () => ({ paneId: CNAME, isActiveWithinWindow: opts.motion ?? true, silenceWindowSeconds: 3,
+      lastActivityAt: new Date(NOW.getTime() - (opts.lastWriteAge ?? 1000)).toISOString(), lastObservedAt: NOW.toISOString() }) },
+  });
+  return { observation: obs, activity: out[0]!.agentActivity! };
+}
+describe("issue824 existing strict adapter idle frame (behavioral red-first)", () => {
+  it("the existing reader distinguishes completed idle from live work, streaming, unknown and misbound frames", () => {
+    expect(busyFrame).not.toBe(cframe);
+    const readings = {
+      idle: readSeatBeforePaste(cframe, "claude-code", CNAME),
+      busy: readSeatBeforePaste(busyFrame, "claude-code", CNAME),
+      misbound: readSeatBeforePaste(cframe, "claude-code", "someone.else@sample-rig"),
+      unknown: readSeatBeforePaste("unknown output", "claude-code", CNAME),
+      codexIdle: readSeatBeforePaste(codexFrame, "codex"),
+      codexStreaming: readSeatBeforePaste(codexFrame.replace(/^ {2}Worked for[^\n]+$/m, "• Streaming an unfinished answer"), "codex"),
+    };
+    expect(readings).toEqual({ idle: "idle", busy: "not-idle", misbound: "unknown", unknown: "unknown", codexIdle: "idle", codexStreaming: "unknown" });
+    console.log("824_STRICT_DISTINCTION", JSON.stringify(readings));
+  });
+  it("a current bound completed-idle observation outranks redraw motion and the old idle hook", async () => {
+    const result = await adapterFold(cframe);
+    console.log("824_STRICT_IDLE_FOLD", JSON.stringify(result));
+    expect(result.activity.state).toBe("idle");
+    expect(result.activity.evidenceSource).toBe("pane_heuristic");
+  });
+  it("the Codex completed frame can prove idle, but the same footer while streaming cannot", async () => {
+    expect((await adapterFold(codexFrame, { sourceRuntime: "codex" })).activity.state).toBe("idle");
+    const streaming = codexFrame.replace(/^ {2}Worked for[^\n]+$/m, "• Streaming an unfinished answer");
+    expect((await adapterFold(streaming, { sourceRuntime: "codex" })).activity.state).toBe("running");
+  });
+  it.each(["0.168.0", "99.0.0"])("an unrecorded Codex %s frame stays unknown under redraw motion", async (version) => {
+    // Synthetic version edits of the recorded 0.160 fixture, not native newer-version captures.
+    const frame = codexFrame.replaceAll("0.160.0", version);
+    for (const pane of [frame, frame.replace(/^ {2}Worked for[^\n]+$/m, "• Streaming an unfinished answer")]) {
+      expect(readSeatBeforePaste(pane, "codex")).toBe("unknown");
+      const result = await adapterFold(pane, { sourceRuntime: "codex", hook: null, lastWriteAge: 2000 });
+      expect(result.activity.state).toBe("unknown");
+      expect(result.activity.reason).not.toBe("window_activity_motion");
+    }
+  });
+  it("the captured Codex agents hint preserves completed idle despite redraws", async () => {
+    expect.soft(readSeatBeforePaste(codexCompleted, "codex")).toBe("idle");
+    for (const hook of [null, oldIdle]) {
+      const result = await adapterFold(codexCompleted, { sourceRuntime: "codex", hook });
+      expect.soft(result.activity.state).toBe("idle");
+      expect(result.activity.evidenceSource).toBe("pane_heuristic");
+    }
+  });
+  it("the captured working frame remains running without motion", async () => {
+    expect(readSeatBeforePaste(codexWorking, "codex")).toBe("not-idle");
+    expect((await adapterFold(codexWorking, { sourceRuntime: "codex", hook: null, motion: false })).activity.state).toBe("running");
+  });
+  it("the agents footer alone cannot prove idle while output is unfinished", async () => {
+    // Synthetic spinner-hidden stream, not a native streaming capture.
+    const stream = codexCompleted.replace(/^ {2}Worked for[^\n]+$/m, "• Streaming an unfinished answer");
+    expect(readSeatBeforePaste(stream, "codex")).toBe("unknown");
+    expect((await adapterFold(stream, { sourceRuntime: "codex", hook: null })).activity.state).toBe("running");
+    const badHint = codexCompleted.replace("← for agents", "unknown hint");
+    expect(readSeatBeforePaste(badHint, "codex")).toBe("unknown");
+  });
+  it("an unsupported Codex frame cannot turn an idle or stale hook into running, while positive work and attention remain", async () => {
+    const frame = codexFrame.replaceAll("0.160.0", "99.0.0");
+    for (const hook of [oldIdle, { ...oldIdle, state: "unknown", stale: true }]) {
+      expect((await adapterFold(frame, { sourceRuntime: "codex", hook })).activity.state).toBe("unknown");
+    }
+    for (const state of ["running", "needs_input"]) {
+      expect((await adapterFold(frame, { sourceRuntime: "codex", hook: { ...oldIdle, state } })).activity.state).toBe(state);
+    }
+  });
+  it.each(["  >_ OpenAI Codex (v99.0.0)", "Update available! 99.0.0 -> 99.1.0"])("a fresh idle hook wins without motion on a version-named screen: %s", async (header) => {
+    const frame = `${header}\n${codexCompleted}`;
+    const hook = { ...oldIdle, sampledAt: NOW.toISOString() };
+    expect(readSeatBeforePaste(frame, "codex")).toBe("unknown");
+    const still = await adapterFold(frame, { sourceRuntime: "codex", hook, motion: false });
+    expect(still.observation).toMatchObject({ state: "unknown", reason: "unrecognized_client_version" });
+    expect(still.activity).toEqual(hook);
+    const moving = await adapterFold(frame, { sourceRuntime: "codex", hook, motion: true });
+    expect(moving.activity).toMatchObject({ state: "unknown", reason: "unrecognized_client_version" });
+  });
+  it.each([false, true])("positive pane work survives a version header with motion=%s", async (motion) => {
+    // Synthetic version header over the recorded working frame.
+    const frame = `  >_ OpenAI Codex (v99.0.0)\n${codexWorking}`;
+    expect(readSeatBeforePaste(frame, "codex")).toBe("not-idle");
+    const result = await adapterFold(frame, { sourceRuntime: "codex", hook: null, motion });
+    expect(result.observation).toMatchObject({ state: "agent_active", reason: "mid_work_pattern" });
+    expect(result.activity).toMatchObject({ state: "running", evidenceSource: "pane_heuristic", reason: "mid_work_pattern" });
+  });
+  // Synthetic resumed frames: Codex's session header (drawn as 0.160 draws it) or its update notice over the recorded
+  // 0.167 layouts. Codex 0.167.1 and 0.167.2 changed no TUI code from 0.167.0.
+  const codexHeader = (version: string) => `\n  >_ OpenAI Codex (v${version})\n     ~/example/work\n  permissions: YOLO mode\n\n`;
+  const codexNotice = (version: string) => `│ ✨ Update available! ${version} -> 0.169.0 │\n\n`;
+  it.each(["0.167.0", "0.167.1", "0.167.2"])("a resumed Codex %s seat that shows its version reads the recorded 0.167 layout", async (version) => {
+    for (const shown of [codexHeader(version), codexNotice(version)]) {
+      const completed = `${shown}${codexCompleted}`;
+      expect(readSeatBeforePaste(completed, "codex")).toBe("idle");
+      const idle = await adapterFold(completed, { sourceRuntime: "codex", hook: null });
+      expect(idle.observation?.reason).not.toBe("unrecognized_client_version");
+      expect(idle.activity).toMatchObject({ state: "idle", evidenceSource: "pane_heuristic" });
+      const working = `${shown}${codexWorking}`;
+      expect(readSeatBeforePaste(working, "codex")).toBe("not-idle");
+      expect((await adapterFold(working, { sourceRuntime: "codex", hook: null, motion: false })).activity.state).toBe("running");
+    }
+  });
+  // 0.167.3 is a later patch nobody has checked, so it stays unknown until it is.
+  it.each(["0.167.3", "0.168.0", "0.169.0", "0.167.0-alpha.4.3", "0.167", "0.160.1"])("a Codex %s version over the same layout stays unknown", async (version) => {
+    for (const shown of [codexHeader(version), codexNotice(version)]) {
+      const frame = `${shown}${codexCompleted}`;
+      expect(readSeatBeforePaste(frame, "codex")).toBe("unknown");
+      const result = await adapterFold(frame, { sourceRuntime: "codex", hook: null });
+      expect(result.observation).toMatchObject({ state: "unknown", reason: "unrecognized_client_version" });
+      expect(result.activity.state).toBe("unknown");
+    }
+  });
+  it("a newer redraw after an old idle capture keeps D2 running", async () => {
+    expect((await adapterFold(cframe, { age: 2000 })).activity.state).toBe("running");
+    // The write and capture are in the same second: ordering is unknown,
+    // so that capture cannot suppress motion.
+    expect((await adapterFold(cframe, { age: 500 })).activity.state).toBe("running");
+  });
+  it("expired, misbound and wrong-runtime samples do not suppress live motion", async () => {
+    for (const opts of [{ age: 6000 }, { sourceName: "someone.else@sample-rig" }, { runtime: "codex" }]) {
+      expect((await adapterFold(cframe, opts)).activity.state).toBe("running");
+    }
+  });
+  it("current work and needs-input keep their meaning over the idle frame", async () => {
+    expect((await adapterFold(busyFrame)).activity.state).toBe("running");
+    for (const state of ["running", "needs_input"]) expect((await adapterFold(cframe, { hook: { ...oldIdle, state, sampledAt: NOW.toISOString() } })).activity.state).toBe(state);
+  });
+  it("a later motion poll with no new write does not invalidate the completed idle frame", async () => {
+    expect((await adapterFold(cframe, { age: 900, lastWriteAge: 2000 })).activity.state).toBe("idle");
+  });
+  it("without motion the idle hook retains its full provenance", async () => {
+    const hook = { ...oldIdle, eventAt: oldIdle.sampledAt };
+    expect((await adapterFold(cframe, { motion: false, hook })).activity).toEqual(hook);
+  });
+  it.each(["single", "batch"] as const)("a deferred %s read never dates held idle bytes by response completion", async (path) => {
+    // Cover both a write in the capture's second and a read spanning a second.
+    for (const age of [900, 1100]) {
+      let clock = new Date(NOW.getTime() - age);
+      const began = clock.toISOString();
+      let release!: () => void;
+      let entered!: () => void;
+      const started = new Promise<void>(resolve => { entered = resolve; });
+      const held = new Promise<void>(resolve => { release = resolve; });
+      const tmux = {
+        capturePaneContent: async () => { entered(); await held; return cframe; },
+        ...(path === "batch" ? { capturePanesContent: async () => {
+          entered(); await held;
+          return new Map([[CNAME, { text: cframe, capturedAt: clock }]]);
+        } } : {}),
+      };
+      const structural = new SeatStructuralActivityService(tmux, () => clock);
+      const db = createFullTestDb();
+      try {
+        const repo = new RigRepository(db);
+        const registry = new SessionRegistry(db);
+        const rig = repo.createRig("sample-rig");
+        const node = repo.addNode(rig.id, "review.r1", { runtime: "claude-code" });
+        const session = registry.registerSession(node.id, CNAME);
+        registry.updateStatus(session.id, "running");
+        registry.updateBinding(node.id, { tmuxSession: CNAME, attachmentType: "tmux" });
+        const pending = path === "batch" ? structural.pollAllRunningTmuxSeats(db) : structural.pollSeat(CNAME, undefined, "claude-code");
+        await started;
+        clock = new Date(NOW.getTime() - 400); // work resumes while old idle bytes are held
+        const motion = new SeatActivityService({ tmux: { readPaneLastActivity: async () => Math.floor(clock.getTime() / 1000) }, defaultWindowSeconds: 3, now: () => clock });
+        await motion.pollSeat(CNAME);
+        clock = new Date(NOW.getTime() - 100); // response completes after motion was observed
+        release(); await pending;
+        clock = NOW;
+        const out = await attachAgentActivity([{ canonicalSessionName: CNAME, nodeId: node.id, runtime: "claude-code", attachmentType: "tmux" }] as never, {
+          now: NOW, tmuxAdapter: { hasSession: async () => true } as never,
+          activityStore: { getLatestForNode: () => oldIdle } as never,
+          structuralActivity: structural, seatActivity: motion,
+        });
+        expect(out[0]!.agentActivity!.state, `capture age=${age}`).toBe("running");
+        expect(structural.getStructuralActivity(CNAME)?.idleFrame?.captureStartedAt).toBe(began);
+      } finally { release(); db.close(); }
+    }
+  });
+});

@@ -1,16 +1,37 @@
 import assert from 'node:assert/strict';
+import { verifyPromptState } from './prompt-state.mjs';
+import { verifyMcpStdio } from './mcp-stdio.mjs';
+import { verifyReducedEnvRestart, verifyGoneProcess } from './reduced-env-restart.mjs';
 
 export const RESULT_PREFIX = 'OPENRIG_SCENARIO_RESULT=';
 export const SCENARIO = 'queue-baton-survives-restart';
 export const CASES = {
+  'refocus-parked': { file: 'library/refocus-parked-baton.yaml', scenario: 'refocus-parked-baton', kind: 'hook', seed: 'parked-baton-as-current', failedStep: 4 },
   fixture: { file: 'scenarios/scenario-02-baton.yaml', destination: 'dev-worker@scn-baton', failedStep: 3 },
   library: { file: 'library/queue-baton-survives-restart.yaml', destination: 'dev-qa@dev-pair-stub', failedStep: 4, seed: 'baton-drop' },
 };
+// A fresh seat also holds OpenRig's pending roster notice, which names no mission (#3849). It's set aside when deciding the
+// mission, so the parked row's slice is still the labelled context, and the notice stays listed. Pinning the notice (as
+// #3941 first did) keeps the check honest: it can't pass because the notice went missing.
+const parkedContext = [
+  'HELD WORK (blocked; this is not next):\n- refocus-baton — ',
+  'blocked on external:scenario-release',
+  'CONTEXT FROM HELD AND PENDING WORK — nothing is in progress, and every held and pending row (1 held, 0 pending; 1 OpenRig notice set aside) resolves to this slice.',
+  'POSSIBLE NEXT WORK (pending; no order implied):\n- qitem-roster-ready-',
+];
 // Stub-script scenarios run in their passing form only. Their planted failures are
 // product-code mutations, so they stay per-PR evidence outside CI.
 export const PASSING_CASES = {
+  'prompt-state': { file: 'library/prompt-state.json', scenario: 'prompt-state', kind: 'prompt-state' },
+  'refocus-active': { file: 'library/refocus-active-baton.yaml', scenario: 'refocus-active-baton', kind: 'hook',
+    includes: ['Trace the exact held work'], excludes: ['FALLBACK'] },
+  // The parked case with the work packet switched off: the held row's slice as labelled context, never as current work.
+  'refocus-parked-off': { file: 'library/refocus-parked-baton-packet-off.yaml', scenario: 'refocus-parked-baton-packet-off', kind: 'hook',
+    includes: [...parkedContext, 'Trace the exact held work'],
+    excludes: ['FALLBACK', 'WORK FROM QUEUE EVIDENCE', 'does not settle one mission'] },
   transcript: { file: 'library/transcript-reads-addressed-seat.yaml', scenario: 'transcript-reads-addressed-seat' },
   capture: { file: 'library/capture-returns-addressed-seat.yaml', scenario: 'capture-returns-addressed-seat' },
+  'daemon-restart': { file: 'library/daemon-restart-preserves-team-identity.yaml', scenario: 'daemon-restart-preserves-team-identity' },
 };
 
 // Only a clean PASS of the named scenario counts: no error, no seed, no fault.
@@ -28,6 +49,30 @@ export function verifyPassingRun(exitCode, report, caseName) {
   assert.deepEqual(report.records[0], report.result);
   assert.equal(exitCode, 0);
   assert.equal(report.result.verdict, 'PASS');
+  if (caseName === 'prompt-state') verifyPromptState(report.promptState);
+  if (caseName === 'daemon-restart') {
+    verifyMcpStdio(report.mcp);
+    verifyReducedEnvRestart(report.reducedEnv);
+    verifyGoneProcess(report.reducedEnv.gone);
+    const proof = report.preservation;
+    assert.equal(proof?.failedBackupUnchanged, true);
+    assert.match(proof.editedSha256, /^[0-9a-f]{64}$/);
+    assert.equal(proof.backedUpSha256, proof.editedSha256);
+    assert.ok(proof.targetFilesChecked > 0);
+    assert.equal(proof.version, proof.shippedVersion);
+    assert.notEqual(proof.version, '0.0.1');
+  }
+  if (selected.kind === 'hook') {
+    verifyHookOutput(report.hook);
+    for (const text of selected.includes) assert.ok(report.hook.additionalContext.includes(text), text);
+    for (const text of selected.excludes) assert.ok(!report.hook.additionalContext.includes(text), text);
+  }
+}
+
+function verifyHookOutput(hook) {
+  const parsed = JSON.parse(hook.rawOutput);
+  assert.equal(parsed.hookSpecificOutput.hookEventName, 'UserPromptSubmit');
+  assert.equal(parsed.hookSpecificOutput.additionalContext, hook.additionalContext);
 }
 
 // A failed start, bad command, timeout, or unrelated assertion is NOT a caught regression.
@@ -36,6 +81,35 @@ export function verifyRun(mode, exitCode, report, caseName = 'fixture') {
   assert.ok(selected, 'unknown scenario case');
   assert.equal(report.caseName ?? 'fixture', caseName);
   assert.equal(report.mode, mode);
+  if (selected.kind === 'hook') {
+    assert.equal(report.mode, mode); assert.equal(report.caseName, caseName);
+    assert.match(report.scenarioSha256 ?? '', /^[0-9a-f]{64}$/);
+    assert.equal(report.result?.scenario, selected.scenario);
+    assert.equal(report.error, undefined);
+    assert.deepEqual(report.records, [report.result]);
+    assert.deepEqual(report.seed, { class: selected.seed, enabled: mode !== 'healthy' });
+    verifyHookOutput(report.hook);
+    const context = report.hook.additionalContext;
+    if (mode === 'healthy') {
+      // The work packet is on: the parked row is held work, and its slice is labelled context, never the current work.
+      assert.equal(exitCode, 0); assert.equal(report.result.verdict, 'PASS'); assert.equal(report.fault, null);
+      for (const text of parkedContext) assert.ok(context.includes(text), text);
+      assert.ok(!context.includes('does not settle one mission'));
+      assert.ok(!context.includes('WORK FROM QUEUE EVIDENCE'));
+    } else {
+      assert.equal(mode, 'seeded'); assert.equal(exitCode, 1);
+      assert.deepEqual(report.fault, { class: selected.seed, movedRows: 1 });
+      assert.equal(report.result.verdict, 'FAIL'); assert.equal(report.result.failedStep, selected.failedStep);
+      assert.equal(report.result.observation?.surface, 'hook_context');
+      assert.equal(report.result.observation.value.rawOutput, report.hook.rawOutput);
+      assert.equal(report.result.observation.value.content, report.hook.additionalContext);
+      // The planted regression: the held row rendered as the seat's current work, with the slice's intent.
+      assert.ok(context.includes('WORK FROM QUEUE EVIDENCE — tag mission:regression + slice:SCN.1 on row refocus-baton'));
+      assert.ok(context.includes('Trace the exact held work'));
+      assert.ok(!context.includes('HELD WORK'));
+    }
+    return;
+  }
   assert.equal(report.result?.scenario, SCENARIO);
   assert.equal(report.error, undefined);
   assert.equal(report.records.length, 1);

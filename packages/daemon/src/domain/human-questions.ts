@@ -15,13 +15,26 @@ export interface HumanQuestion {
   options: HumanQuestionOption[];
 }
 
-/** questionId → chosen optionId. */
-export type HumanAnswers = Record<string, string>;
+/** A whole thread reply, not a button choice or a human-selected question. */
+export interface TypedHumanReply {
+  kind: "typed-reply";
+  text: string;
+  placement: "first-unanswered" | "explicit";
+  /** Other question slots still empty immediately after this reply's placement. */
+  unansweredCount: number;
+}
+
+/** questionId → chosen optionId (string) or explicitly tagged whole typed reply. */
+export type HumanAnswers = Record<string, string | TypedHumanReply>;
 
 /** The outcome of recording one clicked answer (QueueRepository.recordHumanAnswer). */
 export type RecordHumanAnswerResult =
   | { status: "recorded"; answers: HumanAnswers; complete: boolean; questions: HumanQuestion[] }
-  | { status: "not-applicable"; reason: string };
+  /** answerOnRecord: the decision is no longer pending, and this asked human's clicked answer is the one it holds.
+   *  decidedForThem: it was decided on this asked human's behalf, inside their mode's decision room.
+   *  answeredBy: another person's committed answer is the ask's answer; nothing of this person's was recorded. */
+  | { status: "not-applicable"; reason: string; answerOnRecord?: true;
+    decidedForThem?: { decidedBy: string; modeName: string; chose: string; reversible: boolean }; answeredBy?: string };
 
 export const MAX_HUMAN_QUESTIONS = 4;
 export const MIN_OPTIONS = 2;
@@ -72,22 +85,44 @@ export function parseHumanQuestions(value: unknown): HumanQuestionsParse {
   return { ok: true, questions };
 }
 
-/** The recorded option for a question. Own keys only: a question id like "constructor" must
+/** The recorded answer for a question. Own keys only: a question id like "constructor" must
  *  not read the inherited Object.prototype member as an answer. */
-function ownAnswer(answers: HumanAnswers, questionId: string): string | undefined {
+function ownAnswer(answers: HumanAnswers, questionId: string): string | TypedHumanReply | undefined {
   return Object.prototype.hasOwnProperty.call(answers, questionId) ? answers[questionId] : undefined;
 }
 
-/** One "question: chosen label" line per answered question, in question order. */
+export function describeTypedReplyPlacement(question: HumanQuestion, reply: TypedHumanReply): string {
+  if (reply.placement === "explicit") return `Typed reply to ${JSON.stringify(question.question)}`;
+  return `Whole typed reply, automatically placed under first unanswered question ${JSON.stringify(question.question)}; ${reply.unansweredCount} question${reply.unansweredCount === 1 ? "" : "s"} left unanswered`;
+}
+
+/** Button choices use option labels; typed replies keep their words and placement provenance. */
 export function formatHumanAnswers(questions: readonly HumanQuestion[], answers: HumanAnswers): string[] {
   return questions.flatMap((q) => {
-    const optionId = ownAnswer(answers, q.id);
-    if (optionId == null) return [];
-    return [`${q.question}: ${q.options.find((o) => o.id === optionId)?.label ?? optionId}`];
+    const answer = ownAnswer(answers, q.id);
+    if (answer == null) return [];
+    if (typeof answer !== "string") return [`${describeTypedReplyPlacement(q, answer)}: ${answer.text}`];
+    return [`${q.question}: ${q.options.find((o) => o.id === answer)?.label ?? answer}`];
+  });
+}
+
+/** What was chosen, in question order: a button choice's option label, or null for a typed reply (a settled card names
+ *  the choice; the typed words stay in the thread). Empty when nothing is recorded. */
+export function chosenAnswers(questions: readonly HumanQuestion[], answers: HumanAnswers): Array<string | null> {
+  return questions.flatMap((q) => {
+    const answer = ownAnswer(answers, q.id);
+    if (answer == null) return [];
+    return [typeof answer === "string" ? q.options.find((o) => o.id === answer)?.label ?? answer : null];
   });
 }
 
 /** The questions still waiting for an answer. */
 export function unansweredQuestions(questions: readonly HumanQuestion[], answers: HumanAnswers): HumanQuestion[] {
   return questions.filter((q) => ownAnswer(answers, q.id) == null);
+}
+
+/** Return the person's original answer, without the attribution footer used by both surfaces. */
+export function humanAnswerText(body: string): string {
+  const footer = body.lastIndexOf("\n\n---\n");
+  return (footer < 0 ? body : body.slice(0, footer)).trim();
 }

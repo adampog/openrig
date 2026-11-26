@@ -1,13 +1,34 @@
+import { claudeAutoModeStatus, type ClaudeAutoModeStatus } from "./claude-auto-mode.js";
+import type { ClaudeCompactionEnforcer, ObservedCompaction } from "./claude-compaction-enforcer.js";
+import path from "node:path";
+import { TerminalPolicyStore } from "./terminal-policy.js";
 import type { RigRepository } from "./rig-repository.js";
 import { deriveCanonicalFromEntry, getNodeInventory } from "./node-inventory.js";
 import { parseSessionName } from "./session-name.js";
-import type { NodeInventoryEntry } from "./types.js";
+import { recordedRunner, sessionCommunityRunnerSelect } from "./session-registry.js";
+import type { NodeInventoryEntry, SeatIdentityVerdict } from "./types.js";
 import { NativePermissionStore, type StoredNativePermissionSelection, type ResolvedSeatPermission } from "./native-permission-store.js";
 import { AppliedLaunchObservationStore, type StoredAppliedLaunchObservation } from "./applied-launch-observation-store.js";
+import { planPermissionAccount, type PermissionAccount } from "./permission-account.js";
+import { seatAccountHome, RUNTIME_HOME_VAR, seatRuntimeHome, type HomeRuntime } from "./seat-runtime-home.js";
+import { claudeSeatTokenFallbackNotice, claudeSeatTokenFileProblem, readClaudeSeatTokenRef } from "./claude-seat-token.js";
+import { unavailablePermissionStop, type PermissionStopStatus } from "./permission-stop-observation.js";
+import type { AgentActivityStore } from "./agent-activity-store.js";
+import { readRefocusRecord, type RefocusRecord } from "./refocus-record.js";
+import { readGuidanceProjection, type GuidanceProjection, type GuidanceSession } from "./guidance-projection.js";
+import { readNodeStartupSnapshot, seatGuidanceFile } from "./restore-guidance.js";
 
 const SEAT_LOOKUP_GUIDANCE = "List seats with: rig ps --nodes";
 
 export interface SeatStatus {
+  inputRoute?: "typed" | "native";
+  /** Latest bounded observation across actors, not aggregate pending state or proof a guard ran.
+   * Completion applies only to the displayed actor; other actors' pending state is unknown. */
+  permission_stop?: PermissionStopStatus;
+  compaction?: ObservedCompaction & { owedRestore: ReturnType<ClaudeCompactionEnforcer["getOwedRestore"]> };
+  /** Claude and Codex seats: what OpenRig's own refocus hook has recorded for this seat, from its state files. Evidence
+   *  of what ran, not readiness from configuration. */
+  refocus?: RefocusRecord;
   seat_ref: string;
   rig_id: string;
   rig_name: string;
@@ -15,8 +36,20 @@ export interface SeatStatus {
   pod_id: string | null;
   pod_namespace: string | null;
   runtime: string | null;
+  /** Configured cwd for future launches; an existing process can still use its old cwd. */
+  launch_cwd: string | null;
+  /** The registered person who answers this seat's runner permission requests; null when no one is chosen. */
+  permissions_to: string | null;
+  /** Whether the seat's newest session was launched as a community runner, the kind that submits permission requests. */
+  runner: boolean;
   current_occupant: string | null;
+  /** The session record's own status. A pane OpenRig can't confirm as the seat's runtime (a bare shell) keeps it
+   *  `running`; `lifecycle_state` says how the seat reads. */
   session_status: string | null;
+  /** The seat's state as `rig ps --nodes` shows it (node-inventory's lifecycleState): `attention_required`, never
+   *  `running`, while startup needs attention or the pane's process identity down-ranks it. */
+  lifecycle_state: NodeInventoryEntry["lifecycleState"];
+  session_reason: SeatIdentityVerdict["reason"];
   startup_status: NodeInventoryEntry["startupStatus"];
   occupant_lifecycle: NodeInventoryEntry["occupantLifecycle"];
   continuity_outcome: NodeInventoryEntry["continuityOutcome"];
@@ -24,6 +57,21 @@ export interface SeatStatus {
   previous_occupant: string | null;
   handover_at: string | null;
   restore_outcome: NodeInventoryEntry["restoreOutcome"];
+  /** Claude, Codex and Pi seats: the home (and with it the login) the seat's launches use. Configured, not proof of
+   *  which login a running process holds. `ignored` is a declared value that isn't an absolute path. */
+  runtime_home?: {
+    variable: "CLAUDE_CONFIG_DIR" | "CODEX_HOME" | "PI_CODING_AGENT_DIR";
+    home: string | null;
+    source: "member" | "rig" | "account-switch" | "daemon" | "native_default";
+    ignored?: { source: "member" | "rig" | "account-switch"; value: string };
+  };
+  /** A Claude seat's own subscription token: its reference (never the value), and whether the file would give Claude the
+   *  token at the next launch. When it wouldn't, Claude starts on the config dir's stored login, and `notice` says so. */
+  claude_token?: { kind?: "api-key"; label: string; token_file: string; file: "readable" | "unusable"; problem?: string; notice?: string };
+  /** A running Claude or Codex seat: OpenRig's blocks in its guidance file, set against when the running agent loaded
+   *  that file. Whether a block could be in the agent's context, never whether the agent read it. */
+  guidance?: GuidanceProjection;
+  terminalPolicy: ReturnType<TerminalPolicyStore["account"]> | { state: "unknown"; error: string };
   permissions: {
     selectionState: "explicit" | "inherit" | "unknown";
     desired: StoredNativePermissionSelection | null;
@@ -31,6 +79,10 @@ export interface SeatStatus {
     nativeEffect: "unverified";
     error?: string;
     effective?: ResolvedSeatPermission;
+    /** The planned account for the next fresh managed launch (permission-account.ts); absent when it can't be read. */
+    account?: PermissionAccount;
+    /** A Claude seat's autoMode block, saved against the last launch's; absent when neither has one. */
+    claudeAutoMode?: ClaudeAutoModeStatus;
   };
 }
 
@@ -45,9 +97,16 @@ interface SeatMatch {
 
 export class SeatStatusService {
   private rigRepo: RigRepository;
+  private env: NodeJS.ProcessEnv;
+  private compactionEnforcer?: Pick<ClaudeCompactionEnforcer, "recoverSeat" | "observedCompaction" | "getOwedRestore">;
+  private activityStore?: Pick<AgentActivityStore, "getPermissionStopForNode">;
 
-  constructor(deps: { rigRepo: RigRepository }) {
+  constructor(deps: { rigRepo: RigRepository; env?: NodeJS.ProcessEnv; compactionEnforcer?: SeatStatusService["compactionEnforcer"];
+    activityStore?: SeatStatusService["activityStore"] }) {
+    this.activityStore = deps.activityStore;
+    this.compactionEnforcer = deps.compactionEnforcer;
     this.rigRepo = deps.rigRepo;
+    this.env = deps.env ?? process.env;
   }
 
   getStatus(seatRef: string): SeatStatusResult {
@@ -77,6 +136,16 @@ export class SeatStatusService {
     return { ok: true, status: this.projectStatus(ref, matches[0]!.entry) };
   }
 
+  getStatusByNodeId(nodeId: string): SeatStatusResult {
+    const id = nodeId.trim();
+    if (!id) return { ok: false, code: "seat_ref_required", message: "node ID is required", guidance: SEAT_LOOKUP_GUIDANCE };
+    const row = this.rigRepo.db.prepare(`SELECT n.rig_id FROM nodes n JOIN rigs r ON r.id = n.rig_id
+      WHERE n.id = ? AND r.archived_at IS NULL`).get(id) as { rig_id: string } | undefined;
+    const entry = row && this.entriesForRig(row.rig_id).find(candidate => candidate.nodeId === id);
+    if (!entry) return { ok: false, code: "seat_not_found", message: `Node "${id}" not found in an active rig.`, guidance: SEAT_LOOKUP_GUIDANCE };
+    return { ok: true, status: this.projectStatus(entry.canonicalSessionName ?? deriveCanonicalFromEntry(entry) ?? entry.logicalId, entry) };
+  }
+
   private findMatches(ref: string): SeatMatch[] {
     // OPR.0.4.6.MH1 FR-8: the shared parse contract (greedy first-@ rig).
     const parsed = parseSessionName(ref);
@@ -104,15 +173,24 @@ export class SeatStatusService {
 
   private projectStatus(seatRef: string, entry: NodeInventoryEntry): SeatStatus {
     return {
+      permission_stop: this.permissionStopStatus(entry),
+      ...this.compactionStatus(entry),
+      ...this.refocusStatus(entry),
       seat_ref: seatRef,
+      inputRoute: this.rigRepo.getNodeInputRoute(entry.nodeId),
       rig_id: entry.rigId,
       rig_name: entry.rigName,
       logical_id: entry.logicalId,
       pod_id: entry.podId,
       pod_namespace: entry.podNamespace ?? null,
       runtime: entry.runtime,
+      launch_cwd: entry.cwd,
+      permissions_to: this.rigRepo.getNodePermissionsTo(entry.nodeId),
+      runner: this.launchedAsRunner(entry.nodeId),
       current_occupant: entry.canonicalSessionName,
       session_status: entry.sessionStatus,
+      lifecycle_state: entry.lifecycleState,
+      session_reason: entry.identityVerdict?.reason ?? null,
       startup_status: entry.startupStatus,
       occupant_lifecycle: entry.occupantLifecycle,
       continuity_outcome: entry.continuityOutcome,
@@ -120,19 +198,112 @@ export class SeatStatusService {
       previous_occupant: entry.previousOccupant,
       handover_at: entry.handoverAt,
       restore_outcome: entry.restoreOutcome,
-      permissions: this.permissionStatus(entry.nodeId, entry.runtime),
+      ...this.runtimeHomeStatus(entry.nodeId, entry.runtime),
+      ...this.claudeTokenStatus(entry.nodeId, entry.runtime),
+      ...this.guidanceStatus(entry),
+      permissions: this.permissionStatus(entry.nodeId, entry.runtime, entry.canonicalSessionName ?? deriveCanonicalFromEntry(entry) ?? seatRef),
+      terminalPolicy: this.terminalPolicyStatus(entry.nodeId, entry.runtime),
     };
   }
 
-  private permissionStatus(nodeId: string, runtime?: string | null): SeatStatus["permissions"] {
-    const lastLaunchArguments = new AppliedLaunchObservationStore(this.rigRepo.db).readCurrent(nodeId);
+  private permissionStopStatus(entry: NodeInventoryEntry): PermissionStopStatus {
     try {
-      const store = new NativePermissionStore(this.rigRepo.db);
-      const desired = store.read(nodeId);
-      const effective = runtime ? store.resolve(nodeId, runtime) : undefined;
-      return { selectionState: desired ? "explicit" : "inherit", desired, lastLaunchArguments, nativeEffect: "unverified", ...(effective ? { effective } : {}) };
-    } catch (error) {
-      return { selectionState: "unknown", desired: null, lastLaunchArguments, nativeEffect: "unverified", error: (error as Error).message };
+      const observed = entry.canonicalSessionName ? this.activityStore?.getPermissionStopForNode(entry.nodeId, entry.canonicalSessionName) : undefined;
+      return entry.occupantLifecycle === "active" && entry.sessionStatus === "running" ? observed ?? unavailablePermissionStop()
+        : unavailablePermissionStop();
     }
+    catch { return unavailablePermissionStop(); }
   }
+
+  private refocusStatus(entry: NodeInventoryEntry): Pick<SeatStatus, "refocus"> {
+    if ((entry.runtime !== "claude-code" && entry.runtime !== "codex") || !entry.canonicalSessionName) return {};
+    // The same home the hook resolves (refocus.cjs).
+    const home = this.env.OPENRIG_HOME || path.join(this.env.HOME || "/tmp", ".openrig");
+    return { refocus: readRefocusRecord(home, entry.canonicalSessionName, entry.resumeToken ?? null) };
+  }
+
+  private guidanceStatus(entry: NodeInventoryEntry): Pick<SeatStatus, "guidance"> {
+    if ((entry.runtime !== "claude-code" && entry.runtime !== "codex") || entry.sessionStatus !== "running" || !entry.cwd) return {};
+    const db = this.rigRepo.db;
+    let recorded: string | null = null;
+    try { recorded = readNodeStartupSnapshot(db, entry.nodeId)?.guidanceFile ?? null; } catch { /* the runtime's default file */ }
+    const file = seatGuidanceFile(entry.runtime, entry.cwd, this.rigRepo.getRigClaudeManagedBlockFile(entry.rigId), recorded);
+    if (!file) return {};
+    let session: GuidanceSession | null = null;
+    try {
+      const row = db.prepare("SELECT origin, created_at, startup_completed_at FROM sessions WHERE node_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1")
+        .get(entry.nodeId) as { origin: string; created_at: string | null; startup_completed_at: string | null } | undefined;
+      if (row) session = { origin: row.origin === "claimed" ? "claimed" : "launched", createdAt: row.created_at, startupCompletedAt: row.startup_completed_at };
+    } catch { /* no session to place the blocks against: they read unknown */ }
+    return { guidance: readGuidanceProjection({ db, file, runtime: entry.runtime, session }) };
+  }
+
+  private compactionStatus(entry: NodeInventoryEntry): Pick<SeatStatus, "compaction"> {
+    const enforcer = this.compactionEnforcer, session = entry.canonicalSessionName;
+    if (!enforcer || entry.runtime !== "claude-code" || !session) return {};
+    enforcer.recoverSeat({ sessionName: session, cwd: entry.cwd, runtime: entry.runtime });
+    const observed = enforcer.observedCompaction(session);
+    return observed ? { compaction: { ...observed, owedRestore: enforcer.getOwedRestore(session) } } : {};
+  }
+
+  private launchedAsRunner(nodeId: string): boolean {
+    const db = this.rigRepo.db;
+    const row = db.prepare(`SELECT ${sessionCommunityRunnerSelect(db)} AS community_runner FROM sessions s WHERE s.node_id = ? ORDER BY s.id DESC LIMIT 1`)
+      .get(nodeId) as { community_runner: number | null } | undefined;
+    return recordedRunner(row?.community_runner);
+  }
+
+  private runtimeHomeStatus(nodeId: string, runtime: string | null): Pick<SeatStatus, "runtime_home"> {
+    if (!runtime || !Object.hasOwn(RUNTIME_HOME_VAR, runtime)) return {};
+    const variable = RUNTIME_HOME_VAR[runtime as HomeRuntime];
+    const own = seatRuntimeHome(this.rigRepo.db, nodeId, runtime as HomeRuntime);
+    const ignored = own.ignored ? { ignored: own.ignored } : {};
+    if (own.home && own.source) return { runtime_home: { variable, home: own.home, source: own.source } };
+    // The daemon's explicit value, as its launches pass it on; else the runtime's native default under HOME.
+    const daemon = runtime === "pi" ? undefined : this.env[variable];
+    if (daemon) return { runtime_home: { variable, home: daemon, source: "daemon", ...ignored } };
+    const home = this.env.HOME;
+    // Unconfigured Pi uses its managed seat directory, not the operator's ~/.pi/agent login.
+    const native = home && runtime !== "pi" ? path.join(home, runtime === "codex" ? ".codex" : ".claude") : null;
+    return { runtime_home: { variable, home: native, source: "native_default", ...ignored } };
+  }
+
+  /** Report a Claude token's stored reference and file availability without reading its value or verifying the login. */
+  private claudeTokenStatus(nodeId: string, runtime: string | null): Pick<SeatStatus, "claude_token"> {
+    if (runtime !== "claude-code") return {};
+    const ref = readClaudeSeatTokenRef(this.rigRepo.db, nodeId);
+    if (!ref) return {};
+    const problem = claudeSeatTokenFileProblem(ref);
+    return { claude_token: { ...(ref.kind ? { kind: ref.kind } : {}), label: ref.label, token_file: ref.tokenFile, file: problem ? "unusable" : "readable",
+      ...(problem ? { problem, notice: seatAccountHome(this.rigRepo.db, nodeId, "claude-code")
+        ? "The selected account token is unusable; no agent will start." : claudeSeatTokenFallbackNotice(ref, problem) } : {}) } };
+  }
+
+  private terminalPolicyStatus(nodeId: string, runtime: string | null): SeatStatus["terminalPolicy"] {
+    try { return new TerminalPolicyStore(this.rigRepo.db).account(nodeId, runtime); }
+    catch (error) { return { state: "unknown", error: (error as Error).message }; }
+  }
+
+  private permissionStatus(nodeId: string, runtime: string | null | undefined, seat: string): SeatStatus["permissions"] {
+    const lastLaunchArguments = new AppliedLaunchObservationStore(this.rigRepo.db).readCurrent(nodeId);
+    // Without a plan, whether the next launch is in auto mode is unknown, not false.
+    const autoModeStatus = (account?: PermissionAccount) => {
+      const status = runtime === "claude-code" ? claudeAutoModeStatus(this.rigRepo.db, nodeId, lastLaunchArguments?.claudeAutoMode,
+        account ? /--permission-mode auto\b/.test(account.nativeArgument ?? "") : undefined) : undefined;
+      return status ? { claudeAutoMode: status } : {};
+    };
+    // Each fact is read on its own, so one that can't be read doesn't hide the others.
+    const store = new NativePermissionStore(this.rigRepo.db);
+    let desired: ReturnType<NativePermissionStore["read"]> | undefined;
+    let effective: ReturnType<NativePermissionStore["resolve"]> | undefined;
+    let account: PermissionAccount | undefined;
+    const errors: string[] = [];
+    try { desired = store.read(nodeId); } catch (error) { errors.push((error as Error).message); }
+    try { if (runtime) effective = store.resolve(nodeId, runtime); } catch (error) { errors.push((error as Error).message); }
+    try { account = planPermissionAccount(this.rigRepo.db, nodeId, seat, runtime ?? null); } catch (error) { errors.push((error as Error).message); }
+    return { selectionState: desired === undefined ? "unknown" : desired ? "explicit" : "inherit", desired: desired ?? null, lastLaunchArguments,
+      nativeEffect: "unverified", ...(effective ? { effective } : {}), ...(account ? { account } : {}),
+      ...(errors.length ? { error: errors.join("; ") } : {}), ...autoModeStatus(account) };
+  }
+
 }

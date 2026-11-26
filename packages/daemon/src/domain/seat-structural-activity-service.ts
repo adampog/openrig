@@ -1,6 +1,10 @@
 import type Database from "better-sqlite3";
 import type { PaneCapture, TmuxAdapter } from "../adapters/tmux.js";
-import { classifyPaneActivity, type PaneActivityClassification } from "./session-transport.js";
+import { communityHarnessPaneActivity, classifyPaneActivity, codexWorkingElapsed, isCodexLiveWorkingFrame, namesAnotherClientVersion, readSeatBeforePaste, type PaneActivityClassification } from "./session-transport.js";
+import { communityHarnessOf } from "./built-in-runtimes.js";
+import { detectCodexLimitBanner, type CodexLimitBanner } from "./provider/codex-limit-banner.js";
+import { IDLE_FULL_CAPTURE_MS, windowSnapshot } from "./transcript-rotation.js";
+import { sessionCommunityHarnessSelect } from "./session-registry.js";
 
 /** A cached STRUCTURAL pane observation: the classifyPaneActivity verdict plus WHEN the pane was read
  *  as motion. observedAt is a LIVENESS timestamp (last time we saw the pane), NOT a hook-arrival age —
@@ -10,6 +14,19 @@ export interface StructuralObservation {
   reason: string;
   evidence: string | null;
   observedAt: string;
+  /** A lower bound taken before the capture's read, when known: a reader may use the frame only for the occupant
+   *  present by then. */
+  captureStartedAt?: string;
+  /** The pane and its process this capture read, when the batched capture reported them (#2515). */
+  pane?: { id: string; pid: number };
+  /** A complete idle frame read for this capture's target, not a generic footer or hook. */
+  idleFrame?: { sessionName: string; runtime: "claude-code" | "codex"; captureStartedAt: string };
+  /** A Codex working observation is usable only for the occupant present when capture began. */
+  codexWorkingFrame?: { captureStartedAt: string; proofAt: string; previousCaptureStartedAt?: string };
+  codexWorkingClock?: { seconds: number; captureStartedAt: string };
+  /** Set when a later sweep found the pane unchanged since observedAt without capturing it. Freshness counts from it;
+   *  observedAt stays the capture. */
+  checkedAt?: string;
 }
 
 export const DEFAULT_STRUCTURAL_POLL_INTERVAL_MS = 1000;
@@ -33,23 +50,43 @@ export const DEFAULT_STRUCTURAL_STALE_MS = 5000;
  *         positive verdict never survives a capture outage or a same-name occupant transition; and
  *   (MF2) sweeps are SINGLE-FLIGHT and HELD until the real captures settle — a slow/stuck tmux can
  *         never accumulate overlapping whole-fleet captures (only one sweep's captures are ever in
- *         flight). We deliberately do NOT time-out a capture to release the guard: execCommand has no
- *         AbortSignal, so a wrapper timeout would release single-flight while the child process lives,
- *         letting a later sweep spawn MORE children — the storm at the process level. A permanently
- *         stuck tmux therefore degrades to "no structural signal" (honest, via MF1 age-expiry), never
- *         a storm. A kill-backed capture primitive (bounded abort) is a tmux-adapter follow-on.
+ *         flight). Default argv and POSIX legacy tmux execs have a kill-backed deadline: the client is killed and reaped
+ *         before the failure releases single-flight. We still do NOT race a capture against a wrapper
+ *         timeout, which could leave an injected or alternate executor alive and let a later sweep
+ *         spawn MORE children. Failed or stuck captures degrade to "no structural signal" (via MF1
+ *         invalidation/age-expiry), never an idle observation or an overlapping capture storm.
  */
 export class SeatStructuralActivityService {
   private readonly latestBySession = new Map<string, StructuralObservation>();
+  // window_activity (epoch seconds) when each cached verdict's capture was taken, with that sweep's start second.
+  private readonly capturedActivity = new Map<string, { activity: number; size?: string; startSec: number; fullAt: number }>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private sweeping = false; // single-flight guard: one whole-fleet sweep at a time (MUST-FIX 2)
+  private activityChanged?: (sessionName: string) => void;
+  private bannerEmitter:
+    | ((sessionName: string, banner: CodexLimitBanner | null, observedAt: Date) => void)
+    | null = null;
 
   constructor(
-    private readonly tmuxAdapter: Pick<TmuxAdapter, "capturePaneContent"> & Partial<Pick<TmuxAdapter, "capturePanesContent">>,
+    private readonly tmuxAdapter: Pick<TmuxAdapter, "capturePaneContent"> & Partial<Pick<TmuxAdapter, "capturePanesContent" | "readAllSessionWindowActivity" | "readAllSessionWindows">>,
     private readonly now: () => Date = () => new Date(),
     private readonly captureLines: number = 20,
     private readonly staleAfterMs: number = DEFAULT_STRUCTURAL_STALE_MS,
   ) {}
+
+  /**
+   * Attach the Codex limit-banner emitter (#763). Kept as late attachment
+   * (rather than a constructor dep) so construction order with the activity
+   * store is untouched: startup attaches it once the store exists.
+   */
+  attachCodexLimitBanner(
+    emitter: (sessionName: string, banner: CodexLimitBanner | null, observedAt: Date) => void,
+  ): void {
+    this.bannerEmitter = emitter;
+  }
+
+  /** Notify from the existing captures only, after the cache holds the new verdict. */
+  attachActivityChanged(listener: (sessionName: string) => void): void { this.activityChanged = listener; }
 
   /** The cached structural observation — ONLY while current (capture-FREE read). Returns null AND evicts
    *  once the observation is older than the freshness window, so a stalled/failed poller never leaves a
@@ -57,7 +94,7 @@ export class SeatStructuralActivityService {
   getStructuralActivity(sessionName: string): StructuralObservation | null {
     const obs = this.latestBySession.get(sessionName);
     if (!obs) return null;
-    if (this.now().getTime() - Date.parse(obs.observedAt) >= this.staleAfterMs) {
+    if (this.now().getTime() - Date.parse(obs.checkedAt ?? obs.observedAt) >= this.staleAfterMs) {
       this.latestBySession.delete(sessionName);
       return null;
     }
@@ -68,13 +105,17 @@ export class SeatStructuralActivityService {
    *  null or failed capture INVALIDATES the prior row (never leaves a stale positive verdict) and
    *  returns null (MUST-FIX 1). `prefetched` (#308) is the sweep's batched capture: a session it holds (null = gone or
    *  empty) is used as is; one it lacks is captured here, per seat. */
-  async pollSeat(sessionName: string, prefetched?: Map<string, PaneCapture> | null): Promise<StructuralObservation | null> {
+  async pollSeat(sessionName: string, prefetched?: Map<string, PaneCapture> | null, runtime?: string | null, communityHarness?: string | null, prefetchedStartedAt?: Date): Promise<StructuralObservation | null> {
     let content: string | null;
     let observedAt: Date | null = null;
+    let pane: StructuralObservation["pane"];
+    // Completion can lag the bytes: use a lower bound taken before the actual read.
+    const captureStartedAt = prefetched?.has(sessionName) ? prefetchedStartedAt : this.now();
     if (prefetched?.has(sessionName)) {
       const capture = prefetched.get(sessionName)!;
       content = capture.text;
       observedAt = capture.capturedAt; // the capture's own time, never the end of the sweep (#309 review)
+      pane = capture.pane;
     } else {
       try {
         content = await this.tmuxAdapter.capturePaneContent(sessionName, this.captureLines);
@@ -87,14 +128,52 @@ export class SeatStructuralActivityService {
       this.latestBySession.delete(sessionName);
       return null;
     }
-    const c = classifyPaneActivity(content);
+    const c = communityHarnessPaneActivity(classifyPaneActivity(content), communityHarness, content);
+    // Redraws from an unrecorded Codex layout cannot establish work or completed idle.
+    // Keep positive work and attention visible; native hooks are resolved separately by the activity fold.
+    const unrecognizedVersion = runtime === "codex" && c.state !== "attention" && c.state !== "agent_active" && namesAnotherClientVersion(content, "codex");
+    const at = observedAt ?? this.now();
+    const latest = this.latestBySession.get(sessionName);
+    // A counter or proof read from another pane or process says nothing about this one, so compare only within one.
+    const previous = latest?.pane && pane && (latest.pane.id !== pane.id || latest.pane.pid !== pane.pid) ? undefined : latest;
+    const seconds = runtime === "codex" && captureStartedAt && c.state !== "attention" ? codexWorkingElapsed(content) : null;
+    const previousAge = previous ? at.getTime() - Date.parse(previous.observedAt) : NaN;
+    const advanced = seconds !== null && previous?.codexWorkingClock && seconds > previous.codexWorkingClock.seconds
+      && previousAge >= 0 && previousAge < DEFAULT_STRUCTURAL_STALE_MS;
+    const adjacent = seconds !== null && isCodexLiveWorkingFrame(content);
+    const firstAdjacent = adjacent && (previous?.codexWorkingClock === undefined || previous.codexWorkingClock.seconds !== seconds);
+    const priorProof = seconds !== null && previous?.codexWorkingClock?.seconds === seconds && previous.codexWorkingFrame
+      && at.getTime() - Date.parse(previous.codexWorkingFrame.proofAt) < DEFAULT_STRUCTURAL_STALE_MS ? previous.codexWorkingFrame : undefined;
+    const workingFrame = captureStartedAt && seconds !== null && (firstAdjacent || advanced)
+      ? { captureStartedAt: captureStartedAt.toISOString(), proofAt: at.toISOString(),
+        ...(advanced ? { previousCaptureStartedAt: previous!.codexWorkingClock!.captureStartedAt } : {}) }
+      : priorProof;
     const obs: StructuralObservation = {
-      state: c.state,
-      reason: c.reason,
+      state: unrecognizedVersion ? "unknown" : c.state,
+      reason: unrecognizedVersion ? "unrecognized_client_version" : c.reason,
       evidence: c.evidence,
-      observedAt: (observedAt ?? this.now()).toISOString(),
+      observedAt: at.toISOString(),
+      ...(captureStartedAt ? { captureStartedAt: captureStartedAt.toISOString() } : {}),
+      ...(pane ? { pane } : {}),
+      ...(captureStartedAt && seconds !== null ? { codexWorkingClock: { seconds, captureStartedAt: captureStartedAt.toISOString() } } : {}),
+      ...(workingFrame ? { codexWorkingFrame: workingFrame } : {}),
+      ...(captureStartedAt && c.state === "agent_idle" && (runtime === "claude-code" || runtime === "codex")
+        && readSeatBeforePaste(content, runtime, sessionName) === "idle"
+        ? { idleFrame: { sessionName, runtime, captureStartedAt: captureStartedAt.toISOString() } } : {}),
     };
     this.latestBySession.set(sessionName, obs);
+    if (latest?.state !== obs.state || latest?.reason !== obs.reason) this.activityChanged?.(sessionName);
+    // #763: a Codex usage-limit banner is invisible to the hook vocabulary,
+    // so the reactive tap never fires for it. Report what the seat shows, on
+    // transition only (the recorder skips an already-reported banner). A poll
+    // ends the episode only with positive structural evidence and no banner.
+    // Null/failed, blank and unrecognized captures cannot establish recovery.
+    if (runtime === "codex" && this.bannerEmitter) {
+      const banner = detectCodexLimitBanner(content);
+      if (banner || (content.trim().length > 0 && obs.state !== "unknown")) {
+        this.bannerEmitter(sessionName, banner, at);
+      }
+    }
     return obs;
   }
 
@@ -106,7 +185,7 @@ export class SeatStructuralActivityService {
     this.sweeping = true;
     try {
       const rows = db.prepare(`
-        SELECT s.session_name as session_name
+        SELECT s.session_name as session_name, n.runtime as runtime, ${sessionCommunityHarnessSelect(db)} as community_harness
         FROM nodes n
         JOIN sessions s ON s.node_id = n.id
           AND s.id = (SELECT s2.id FROM sessions s2 WHERE s2.node_id = n.id ORDER BY s2.id DESC LIMIT 1)
@@ -114,18 +193,48 @@ export class SeatStructuralActivityService {
         WHERE s.status = 'running'
           AND s.session_name IS NOT NULL
           AND COALESCE(b.attachment_type, 'tmux') = 'tmux'
-      `).all() as Array<{ session_name: string }>;
+      `).all() as Array<{ session_name: string; runtime: string | null; community_harness: string | null }>;
       const live = new Set(rows.map((r) => r.session_name));
+      const runtimeBySession = new Map(rows.map((r) => [r.session_name, r.runtime] as const));
+      const communityHarnessBySession = new Map(rows.map((r) => [r.session_name, communityHarnessOf(r.community_harness, r.runtime)] as const));
       for (const s of Array.from(this.latestBySession.keys())) {
         if (!live.has(s)) this.latestBySession.delete(s); // release memory + never serve a stale read
       }
+      for (const s of Array.from(this.capturedActivity.keys())) if (!live.has(s)) this.capturedActivity.delete(s);
+      const sweepAt = this.now();
+      const startSec = Math.floor(sweepAt.getTime() / 1000);
+      // A listing started by this sweep, so a write before the sweep moves its activity; rotation reuses it. A listing
+      // still running from earlier, or a stalled one, means no hint: every seat is captured, as before.
+      const activity = this.tmuxAdapter.readAllSessionWindows || this.tmuxAdapter.readAllSessionWindowActivity
+        ? await windowSnapshot(this.tmuxAdapter as TmuxAdapter, DEFAULT_STRUCTURAL_POLL_INTERVAL_MS, true) : null;
+      // tmux bumps window_activity on every pane write: a seat whose activity is unchanged and older than the sweep
+      // that captured it shows the same pane, so its cached verdict stays current (checkedAt) without a capture.
+      const due = rows.filter((r) => {
+        const seen = this.capturedActivity.get(r.session_name);
+        const now = activity?.get(r.session_name);
+        const obs = this.latestBySession.get(r.session_name);
+        // The Codex limit row is refreshed by the capture that sees the banner, and ages out without it.
+        if (runtimeBySession.get(r.session_name) === "codex" && this.bannerEmitter) return true;
+        if (seen && obs && now !== undefined && now.activity === seen.activity && now.size === seen.size && now.activity < seen.startSec
+          && sweepAt.getTime() - seen.fullAt < IDLE_FULL_CAPTURE_MS) {
+          this.latestBySession.set(r.session_name, { ...obs, checkedAt: sweepAt.toISOString() });
+          return false;
+        }
+        return true;
+      });
       // #308: one batched capture for the whole fleet (a few tmux calls) instead of a fork per seat; anything the batch
       // didn't cover (no listing, a failed chunk) is read per seat inside pollSeat, as before.
-      const prefetched = this.tmuxAdapter.capturePanesContent
-        ? await this.tmuxAdapter.capturePanesContent(rows.map((r) => r.session_name), this.captureLines, this.now).catch(() => null)
+      const captureStartedAt = this.now();
+      const prefetched = this.tmuxAdapter.capturePanesContent && due.length > 0
+        ? await this.tmuxAdapter.capturePanesContent(due.map((r) => r.session_name), this.captureLines, this.now).catch(() => null)
         : null;
-      await Promise.all(rows.map(async (r) => {
-        try { await this.pollSeat(r.session_name, prefetched); } catch { /* isolate: one seat's failure never crashes the sweep */ }
+      await Promise.all(due.map(async (r) => {
+        try {
+          const obs = await this.pollSeat(r.session_name, prefetched, runtimeBySession.get(r.session_name) ?? null, communityHarnessBySession.get(r.session_name), captureStartedAt);
+          const seen = activity?.get(r.session_name);
+          if (obs && seen !== undefined) this.capturedActivity.set(r.session_name, { activity: seen.activity, size: seen.size, startSec, fullAt: sweepAt.getTime() });
+          else this.capturedActivity.delete(r.session_name);
+        } catch { /* isolate: one seat's failure never crashes the sweep */ }
       }));
     } finally {
       this.sweeping = false;

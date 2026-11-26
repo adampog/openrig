@@ -20,7 +20,8 @@ function mockTmux(): TmuxAdapter {
     sendText: vi.fn(async () => ({ ok: true as const })),
     hasSession: vi.fn(async () => true),
     getPaneCommand: vi.fn(async () => "claude"),
-    capturePaneContent: vi.fn(async () => ""),
+    // A resumed Claude's drawn screen: Claude's process alone, with nothing drawn, only stands when the resume's wait runs out.
+    capturePaneContent: vi.fn(async () => `Claude Code v2.1.310\n${"─".repeat(60)}\n❯ \n${"─".repeat(60)}\n  ⏵⏵ accept edits on (shift+tab to cycle)`),
     createSession: vi.fn(async () => ({ ok: true as const })),
     killSession: vi.fn(async () => ({ ok: true as const })),
     listSessions: vi.fn(async () => []),
@@ -124,7 +125,13 @@ describe("OPR.0.4.8.2 YOLO mode — opt-in, default OFF, launch-flag surface onl
 
     delete process.env.OPENRIG_YOLO;
     const tmuxOff = mockTmux();
-    await new CodexRuntimeAdapter({ tmux: tmuxOff, fsOps: codexFs }).launchHarness(makeBinding(), forkOpts);
+    // The verified child capture is covered in codex-fork-startup-recovery; this checks the launch flags.
+    const forkAdapter = (tmux: ReturnType<typeof mockTmux>) => {
+      const adapter = new CodexRuntimeAdapter({ tmux, fsOps: codexFs });
+      vi.spyOn(adapter as never, "captureVerifiedForkId").mockResolvedValue("child-thread" as never);
+      return adapter;
+    };
+    await forkAdapter(tmuxOff).launchHarness(makeBinding(), forkOpts);
     const off = (tmuxOff.sendText as ReturnType<typeof vi.fn>).mock.calls[0]?.[1] as string;
     expect(off).toContain("fork");
     expect(off).toContain("-s workspace-write");
@@ -132,7 +139,7 @@ describe("OPR.0.4.8.2 YOLO mode — opt-in, default OFF, launch-flag surface onl
 
     process.env.OPENRIG_YOLO = "1";
     const tmuxOn = mockTmux();
-    await new CodexRuntimeAdapter({ tmux: tmuxOn, fsOps: codexFs }).launchHarness(makeBinding(), forkOpts);
+    await forkAdapter(tmuxOn).launchHarness(makeBinding(), forkOpts);
     const on = (tmuxOn.sendText as ReturnType<typeof vi.fn>).mock.calls[0]?.[1] as string;
     expect(on).toContain("-s danger-full-access");
     expect(on).toContain("fork");

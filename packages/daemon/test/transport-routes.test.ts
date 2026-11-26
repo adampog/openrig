@@ -25,6 +25,10 @@ import { transportRoutes } from "../src/routes/transport.js";
 import { OutboxHandler } from "../src/domain/outbox-handler.js";
 import { outboxEntriesSchema } from "../src/db/migrations/027_outbox_entries.js";
 import { createFullTestDb } from "./helpers/test-app.js";
+import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
+import { ActivityGrantStore } from "../src/domain/activity-grants.js";
+import { RunnerChannel } from "../src/domain/runner-channel.js";
+import { SeatDeliveryGuard, resolveGuardTarget } from "../src/domain/seat-delivery-guard.js";
 
 function setupDb(): Database.Database {
   return createFullTestDb();
@@ -83,6 +87,38 @@ describe("transport routes", () => {
   afterEach(() => {
     db.close();
   });
+
+  it.each(["claude-code", "codex", "cursor", "hermes", "openclaw", "openclaw-gateway", "pi-tui", "terminal", "stub", "agy"])(
+    "%s stays typed by default and cannot acquire native operations without an actual capable run", async runtime => {
+      // The curated transport fixture excludes native outbox migrations; exercise the production schema here.
+      db.close(); db = createDb(); migrate(db, ALL_MIGRATIONS);
+      rigRepo = new RigRepository(db); sessionRegistry = new SessionRegistry(db);
+      const rig = rigRepo.createRig("matrix"), node = rigRepo.addNode(rig.id, "worker", { runtime });
+      sessionRegistry.registerSession(node.id, "worker@matrix");
+      const grants = new ActivityGrantStore(db), outbox = new OutboxHandler(db), channel = new RunnerChannel(grants, outbox);
+      const effects: string[] = [];
+      const tmux = mockTmux({ sendText: async (_target, text) => { effects.push(text); return { ok: true }; },
+        sendKeys: async () => { effects.push("keys"); return { ok: true }; } });
+      tmux.deliveryGuard = new SeatDeliveryGuard(db, name => resolveGuardTarget(db, name));
+      const transport = new SessionTransport({ db, rigRepo, sessionRegistry, tmuxAdapter: tmux, runnerChannel: channel });
+      expect(db.prepare("SELECT input_route FROM nodes WHERE id=?").get(node.id)).toEqual({ input_route: "typed" });
+      expect(grants.activeForNode(node.id)).toBeNull();
+      for (const kind of ["input", "wake", "cancel"] as const) expect(channel.capable(node.id, kind)).toBe(false);
+      for (const kind of ["input", "wake"] as const) expect(() => channel.admit(node.id, { outboxId: kind, senderSession: "sender", destinationSession: "worker@matrix",
+        body: "never offered", kind, inputRoute: "native", payload: kind === "wake" ? { question: "never offered" } : { text: "never offered" } })).toThrow(/capable/);
+      expect(outbox.runnerReceipts(node.id, "invented-run")).toEqual([]);
+      expect(() => channel.cancel(node.id, { requestId: "cancel-refusal", sender: "sender", destination: "worker@matrix",
+        target: { runId: "absent-hosted-run", nativeTurnId: "absent-invocation" } }))
+        .toThrow(expect.objectContaining({ code: "runner_unavailable", status: 409 }));
+      expect(outbox.runnerReceipt("cancel-refusal")).toBeNull();
+      db.prepare("UPDATE nodes SET input_route='native' WHERE id=?").run(node.id);
+      const result = await transport.send("worker@matrix", "never typed", { deliveryId: "native-refusal", actorSession: "sender" });
+      expect(result.ok).toBe(false);
+      expect(outbox.runnerReceipt("native-refusal")).toBeNull();
+      expect(effects).toEqual([]);
+      // This unavailable-run test creates no host-pane/PID grant or fake native consumer for a raw TUI.
+      expect(db.prepare("SELECT COUNT(*) AS n FROM activity_grants WHERE node_id=?").get(node.id)).toEqual({ n: 0 });
+    });
 
   function seedRig() {
     const rig = rigRepo.createRig("my-rig");
@@ -158,6 +194,40 @@ describe("transport routes", () => {
     expect(rows[0]!["destination_session"]).toBe("dev-impl@my-rig");
     expect(rows[0]!["body"]).toBe("hello");
     expect(rows[0]!["identity_provenance"]).toBe("transport:v1"); // era-stamp from the run, not hardcoded-lying
+  });
+
+  // #1813: a single send that landed left its audit row pending for ever, while broadcast marks each recipient's row. The
+  // case is review-r2's.
+  it("A3 — a DERIVED send that landed marks its outbox row delivered, as broadcast's rows are", async () => {
+    seedRig();
+    const res = await sendApp().request("/api/transport/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-OpenRig-Session": "orch@my-rig" },
+      body: JSON.stringify({ session: "dev-impl@my-rig", text: "hello" }),
+    });
+    expect(res.status).toBe(200);
+    const rows = outboxRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!["delivery_state"]).toBe("delivered");
+    expect(rows[0]!["delivered_at"]).toEqual(expect.any(String));
+  });
+
+  it("an urgent send names who marked it, from the sender's identity, never the body; a send to the sender's own seat says so", async () => {
+    seedRig();
+    const res = await sendApp().request("/api/transport/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-OpenRig-Session": "orch@my-rig" },
+      body: JSON.stringify({ session: "dev-impl@my-rig", text: "the build is red", urgent: true, actorSession: "someone-else@my-rig" }),
+    });
+    expect(await res.json()).toMatchObject({ ok: true, urgent: { by: "orch@my-rig" } });
+    const self = await sendApp().request("/api/transport/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-OpenRig-Session": "dev-impl@my-rig" },
+      body: JSON.stringify({ session: "dev-impl@my-rig", text: "note to self" }),
+    });
+    const selfBody = await self.json() as Record<string, unknown>;
+    expect(selfBody).toMatchObject({ fromDestinationSeat: true });
+    expect(selfBody.urgent).toBeUndefined();
   });
 
   it("A3 — a cross-host send records the ORIGIN triple (the derived header), never the relay's seat", async () => {
@@ -256,6 +326,42 @@ describe("transport routes", () => {
   //    RESOLVED recipient (the schema's typed+indexed destination_session + per-row delivery_state is a
   //    per-recipient design; a TargetSpec would poison the typed column). Same downstream-of-derivation
   //    shape as /send. ──
+  it("broadcast records an unconfirmed submission after paste as indeterminate", async () => {
+    seedRig();
+    migrate(db, [outboxEntriesSchema]);
+    db.exec("ALTER TABLE outbox_entries ADD COLUMN identity_provenance TEXT");
+    const transport = new SessionTransport({ db, rigRepo, sessionRegistry, tmuxAdapter: mockTmux({
+      sendKeys: async () => ({ ok: false as const, code: "session_not_found", message: "Enter result lost" }),
+    }) });
+    const app = createApp({ sessionTransport: transport, outboxHandler: new OutboxHandler(db) });
+    const res = await app.request("/api/transport/broadcast", {
+      method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": "orch@my-rig" },
+      body: JSON.stringify({ sessions: ["dev-impl@my-rig"], text: "team update" }),
+    });
+    const body = await res.json();
+    expect(body.results[0]).toMatchObject({ ok: false, inputPhase: "written" });
+    expect(outboxRows().map(row => row["delivery_state"])).toEqual(["indeterminate"]);
+  });
+  it("broadcast distinguishes a lost text-write result from another recipient's successful send", async () => {
+    seedRig();
+    migrate(db, [outboxEntriesSchema]);
+    db.exec("ALTER TABLE outbox_entries ADD COLUMN identity_provenance TEXT");
+    const transport = new SessionTransport({ db, rigRepo, sessionRegistry, tmuxAdapter: mockTmux({
+      sendText: async target => target.includes("dev-qa")
+        ? { ok: false as const, code: "session_not_found", message: "paste result lost" }
+        : { ok: true as const },
+    }) });
+    const app = createApp({ sessionTransport: transport, outboxHandler: new OutboxHandler(db) });
+    const res = await app.request("/api/transport/broadcast", {
+      method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": "orch@my-rig" },
+      body: JSON.stringify({ rig: "my-rig", text: "team update" }),
+    });
+    const body = await res.json();
+    expect(body.results.find((result: { sessionName: string }) => result.sessionName === "dev-qa@my-rig"))
+      .toMatchObject({ ok: false, inputPhase: "attempted" });
+    expect(Object.fromEntries(outboxRows().map(row => [row["destination_session"], row["delivery_state"]])))
+      .toEqual({ "dev-impl@my-rig": "delivered", "dev-qa@my-rig": "indeterminate" });
+  });
   it("A3b — a broadcast auto-records N rows, one per RESOLVED recipient (sender=derived, provenance=transport:v1, destination=each session, never the TargetSpec)", async () => {
     seedRig();
     const res = await sendApp().request("/api/transport/broadcast", {
@@ -313,6 +419,36 @@ describe("transport routes", () => {
       expect(row["sender_session"]).toBe("orch@my-rig");
       expect(row["sender_session"]).not.toContain("mallory");
     }
+  });
+
+  it("a header-LESS broadcast carries the delivered-unsigned notice only when something was sent", async () => {
+    seedRig();
+    const post = (body: Record<string, unknown>) => sendApp().request("/api/transport/broadcast", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" }, // no X-OpenRig-Session
+      body: JSON.stringify(body),
+    });
+    const missed = (await (await post({ rig: "no-such-rig", text: "hi" })).json()) as { sent: number; warning?: string };
+    expect(missed.sent).toBe(0);
+    expect(missed.warning).toBeUndefined();
+    const sent = (await (await post({ rig: "my-rig", text: "hi" })).json()) as { sent: number; warning?: string };
+    expect(sent.sent).toBeGreaterThan(0);
+    expect(sent.warning).toContain("Delivered without sender identity");
+  });
+
+  it.each([
+    [{ total: 2, sent: 0, retained: 2, failed: 0, results: [] }, "Held for delivery without sender identity"],
+    [{ total: 2, sent: 1, retained: 1, failed: 0, results: [] }, "Delivered without sender identity"],
+  ])("a header-LESS broadcast still advises signing when recipients retain the text (%#)", async (result, notice) => {
+    const app = createApp({ sessionTransport: { broadcast: async () => result } as unknown as SessionTransport });
+    const res = await app.request("/api/transport/broadcast", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" }, // no X-OpenRig-Session
+      body: JSON.stringify({ rig: "my-rig", text: "hi" }),
+    });
+    const body = (await res.json()) as { warning?: string };
+    expect(body.warning).toContain(notice);
+    expect(body.warning).toContain("Follow up and sign it");
   });
 
   it("A3b — a header-LESS broadcast auto-records NO rows (no derived sender to attribute)", async () => {
@@ -373,6 +509,46 @@ describe("transport routes", () => {
     expect(body.outcome).toBe("failed");
   });
 
+  it.each(["different body", "different long tail", "wrapped full", "wrapped wrong tail", "suffix same line", "suffix next line", "agent reply", "plain assistant output", "thinking before framed composer", "quoted reply", "unsent input", "submitted transcript"])(
+    "POST /send verifies submitted message identity: %s",
+    async (mode) => {
+      seedRig();
+      const text = "From: sender-agent@demo\nTo: dev-impl@my-rig\nSent: 10-11 05:00Z\n---\nPlease check this task.";
+      const message = ["different long tail", "wrapped full", "wrapped wrong tail"].includes(mode) ? text.replace("Please check this task.",
+        "A shared opening longer than forty characters belongs to both messages. Requested tail.") : text;
+      const rendered = "❯ " + message.split("\n").join("\n  ");
+      const wrapped = rendered.replace("belongs to both", "belongs to\n  both");
+      const expectedVerified = ["submitted transcript", "wrapped full", "agent reply", "plain assistant output", "thinking before framed composer"].includes(mode);
+      let submitted = false;
+      const tmux = mockTmux({
+        sendKeys: async () => { submitted = true; return { ok: true }; },
+        capturePaneContent: async () => !submitted ? "idle\n❯ "
+          : mode === "unsent input"
+            ? "────────────────────\n" + rendered + "\n────────────────────\n? for shortcuts"
+            : mode === "thinking before framed composer"
+              ? rendered + "\n\n✻ Thinking… (esc to interrupt)\n\n────────────────────\n❯ \n────────────────────\n? for shortcuts"
+            : (mode === "different body" ? rendered.replace("this task", "a different task")
+              : mode === "different long tail" ? rendered.replace("Requested tail.", "Other tail.")
+              : mode === "wrapped wrong tail" ? wrapped.replace("Requested tail.", "Other tail.")
+              : mode === "wrapped full" ? wrapped
+              : mode === "suffix same line" ? rendered + " Extra body."
+              : mode === "suffix next line" ? rendered + "\n  Extra body."
+              : mode === "agent reply" ? rendered + "\n⏺ Agent reply"
+              : mode === "plain assistant output" ? rendered.replace(/^❯/, "›") + "\nAssistant output without a role glyph"
+              : mode === "quoted reply" ? rendered + "\n  ⏺ extra quoted body" : rendered) + "\n❯ ",
+      });
+      const transport = new SessionTransport({ db, rigRepo, sessionRegistry, tmuxAdapter: tmux, sleep: async () => undefined });
+      const res = await createApp({ sessionTransport: transport }).request("/api/transport/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session: "dev-impl@my-rig", text: message, verify: true }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ ok: true, verified: expectedVerified,
+        outcome: expectedVerified ? "delivered" : "rendered-unconfirmed" });
+    },
+  );
+
   it("POST /send to a mid-work pane returns 200 and DELIVERS with a non-blocking advisory (OPR.0.4.3.28 fast-follow — mid_work downgraded)", async () => {
     seedRig();
     const tmux = {
@@ -405,6 +581,26 @@ describe("transport routes", () => {
     });
     expect(res.status).toBe(409);
     expect((await res.json()).reason).toBe("target_needs_input");
+  });
+
+  it("POST /send to a Claude seat whose recorded pane is gone returns 409 and names the repair, not a 500", async () => {
+    const { node1 } = seedRig();
+    sessionRegistry.updateBinding(node1.id, { tmuxSession: "dev-impl@my-rig", tmuxPane: "%1" });
+    const sendText = vi.fn(async () => ({ ok: true as const }));
+    // The seat was resumed by hand in its session, so the session's only pane is a new one.
+    const tmux = { ...mockTmux({ sendText }), listPanes: async () => [{ id: "%7" }] } as unknown as TmuxAdapter;
+    const transport = new SessionTransport({ db, rigRepo, sessionRegistry, tmuxAdapter: tmux });
+    const app = createApp({ sessionTransport: transport });
+    const res = await app.request("/api/transport/send", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session: "dev-impl@my-rig", text: "status?" }),
+    });
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body).toMatchObject({ ok: false, sent: false, reason: "target_runtime_conflict" });
+    expect(body.error).toContain("The session does not have the expected bound pane. No text was sent.");
+    expect(body.error).toContain("rig reconcile-session dev-impl@my-rig");
+    expect(sendText).not.toHaveBeenCalled();
   });
 
   // OPR.0.4.1.10 — the route rejects contradictory / unauditable override requests before transport.
@@ -466,7 +662,8 @@ describe("transport routes", () => {
     expect(body.sent).toBe(true);
     expect(body.attempts).toBe(2);
     expect(body.activity.state).toBe("idle");
-    expect(sendTextSpy).toHaveBeenCalledWith("dev-impl@my-rig", "hello");
+    // The route passes the caller's cancellation check, run by the adapter just before the paste.
+    expect(sendTextSpy).toHaveBeenCalledWith("dev-impl@my-rig", "hello", expect.any(Function));
   });
 
   it("POST /send rejects force with waitForIdleMs before sending", async () => {
@@ -491,33 +688,49 @@ describe("transport routes", () => {
     expect(sendTextSpy).not.toHaveBeenCalled();
   });
 
-  it("POST /send maps wait timeout to 409 without sending text", async () => {
+  it.each([0, 5])("POST /send maps wait timeout to 409 without sending text (capture cost %ims)", async (captureCostMs) => {
     seedRig();
-    const sendTextSpy = vi.fn(async () => ({ ok: true as const }));
-    const tmux = mockTmux({
-      capturePaneContent: async () => "Working on task...\n⠋ Processing\nesc to interrupt",
-      sendText: sendTextSpy,
-    });
-    const transport = new SessionTransport({
-      db,
-      rigRepo,
-      sessionRegistry,
-      tmuxAdapter: tmux,
-      waitForIdlePollMs: 1,
-    });
-    const app = createApp({ sessionTransport: transport });
+    // Test expiry after a completed busy observation, independently of runner speed.
+    // Match the one-millisecond domain tests: advance the deadline and race timer only at the poll.
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    try {
+      const sendTextSpy = vi.fn(async () => ({ ok: true as const }));
+      const tmux = mockTmux({
+        capturePaneContent: async () => {
+          const end = performance.now() + captureCostMs;
+          while (performance.now() < end) { /* controlled classification CPU cost */ }
+          return "Working on task...\n⠋ Processing\nesc to interrupt";
+        },
+        sendText: sendTextSpy,
+      });
+      const sleep = vi.fn(async (ms: number) => { await vi.advanceTimersByTimeAsync(ms); });
+      const transport = new SessionTransport({
+        db,
+        rigRepo,
+        sessionRegistry,
+        tmuxAdapter: tmux,
+        sleep,
+        waitForIdlePollMs: 1,
+      });
+      const app = createApp({ sessionTransport: transport });
 
-    const res = await app.request("/api/transport/send", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session: "dev-impl@my-rig", text: "hello", waitForIdleMs: 1 }),
-    });
-    expect(res.status).toBe(409);
-    const body = await res.json();
-    expect(body.ok).toBe(false);
-    expect(body.reason).toBe("wait_for_idle_timeout");
-    expect(body.sent).toBe(false);
-    expect(sendTextSpy).not.toHaveBeenCalled();
+      const res = await app.request("/api/transport/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session: "dev-impl@my-rig", text: "hello", waitForIdleMs: 1 }),
+      });
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.ok).toBe(false);
+      expect(body.reason).toBe("wait_for_idle_timeout");
+      expect(body.sent).toBe(false);
+      expect(body.activity?.state).toBe("running");
+      expect(body.waitedMs).toBe(1);
+      expect(sleep).toHaveBeenCalledExactlyOnceWith(1);
+      expect(sendTextSpy).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("POST /send with ambiguous session returns 409", async () => {
@@ -888,21 +1101,42 @@ describe("transport routes", () => {
     expect(delivered.every((t) => !t.includes("anyone@my-rig"))).toBe(true);
   });
 
-  it("P21 I4 → S2: --dangerously-interact with NO identity delivers; a non-needs_input target writes NO override audit row", async () => {
+  it("P21 I4 → S2: --dangerously-interact with NO identity delivers and audits its actual idle state", async () => {
     seedRig();
     const eventBus = new EventBus(db);
-    const app = createApp({ sessionTransport: new SessionTransport({ db, rigRepo, sessionRegistry, tmuxAdapter: mockTmux(), eventBus, agentActivityStore: new AgentActivityStore({ db, eventBus }) }) });
+    const agentActivityStore = new AgentActivityStore({ db, eventBus });
+    agentActivityStore.recordHookEvent({ runtime: "claude-code", sessionName: "dev-impl@my-rig", hookEvent: "Stop" });
+    const app = createApp({ sessionTransport: new SessionTransport({ db, rigRepo, sessionRegistry, tmuxAdapter: mockTmux(), eventBus, agentActivityStore }) });
     const res = await app.request("/api/transport/send", {
       method: "POST",
       headers: { "Content-Type": "application/json" }, // NO X-OpenRig-Session
       body: JSON.stringify({ session: "dev-impl@my-rig", text: "drive it", dangerouslyInteract: true, reason: "why" }),
     });
-    // S2 (OPR.0.5.4.3): the 401 is retired. The idle target takes the normal
-    // send path; the override audit exists only on the needs_input branch, so
-    // no row is written here — unchanged posture, now unattributed-tolerant.
+    // Unknown-sender delivery stays accepted. Explicit interaction now audits
+    // every readiness state without inventing an actor or a positive prompt.
     expect(res.status).toBe(200);
-    const rows = db.prepare("SELECT * FROM events WHERE type = 'transport.prompt_override'").all();
-    expect(rows).toHaveLength(0);
+    const rows = db.prepare("SELECT payload FROM events WHERE type = 'transport.prompt_override'").all() as Array<{ payload: string }>;
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0]!.payload)).toMatchObject({ actorSession: null,
+      overrideReason: "why", detectedState: "idle", evidenceSource: "runtime_hook" });
+  });
+
+  it("an urgent prompt answer types exactly its own bytes: the urgent label stays in the result, never in the keys", async () => {
+    seedRig();
+    const eventBus = new EventBus(db);
+    const agentActivityStore = new AgentActivityStore({ db, eventBus });
+    agentActivityStore.recordHookEvent({ runtime: "claude-code", sessionName: "dev-impl@my-rig", hookEvent: "Stop" });
+    const typed: string[] = [];
+    const tmux = mockTmux({ sendText: async (_target, text) => { typed.push(text); return { ok: true }; } });
+    const app = createApp({ sessionTransport: new SessionTransport({ db, rigRepo, sessionRegistry, tmuxAdapter: tmux, eventBus, agentActivityStore }) });
+    const res = await app.request("/api/transport/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-OpenRig-Session": "orch@my-rig" },
+      body: JSON.stringify({ session: "dev-impl@my-rig", text: "1", dangerouslyInteract: true, reason: "pick option 1", urgent: true }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ urgent: { by: "orch@my-rig" } });
+    expect(typed).toEqual(["1"]);
   });
 
   it("P21 I4: a body actorSession that DIFFERS from the header is SUPERSEDED (no identity_mismatch refusal)", async () => {

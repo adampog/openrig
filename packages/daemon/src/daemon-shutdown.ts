@@ -2,7 +2,33 @@ import { writeFileSync, renameSync } from "node:fs";
 
 export const DAEMON_SHUTDOWN_TIMEOUT_MS = 10_000;
 export const DAEMON_STOP_WAIT_MS = DAEMON_SHUTDOWN_TIMEOUT_MS + 2_000;
+// Shared lifecycle budgets: an async command caller must outlive the owned-child
+// readiness wait, one probe, shutdown cleanup, and a small process/I/O margin.
+// The readiness wait is the default of daemon.start_readiness_wait_seconds; the setting takes 1 to the max.
+export const DAEMON_START_READINESS_WAIT_MS = 180_000;
+export const DAEMON_START_PROBE_TIMEOUT_MS = 2_000;
+const DAEMON_START_CALLER_MARGIN_MS = DAEMON_START_PROBE_TIMEOUT_MS + DAEMON_STOP_WAIT_MS + 5_000;
+/** The budget of an async caller of a start whose readiness wait is `readinessWaitMs`. */
+export function daemonStartCommandTimeoutMs(readinessWaitMs: number = DAEMON_START_READINESS_WAIT_MS): number {
+  return readinessWaitMs + DAEMON_START_CALLER_MARGIN_MS;
+}
+/** The longest wait whose caller budget a Node timer can hold: setTimeout and execFile's `timeout` take at most
+ *  2^31 - 1 ms (about 24.8 days); past it, Node fires the timer after 1 ms. 2147464 seconds. */
+export const DAEMON_START_READINESS_WAIT_MAX_SECONDS = Math.floor((2 ** 31 - 1 - DAEMON_START_CALLER_MARGIN_MS) / 1000);
+export const DAEMON_START_COMMAND_TIMEOUT_MS = daemonStartCommandTimeoutMs();
 export const DAEMON_HTTP_CONNECTION_GRACE_MS = 250;
+let markDaemonStopping: () => void = () => {};
+/** Settles when the daemon starts shutting down. A request that waits for a change (a permission read's long-poll)
+ *  answers then with what it has, so its connection doesn't hold the shutdown's connections phase. */
+export const daemonStopping: Promise<void> = new Promise((resolve) => { markDaemonStopping = resolve; });
+// A daemon whose listener failed to bind exits with this code (sysexits EX_UNAVAILABLE) after one
+// `OPENRIG_LISTEN_FAILED <errno> <host:port> <guidance>` line, so a supervisor can tell a failed bind, which needs a
+// look before another start, from a crash. It skips the shutdown: no shutdown receipt and no recorded stop.
+export const DAEMON_LISTEN_FAILED_EXIT_CODE = 69;
+/** The guidance for a held daemon port, shared by `rig daemon start` and the daemon's own listen-failure line. */
+export function occupiedPortGuidance(port: number): string {
+  return `Address already in use (EADDRINUSE) on port ${port}. Inspect the listener before stopping it, or run 'rig daemon start --port <unused-port>'.`;
+}
 export const DAEMON_SHUTDOWN_RECEIPT = "daemon-shutdown.json";
 export interface DaemonShutdownReceipt {
   schema: "openrig.daemon-shutdown/v1";
@@ -115,6 +141,7 @@ export function createDaemonShutdown(options: {
   return (signal) => {
     if (started) return;
     started = true;
+    markDaemonStopping();
     let finished = false;
     let phase = "starting";
     const startedAt = new Date().toISOString();
@@ -144,7 +171,8 @@ export function createDaemonShutdown(options: {
         log(`[shutdown] outcome receipt unavailable: ${String(error)}`);
         code = 1;
       }
-      log(`[shutdown] ${outcome}; phase=${receipt.phase}; budget=${timeoutMs}ms; exit=${code}`);
+      // The log keeps this run's timing after a later shutdown replaces the single receipt.
+      log(`[shutdown] ${outcome}; phase=${receipt.phase}; budget=${timeoutMs}ms; exit=${code}; pid=${receipt.pid}; started=${startedAt}; completed=${receipt.completedAt}`);
       exit(code);
     };
     // Referenced deliberately: this must also enforce the bound with no servers.
@@ -152,7 +180,8 @@ export function createDaemonShutdown(options: {
       fail(`whole-shutdown budget exhausted (${timeoutMs}ms); pending effects are unverified`);
       finish("timed-out");
     }, timeoutMs);
-    log(`OpenRig daemon received ${signal}; shutting down (budget ${timeoutMs}ms)`);
+    // startedAt is when this callback ran, not when the kernel delivered the signal.
+    log(`OpenRig daemon received ${signal}; shutting down (budget ${timeoutMs}ms); pid=${process.pid}; callback started ${startedAt}`);
     void (async () => {
       for (const [name, run] of options.phases) {
         if (finished) return;

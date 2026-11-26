@@ -5,6 +5,7 @@
 // `allow_switch_decision` (BR-2).
 
 import { signalEligibleForAutomation } from "./provider-policy.js";
+import { rollupHostUsage } from "./host-usage-rollup.js";
 import type { ProviderBinding, ProviderKind, ProviderSignal } from "./provider-types.js";
 
 /** One provider-native usage window from the Codex app-server `account/rateLimits/read`. */
@@ -130,6 +131,8 @@ export interface ClaudeSignalInput {
   seatSession: string;
   /** false = the statusline cache has not been written yet (before the first API response). */
   cachePresent: boolean;
+  /** True when a cache file exists but cannot be read or parsed. Distinct from an empty reading. */
+  cacheUnreadable?: boolean;
   /** Present only when the cache exists and carried a rate_limits object. */
   reading?: ClaudeStatuslineReading;
   asOf: string;
@@ -139,6 +142,7 @@ export interface ClaudeSignalInput {
 export const CLAUDE_UNKNOWN_REASON = {
   no_statusline_cache_yet: "claude_no_statusline_cache_yet",
   empty_reading: "claude_statusline_cache_had_no_windows",
+  unreadable_cache: "claude_statusline_cache_unreadable",
 } as const;
 
 function claudeUnknownSignal(
@@ -164,15 +168,20 @@ function claudeUnknownSignal(
 /**
  * Normalize a Claude statusline `rate_limits` reading into `signals[]` rows.
  * - seat before first response (no cache) → explicit unknown row.
+ * - a cache that exists but cannot be read/parsed → its own unknown reason (broken, not empty).
  * - seat with subscription windows → one `provider_statusline` row per window (five_hour, and
  *   seven_day normalized to "weekly"); a genuine 0 survives as 0.
  * - subscription with cache but no windows → explicit unknown row (never fabricated zeros).
  */
 export function claudeStatuslineSignals(input: ClaudeSignalInput): ProviderSignal[] {
-  const { seatSession, cachePresent, reading, asOf, staleAfter } = input;
+  const { seatSession, cachePresent, cacheUnreadable, reading, asOf, staleAfter } = input;
 
   if (!cachePresent) {
     return [claudeUnknownSignal(seatSession, asOf, CLAUDE_UNKNOWN_REASON.no_statusline_cache_yet, staleAfter)];
+  }
+
+  if (cacheUnreadable) {
+    return [claudeUnknownSignal(seatSession, asOf, CLAUDE_UNKNOWN_REASON.unreadable_cache, staleAfter)];
   }
 
   const windows: Array<["five_hour" | "weekly", ClaudeStatuslineWindow | undefined]> = [
@@ -212,20 +221,21 @@ export function claudeStatuslineSignals(input: ClaudeSignalInput): ProviderSigna
 
 export type ReactiveEventKind = "at_limit" | "stream_failure" | "stop_error";
 
-export interface ReactiveEventInput {
-  provider: ProviderKind;
-  accountRef: string;
+export type ReactiveEventInput = {
   kind: ReactiveEventKind;
   asOf: string;
   // Required: a reactive event without a freshness bound could never pass BR-2, and a momentary
   // event must always carry when it expires. Staleness itself stays the shared predicate's job.
   staleAfter: string;
-}
+  /** #99: when the provider's own failure says the limit resets. Absent, the pool falls back to the bounded retry. */
+  resetsAt?: string;
+} & ({ provider: ProviderKind; accountRef: string; seatSession?: never }
+  | { provider: "claude"; seatSession: string; accountRef?: never });
 
 export function reactiveEventSignal(input: ReactiveEventInput): ProviderSignal {
   return {
     provider: input.provider,
-    accountRef: input.accountRef,
+    ...(input.accountRef !== undefined ? { accountRef: input.accountRef } : { seatSession: input.seatSession }),
     sourceClass: "provider_event",
     authority: "reactive_error",
     asOf: input.asOf,
@@ -236,6 +246,7 @@ export function reactiveEventSignal(input: ReactiveEventInput): ProviderSignal {
     // At-limit exhaustion is an actionable switch trigger; stream/stop errors are advisory.
     automationUse: input.kind === "at_limit" ? "allow_switch_decision" : "advisory_only",
     // No usedPercent — a reactive event is exhaustion evidence, not a remaining meter.
+    ...(input.resetsAt !== undefined ? { resetsAt: input.resetsAt } : {}),
   };
 }
 
@@ -252,7 +263,8 @@ export interface UsageLimitPool {
 /**
  * Derive the provider/account pools whose fresh structured evidence says they are
  * exhausted. Claude statusline has no account ref, so its shipped one-account-per-host
- * invariant is one local pool. Codex uses the existing account binding. Nothing unknown,
+ * invariant is one local pool, unless seat windows contradict that shared account. Explicit
+ * config homes remain separate pools. Codex uses the existing account binding. Nothing unknown,
  * stale, advisory, unbound, or already expired can create a park.
  */
 export function deriveUsageLimitPools(input: {
@@ -260,6 +272,9 @@ export function deriveUsageLimitPools(input: {
   bindings: ProviderBinding[];
   now: Date;
   fallbackSeconds: number;
+  /** A Claude seat's own config dir, when it declares one: its login, and so its limit, is separate from the
+   *  daemon's and from other homes'. Absent, every Claude seat shares one pool as before. */
+  claudeHomeOf?: (seatSession: string) => string | undefined;
 }): UsageLimitPool[] {
   const nowMs = input.now.getTime();
   if (!Number.isFinite(nowMs)) return [];
@@ -273,10 +288,34 @@ export function deriveUsageLimitPools(input: {
       (signal.sourceClass === "provider_event" && signal.authority === "reactive_error"),
   );
 
+  const sharedClaudePoolKey = (seatSession: string | undefined) => {
+    const home = seatSession ? input.claudeHomeOf?.(seatSession) : undefined;
+    return home ? `claude:home:${home}` : "claude:local";
+  };
+  // Reuse the rollup's conflict verdict within each proposed shared home. A different
+  // home's reset schedule cannot disprove sharing among seats in this home.
+  const claudeSignalsByPool = new Map<string, ProviderSignal[]>();
+  for (const signal of input.signals) {
+    if (signal.provider !== "claude") continue;
+    const key = sharedClaudePoolKey(signal.seatSession);
+    const lane = claudeSignalsByPool.get(key) ?? [];
+    lane.push(signal);
+    claudeSignalsByPool.set(key, lane);
+  }
+  const conflictingClaudePools = new Set([...claudeSignalsByPool].filter(([, signals]) =>
+    rollupHostUsage({ signals, codexProfilesPresent: false, now: input.now.toISOString() })
+      .some(row => row.anomalies.some(anomaly => anomaly.kind === "conflicting_seat_windows")),
+  ).map(([key]) => key));
+  const claudePoolKey = (seatSession: string | undefined) => {
+    const sharedKey = sharedClaudePoolKey(seatSession);
+    if (!conflictingClaudePools.has(sharedKey)) return sharedKey;
+    // The failure still proves this seat is limited; it cannot hold an unrelated login.
+    return seatSession ? `claude:seat:${seatSession}` : null;
+  };
   const pools = new Map<string, { provider: ProviderKind; signals: ProviderSignal[] }>();
   for (const signal of exhausted) {
     const poolKey = signal.provider === "claude"
-      ? "claude:local"
+      ? claudePoolKey(signal.seatSession)
       : signal.accountRef
         ? `codex:${signal.accountRef}`
         : null;
@@ -291,11 +330,12 @@ export function deriveUsageLimitPools(input: {
     const statedResets = pool.signals
       .map((signal) => Date.parse(signal.resetsAt ?? ""))
       .filter((value) => Number.isFinite(value) && value > nowMs);
-    const fallbackResets = pool.provider === "codex"
-      ? pool.signals
-          .map((signal) => Date.parse(signal.asOf) + input.fallbackSeconds * 1000)
-          .filter((value) => Number.isFinite(value) && value > nowMs)
-      : [];
+    // A typed Claude failure carries a reset only when Claude's own message stated one (#99). Without it, use
+    // the existing bounded retry interval, as for Codex events; a Claude meter missing its reset still cannot invent one.
+    const fallbackResets = pool.signals
+      .filter((signal) => pool.provider === "codex" || (signal.sourceClass === "provider_event" && signal.authority === "reactive_error"))
+      .map((signal) => Date.parse(signal.asOf) + input.fallbackSeconds * 1000)
+      .filter((value) => Number.isFinite(value) && value > nowMs);
     const expiryMs = statedResets.length > 0
       ? Math.max(...statedResets)
       : fallbackResets.length > 0
@@ -305,7 +345,8 @@ export function deriveUsageLimitPools(input: {
 
     const seatSessions = pool.provider === "claude"
       ? input.signals
-          .filter((signal) => signal.provider === "claude" && typeof signal.seatSession === "string")
+          .filter((signal) => signal.provider === "claude" && typeof signal.seatSession === "string"
+            && claudePoolKey(signal.seatSession) === poolKey)
           .map((signal) => signal.seatSession!)
       : input.bindings
           .filter((binding) => binding.accountId === pool.signals[0]!.accountRef)

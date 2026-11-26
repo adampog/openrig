@@ -1,10 +1,57 @@
+import { randomUUID } from "node:crypto";
 import { Command } from "commander";
 import { DaemonClient } from "../client.js";
 import { getDaemonStatus, getDaemonUrl , daemonStatusGuard} from "../daemon-lifecycle.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
 import { resolveIdentitySource } from "./whoami.js";
-import { runWake, defaultWakeRunner, defaultWakeFileLocator, type WakeRunner } from "../ask-wake.js";
+import { runWake, DEFAULT_WAKE_TIMEOUT_MS, defaultWakeRunner, defaultWakeFileLocator, type WakeRunner } from "../ask-wake.js";
+
+interface NativeWakeReceipt { requestId: string; stage: string; erasedAt?: string; reconciliation?: string; result?: { kind?: string; completion?: string; answer?: string | null } }
+async function askLiveRunner(client: DaemonClient, seat: string, question: string, timeoutMs: number, json: boolean): Promise<boolean> {
+  try {
+    const view = await client.get<{ inputRoute?: string; nativeInput?: { wake?: boolean }; seat_ref?: string; rig_id?: string; rig_name?: string;
+      logical_id?: string; runtime?: string | null; session_status?: string | null; runner?: boolean; error?: unknown }>(`/api/seat/status/${encodeURIComponent(seat)}`);
+    const legacyStatus = !("inputRoute" in view.data) && !("error" in view.data)
+      && [view.data.seat_ref, view.data.rig_id, view.data.rig_name, view.data.logical_id].every(value => typeof value === "string" && value.length > 0)
+      && (typeof view.data.runtime === "string" || view.data.runtime === null)
+      && (typeof view.data.session_status === "string" || view.data.session_status === null) && typeof view.data.runner === "boolean";
+    if (view.status >= 200 && view.status < 300 && (view.data.inputRoute === "typed" || legacyStatus)) return false;
+    if (view.status < 200 || view.status >= 300 || view.data.inputRoute !== "native") throw new Error("Seat input route is unavailable; no wake submitted.");
+  } catch (error) {
+    if (json) console.log(JSON.stringify({ unavailable: true, error: (error as Error).message }));
+    else console.error(`Wake unavailable: ${(error as Error).message}`);
+    process.exitCode = 2;
+    return true;
+  }
+  const requestId = `wake-${randomUUID()}`, path = `/api/seat/command/${encodeURIComponent(seat)}`;
+  let receipt: NativeWakeReceipt | undefined;
+  const show = (extra: Record<string, unknown> = {}) => {
+    if (json) console.log(JSON.stringify({ requestId, ...(receipt ? { receipt } : {}), ...extra }));
+    else if (receipt?.result?.completion === "completed" && typeof receipt.result.answer === "string") console.log(receipt.result.answer);
+    else console.error(`Native wake ${requestId}: ${String(extra.error ?? (extra.timedOut ? "caller wait timed out; native work remains recorded" : receipt?.result?.completion ?? receipt?.stage ?? "outcome unavailable"))}`);
+  };
+  try {
+    const submitted = await client.post<{ runnerReceipt?: NativeWakeReceipt; error?: string; reason?: string }>(path, { requestId, type: "wake", question });
+    receipt = submitted.data.runnerReceipt;
+    if (submitted.status >= 400) { show({ error: submitted.data.error ?? submitted.data.reason ?? "native wake refused" }); process.exitCode = 2; return true; }
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      if (receipt && receipt.requestId !== requestId) throw new Error("Native wake receipt names another request");
+      if (receipt?.reconciliation === "receiver_state_lost") { show({ unavailable: true, error: "native receiver state was lost; outcome remains uncertain" }); process.exitCode = 2; return true; }
+      if (receipt?.erasedAt) { show({ unavailable: true, error: "native request content was erased" }); process.exitCode = 2; return true; }
+      if (receipt && ["completed", "rejected"].includes(receipt.stage)) {
+        show(); if (receipt.result?.kind !== "wake" || receipt.result.completion !== "completed" || typeof receipt.result.answer !== "string") process.exitCode = 2;
+        return true;
+      }
+      if (Date.now() >= deadline) { show({ timedOut: true }); process.exitCode = 2; return true; }
+      const lookup = await client.get<{ receipt?: NativeWakeReceipt }>(`${path}?requestId=${encodeURIComponent(requestId)}`);
+      if (lookup.status >= 400 || !lookup.data.receipt) throw new Error("Retained native result is unavailable; refresh this request ID");
+      receipt = lookup.data.receipt;
+      if (!["completed", "rejected"].includes(receipt.stage)) await new Promise(resolve => setTimeout(resolve, Math.min(100, Math.max(0, deadline - Date.now()))));
+    }
+  } catch (error) { show({ unavailable: true, error: (error as Error).message }); process.exitCode = 2; return true; }
+}
 
 interface AskRigInfo {
   name: string;
@@ -85,8 +132,8 @@ export function askCommand(depsOverride?: StatusDeps): Command {
     .option("--json", "JSON output for agents")
     .option("--seat <session-name>", "Scope the search to ONE seat's transcript across every generation that sat in it (cross-generation archaeology)")
     .option("--session <token>", "Search ONE specific session's JSONL by its session token (read-only)")
-    .option("--wake <seat[@gen]|token>", "EXECUTES: wake a session (by seat[@generation] or raw resume token) — ask one question, get a snapshot answer, back to cold (runtime cost; explicit, never an implicit escalation from a search)")
-    .option("--runtime <runtime>", "runtime for --wake: claude (default) or codex")
+    .option("--wake <target>", "EXECUTES: explicitly native seats use their live run channel; typed seats or runtime IDs/titles use a one-shot Claude/Codex wake (runtime cost; explicit, never an implicit escalation from search)")
+    .option("--runtime <runtime>", "one-shot runtime for typed --wake targets or raw tokens: claude (default) or codex")
     .option("--wake-timeout <seconds>", "bounded wake timeout in seconds (default 180)")
     .addHelpText("after", `
 rig ask is one verb for information about the PAST, three ways to reach it:
@@ -95,10 +142,15 @@ rig ask is one verb for information about the PAST, three ways to reach it:
                                             generation that sat in it (L1, read-only)
   3. rig ask <rig> "<q>" --session <token>  search ONE session's JSONL by
                                             token — "I have the token, find it" (L2, read-only)
-  4. rig ask <rig> "<q>" --wake <seat[@gen]|token>
-                                            WAKE that session (by seat[@generation]
-                                            or raw token), ask, get a snapshot
-                                            answer, back to cold (L3, EXECUTES)
+  4. rig ask <rig> "<q>" --wake <target>
+                                            WAKE the selected native seat's live run
+                                            for its dedicated answer, or resume a typed
+                                            Claude/Codex target once, back to cold
+                                            (L3, EXECUTES)
+
+Wake seat targets must include the rig: member@rig or member@rig@N (1 = newest tenure).
+Values without @ go unchanged to the runtime as a session ID or title; a bare member
+name is not resolved within <rig>.
 
 Levels 1-2 are read-only archaeology (cheap, safe). Level 3 (--wake) EXECUTES an
 agent — the only level with runtime cost. The answer is snapshot testimony:
@@ -108,12 +160,17 @@ Examples:
   rig ask my-rig "what decisions were made about deployment?"
   rig ask my-rig "what did we decide" --seat dev-planner@my-rig
   rig ask my-rig "SECRET_MARKER" --session 3f2a-...-9c1
+  rig ask my-rig "summarize the gateway plan" --wake dev-planner@my-rig
+  rig ask my-rig "summarize the previous plan" --wake dev-planner@my-rig@2
   rig ask my-rig "summarize the gateway plan" --wake 3f2a-...-9c1
 
 Exit codes:
   0  Success
-  1  Daemon not running
-  2  Failed to fetch data from daemon (or wake timed out)`);
+  1  Daemon not running, the rig is unknown or ambiguous, or --runtime or
+     --wake-timeout is invalid
+  2  Failed to fetch data from daemon; the --wake seat has no such tenure or
+     no current native wake capability; a typed target isn't Claude/Codex or
+     has no resume token; or the wake failed or timed out`);
 
   const getDeps = (): AskCommandDeps => (depsOverride as AskCommandDeps | undefined) ?? {
     lifecycleDeps: realDeps(),
@@ -123,8 +180,8 @@ Exit codes:
   cmd.action(async (rig: string, question: string, opts: { json?: boolean; seat?: string; session?: string; wake?: string; runtime?: string; wakeTimeout?: string }) => {
     const deps = getDeps();
 
-    // L3 — WAKE: EXECUTES the runtime headless. A raw token wakes CLI-locally; a
-    // seat[@gen] target is resolved to a token via the daemon first. Explicit
+    // L3 — WAKE: EXECUTES. An explicitly native seat uses its live run channel;
+    // typed seats resolve through the daemon and raw tokens wake CLI-locally. Explicit
     // --wake only — never an implicit escalation from a failed L1/L2 search, and
     // an unresolvable seat REFUSES with teaching (never a guessed wake).
     if (opts.wake) {
@@ -139,7 +196,7 @@ Exit codes:
       }
 
       let token = target;
-      let runtime: "claude" | "codex" = opts.runtime === "codex" ? "codex" : "claude";
+      let runtime = opts.runtime ?? "claude";
 
       if (target.includes("@")) {
         const status = await getDaemonStatus(deps.lifecycleDeps);
@@ -151,6 +208,7 @@ Exit codes:
         }
         const client = deps.clientFactory(getDaemonUrl(status));
         const { seat, generation } = parseSeatGen(target);
+        if (generation === undefined && await askLiveRunner(client, seat, question, timeoutMs ?? DEFAULT_WAKE_TIMEOUT_MS, opts.json ?? false)) return;
         const res = await client.post<WakeResolution>("/api/wake-resolve", { seat, generation });
         if (res.status >= 400) {
           console.error(`Failed to resolve seat (HTTP ${res.status}). Check daemon status with: rig status`);
@@ -171,6 +229,13 @@ Exit codes:
         }
         token = resolution.token;
         runtime = resolution.runtime;
+      }
+
+      if (runtime === "claude-code") runtime = "claude";
+      if (runtime !== "claude" && runtime !== "codex") {
+        console.error(`Wake runtime '${runtime || "unknown"}' is not supported. Supported runtimes are claude and codex.`);
+        process.exitCode = 1;
+        return;
       }
 
       const runner = deps.wakeRunner ?? defaultWakeRunner;
@@ -215,6 +280,10 @@ Exit codes:
     }
 
     const result = res.data;
+    // The daemon answers rig: null only when the rig name matched no rig or
+    // more than one. Exit 1 like rig send/transcript/release do for a missing
+    // target, so a script or agent can tell a mistyped rig from "no matches".
+    if (!result.rig) process.exitCode = 1;
 
     if (opts.json) {
       console.log(JSON.stringify(result));

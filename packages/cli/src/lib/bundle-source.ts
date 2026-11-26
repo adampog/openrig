@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdirSync, mkdtempSync, realpathSync, statSync, lstatSync, readdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, statSync, lstatSync, readdirSync, writeFileSync, readFileSync, existsSync, rmSync, chmodSync } from "node:fs";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { DaemonClient } from "../client.js";
@@ -65,7 +65,8 @@ export function selectGitHubBundleSource(input: string, refs: string): BundleSou
     } else {
       for (let end = refAndFolder.length; end > 0; end--) {
         const ref = refAndFolder.slice(0, end).join("/");
-        const commit = named.get(`refs/heads/${ref}`) ?? named.get(`refs/tags/${ref}^{}`) ?? named.get(`refs/tags/${ref}`);
+        const commit = named.get(`refs/heads/${ref}`) ?? named.get(`refs/tags/${ref}^{}`) ?? named.get(`refs/tags/${ref}`)
+          ?? (ref === "HEAD" ? named.get("HEAD") : undefined);
         if (commit) { requestedRef = ref; resolvedCommit = commit; folderParts = refAndFolder.slice(end); break; }
       }
     }
@@ -261,10 +262,23 @@ export interface BundleLinkOptions {
   minDaemonVersion?: string;
   minCliVersion?: string;
   includePackages?: string[];
+  includeLoginFiles?: boolean;
   contextPack?: string[];
   projectDir?: string;
   allowDrift?: boolean;
   provenance?: Record<string, unknown>;
+  /** Local receipt only; never sent to the assembler. */
+  buildProvenance?: Record<string, unknown>;
+}
+
+/** A private local receipt; it is never staged in the archive or sent to the daemon. */
+export function writeBundleBuildReceipt(receiptPath: string, bundlePath: string, result: Record<string, unknown>, provenance?: Record<string, unknown>): string | undefined {
+  try {
+    writeFileSync(receiptPath, JSON.stringify({ ...result, bundlePath, ...(provenance ? { provenance } : {}) }, null, 2) + "\n", { mode: 0o600 });
+    chmodSync(receiptPath, 0o600);
+  } catch (error) {
+    return `The private build receipt could not be written at ${receiptPath}: ${(error as Error).message}. The bundle creation result is unchanged.`;
+  }
 }
 
 /** Four commands share this preparation. The archive and receipt outlive install/history. */
@@ -310,6 +324,7 @@ export async function importGitHubBundle(input: string, deps: StatusDeps, opts: 
       specPath, rigRoot: folder, outputPath: bundlePath,
       bundleName, bundleVersion: opts.bundleVersion ?? "0.1.0",
       includePackages: opts.includePackages,
+      ...(opts.includeLoginFiles ? { includeLoginFiles: true } : {}),
       ...(opts.projectDir ? { projectDir: path.resolve(opts.projectDir) } : {}),
       ...(opts.contextPack?.length ? { contextPackDirs: opts.contextPack.map(dir => path.resolve(dir)) } : {}),
       provenance: { ...opts.provenance, source: prepared.source },
@@ -327,7 +342,8 @@ export async function importGitHubBundle(input: string, deps: StatusDeps, opts: 
     || (res.data.source as BundleSource | undefined)?.resolvedCommit !== prepared.source.resolvedCommit)) {
     throw new Error(`The daemon did not return bundle source/digest evidence. Update the local daemon before importing links. The created archive is retained at ${bundlePath}; no install was requested.`);
   }
-  writeFileSync(path.join(path.dirname(prepared.receiptPath), "build.json"), JSON.stringify({ ...res.data, bundlePath }, null, 2) + "\n");
+  const receiptWarning = writeBundleBuildReceipt(path.join(path.dirname(prepared.receiptPath), "build.json"), bundlePath, res.data, opts.buildProvenance);
+  if (receiptWarning) res.data.warning = [res.data.warning, receiptWarning].filter(Boolean).join("; ");
   return { client, bundlePath, res };
 }
 

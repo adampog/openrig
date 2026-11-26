@@ -29,8 +29,9 @@ import { assertSafeInstallRef, assertTreeHasNoSymlinks, assertDestinationNamespa
 import { addGitContext, inspectGitContext, updateGitContext } from "../lib/context-git.js";
 import { ConfigStore } from "../config-store.js";
 import { DaemonClient, formatDaemonHostForUrl } from "../client.js";
-import { enumArg } from "../cli-error.js";
-import { getDaemonStatus, getDaemonUrl, startDaemon, statusGuardMessage} from "../daemon-lifecycle.js";
+import { enumArg, renderCaughtTransportError } from "../cli-error.js";
+import { getDaemonStatus, getDaemonUrl, startDaemon, statusGuardMessage } from "../daemon-lifecycle.js";
+import { daemonMayAnswer } from "../daemon-reachability.js";
 import { resolveWorkPosition, type WorkInstallPlan } from "../lib/work-install.js";
 import {
   reconcileSkillLoadout,
@@ -41,7 +42,10 @@ import {
 import { realDeps } from "./daemon.js";
 import { prepareDaemonAutoStart } from "../daemon-auto-start.js";
 import { readOpenRigEnv } from "../openrig-compat.js";
+import { resolveRecapSeat, type RigSeat } from "../recap-seat.js";
+import { parseSessionName } from "../session-name.js";
 import type { StatusDeps } from "./status.js";
+import { reconstructionCommand } from "./context-reconstruction.js";
 
 const contextRuntimeArg = enumArg(["claude-code", "claude", "codex"]);
 
@@ -112,13 +116,8 @@ interface PreviewWire {
   missingFiles: Array<{ path: string; role: string }>;
 }
 
-const SAFE_REF_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-
-function assertSafeTopologySegment(kind: "rig" | "seat", value: string): void {
-  if (value === "." || value === ".." || !SAFE_REF_SEGMENT.test(value)) {
-    throw new Error(`unsafe ${kind} segment '${value}' — topology addresses require one bounded path segment`);
-  }
-}
+/** A write the OS refused for this process: a sandboxed seat's writable roots don't include the topology tree. */
+const WRITE_REFUSED_CODES = new Set(["EPERM", "EACCES", "EROFS"]);
 
 function assertLocalGitClient(client: DaemonClient): void {
   if (!["127.0.0.1", "localhost", "[::1]"].includes(new URL(client.baseUrl).hostname)) {
@@ -198,6 +197,7 @@ async function installPackFromUrl(
     // Re-validate the on-disk staged pack, then publish atomically.
     validateContextPackManifestForInstall(join(staging, "manifest.yaml"));
     assertTreeHasNoSymlinks(staging);
+    mkdirSync(dirname(targetDir), { recursive: true });
     renameSync(staging, targetDir);
     return { targetDir, installName };
   } catch (err) {
@@ -254,6 +254,8 @@ Examples:
   rig context trace --rig factory --seat orch-lead --name LEARNED.md
   rig context trace --rig factory --pod dev --seat dev-qa --name LEARNED.md
 `);
+
+  cmd.addCommand(reconstructionCommand());
 
   const getDeps = (): StatusDeps => depsOverride ?? {
     lifecycleDeps: realDeps(),
@@ -327,6 +329,11 @@ Examples:
           return;
         }
         skillLoadout = resolvedSkills.loadout;
+        // A skill with uncommitted catalog content blocks only itself: name it, project the rest, and exit non-zero
+        // when something selected it.
+        const skippedSkills = skillLoadout.skipped ?? [];
+        if (!opts.json) for (const skip of skippedSkills) console.error(`Warning: ${skip.message}`);
+        if (skippedSkills.some((skip) => skip.selectedBy.length > 0)) process.exitCode = 1;
         skillProjection = reconcileSkillLoadout({
           loadout: skillLoadout,
           runtime: opts.runtime === "codex" ? "codex" : "claude-code",
@@ -412,11 +419,33 @@ Examples:
         status = await getDaemonStatus(deps.lifecycleDeps);
       }
     }
-    if (status.state !== "running" || status.healthy === false) {
+    if (!daemonMayAnswer(status)) {
       // B8-1b: epistemic-matched language via the one helper (down ≠ busy).
       const gm = statusGuardMessage(status); throw new Error(`${gm.fact} ${gm.action}`);
     }
     return deps.clientFactory(getDaemonUrl(status));
+  }
+
+  /** A rig's seats as the daemon records them, for mapping a recap's --seat by identity. Never starts the daemon. */
+  async function rigSeats(rig: string): Promise<RigSeat[] | { unavailable: string }> {
+    try {
+      const client = await getClient();
+      const rigs = await client.get<Array<{ rigId: string; name: string }>>("/api/ps");
+      if (rigs.status !== 200 || !Array.isArray(rigs.data)) return { unavailable: `the daemon's rig list returned HTTP ${rigs.status}` };
+      const ids = rigs.data.filter((entry) => entry.name === rig).map((entry) => entry.rigId);
+      if (ids.length !== 1) return { unavailable: ids.length ? `${ids.length} rigs are named ${rig}` : `the daemon has no rig named ${rig}` };
+      const nodes = await client.get<Array<{ logicalId: string; podNamespace?: string | null; canonicalSessionName: string | null }>>(
+        `/api/rigs/${encodeURIComponent(ids[0]!)}/nodes`);
+      if (nodes.status !== 200 || !Array.isArray(nodes.data)) return { unavailable: `the daemon's seat list returned HTTP ${nodes.status}` };
+      return nodes.data.flatMap((node) => {
+        const session = node.canonicalSessionName ? parseSessionName(node.canonicalSessionName) : undefined;
+        if (session?.kind !== "canonical") return [];
+        const pod = node.podNamespace;
+        return [{ logicalId: node.logicalId, member: pod && node.logicalId.startsWith(`${pod}.`) ? node.logicalId.slice(pod.length + 1) : node.logicalId, folder: session.member }];
+      });
+    } catch (err) {
+      return { unavailable: (err as Error).message };
+    }
   }
 
   // OPR.0.5.3.6 — the productized chain-file trace. Daemon-independent by
@@ -477,7 +506,7 @@ Examples:
     .action(async (opts: { out: string; from: string[] }) => {
       const deps = getDeps();
       const status = await getDaemonStatus(deps.lifecycleDeps);
-      if (status.state !== "running" || status.healthy === false) {
+      if (!daemonMayAnswer(status)) {
         console.error("Daemon is not running. Start it with: rig daemon start");
         process.exitCode = 1;
         return;
@@ -503,7 +532,7 @@ Examples:
           `(${res.data.bytes ?? 0} bytes, ~${res.data.estimatedTokens ?? 0} tokens).`,
         );
       } catch (err) {
-        console.error((err as Error).message);
+        if (!renderCaughtTransportError(err)) console.error((err as Error).message);
         process.exitCode = 1;
       }
     });
@@ -675,6 +704,7 @@ Examples:
   // library verb — nothing here sends to a seat. Naming rig/seat (or mission)
   // is the caller's explicit grant of read access to that directory subtree.
   cmd.command("profile")
+    .description("Compose a context pack's atoms into the profile for one --situation and print it")
     .argument("<name-or-ref>", "Context pack name or path-like ref (its manifest must declare atoms)")
     .requiredOption("--situation <situation>", "fresh | handover | post-compaction")
     // r1 4d obs 2: default from the seat's own environment — a codex seat that
@@ -776,37 +806,50 @@ Examples:
   // trace: the seat dir resolves from topology.root CONFIG; the write flows
   // through the ONE store (supersession + addressability gate); advisory
   // contract findings ride stderr while the write still lands — the boundary
-  // is never blocked on prose shape.
+  // is never blocked on prose shape. A process that may not write the topology
+  // tree (a sandboxed seat) hands the same recap to the daemon, which owns it.
   cmd.command("recap-write")
     .description("Write this seat's authored RECAP (decisions-with-rationale) at the handover boundary; supersedes the previous recap into the seat's chain")
-    .requiredOption("--rig <rig>", "Rig name (the rigs/<rig> altitude)")
-    .requiredOption("--seat <seat>", "Seat id (the seats/<seat> altitude)")
+    .option("--rig <rig>", "Rig name (the rigs/<rig> altitude; default: this seat's rig, from OPENRIG_SESSION_NAME)")
+    .option("--seat <seat>", "The seat's folder: the part of its session name before @, e.g. dev-qa (default: this seat). A seat's recorded logical id or member id maps to its folder when the daemon can check it")
     .requiredOption("--file <path>", "Markdown file containing the recap content")
-    .action(async (opts: { rig: string; seat: string; file: string }) => {
+    .action(async (opts: { rig?: string; seat?: string; file: string }) => {
       try {
-        const { writeSeatRecap, validateRecapContract, listRecapChain } = await import("@openrig/daemon/seat-recap-store");
+        const { writeSeatRecapAt, validateRecapContract } = await import("@openrig/daemon/seat-recap-store");
         const content = readFileSync(opts.file, "utf-8");
-        const store = new ConfigStore();
-        const topologyRoot = String(store.resolveWithSource("topology.root").value);
-        assertSafeTopologySegment("rig", opts.rig);
-        assertSafeTopologySegment("seat", opts.seat);
-        const rigDir = join(topologyRoot, "rigs", opts.rig);
-        if (!existsSync(rigDir)) {
-          throw new Error(`rig directory ${rigDir} does not exist — check --rig against the topology tree (topology.root=${topologyRoot}).`);
-        }
-        const seatDir = join(topologyRoot, "rigs", opts.rig, "seats", opts.seat);
-        assertDestinationNamespaceContained(join(topologyRoot, "rigs"), `${opts.rig}/seats/${opts.seat}/RECAP.md`);
-        mkdirSync(seatDir, { recursive: true });
+        const topologyRoot = String(new ConfigStore().resolveWithSource("topology.root").value);
+        const sessionName = readOpenRigEnv("OPENRIG_SESSION_NAME", "RIGGED_SESSION_NAME")?.trim();
+        const own = sessionName ? parseSessionName(sessionName) : undefined;
+        const rigName = opts.rig ?? (own?.kind === "canonical" ? own.rig : undefined);
+        // A named seat is checked against the rig's recorded seats when the daemon answers; a failed check doesn't stop the write.
+        const seats = opts.seat !== undefined && rigName ? await rigSeats(rigName) : undefined;
+        const target = resolveRecapSeat({ rig: opts.rig, seat: opts.seat, topologyRoot, sessionName, seats });
+        if ("error" in target) { console.error(target.error); process.exitCode = 1; return; }
         for (const f of validateRecapContract(content)) {
           console.error(f.kind === "no-decisions-section"
             ? "ADVISORY no-decisions-section: the authoring contract asks for decisions WITH rationale — conclusions alone are the lossy handoff shape."
             : `ADVISORY nonstandard-unverified-marker (line ${f.line}): use the canonical 'UNVERIFIED:' form so uncertain facts stay findable.`);
         }
-        writeSeatRecap({ seatDir, content });
-        const chain = listRecapChain(seatDir);
-        console.log(`Recap written: ${join(seatDir, "RECAP.md")}${chain.length > 0 ? ` (${chain.length} superseded predecessor${chain.length === 1 ? "" : "s"} retained)` : ""}`);
+        let written: { path: string; superseded: number; daemonUrl?: string };
+        try {
+          written = writeSeatRecapAt({ topologyRoot, rig: target.rig, seat: target.seat, content });
+        } catch (err) {
+          if (!WRITE_REFUSED_CODES.has((err as NodeJS.ErrnoException).code ?? "")) throw err;
+          // The daemon owns the topology tree (it primes RECAP.md at the next rebuild): it writes the same recap through
+          // the same store, so a sandboxed seat saves its recap without a wider writable root. Said first, so a daemon
+          // that can't be reached is reported with its reason.
+          console.error(`Note: this process can't write the topology tree (${(err as Error).message}), so the daemon writes the recap instead.`);
+          const client = await getClient();
+          const res = await client.post<{ path?: string; superseded?: number; message?: string }>("/api/context-packs/seat-recap", { rig: target.rig, seat: target.seat, content });
+          if (res.status !== 200 || typeof res.data.path !== "string") throw new Error(res.data.message ?? `Daemon returned HTTP ${res.status}`);
+          written = { path: res.data.path, superseded: res.data.superseded ?? 0, daemonUrl: client.baseUrl };
+        }
+        console.log(`Recap written: ${written.path}${written.superseded > 0 ? ` (${written.superseded} superseded predecessor${written.superseded === 1 ? "" : "s"} retained)` : ""}`
+          + (written.daemonUrl ? `, by the daemon at ${written.daemonUrl}` : ""));
+        for (const note of target.notes) console.error(`Note: ${note}`);
       } catch (err) {
-        console.error((err as Error).message);
+        // A daemon write that timed out says its outcome is unknown, so it's checked before a retry supersedes it again.
+        if (!renderCaughtTransportError(err)) console.error((err as Error).message);
         process.exitCode = 1;
       }
     });
@@ -832,7 +875,7 @@ Examples:
           for (const e of data.errors) console.log(`  - ${e.source}: ${e.error}`);
         }
       } catch (err) {
-        console.error((err as Error).message);
+        if (!renderCaughtTransportError(err)) console.error((err as Error).message);
         process.exitCode = 1;
       }
     });
@@ -922,7 +965,7 @@ Examples:
           if (gitSelection) console.log(`Git ${gitSelection.revision} from ${gitSelection.checkout}; inspect/update with rig context source.`);
         }
       } catch (err) {
-        console.error((err as Error).message);
+        if (!renderCaughtTransportError(err)) console.error((err as Error).message);
         process.exitCode = 1;
       }
     });
@@ -955,8 +998,10 @@ Examples:
           // in both terminal and machine use, without a second status renderer.
           console.log(JSON.stringify(result, null, 2));
         } catch (err) {
-          const message = (err as Error).message;
-          console.error(opts.json ? JSON.stringify({ error: message }) : message);
+          if (!renderCaughtTransportError(err, opts.json ?? false)) {
+            const message = (err as Error).message;
+            console.error(opts.json ? JSON.stringify({ error: message }) : message);
+          }
           process.exitCode = 1;
         }
       });
@@ -986,7 +1031,7 @@ Examples:
         }
         console.log(`Removed context pack '${res.data.ref}'.${typeof res.data.count === "number" ? ` Library now has ${res.data.count} context pack(s).` : ""}`);
       } catch (err) {
-        console.error((err as Error).message);
+        if (!renderCaughtTransportError(err)) console.error((err as Error).message);
         process.exitCode = 1;
       }
     });

@@ -1,0 +1,286 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createFullTestDb } from "./helpers/test-app.js";
+import { RigRepository } from "../src/domain/rig-repository.js";
+import { NativePermissionStore } from "../src/domain/native-permission-store.js";
+import { planPermissionAccount, planRestorePermission } from "../src/domain/permission-account.js";
+import { claudePostureFlag } from "../src/adapters/yolo-mode.js";
+import { SeatStatusService } from "../src/domain/seat-status-service.js";
+import { KERNEL_CLAUDE_ALLOW, TEAM_CLAUDE_ALLOW, TEAM_CLAUDE_ASK } from "../src/adapters/kernel-authority.js";
+import { SessionRegistry } from "../src/domain/session-registry.js";
+import { readReceivingAgentSetting } from "../src/domain/queue-owner.js";
+import { ClaudeCodeAdapter } from "../src/adapters/claude-code-adapter.js";
+import { CodexRuntimeAdapter } from "../src/adapters/codex-runtime-adapter.js";
+import type { NodeBinding } from "../src/domain/runtime-adapter.js";
+import type { TmuxAdapter } from "../src/adapters/tmux.js";
+
+// The receiving agent as the daemon resolves it; null reads the real setting.
+const receiving = vi.hoisted(() => ({ value: null as null | { session: string | null; source?: "env" | "file" | "default" } }));
+vi.mock("../src/domain/queue-owner.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/domain/queue-owner.js")>();
+  return { ...actual, readReceivingAgentSetting: () => receiving.value ?? actual.readReceivingAgentSetting() };
+});
+
+const dbs: ReturnType<typeof createFullTestDb>[] = [];
+afterEach(() => { for (const db of dbs.splice(0)) db.close(); vi.unstubAllEnvs(); receiving.value = null; });
+
+function seat(runtime: string, rigName = "workshop") {
+  const db = createFullTestDb(); dbs.push(db);
+  const rigRepo = new RigRepository(db);
+  const rig = rigRepo.createRig(rigName);
+  const node = rigRepo.addNode(rig.id, "dev.builder", { runtime, cwd: "/inert/project" });
+  return { db, rigRepo, rig, node };
+}
+const env = { OPENRIG_YOLO: "0" } as NodeJS.ProcessEnv;
+/** Attach a policy as the instantiator does: the ref plus its persisted provenance. */
+function attach(rigRepo: RigRepository, db: ReturnType<typeof createFullTestDb>, nodeId: string, ref: string, launchPosture: "floor" | "full_bypass" | "auto") {
+  db.prepare("UPDATE nodes SET permission_policy = ? WHERE id = ?").run(ref, nodeId);
+  rigRepo.setNodePolicyProvenance(nodeId, { origin: ref === "none" ? "deliberate_none" : "builtin", resolvedTarget: null, declaringDir: null, launchPosture });
+}
+
+describe("the planned permission account", () => {
+  it("names OpenRig's team default and its lists for a Claude seat with no policy or seat choice, not 'OpenRig default'", () => {
+    const { db, node } = seat("claude-code");
+    const account = planPermissionAccount(db, node.id, "dev-builder@workshop", "claude-code", env);
+    expect(account).toMatchObject({ basis: "planned", source: "team_default", nativeArgument: "--permission-mode acceptEdits", overrides: [] });
+    expect(account.openRigAdds.claudeAllow).toEqual(TEAM_CLAUDE_ALLOW);
+    expect(account.openRigAdds.claudeAsk).toEqual(TEAM_CLAUDE_ASK);
+    expect(account.summary).toContain("OpenRig's team default");
+    expect(account.summary).toContain(`OpenRig adds ${TEAM_CLAUDE_ALLOW.length} allowances and asks before ${TEAM_CLAUDE_ASK.length} lifecycle commands`);
+    expect(account.unknown.join(" ")).toContain("aren't read here");
+    expect(account.controls[0]).toBe('rig seat set-permissions dev-builder@workshop --mode <mode> --reason "<why>"');
+  });
+
+  it("leaves seat decide-permission out of the asks only on the host's receiving agent, and says why", () => {
+    const { db, rigRepo, rig, node } = seat("claude-code");
+    const other = rigRepo.addNode(rig.id, "dev.reviewer", { runtime: "claude-code", cwd: "/inert/project" });
+    new SessionRegistry(db).registerSession(node.id, "dev-builder@workshop");
+    new SessionRegistry(db).registerSession(other.id, "dev-reviewer@workshop");
+    receiving.value = { session: "dev-builder@workshop", source: "file" };
+    const receiver = planPermissionAccount(db, node.id, "dev-builder@workshop", "claude-code", env);
+    expect(receiver.openRigAdds.claudeAsk).toEqual(TEAM_CLAUDE_ASK.filter(rule => rule !== "Bash(rig seat decide-permission:*)"));
+    expect(receiver.openRigAdds.claudeAsk).toContain("Bash(rig seat set-permissions:*)");
+    expect(receiver.openRigAdds.notes.join(" ")).toContain("receiving agent (agents.operator_session), so rig seat decide-permission doesn't ask here");
+    const teammate = planPermissionAccount(db, other.id, "dev-reviewer@workshop", "claude-code", env);
+    expect(teammate.openRigAdds.claudeAsk).toEqual(TEAM_CLAUDE_ASK);
+    expect(teammate.openRigAdds.notes.join(" ")).not.toContain("agents.operator_session");
+  });
+
+  it("keeps the ask listed when only the daemon's environment names the receiving agent, and says why", () => {
+    const { db, node } = seat("claude-code");
+    new SessionRegistry(db).registerSession(node.id, "dev-builder@workshop");
+    receiving.value = { session: "dev-builder@workshop", source: "env" };
+    const account = planPermissionAccount(db, node.id, "dev-builder@workshop", "claude-code", env);
+    expect(account.openRigAdds.claudeAsk).toEqual(TEAM_CLAUDE_ASK);
+    expect(account.openRigAdds.notes.join(" ")).toContain("from OPENRIG_AGENTS_OPERATOR_SESSION in its own environment");
+    expect(account.openRigAdds.notes.join(" ")).toContain("whether it's skipped depends on what the seat's rig config resolves");
+  });
+
+  it("reads the receiving agent's source from the settings store", () => {
+    vi.stubEnv("OPENRIG_AGENTS_OPERATOR_SESSION", "dev-builder@workshop");
+    expect(readReceivingAgentSetting()).toEqual({ session: "dev-builder@workshop", source: "env" });
+  });
+
+  it("names the kernel default and the kernel list for a kernel Claude seat", () => {
+    const { db, node } = seat("claude-code", "kernel");
+    const account = planPermissionAccount(db, node.id, "kernel-seat", "claude-code", env);
+    expect(account).toMatchObject({ source: "kernel_default", nativeArgument: "--permission-mode acceptEdits" });
+    expect(account.openRigAdds).toMatchObject({ claudeAllow: KERNEL_CLAUDE_ALLOW, claudeAsk: [] });
+  });
+
+  it("shows an explicit seat choice, who made it and why, and the recorded policy it's used instead of", () => {
+    const { db, rigRepo, node } = seat("claude-code");
+    attach(rigRepo, db, node.id, "builtin:yolo", "full_bypass");
+    new NativePermissionStore(db).write(node.id, { runtime: "claude-code", mode: "plan" }, "person@host", "careful review");
+    const account = planPermissionAccount(db, node.id, "dev-builder@workshop", "claude-code", env);
+    expect(account).toMatchObject({ source: "explicit", nativeArgument: "--permission-mode plan", overrides: ["member policy builtin:yolo"],
+      explicit: { mode: "plan", actor: "person@host", reason: "careful review" } });
+    expect(account.openRigAdds.claudeAllow).toEqual([]);
+    expect(account.summary).toContain("this seat's own choice (person@host: careful review)");
+  });
+
+  // Claude Code answers plan-mode turns with Sonnet when its model setting is exactly the alias `haiku`; a full id keeps it.
+  it.each([
+    ["haiku", "plan", true], [" haiku ", "plan", true],
+    ["claude-haiku-4-5", "plan", false], ["opusplan", "plan", false], ["sonnet", "plan", false],
+    ["haiku", "acceptEdits", false], ["haiku", null, false],
+  ] as const)("model %j with saved mode %j: names plan mode's Sonnet answer for the bare haiku alias only (%s)", (model, mode, named) => {
+    const { db, node } = seat("claude-code");
+    db.prepare("UPDATE nodes SET model = ? WHERE id = ?").run(model, node.id);
+    if (mode) new NativePermissionStore(db).write(node.id, { runtime: "claude-code", mode }, "person@host", "careful review");
+    const account = planPermissionAccount(db, node.id, "dev-builder@workshop", "claude-code", env);
+    expect(account.advisories).toEqual(named ? ['Claude Code answers plan-mode turns with Sonnet when the model is the alias "haiku". To keep Haiku, '
+      + 'set a full Haiku model id: rig seat set-model dev-builder@workshop --model <full Haiku id> --reason "<why>".'] : []);
+    expect(account.nativeArgument).toBe(mode ? `--permission-mode ${mode}` : "--permission-mode acceptEdits");
+  });
+
+  it("follows a member's full-bypass policy", () => {
+    const { db, rigRepo, node } = seat("claude-code");
+    attach(rigRepo, db, node.id, "builtin:yolo", "full_bypass");
+    const account = planPermissionAccount(db, node.id, "dev-builder@workshop", "claude-code", env);
+    expect(account).toMatchObject({ source: "member_policy", nativeArgument: "--dangerously-skip-permissions" });
+  });
+
+  it("names Codex's team-default roots and leaves its network access unknown", () => {
+    const { db, node } = seat("codex");
+    const account = planPermissionAccount(db, node.id, "dev-builder@workshop", "codex", env);
+    expect(account).toMatchObject({ source: "team_default", nativeArgument: "-s workspace-write" });
+    expect(account.openRigAdds.notes.join(" ")).toContain("the shared workspace and the pod's state folder");
+    expect(account.unknown.join(" ")).toContain("Codex network access");
+  });
+
+  it("names a Codex seat's own profile when no policy or choice is recorded", () => {
+    const { db, node } = seat("codex");
+    db.prepare("UPDATE nodes SET codex_config_profile = ? WHERE id = ?").run("careful", node.id);
+    const account = planPermissionAccount(db, node.id, "dev-builder@workshop", "codex", env);
+    expect(account).toMatchObject({ source: "floor", nativeArgument: "-p careful" });
+    expect(account.summary).toContain("the named Codex profile careful governs its sandbox and approvals");
+  });
+
+  it("keeps the resolver's explanation when a Codex member asks for auto, which Codex doesn't have", () => {
+    const { db, rigRepo, node } = seat("codex");
+    attach(rigRepo, db, node.id, "builtin:auto", "auto");
+    const account = planPermissionAccount(db, node.id, "dev-builder@workshop", "codex", env);
+    expect(account).toMatchObject({ source: "member_policy", nativeArgument: "-s workspace-write" });
+    expect(account.summary).toContain("Codex has no auto mode and launches at the floor");
+  });
+
+  it("names a Codex profile that supplies the argument under a policy, keeping the policy as the source", () => {
+    const { db, rigRepo, node } = seat("codex");
+    attach(rigRepo, db, node.id, "none", "floor");
+    db.prepare("UPDATE nodes SET codex_config_profile = ? WHERE id = ?").run("careful", node.id);
+    const account = planPermissionAccount(db, node.id, "dev-builder@workshop", "codex", env);
+    expect(account).toMatchObject({ source: "member_policy", nativeArgument: "-p careful" });
+    expect(account.summary).toContain("the named Codex profile careful governs its sandbox and approvals");
+  });
+
+  it.each(["claude-code", "codex"])("%s: OPENRIG_YOLO doesn't widen a seat with no policy, and the account matches what the real adapter emits", async (runtime) => {
+    vi.stubEnv("OPENRIG_YOLO", "1");
+    const { db, rigRepo, node } = seat(runtime);
+    const account = planPermissionAccount(db, node.id, "dev-builder@workshop", runtime, process.env);
+    expect(account).toMatchObject({ source: "team_default", nativeArgument: runtime === "claude-code" ? "--permission-mode acceptEdits" : "-s workspace-write" });
+    // The launch's own path: the binding a fresh launch builds (seat-lifecycle-service: the persisted policy posture, else
+    // "floor"), NativePermissionStore.apply, then the real adapter's command.
+    const session = new SessionRegistry(db).registerSession(node.id, "dev-builder@workshop");
+    const binding = new NativePermissionStore(db).apply({ id: "binding", nodeId: node.id, cwd: "/inert/project", tmuxSession: session.sessionName,
+      launchPosture: rigRepo.getNodePolicyProvenance(node.id)?.launchPosture ?? "floor" } as NodeBinding, runtime);
+    const send = vi.fn(async () => ({ ok: false as const, message: "inert boundary" }));
+    const deps = { tmux: { sendShellCommand: send, sendText: send } as unknown as TmuxAdapter,
+      fsOps: { readFile: () => { throw new Error("missing"); }, exists: () => false, writeFile: vi.fn(), mkdirp: vi.fn(), copyFile: vi.fn() },
+      prepareTeamWorkspace: vi.fn(() => ["/configured/work"]) };
+    const adapter = runtime === "claude-code" ? new ClaudeCodeAdapter(deps as never) : new CodexRuntimeAdapter(deps as never);
+    await adapter.launchHarness(binding, { name: session.sessionName });
+    const cmd = String((send.mock.calls[0] as unknown[])[1]);
+    expect(cmd).toContain(account.nativeArgument!);
+    expect(cmd).not.toContain(runtime === "claude-code" ? "--dangerously-skip-permissions" : "danger-full-access");
+    if (runtime === "claude-code") expect(cmd).toContain("Bash(rig:*)");
+  });
+
+  it("sets no native argument for Pi", () => {
+    const { db, node } = seat("pi");
+    expect(planPermissionAccount(db, node.id, "dev-builder@workshop", "pi", env)).toMatchObject({ source: null, nativeArgument: null, controls: [] });
+  });
+
+  it("is on rig seat status, beside the existing permission fields", () => {
+    const { rigRepo } = seat("claude-code");
+    const result = new SeatStatusService({ rigRepo }).getStatus("dev.builder");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.status.permissions).toMatchObject({ selectionState: "inherit", nativeEffect: "unverified", account: { basis: "planned", runtime: "claude-code" } });
+  });
+});
+
+// After a reboot a seat came back in a mode the person didn't expect. The plan previews now show, per seat, the permission
+// restore will start it with: restore's own posture through the launch's resolver, with no precedence change.
+describe("a seat's planned permission on restore", () => {
+  const inputs = (nodeId: string, restorePosture: () => "floor" | "full_bypass" | "auto") =>
+    ({ nodeId, seat: "dev-builder@workshop", runtime: "claude-code", restorePosture, podAware: true, startupContext: true });
+
+  it("starts from the posture restore re-reads, not the cached one a fresh launch uses", () => {
+    const { db, rigRepo, node } = seat("claude-code");
+    attach(rigRepo, db, node.id, "builtin:yolo", "full_bypass");
+    const restored = planRestorePermission(db, inputs(node.id, () => "floor"), env);
+    const fresh = planPermissionAccount(db, node.id, "dev-builder@workshop", "claude-code", env);
+    expect(fresh.nativeArgument).toBe(claudePostureFlag(env, "full_bypass", undefined));
+    expect(restored).toMatchObject({ basis: "planned", source: "member_policy", nativeArgument: claudePostureFlag(env, "floor", undefined) });
+    expect(restored.summary.startsWith("On restore: ")).toBe(true);
+    expect(fresh.summary.startsWith("Next launch: ")).toBe(true);
+  });
+
+  it("keeps the seat's own choice ahead of restore's posture, as the launch does", () => {
+    const { db, rigRepo, node } = seat("claude-code");
+    attach(rigRepo, db, node.id, "builtin:yolo", "full_bypass");
+    new NativePermissionStore(db).write(node.id, { runtime: "claude-code", mode: "auto" }, "person@host", "after the reboot");
+    const restored = planRestorePermission(db, inputs(node.id, () => "full_bypass"), env);
+    expect(restored).toMatchObject({ basis: "planned", source: "explicit", nativeArgument: "--permission-mode auto",
+      explicit: { mode: "auto", actor: "person@host", reason: "after the reboot" }, overrides: ["member policy builtin:yolo"] });
+  });
+
+  it("reads unknown, with restore's own reason, when restore would refuse the seat's permission facts", () => {
+    const { db, node } = seat("claude-code");
+    new NativePermissionStore(db).write(node.id, { runtime: "claude-code", mode: "plan" }, "person@host", "review");
+    const restored = planRestorePermission(db, { ...inputs(node.id, () => "floor"), runtime: "codex" }, env);
+    expect(restored.basis).toBe("unknown");
+    expect(restored.summary).toContain("Seat runtime changed since permission selection");
+  });
+
+  it.each([
+    [{ podAware: false }, "runtime from its resume token"],
+    // Restore resumes a seat with a resume token and no saved context, so the reason mustn't say it starts fresh.
+    [{ podAware: true, startupContext: false }, "no saved startup context, so this read can't settle whether restore resumes its saved conversation or starts it fresh"],
+    [{ podAware: undefined, startupContext: undefined }, "no saved snapshot names this seat"],
+    [{ podAware: true, startupContext: true, runtimeError: "No session was started for this seat." }, "restore stops for a runtime decision"],
+  ])("reads a restore path it can't settle as unknown with the reason, never a definite mode (%o)", (path, words) => {
+    const { db, rigRepo, node } = seat("claude-code");
+    attach(rigRepo, db, node.id, "builtin:yolo", "full_bypass");
+    const restored = planRestorePermission(db, { ...inputs(node.id, () => "floor"), ...path }, env);
+    expect(restored).toEqual({ basis: "unknown", runtime: "claude-code", summary: expect.stringContaining(words) });
+    expect(restored.summary).not.toContain("On restore");
+  });
+
+  // A custom policy file can move between auto and full_bypass after its posture was cached; restore re-reads it, so the
+  // note on Codex's missing auto mode must agree with the flags restore plans, for a member's policy and a rig's.
+  it.each([
+    ["member", "auto", "full_bypass", "-s danger-full-access -a never", false],
+    ["member", "full_bypass", "auto", "-s workspace-write", true],
+    ["rig", "auto", "full_bypass", "-s danger-full-access -a never", false],
+    ["rig", "full_bypass", "auto", "-s workspace-write", true],
+  ] as const)("explains a Codex %s policy's floor fallback from the posture restore plans (cached %s, now %s)", (level, cached, now, argument, floor) => {
+    const { db, rigRepo, rig, node } = seat("codex");
+    const provenance = { origin: "custom" as const, resolvedTarget: "/policies/team.yaml", declaringDir: "/policies", launchPosture: cached };
+    if (level === "member") {
+      db.prepare("UPDATE nodes SET permission_policy = ? WHERE id = ?").run("./team.yaml", node.id);
+      rigRepo.setNodePolicyProvenance(node.id, provenance);
+    } else {
+      db.prepare("UPDATE rigs SET permission_policy = ? WHERE id = ?").run("./team.yaml", rig.id);
+      rigRepo.setRigPolicyProvenance(rig.id, provenance);
+    }
+    const restored = planRestorePermission(db, { ...inputs(node.id, () => now), runtime: "codex" }, env);
+    expect(restored).toMatchObject({ basis: "planned", source: `${level}_policy`, nativeArgument: argument });
+    expect(restored.summary.includes("Codex has no auto mode and launches at the floor")).toBe(floor);
+  });
+
+  it("plans only the path restore's posture is exact for: a pod seat with saved startup context", () => {
+    const { db, node } = seat("claude-code");
+    const restored = planRestorePermission(db, inputs(node.id, () => "floor"), env);
+    expect(restored.basis).toBe("planned");
+    expect(restored.summary.startsWith("On restore: ")).toBe(true);
+    expect(restored.basis === "planned" ? restored.unknown.join(" ") : "").toContain("This is the plan for restoring this seat");
+  });
+
+  // Startup makes the permission decision for every runtime, Pi included, and fails the seat on its error.
+  it("reads unknown when startup would refuse a Pi seat's choice, made for another runtime or unreadable", () => {
+    const { db, node } = seat("pi");
+    expect(planRestorePermission(db, { ...inputs(node.id, () => "floor"), runtime: "pi" }, env))
+      .toMatchObject({ basis: "planned", summary: "Pi has no native permission policy; its resource trust is set at launch." });
+    new NativePermissionStore(db).write(node.id, { runtime: "claude-code", mode: "plan" }, "person@host", "before the switch");
+    const changed = planRestorePermission(db, { ...inputs(node.id, () => "floor"), runtime: "pi" }, env);
+    expect(changed).toMatchObject({ basis: "unknown", runtime: "pi" });
+    expect(changed.summary).toContain("Seat runtime changed since permission selection");
+    // A stored choice is only ever Claude's or Codex's (the table checks it); an unreadable mode fails startup's read first.
+    db.prepare("UPDATE node_permission_selections SET mode = 'not-a-mode' WHERE node_id = ?").run(node.id);
+    const unreadable = planRestorePermission(db, { ...inputs(node.id, () => "floor"), runtime: "pi" }, env);
+    expect(unreadable).toMatchObject({ basis: "unknown", runtime: "pi" });
+    expect(unreadable.summary).toContain("Invalid persisted native permission selection");
+    expect(unreadable.summary).not.toContain("Pi has no native permission policy");
+  });
+});

@@ -1,16 +1,28 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import {
   buildInternalLeakMessage,
   scanInternalLeaks,
 } from "./internal-leak-scanner.mjs";
+import { LEAK_GUARD_RULES_ENV, leakGuardRulesPath, readTermRules } from "./leak-guard-rules.mjs";
 
 export function main(argv = process.argv.slice(2)) {
   const options = parseArguments(argv);
-  const rules = readRules(options.rules);
+  if (!options.rules) {
+    if (options.requireRules) {
+      process.stderr.write(
+        `No leak-guard rules file (--rules or ${LEAK_GUARD_RULES_ENV}): refusing to report a clean scan ` +
+        `whose term checks never ran.\n`,
+      );
+      return 1;
+    }
+    process.stderr.write(`No leak-guard rules file (--rules or ${LEAK_GUARD_RULES_ENV}): the term checks are skipped.\n`);
+  }
+  const rules = readTermRules(options.rules);
   const files = selectFiles(options);
   const findings = files.flatMap(({ path, bytes }) =>
     scanInternalLeaks({ path, bytes, rules }),
@@ -32,18 +44,25 @@ export function main(argv = process.argv.slice(2)) {
   return 0;
 }
 
+/** Flags that carry no value of their own; every other `--name` is followed by one. */
+const VALUELESS_FLAGS = new Set(["require-rules"]);
+
 function parseArguments(argv) {
   const values = {};
-  for (let index = 0; index < argv.length; index += 2) {
+  for (let index = 0; index < argv.length; index++) {
     const key = argv[index];
-    const value = argv[index + 1];
-    if (!key?.startsWith("--") || value === undefined) {
-      throw new Error(`Invalid argument near ${key ?? "<end>"}`);
+    if (!key?.startsWith("--")) throw new Error(`Invalid argument near ${key ?? "<end>"}`);
+    const name = key.slice(2);
+    if (VALUELESS_FLAGS.has(name)) {
+      values[name] = "true";
+      continue;
     }
-    values[key.slice(2)] = value;
+    const value = argv[++index];
+    if (value === undefined) throw new Error(`Invalid argument near ${key}: it needs a value`);
+    values[name] = value;
   }
-  if (!values.repo || !values.rules || !values.mode) {
-    throw new Error("--repo, --rules, and --mode are required");
+  if (!values.repo || !values.mode) {
+    throw new Error("--repo and --mode are required");
   }
   if (!["full", "staged", "range", "tree"].includes(values.mode)) {
     throw new Error(`Unknown mode: ${values.mode}`);
@@ -60,23 +79,12 @@ function parseArguments(argv) {
   return {
     ...values,
     repo: resolve(values.repo),
-    rules: resolve(values.rules),
+    rules: values.rules ? resolve(values.rules) : leakGuardRulesPath(),
+    requireRules: values["require-rules"] === "true",
     ...(values.tree ? { tree: resolve(values.tree) } : {}),
     ...(values["files-manifest"] ? { filesManifest: resolve(values["files-manifest"]) } : {}),
     ...(values.report ? { report: resolve(values.report) } : {}),
   };
-}
-
-function readRules(path) {
-  if (!existsSync(path)) throw new Error(`Rules file not found: ${path}`);
-  try {
-    const rules = JSON.parse(readFileSync(path, "utf8"));
-    validateRules(rules, path);
-    return rules;
-  } catch (error) {
-    if (error.message.startsWith(`Invalid rules file ${path}:`)) throw error;
-    throw new Error(`Invalid rules file ${path}: ${error.message}`);
-  }
 }
 
 function selectFiles(options) {
@@ -196,39 +204,6 @@ function changedPathsAtCommit(repo, commit) {
   ].sort();
 }
 
-function validateRules(rules, path) {
-  if (rules === null || typeof rules !== "object" || Array.isArray(rules)) {
-    throw new Error(`Invalid rules file ${path}: rules must be an object`);
-  }
-  for (const field of [
-    "path_prefixes",
-    "seat_and_rig_patterns",
-    "host_patterns",
-    "charged_terms",
-    "internal_path_globs",
-    "allowed_context_substrings",
-  ]) {
-    if (
-      !Array.isArray(rules[field]) ||
-      rules[field].length === 0 ||
-      rules[field].some((value) => typeof value !== "string" || value === "")
-    ) {
-      throw new Error(
-        `Invalid rules file ${path}: ${field} must be a nonempty string array`,
-      );
-    }
-  }
-  if (Object.hasOwn(rules, "allowed_context_lines") && (
-    !Array.isArray(rules.allowed_context_lines) ||
-    rules.allowed_context_lines.some((value) =>
-      typeof value !== "string" || value === "" || /[\r\n]/.test(value))
-  )) {
-    throw new Error(
-      `Invalid rules file ${path}: allowed_context_lines must be an array of nonempty single-line strings`,
-    );
-  }
-}
-
 function git(repo, args) {
   return execFileSync("git", args, { cwd: repo });
 }
@@ -241,7 +216,7 @@ function splitNul(bytes) {
     .sort();
 }
 
-if (import.meta.url === `file://${resolve(process.argv[1])}`) {
+if (process.argv[1] && existsSync(process.argv[1]) && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
   try {
     process.exitCode = main();
   } catch (error) {

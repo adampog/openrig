@@ -38,8 +38,8 @@ export function isScaffoldPlaceholderText(text: string): boolean {
  *  intent-stage gate). `null` → false. */
 export function hasAuthoredNumberedItem(body: string | null): boolean {
   if (body === null) return false;
-  for (const line of body.split("\n")) {
-    const m = line.match(/^\s*\d+[.)]\s+(.+)$/);
+  for (const line of body.split(/\r?\n/)) {
+    const m = line.match(/^\s*\d+[.)]\s+(\S.*)$/);
     if (m && !isScaffoldPlaceholderText(m[1]!.trim())) return true;
   }
   return false;
@@ -62,7 +62,7 @@ export function isPlaceholderOnlyBlock(block: string | null): boolean {
   return lines.every((l) => isScaffoldPlaceholderText(l));
 }
 
-/** PM dogfood #1 (qitem-20260720015700-630eef64) — true when `body` is a
+/** PM dogfood #1 — true when `body` is a
  *  PRESENT section whose EVERY non-blank line is scaffold-placeholder
  *  content: either a bare placeholder line, or a structural list row
  *  (numbered `1.`/`1)`, checkbox `- [ ]`, or bullet `-`/`*`) whose text is a

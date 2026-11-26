@@ -7,7 +7,12 @@ import { pathToFileURL } from "node:url";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
-import { closeHttpServer, createDaemonShutdown, DAEMON_SHUTDOWN_TIMEOUT_MS, trackHttpServerResponses } from "../src/daemon-shutdown.js";
+import { closeHttpServer, createDaemonShutdown, DAEMON_SHUTDOWN_TIMEOUT_MS, daemonStopping, trackHttpServerResponses } from "../src/daemon-shutdown.js";
+import { KeepAliveSupervisor } from "../src/domain/keep-alive-supervisor.js";
+import { RigRepository } from "../src/domain/rig-repository.js";
+import { SessionRegistry } from "../src/domain/session-registry.js";
+import { EventBus } from "../src/domain/event-bus.js";
+import { createFullTestDb } from "./helpers/test-app.js";
 
 const dirs: string[] = [];
 afterEach(() => { vi.useRealTimers(); for (const p of dirs.splice(0)) fs.rmSync(p, { recursive: true, force: true }); });
@@ -138,7 +143,31 @@ it("writes clean lifecycle evidence only after every phase has drained", async (
   expect(f.markClean).not.toHaveBeenCalled(); expect(f.exit).not.toHaveBeenCalled();
   release(); await vi.runAllTimersAsync();
   expect(f.markClean).toHaveBeenCalledOnce(); expect(f.exit).toHaveBeenCalledWith(0);
-  expect(f.receipt()).toMatchObject({ outcome: "clean", phase: "complete", failures: [] });
+  const receipt = f.receipt();
+  expect(receipt).toMatchObject({ outcome: "clean", phase: "complete", failures: [] });
+  // The begin and finish lines carry the receipt's own PID and times.
+  expect(f.log).toHaveBeenNthCalledWith(1, `OpenRig daemon received SIGTERM; shutting down (budget ${DAEMON_SHUTDOWN_TIMEOUT_MS}ms); pid=${receipt.pid}; callback started ${receipt.startedAt}`);
+  expect(f.log).toHaveBeenLastCalledWith(`[shutdown] clean; phase=complete; budget=${DAEMON_SHUTDOWN_TIMEOUT_MS}ms; exit=0; pid=${receipt.pid}; started=${receipt.startedAt}; completed=${receipt.completedAt}`);
+});
+it("keeps both shutdowns' timing in a shared log when the second replaces the receipt", async () => {
+  vi.useFakeTimers({ now: new Date("2026-10-22T12:00:00.000Z") });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "shutdown-unit-")); dirs.push(dir);
+  const receiptPath = path.join(dir, "result.json"); const log = vi.fn();
+  const run = async () => {
+    createDaemonShutdown({ phases: [], markClean: vi.fn(), exit: vi.fn(), log, receiptPath })("SIGTERM");
+    await vi.runAllTimersAsync();
+    return JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+  };
+  const first = await run();
+  await vi.advanceTimersByTimeAsync(60_000);
+  const second = await run();
+  expect(JSON.parse(fs.readFileSync(receiptPath, "utf8"))).toEqual(second);
+  expect(second.startedAt).not.toBe(first.startedAt);
+  const lines = log.mock.calls.map(([line]) => line).join("\n");
+  for (const r of [first, second]) {
+    expect(lines).toContain(`callback started ${r.startedAt}`);
+    expect(lines).toContain(`pid=${r.pid}; started=${r.startedAt}; completed=${r.completedAt}`);
+  }
 });
 it.each(["health-diagnosis", "watchdog", "wake-ladder", "connections", "recorder"])("bounds an unresolved %s phase from the first await", async (phase) => {
   vi.useFakeTimers(); const f = fixture([[phase, () => new Promise(() => {})]]);
@@ -146,7 +175,10 @@ it.each(["health-diagnosis", "watchdog", "wake-ladder", "connections", "recorder
   expect(f.exit).not.toHaveBeenCalled();
   await vi.advanceTimersByTimeAsync(1);
   expect(f.exit).toHaveBeenCalledExactlyOnceWith(1); expect(f.markClean).not.toHaveBeenCalled();
-  expect(f.receipt()).toMatchObject({ outcome: "timed-out", phase });
+  const receipt = f.receipt();
+  expect(receipt).toMatchObject({ outcome: "timed-out", phase });
+  expect(Date.parse(receipt.completedAt) - Date.parse(receipt.startedAt)).toBe(DAEMON_SHUTDOWN_TIMEOUT_MS);
+  expect(f.log).toHaveBeenLastCalledWith(`[shutdown] timed-out; phase=${phase}; budget=${DAEMON_SHUTDOWN_TIMEOUT_MS}ms; exit=1; pid=${receipt.pid}; started=${receipt.startedAt}; completed=${receipt.completedAt}`);
 });
 it.each([undefined, null, new Error("service failed")])("records even falsey rejections and still attempts subsequent drains: %s", async (error) => {
   vi.useFakeTimers(); const drain = vi.fn();
@@ -195,3 +227,50 @@ it("enforces the whole-shutdown deadline with no other referenced handles", asyn
   expect(result.code).toBe(1);
   expect(JSON.parse(fs.readFileSync(receiptPath, "utf8"))).toMatchObject({ outcome: "timed-out", phase: "health-diagnosis" });
 }, 7000);
+
+// #2940: the keep-alive supervisor stops first, so no relaunch starts while the rest of the daemon goes down, and a
+// shutdown never reads as a seat falling.
+it("stops the keep-alive supervisor as the first phase, after it was started once the daemon listens", () => {
+  const source = fs.readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
+  expect(source).toMatch(/phases: \[\s*(?:\/\/[^\n]*\n\s*)*\["keep-alive", \(\) => deps\.keepAliveSupervisor\?\.stop\(\)\],/);
+  expect(source).toMatch(/const srv = serve\([\s\S]*?if \(!monitorsStarted\) \{[\s\S]*?deps\.keepAliveSupervisor\?\.start\(\);[\s\S]*?\n {4}\}\);/);
+});
+
+it("the keep-alive phase prevents any new attempt and waits for a tick in flight only a bounded time", async () => {
+  vi.useFakeTimers();
+  const db = createFullTestDb();
+  try {
+    const rigRepo = new RigRepository(db);
+    const sessions = new SessionRegistry(db);
+    const rig = rigRepo.createRig("r01");
+    const node = rigRepo.addNode(rig.id, "dev.driver", { runtime: "terminal" });
+    db.prepare("UPDATE nodes SET keep_alive = 1 WHERE id = ?").run(node.id);
+    sessions.updateStatus(sessions.registerSession(node.id, "dev-driver@r01").id, "detached");
+    // A tick whose reconcile never returns: shutdown must not wait for it past the supervisor's own bound.
+    const launch = vi.fn();
+    const supervisor = new KeepAliveSupervisor({ db, eventBus: new EventBus(db),
+      reconciler: { reconcile: () => new Promise(() => {}) }, restoreOrchestrator: { launchSingleNode: launch } });
+    supervisor.start();
+    await vi.advanceTimersByTimeAsync(30_000);
+    const order: string[] = [];
+    const f = fixture([["keep-alive", async () => { await supervisor.stop(); order.push("keep-alive"); }],
+      ["recorder", () => { order.push("recorder"); }]]);
+    f.shutdown("SIGTERM");
+    await vi.runAllTimersAsync();
+    expect(order).toEqual(["keep-alive", "recorder"]);
+    expect(f.exit).toHaveBeenCalledWith(0);
+    expect(f.receipt()).toMatchObject({ outcome: "clean" });
+    expect(Date.parse(f.receipt().completedAt) - Date.parse(f.receipt().startedAt)).toBeLessThan(DAEMON_SHUTDOWN_TIMEOUT_MS);
+    expect(supervisor.isRunning()).toBe(false);
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(launch).not.toHaveBeenCalled();
+    expect(db.prepare("SELECT status, intentionally_stopped AS flag FROM sessions").get()).toEqual({ status: "detached", flag: 0 });
+  } finally { db.close(); }
+});
+
+it("settles daemonStopping once a shutdown starts, so a request waiting for a change can answer", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "shutdown-unit-")); dirs.push(dir);
+  createDaemonShutdown({ phases: [], markClean: vi.fn(), exit: vi.fn(), log: vi.fn(), receiptPath: path.join(dir, "result.json") })("SIGTERM");
+  const settled = await Promise.race([daemonStopping.then(() => "settled"), new Promise((resolve) => setTimeout(() => resolve("waiting"), 1_000))]);
+  expect(settled).toBe("settled");
+});

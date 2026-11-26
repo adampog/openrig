@@ -1,10 +1,21 @@
+import { FRESHNESS_THRESHOLD_MS } from "./context-usage-store.js";
+import { ActivityGrantStore, type ActivityGrant } from "./activity-grants.js";
+import { usableCommunityNativeRef } from "./community-harness-launch-result.js";
+import { validateSessionFileFormat } from "./resume-token-validation.js";
+import { parseSqliteUtcMs } from "./sqlite-time.js";
+import { AGENT_RUNNER_HOSTED_PI_RPC, SessionRegistry, physicalSessionName, recordedRunner, sessionCommunityRunnerSelect } from "./session-registry.js";
+import { claudeProviderFailureReason, isClaudeRateLimitHook } from "./provider/claude-interruption.js";
 import type Database from "better-sqlite3";
 import type { EventBus } from "./event-bus.js";
-import type { AgentActivity, PersistedEvent } from "./types.js";
+import type { AgentActivity, PersistedEvent, RunnerObservation, RunnerObservations } from "./types.js";
+import { ELICITATION_DESCRIPTOR, PermissionStopObservations, unavailablePermissionStop, type PermissionStopStatus } from "./permission-stop-observation.js";
 
 export const AGENT_ACTIVITY_FRESHNESS_MS = 5 * 60 * 1000;
 
 export interface HookActivityInput {
+  turnId?: string | null;
+  hookAgentId?: string | null;
+
   runtime: string | null;
   sessionName?: string | null;
   nodeId?: string | null;
@@ -16,11 +27,27 @@ export interface HookActivityInput {
    *  inference mis-attributes a delayed prior-occupant hook to the live occupant. Absent on a legacy,
    *  excluded, or no-tenure emitting path ⇒ stamped null ⇒ unresolved at read (never false-fresh). */
   generation?: string | null;
+  /** The emitter's own order for its posts (OpenRig's pi/omp runner), when it sends one. */
+  sourceSequence?: number | null;
+  /** How often the emitter promises to report while it stays idle (OpenRig's pi runner). */
+  livenessSeconds?: number | null;
+  /** #99: the reset instant a Claude usage limit stated; kept only on that typed failure. */
+  resetsAt?: string | null;
+  /** The provider's own session id the hook reports (Claude's session_id). A stated reset is kept only when this is
+   *  the seat's own Claude session (its resume token), so a helper on another login can't park the seat's pool. */
+  sessionId?: string | null;
 }
 
 export type RecordHookActivityResult =
   | { ok: true; activity: AgentActivity; event: PersistedEvent }
   | { ok: false; code: "missing_session_identity" | "session_not_found"; error: string };
+
+export type RunnerObservationReceipt = Pick<RunnerObservation, "runId" | "family" | "sequence" | "receivedAt"> & { eventSeq: number };
+export type RecordRunnerObservationResult = { ok: true; observation: RunnerObservationReceipt }
+  | { ok: false; code: "invalid_runner_observation" | "runner_observation_conflict" | "runner_observation_unavailable"; error: string }
+  | { ok: false; code: "runner_observation_unverified"; retryable: true; error: string };
+export type RunnerObservationRead = { report: RunnerObservation | null;
+  reason: null | "no_data" | "binding_changed" | "binding_unverified" | "stale" | "sample_time_invalid" | "session_mismatch" };
 
 interface AgentActivityStoreDeps {
   db: Database.Database;
@@ -37,6 +64,10 @@ interface AgentActivityStoreDeps {
   /** Confirm that a carried generation is registered for this node. A side-effect-free reservation
    * that never committed must remain unresolvable, not become positive mismatch evidence. */
   isRegisteredOccupantGeneration?: (nodeId: string, generation: string) => boolean;
+  /** Whether a registered generation was followed only by no-launch adoptions (reconcile, bind, self-attach). Adoption
+   * registers the same live process again, so its hooks, still carrying the launch-time generation, are the current
+   * occupant's, as the session-identity route already reads them (#2796). A launch after it makes it earlier. */
+  isOccupantContinuedByAdoption?: (nodeId: string, generation: string) => boolean;
 }
 
 interface SessionLookupRow {
@@ -44,13 +75,20 @@ interface SessionLookupRow {
   node_id: string;
   session_name: string;
   runtime: string | null;
+  /** 1 when this session's community app was launched as a runner; 0 or NULL otherwise. */
+  community_runner?: number | null;
 }
 
 interface EventPayloadRow {
   payload: string;
 }
 
+/** How many of a node's newest hook records a restart-restore orders by the emitter's own sequence. */
+const SOURCE_ORDER_WINDOW = 200;
+
 export class AgentActivityStore {
+  private readonly permissionStops: PermissionStopObservations;
+  private readonly elicitations: PermissionStopObservations;
   readonly db: Database.Database;
   private readonly eventBus: EventBus;
   private readonly now: () => Date;
@@ -58,14 +96,87 @@ export class AgentActivityStore {
   readonly freshnessMs: number;
   private readonly resolveOccupantGeneration?: (nodeId: string) => string | null;
   private readonly isRegisteredOccupantGeneration?: (nodeId: string, generation: string) => boolean;
+  private readonly isOccupantContinuedByAdoption?: (nodeId: string, generation: string) => boolean;
 
   constructor(deps: AgentActivityStoreDeps) {
     this.db = deps.db;
     this.eventBus = deps.eventBus;
     this.now = deps.now ?? (() => new Date());
+    this.permissionStops = new PermissionStopObservations(this.now);
+    this.elicitations = new PermissionStopObservations(this.now, undefined, new Set([ELICITATION_DESCRIPTOR]));
     this.freshnessMs = deps.freshnessMs ?? AGENT_ACTIVITY_FRESHNESS_MS;
     this.resolveOccupantGeneration = deps.resolveOccupantGeneration;
     this.isRegisteredOccupantGeneration = deps.isRegisteredOccupantGeneration;
+    this.isOccupantContinuedByAdoption = deps.isOccupantContinuedByAdoption;
+  }
+
+  /** Bound at ingress, then checked again here and at read. No event or oracle mutation. */
+  observePermissionStop(input: { nodeId: string; sessionName: string; generation: string;
+    actor: unknown; at: unknown; command?: unknown; ruleSuggestions?: unknown; completed: boolean }): void {
+    try {
+      const session = this._resolveSession({ nodeId: input.nodeId, sessionName: input.sessionName });
+      if (!session || session.node_id !== input.nodeId || session.session_name !== input.sessionName || session.runtime !== "claude-code"
+        || this.resolveOccupantGeneration?.(input.nodeId) !== input.generation
+        || this.isRegisteredOccupantGeneration?.(input.nodeId, input.generation) !== true) return;
+      this.permissionStops.observe(input);
+    } catch { /* Optional diagnostic failure cannot change hook behavior. */ }
+  }
+
+  getPermissionStopForNode(nodeId: string, sessionName: string): PermissionStopStatus {
+    try {
+      const generation = this.currentClaudeOccupantGeneration(nodeId, sessionName);
+      if (!generation) {
+        this.permissionStops.forget(nodeId);
+        return unavailablePermissionStop();
+      }
+      return this.permissionStops.read(nodeId, generation);
+    } catch { return unavailablePermissionStop(); }
+  }
+
+  /** An MCP elicitation reaching the seat's Claude (`completed` for its result or a later tool batch). Only the actor
+   *  and time are kept, with the same occupant checks as a permission request. No event, attention or activity. */
+  observeElicitation(input: { nodeId: string; sessionName: string; generation: string; actor: unknown; at: unknown;
+    completed: boolean }): void {
+    try {
+      if (this.currentClaudeOccupantGeneration(input.nodeId, input.sessionName) !== input.generation) return;
+      this.elicitations.observe({ ...input, command: ELICITATION_DESCRIPTOR });
+    } catch { /* Optional observation failure cannot change hook behavior. */ }
+  }
+
+  /** The newest permission or elicitation request from this occupant's main session that nothing settled yet, as an
+   *  ISO time, else null. Evidence a request reached that path, never that a dialog is open; a subagent's request
+   *  isn't tied to the main pane, so it doesn't count. */
+  getUnsettledInputRequestForNode(nodeId: string, sessionName: string): string | null {
+    try {
+      const generation = this.currentClaudeOccupantGeneration(nodeId, sessionName);
+      if (!generation) return null;
+      const times = [this.permissionStops, this.elicitations]
+        .map(observations => observations.unsettledRequestAt(nodeId, generation, null))
+        .filter((at): at is number => at !== null);
+      return times.length ? new Date(Math.max(...times)).toISOString() : null;
+    } catch { return null; }
+  }
+
+  /** The current registered generation of a running, unretired Claude occupant bound to this session, else null. */
+  private currentClaudeOccupantGeneration(nodeId: string, sessionName: string): string | null {
+    const generation = this.resolveOccupantGeneration?.(nodeId);
+    const session = this._resolveSession({ nodeId, sessionName });
+    const status = this.db.prepare(`SELECT s.status, n.occupant_lifecycle FROM sessions s JOIN nodes n ON n.id = s.node_id
+      WHERE s.node_id = ? ORDER BY s.id DESC LIMIT 1`).get(nodeId) as { status: string; occupant_lifecycle: string } | undefined;
+    if (!generation || !session || session.node_id !== nodeId || session.session_name !== sessionName
+      || session.runtime !== "claude-code" || status?.status !== "running" || status.occupant_lifecycle === "retired"
+      || this.isRegisteredOccupantGeneration?.(nodeId, generation) !== true) return null;
+    return generation;
+  }
+
+  /** #99: whether a hook's Claude session id is the seat's own Claude session (its current resume token). A helper
+   *  Claude started from the seat's shell posts as the seat but runs its own session, possibly on another login. */
+  private isSeatOwnClaudeSession(nodeId: string, hookSessionId: string | null | undefined): boolean {
+    const token = typeof hookSessionId === "string" ? hookSessionId.trim() : "";
+    if (!token) return false;
+    const row = this.db.prepare("SELECT resume_type, resume_token FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1")
+      .get(nodeId) as { resume_type: string | null; resume_token: string | null } | undefined;
+    return row?.resume_type === "claude_id" && row.resume_token?.trim() === token;
   }
 
   recordHookEvent(input: HookActivityInput): RecordHookActivityResult {
@@ -102,12 +213,22 @@ export class AgentActivityStore {
       // tap filter on it); semantics that depend on the runtime use the seat's.
       runtime: input.runtime ?? session.runtime,
       seatRuntime: session.runtime,
+      communityRunner: recordedRunner(session.community_runner),
+      piRpc: session.community_runner === AGENT_RUNNER_HOSTED_PI_RPC,
       hookEvent: input.hookEvent,
       subtype: input.subtype ?? null,
       sampledAt,
       eventAt,
       generation,
     });
+    activity.turnId = input.turnId ?? null;
+    if (input.hookAgentId !== undefined) activity.hookAgentId = input.hookAgentId;
+    if (input.sourceSequence) activity.sourceSequence = input.sourceSequence;
+    if (input.livenessSeconds) activity.livenessSeconds = input.livenessSeconds;
+    if (input.resetsAt && isClaudeRateLimitHook(activity.runtime, input.hookEvent, input.subtype)
+      && this.isSeatOwnClaudeSession(session.node_id, input.sessionId)) {
+      activity.resetsAt = input.resetsAt;
+    }
 
     const event = this.eventBus.emit({
       type: "agent.activity",
@@ -121,20 +242,201 @@ export class AgentActivityStore {
     return { ok: true, activity, event };
   }
 
+  /** Observation-only ingress. The receipt and dedup decision share the existing event transaction;
+   * no activity, model/context cache or independent identity verdict is invented here. */
+  recordRunnerObservation(grant: ActivityGrant, input: Record<string, unknown>): RecordRunnerObservationResult {
+    const invalid = (): RecordRunnerObservationResult => ({ ok: false, code: "invalid_runner_observation", error: "Invalid observation report." });
+    const occurredAt = runnerTimestamp(input.occurredAt);
+    const observations = normalizeRunnerObservations(input.observations, grant);
+    if (!grant.runId || input.runId !== grant.runId || !Number.isSafeInteger(input.sequence) || (input.sequence as number) <= 0
+      || !occurredAt || !observations || input.hookEvent !== undefined || input.eventFamily !== undefined
+      || (input.runtime !== undefined && input.runtime !== grant.binding?.runtime)) return invalid();
+    const sequence = input.sequence as number;
+    const receipt = (report: RunnerObservation, eventSeq: number): RunnerObservationReceipt => ({ runId: report.runId,
+      family: report.family, sequence: report.sequence, receivedAt: report.receivedAt, eventSeq });
+    return this.eventBus.withNotifyEnvelope(register => {
+      const grants = new ActivityGrantStore(this.db);
+      let standing: ReturnType<ActivityGrantStore["standing"]> = "unverified";
+      try { standing = grants.standing(grant.grantId); } catch { /* A failed standing read is uncertainty, not revocation. */ }
+      if (standing === "unverified" || standing === "pending") return { ok: false, code: "runner_observation_unverified", retryable: true,
+        error: "This runner observation's bound run couldn't be verified now; retry verification; nothing was recorded." };
+      if (standing !== "current") return { ok: false, code: "runner_observation_unavailable", error: "The bound runner is unavailable." };
+      const session = this.db.prepare(`SELECT s.id AS sessionId, n.rig_id AS rigId FROM sessions s JOIN nodes n ON n.id=s.node_id
+        WHERE s.node_id=? ORDER BY s.id DESC LIMIT 1`).get(grant.nodeId) as { sessionId: string; rigId: string } | undefined;
+      if (!session) return { ok: false, code: "runner_observation_unavailable", error: "The bound session is unavailable." };
+      const previous = this.db.prepare(`SELECT seq, payload FROM events WHERE node_id=? AND type='agent.runner_observation'
+        AND json_extract(payload,'$.runId')=? AND json_extract(payload,'$.family')='observation'
+        AND json_extract(payload,'$.sequence')=? LIMIT 1`).get(grant.nodeId, grant.runId, sequence) as { seq: number; payload: string } | undefined;
+      if (previous) {
+        const report = JSON.parse(previous.payload) as RunnerObservation;
+        if (report.occurredAt !== occurredAt || JSON.stringify(report.observations) !== JSON.stringify(observations)) {
+          return { ok: false, code: "runner_observation_conflict", error: "This observation sequence already names a different report." };
+        }
+        return { ok: true, observation: receipt(report, previous.seq) };
+      }
+      const report: RunnerObservation = { nodeId: grant.nodeId, sessionRowId: session.sessionId, generation: grant.generation,
+        runId: grant.runId!, grantId: grant.grantId, family: "observation", sequence, occurredAt,
+        receivedAt: this.now().toISOString(), observations };
+      const event = this.eventBus.persistWithinTransaction({ type: "agent.runner_observation", rigId: session.rigId, ...report });
+      register(event);
+      if (observations.session && this.getRunnerObservation(grant.nodeId, "session", { freshnessMs: FRESHNESS_THRESHOLD_MS }).report?.sequence === sequence) {
+        const row = this.db.prepare("SELECT session_name,resume_token FROM sessions WHERE id=?").get(session.sessionId) as
+          { session_name: string; resume_token: string | null };
+        // Known Core references are never replaced or re-verified by a runner claim, including matching repeats.
+        const runtime = grant.binding!.runtime;
+        const sessionFile = runtime === "pi" || runtime === "omp" || grant.binding!.runner === AGENT_RUNNER_HOSTED_PI_RPC;
+        // Reporting a path is not authority to persist a token the owning adapter cannot resume.
+        if (!row.resume_token && (!sessionFile || validateSessionFileFormat(observations.session.nativeRef).ok)) {
+          const resumeType = runtime === "pi" || runtime === "omp" ? `${runtime}_session_file` : `community:${runtime}`;
+          new SessionRegistry(this.db).recordLauncherReportedToken(session.sessionId, resumeType, observations.session.nativeRef);
+          register(this.eventBus.persistWithinTransaction({ type: "agent.session_identity", rigId: session.rigId,
+            nodeId: grant.nodeId, sessionName: row.session_name, runtime, sessionId: observations.session.nativeRef, provenance: "launcher" }));
+        }
+      }
+      return { ok: true, observation: receipt(report, event.seq) };
+    });
+  }
+
+  /** Latest supplied component in the current authenticated run. A bad newest sample never selects an older one.
+   * The reader supplies its existing freshness policy; rotation/adoption can retain facts, a new run cannot. */
+  getRunnerObservation(nodeId: string, component: keyof RunnerObservations, policy: { freshnessMs: number; runtime?: string }): RunnerObservationRead {
+    const unknown = (reason: RunnerObservationRead["reason"]): RunnerObservationRead => ({ report: null, reason });
+    try {
+      const grants = new ActivityGrantStore(this.db), active = grants.activeForNode(nodeId);
+      if (!active?.runId) return unknown("no_data");
+      if (policy.runtime !== undefined && active.binding?.runtime !== policy.runtime) return unknown("binding_changed");
+      const standing = grants.standing(active.grantId);
+      if (standing === "unverified") return unknown("binding_unverified");
+      if (standing !== "current") return unknown("binding_changed");
+      const latest = (key: keyof RunnerObservations): RunnerObservation | null => {
+        const row = this.db.prepare(`SELECT payload FROM events WHERE node_id=? AND type='agent.runner_observation'
+          AND json_extract(payload,'$.runId')=? AND json_extract(payload,'$.family')='observation'
+          AND json_type(payload,?) IS NOT NULL ORDER BY json_extract(payload,'$.sequence') DESC, seq DESC LIMIT 1`)
+          .get(nodeId, active.runId, `$.observations.${key}`) as { payload: string } | undefined;
+        return row ? JSON.parse(row.payload) as RunnerObservation : null;
+      };
+      const report = latest(component);
+      if (!report) return unknown("no_data");
+      const source = grants.get(report.grantId);
+      if (!source || source.nodeId !== nodeId || source.runId !== active.runId || report.generation !== active.generation
+        || (["runtime", "runner", "pane", "panePid"] as const).some(key => source.binding?.[key] !== active.binding?.[key])) return unknown("binding_changed");
+      const tenure = this.db.prepare("SELECT boot_at FROM occupant_tenures WHERE node_id=? AND generation_uuid=?")
+        .get(nodeId, source.generation) as { boot_at: string } | undefined;
+      const sample = Date.parse(report.occurredAt), received = Date.parse(report.receivedAt), now = this.now().getTime();
+      const boot = tenure ? parseSqliteUtcMs(tenure.boot_at) : NaN;
+      if (!Number.isFinite(sample) || !Number.isFinite(boot) || sample < boot || sample < Date.parse(source.issuedAt)
+        || sample > received || sample > now) return unknown("sample_time_invalid");
+      if (now - sample >= policy.freshnessMs) return unknown("stale");
+      const session = this.db.prepare("SELECT resume_token FROM sessions WHERE node_id=? ORDER BY id DESC LIMIT 1")
+        .get(nodeId) as { resume_token: string | null } | undefined;
+      const nativeRefs = [report.observations.session?.nativeRef, latest("session")?.observations.session?.nativeRef];
+      if (session?.resume_token && nativeRefs.some(ref => ref && session.resume_token !== ref)) return unknown("session_mismatch");
+      return { report, reason: null };
+    } catch { return unknown("binding_unverified"); }
+  }
+
+  /** #3389: the seat's own report of a compaction: the earliest SessionStart hook with source `compact` recorded for it
+   *  at or after `sinceMs` that came from this occupant, read from the persisted events (a daemon that restarted between
+   *  the hook and the read still finds it). "This occupant" is the asked generation, or one that only no-launch adoptions
+   *  have followed: an adoption mints a new generation for the same live process, whose hooks keep the one it launched
+   *  with (#2796, as the activity read and the session-identity route treat it). A report with no generation, or one
+   *  from an occupant a later launch replaced, is stored as such and is never returned, so it cannot stand in front of
+   *  a later report from this occupant. The generation it carried is returned.
+   *
+   *  The read is bounded at the write, not by how much the seat has recorded: a report is recorded after it is made, so
+   *  one recorded before the second the write started cannot be the report asked for, and the scan starts after the
+   *  newest such record. `events.created_at` has whole-second precision, so the bound is the second before the write's
+   *  second. The hook's own `eventAt` is still checked on every row that is read. */
+  findCompactSessionStart(input: { sessionName: string; sinceMs: number; generation: string }): { observedAt: number; generation: string } | null {
+    if (!input.generation || !Number.isFinite(input.sinceMs)) return null;
+    const nodeId = this._resolveSession({ sessionName: physicalSessionName(this.db, input.sessionName) })?.node_id;
+    if (!nodeId) return null;
+    const recordedBefore = new Date(Math.floor(input.sinceMs / 1000) * 1000 - 1000).toISOString().slice(0, 19).replace("T", " ");
+    const rows = this.db.prepare(`
+      SELECT payload FROM events
+      WHERE node_id = ? AND type = 'agent.activity'
+        AND seq > COALESCE((SELECT seq FROM events WHERE node_id = ? AND type = 'agent.activity' AND created_at < ?
+                            ORDER BY seq DESC LIMIT 1), 0)
+        AND json_extract(payload, '$.activity.rawEvent') = 'SessionStart'
+        AND json_extract(payload, '$.activity.rawSubtype') = 'compact'
+        AND json_extract(payload, '$.activity.generation') IS NOT NULL
+        AND json_extract(payload, '$.activity.eventAt') >= ?
+      ORDER BY seq DESC LIMIT 200`).all(nodeId, nodeId, recordedBefore, new Date(input.sinceMs).toISOString()) as EventPayloadRow[];
+    const same = new Map<string, boolean>();
+    const fromThisOccupant = (generation: string): boolean => {
+      if (generation === input.generation) return true;
+      let known = same.get(generation);
+      if (known === undefined) {
+        try {
+          known = !!this.isRegisteredOccupantGeneration?.(nodeId, generation) && !!this.isOccupantContinuedByAdoption?.(nodeId, generation);
+        } catch { known = false; }
+        same.set(generation, known);
+      }
+      return known;
+    };
+    let earliest: { observedAt: number; generation: string } | null = null;
+    for (const row of rows) {
+      const activity = parseActivityPayload(row.payload)?.activity;
+      const observedAt = activity?.eventAt ? Date.parse(activity.eventAt) : NaN;
+      const generation = activity?.generation;
+      if (!(observedAt >= input.sinceMs) || typeof generation !== "string" || !fromThisOccupant(generation)) continue;
+      if (!earliest || observedAt < earliest.observedAt) earliest = { observedAt, generation };
+    }
+    return earliest;
+  }
+
+  /** When the permission prompt the seat waits at started, read from this occupant's unbroken run of permission hooks that
+   *  ends at its latest hook: the nearest PermissionRequest in that run, or with none, the newest `permission_prompt`
+   *  notification. Claude sends PermissionRequest when it asks and the notification about six seconds later, so every
+   *  notification that follows a request in the run is that request's. A confirmation read from the
+   *  pane joins the run without starting a prompt. Null when another hook, or another occupant's, ends the run before a
+   *  prompt hook: then one prompt can't be told from the next. Read in the emitter's order, as the latest hook is. */
+  findPermissionPromptStart(input: { sessionName: string; generation: string }): string | null {
+    if (!input.generation) return null;
+    const nodeId = this._resolveSession({ sessionName: physicalSessionName(this.db, input.sessionName) })?.node_id;
+    if (!nodeId) return null;
+    const rows = this.db.prepare(`
+      SELECT payload FROM (
+        SELECT payload, seq FROM events
+        WHERE node_id = ? AND type = 'agent.activity'
+        ORDER BY seq DESC LIMIT ${SOURCE_ORDER_WINDOW})
+      ORDER BY json_extract(payload, '$.activity.eventAt') DESC,
+        COALESCE(json_extract(payload, '$.activity.sourceSequence'), 0) DESC, seq DESC`).all(nodeId) as EventPayloadRow[];
+    let start: AgentActivity | null = null;
+    for (const row of rows) {
+      const activity = parseActivityPayload(row.payload)?.activity;
+      if (!activity || activity.generation !== input.generation) break;
+      const request = activity.rawEvent === "PermissionRequest";
+      if (!request && !(activity.rawEvent === "Notification" && activity.rawSubtype === "permission_prompt")) {
+        if (activity.rawEvent === "PermissionPromptConfirmed") continue;
+        break;
+      }
+      // The nearest request owns every notification after it in the run, however many; with no request before the run's
+      // boundary, the newest notification stands for the prompt, so notification-only prompts stay apart.
+      if (request) { start = activity; break; }
+      start ??= activity;
+    }
+    return start?.eventAt ?? null;
+  }
+
   getLatestForNode(input: {
     nodeId?: string | null;
     sessionName?: string | null;
     now?: Date;
+    /** "source": the newest by the emitter's own order (time, then its sequence) among recent records, not by
+     *  arrival. A runner's posts aren't awaited, so an older boundary can arrive after a newer one. */
+    order?: "arrival" | "source";
   }): AgentActivity | null {
+    if (input.sessionName) input = { ...input, sessionName: physicalSessionName(this.db, input.sessionName) };
     const nodeId = input.nodeId ?? (input.sessionName ? this._resolveSession({ sessionName: input.sessionName })?.node_id : null);
     if (!nodeId) return null;
 
-    const row = this.db.prepare(
-      "SELECT payload FROM events WHERE node_id = ? AND type = 'agent.activity' ORDER BY seq DESC LIMIT 1"
-    ).get(nodeId) as EventPayloadRow | undefined;
-    if (!row) return null;
-
-    const payload = parseActivityPayload(row.payload);
+    const payload = input.order === "source" ? this.latestBySourceOrder(nodeId, input.sessionName ?? null) : (() => {
+      const row = this.db.prepare(
+        "SELECT payload FROM events WHERE node_id = ? AND type = 'agent.activity' ORDER BY seq DESC LIMIT 1"
+      ).get(nodeId) as EventPayloadRow | undefined;
+      return row ? parseActivityPayload(row.payload) : null;
+    })();
     if (!payload?.activity) return null;
 
     const activity = payload.activity;
@@ -147,7 +449,9 @@ export class AgentActivityStore {
     //  (1) the carried generation is REGISTERED FOR THIS NODE and differs from live ⇒ MISMATCH:
     //      positive evidence the claim belongs to a prior, dead tenure ⇒ unknown +
     //      `generation_mismatch`, stale:true, provenance RESOLVED. An unregistered prelaunch
-    //      reservation is absence of evidence and stays UNRESOLVABLE, never mismatch.
+    //      reservation is absence of evidence and stays UNRESOLVABLE, never mismatch. A generation followed
+    //      only by no-launch adoptions isn't a prior tenure: adoption re-registered the same live process,
+    //      so it reads as (2) (#2796, as the session-identity route reads it).
     //  (2) both known and EQUAL (incl. a same-native-session relaunch — the ledger treats it as a
     //      continuation with no new generation) ⇒ provenance RESOLVED, deliver normally (fresh).
     //  (3) null on EITHER side ⇒ UNRESOLVABLE: ABSENCE of evidence, not a dead-tenure finding. State
@@ -155,46 +459,14 @@ export class AgentActivityStore {
     //      the seat has not earned; marking null-tenure fresh is bare-attribution one field over). The
     //      STORE delivers the row carrying generationProvenance='unresolved' at the ACTIVITY layer. The
     //      tap's discard-condition change that turns this label into a still-flowing consumer row is a
-    //      FOLLOW-ON (qitem-20260808183747-f7f04662, verify-demotion) — NOT this fold; in the INTERIM
+    //      FOLLOW-ON (verify-demotion) — NOT this fold; in the INTERIM
     //      the unchanged tap still discards it (a bounded regression whose exposure is the mint-race
     //      transient; mm2 is unaffected — its daemon carries no occupant_tenures table until 0.5.1).
     //      Ignorance and evidence get DIFFERENT verdicts; the two paths must not collapse.
     // Gate runs only when a resolver is injected (else legacy clock-only, no label).
-    let generationProvenance: "resolved" | "unresolved" | undefined;
-    if (this.resolveOccupantGeneration) {
-      let liveGeneration: string | null;
-      try {
-        liveGeneration = this.resolveOccupantGeneration(nodeId);
-      } catch {
-        // Resolver EXCEPTION (e.g. a transient ledger/db fault) ⇒ DEGRADE to a distinct unknown
-        // branch: never crash the read, never render fresh. Distinct from a clean null (unresolvable).
-        return this.generationDegraded(activity, referenceTime);
-      }
-      const recordedGeneration = activity.generation ?? null;
-      if (liveGeneration !== null && recordedGeneration !== null) {
-        if (this.isRegisteredOccupantGeneration) {
-          let registered: boolean;
-          try {
-            registered = this.isRegisteredOccupantGeneration(nodeId, recordedGeneration);
-          } catch {
-            return this.generationDegraded(activity, referenceTime);
-          }
-          if (!registered) {
-            return this.generationUnresolved(activity, referenceTime, "generation_unresolvable");
-          }
-        }
-        if (recordedGeneration !== liveGeneration) {
-          return this.generationMismatch(activity, referenceTime);
-        }
-        generationProvenance = "resolved";
-      } else {
-        return this.generationUnresolved(
-          activity,
-          referenceTime,
-          liveGeneration === null ? "generation_unresolvable" : "generation_unverifiable",
-        );
-      }
-    }
+    const verdict = this.occupantVerdict(nodeId, activity, referenceTime);
+    if ("demoted" in verdict) return verdict.demoted;
+    const generationProvenance = verdict.provenance;
 
     const eventTime = activity.eventAt ? Date.parse(activity.eventAt) : NaN;
     if (Number.isFinite(eventTime) && referenceTime.getTime() - eventTime > this.freshnessMs) {
@@ -217,6 +489,177 @@ export class AgentActivityStore {
       stale: false,
       generationProvenance,
     };
+  }
+
+  /** The typed usage limit (Claude's StopFailure/rate_limit, Codex's at_limit) this occupant still held when the daemon
+   *  stopped, read once per seat on a restart, or null. Walks the session's recent records newest first by the emitter's
+   *  order: a newer turn of this occupant (a running record) or Codex's usage_limit_cleared ends the limit first. Each
+   *  record is judged by the occupant rules getLatestForNode uses (`occupantOf`, #2796): a record of another occupant is
+   *  skipped, never deciding this one's hold. Throws when the store can't be read, or when a limit may still be in force
+   *  but a record that would decide it can't be shown to be this occupant's; the caller reads the seat as unknown then. */
+  latestHeldUsageLimit(input: { nodeId: string; sessionName: string; runtime: string }): AgentActivity | null {
+    const rows = this.db.prepare(`
+      SELECT payload FROM (
+        SELECT payload, seq FROM events
+        WHERE node_id = ? AND type = 'agent.activity'
+        ORDER BY seq DESC LIMIT ${SOURCE_ORDER_WINDOW})
+      WHERE json_extract(payload, '$.sessionName') = ?
+      ORDER BY json_extract(payload, '$.activity.eventAt') DESC,
+        COALESCE(json_extract(payload, '$.activity.sourceSequence'), 0) DESC, seq DESC`).all(input.nodeId, input.sessionName) as EventPayloadRow[];
+    let live: string | null = null;
+    try { live = this.resolveOccupantGeneration?.(input.nodeId) ?? null; } catch { /* unknown: no record can be shown to be this occupant's */ }
+    let uncertain = false;
+    // A clear ends a limit only when it's strictly later, as live: a limit recorded at the clear's own instant still holds,
+    // whichever of the two the emitter's sequence or the arrival put first.
+    let clearedAt: number | null = null;
+    for (const row of rows) {
+      const activity = parseActivityPayload(row.payload)?.activity;
+      if (!activity) continue;
+      const clears = activity.state === "running" || (activity.rawEvent === "Notification" && activity.rawSubtype === "usage_limit_cleared");
+      const typed = input.runtime === "codex" ? activity.rawEvent === "at_limit"
+        : isClaudeRateLimitHook(input.runtime, activity.rawEvent, activity.rawSubtype);
+      if (!clears && !typed) continue;
+      if (clearedAt !== null && Date.parse(activity.eventAt ?? "") !== clearedAt) return null;
+      const occupant = this.occupantOf(input.nodeId, activity.generation, live);
+      if (occupant === "foreign") continue;
+      // A clear whose occupant can't be shown may or may not have ended this occupant's limit: keep looking, and if a
+      // limit of this occupant is found below it, say unknown rather than claim either way.
+      if (occupant === "unknown") { if (typed) throw new Error("usage limit of an unresolved occupant"); uncertain = true; continue; }
+      if (clears) {
+        const at = Date.parse(activity.eventAt ?? "");
+        if (!Number.isFinite(at)) return null;
+        clearedAt ??= at;
+        continue;
+      }
+      if (uncertain) throw new Error("usage limit behind a clear of an unresolved occupant");
+      return activity;
+    }
+    return null;
+  }
+
+  /** latestHeldUsageLimit for a session name alone (the Codex banner sweep's input), resolved to its node as hook records are. */
+  heldUsageLimitForSession(sessionName: string, runtime: string): AgentActivity | null {
+    const session = this._resolveSession({ sessionName });
+    return session ? this.latestHeldUsageLimit({ nodeId: session.node_id, sessionName: session.session_name, runtime }) : null;
+  }
+
+  /** Which occupant a recorded generation belongs to, by getLatestForNode's rules: "current" for the live generation or one
+   *  continued only by no-launch adoptions (#2796), "foreign" for a registered tenure a launch replaced, and "unknown"
+   *  when either side can't be read or the recorded one isn't registered. */
+  private occupantOf(nodeId: string, recorded: string | null | undefined, live: string | null): "current" | "foreign" | "unknown" {
+    if (live === null || !recorded) return "unknown";
+    try {
+      if (this.isRegisteredOccupantGeneration && !this.isRegisteredOccupantGeneration(nodeId, recorded)) return "unknown";
+      if (recorded === live) return "current";
+      return this.isOccupantContinuedByAdoption?.(nodeId, recorded) === true ? "current" : "foreign";
+    } catch {
+      return "unknown";
+    }
+  }
+
+  /** The newest of a node's hook records by the emitter's order (time, then its sequence), for one session when named.
+   *  Not by arrival: a runner's posts aren't awaited, so older ones can land after a newer one. Only the node's newest
+   *  SOURCE_ORDER_WINDOW records to arrive are ordered, and the session is chosen from those: a runner's heartbeat grows
+   *  the history without bound, and a late post can't be behind more than the few still in flight. Filtering the session
+   *  before the window would make SQLite walk a new session's whole earlier history. Read once per seat on a restart. */
+  private latestBySourceOrder(nodeId: string, sessionName: string | null): ReturnType<typeof parseActivityPayload> {
+    const row = this.db.prepare(`
+      SELECT payload FROM (
+        SELECT payload, seq FROM events
+        WHERE node_id = ? AND type = 'agent.activity'
+        ORDER BY seq DESC LIMIT ${SOURCE_ORDER_WINDOW})
+      WHERE (? IS NULL OR json_extract(payload, '$.sessionName') = ?)
+      ORDER BY json_extract(payload, '$.activity.eventAt') DESC,
+        COALESCE(json_extract(payload, '$.activity.sourceSequence'), 0) DESC, seq DESC
+      LIMIT 1`).get(nodeId, sessionName, sessionName) as EventPayloadRow | undefined;
+    return row ? parseActivityPayload(row.payload) : null;
+  }
+
+  /** The occupant verdict getLatestForNode gives a record (W2a-1, above): a demoted row when the record isn't the
+   *  live occupant's or that can't be told, else the provenance it is delivered with. */
+  private occupantVerdict(nodeId: string, activity: AgentActivity, referenceTime: Date):
+    { demoted: AgentActivity } | { provenance: "resolved" | "unresolved" | undefined } {
+    if (this.resolveOccupantGeneration) {
+      let liveGeneration: string | null;
+      try {
+        liveGeneration = this.resolveOccupantGeneration(nodeId);
+      } catch {
+        // Resolver EXCEPTION (e.g. a transient ledger/db fault) ⇒ DEGRADE to a distinct unknown
+        // branch: never crash the read, never render fresh. Distinct from a clean null (unresolvable).
+        return { demoted: this.generationDegraded(activity, referenceTime) };
+      }
+      const recordedGeneration = activity.generation ?? null;
+      if (liveGeneration !== null && recordedGeneration !== null) {
+        if (this.isRegisteredOccupantGeneration) {
+          let registered: boolean;
+          try {
+            registered = this.isRegisteredOccupantGeneration(nodeId, recordedGeneration);
+          } catch {
+            return { demoted: this.generationDegraded(activity, referenceTime) };
+          }
+          if (!registered) {
+            return { demoted: this.generationUnresolved(activity, referenceTime, "generation_unresolvable") };
+          }
+        }
+        if (recordedGeneration !== liveGeneration) {
+          // A generation followed only by no-launch adoptions is still the live process's (#2796); a launch after it
+          // is what makes it a prior tenure.
+          let continued: boolean;
+          try {
+            continued = this.isOccupantContinuedByAdoption?.(nodeId, recordedGeneration) === true;
+          } catch {
+            return { demoted: this.generationDegraded(activity, referenceTime) };
+          }
+          if (!continued) return { demoted: this.generationMismatch(activity, referenceTime) };
+        }
+        return { provenance: "resolved" };
+      } else {
+        return { demoted: this.generationUnresolved(
+          activity,
+          referenceTime,
+          liveGeneration === null ? "generation_unresolvable" : "generation_unverifiable",
+        ) };
+      }
+    }
+    return { provenance: undefined };
+  }
+
+  /** #3571: the current occupant's last typed Claude authentication or billing failure that no newer turn has
+   *  superseded, or null. Walks the session's recent records newest first by the emitter's order, as getLatestForNode
+   *  orders them. Any record that shows a newer turn ends it: a running record, a question to a person (asked only
+   *  inside a turn), a Stop or PostToolBatch, or another StopFailure (Claude sends StopFailure instead of Stop, so each
+   *  ends its own turn). An idle notification, a compaction or session-start record, or another occupant's record that
+   *  shows no turn doesn't. The failure keeps its original event time, typed reason and raw value, and must be the live
+   *  occupant's by getLatestForNode's generation rules: an unknown, unresolvable or replaced occupant reads null. Only
+   *  the node's newest SOURCE_ORDER_WINDOW records are read. It isn't aged by the freshness window: it reports that the
+   *  last failure hasn't been superseded, not a fresh check of the account. */
+  latestUnsupersededProviderFailure(input: { nodeId?: string | null; sessionName: string; now?: Date }): AgentActivity | null {
+    const sessionName = physicalSessionName(this.db, input.sessionName);
+    const nodeId = input.nodeId ?? this._resolveSession({ sessionName })?.node_id;
+    if (!nodeId) return null;
+    const rows = this.db.prepare(`
+      SELECT payload FROM (
+        SELECT payload, seq FROM events
+        WHERE node_id = ? AND type = 'agent.activity'
+        ORDER BY seq DESC LIMIT ${SOURCE_ORDER_WINDOW})
+      WHERE json_extract(payload, '$.sessionName') = ?
+      ORDER BY json_extract(payload, '$.activity.eventAt') DESC,
+        COALESCE(json_extract(payload, '$.activity.sourceSequence'), 0) DESC, seq DESC`).iterate(nodeId, sessionName) as IterableIterator<EventPayloadRow>;
+    for (const row of rows) {
+      const activity = parseActivityPayload(row.payload)?.activity;
+      if (!activity) continue;
+      if (activity.state === "running" || activity.state === "needs_input"
+        || activity.rawEvent === "Stop" || activity.rawEvent === "PostToolBatch") return null;
+      if (activity.rawEvent !== "StopFailure") continue;
+      const reason = claudeProviderFailureReason(activity.runtime, activity.rawEvent, activity.rawSubtype);
+      if ((reason !== "provider_auth_error" && reason !== "provider_billing_error") || activity.reason !== reason) return null;
+      const referenceTime = input.now ?? this.now();
+      const verdict = this.occupantVerdict(nodeId, activity, referenceTime);
+      if ("demoted" in verdict) return null;
+      return { ...activity, sampledAt: referenceTime.toISOString(), fallback: false, stale: false,
+        generationProvenance: verdict.provenance };
+    }
+    return null;
   }
 
   /** W2a-1 — the dead-tenure verdict: the claim's occupant generation is REGISTERED FOR THIS NODE and
@@ -243,7 +686,7 @@ export class AgentActivityStore {
    *  State UNKNOWN + a distinct reason + stale:true so no consumer reads it as verified-live (fresh is
    *  a positive liveness claim). The STORE delivers the row carrying generationProvenance:"unresolved"
    *  at the ACTIVITY layer; turning that label into a still-flowing CONSUMER row is the tap FOLLOW-ON
-   *  (verify-demotion, qitem-20260808183747-f7f04662) — the unchanged tap still discards it in the
+   *  (verify-demotion) — the unchanged tap still discards it in the
    *  INTERIM (a bounded regression, mint-race-transient exposure; mm2 has no occupant_tenures table
    *  until 0.5.1). Kept DISTINCT from generationMismatch: ignorance and evidence get different verdicts,
    *  and the paths must not collapse — at the store now, and at the tap when the follow-on lands. */
@@ -296,7 +739,7 @@ export class AgentActivityStore {
   private _resolveSession(input: { sessionName?: string | null; nodeId?: string | null }): SessionLookupRow | null {
     if (input.nodeId) {
       const row = this.db.prepare(`
-        SELECT n.rig_id, n.id AS node_id, s.session_name, n.runtime
+        SELECT n.rig_id, n.id AS node_id, s.session_name, n.runtime, ${sessionCommunityRunnerSelect(this.db)} AS community_runner
         FROM nodes n
         LEFT JOIN sessions s ON s.node_id = n.id
           AND s.id = (SELECT s2.id FROM sessions s2 WHERE s2.node_id = n.id ORDER BY s2.id DESC LIMIT 1)
@@ -307,37 +750,54 @@ export class AgentActivityStore {
     }
 
     if (!input.sessionName) return null;
+    const sessionName = physicalSessionName(this.db, input.sessionName);
     const row = this.db.prepare(`
-      SELECT n.rig_id, n.id AS node_id, s.session_name, n.runtime
+      SELECT n.rig_id, n.id AS node_id, s.session_name, n.runtime, ${sessionCommunityRunnerSelect(this.db)} AS community_runner
       FROM sessions s
       JOIN nodes n ON n.id = s.node_id
       WHERE s.session_name = ?
       ORDER BY s.id DESC
       LIMIT 1
-    `).get(input.sessionName) as SessionLookupRow | undefined;
+    `).get(sessionName) as SessionLookupRow | undefined;
     return row ?? null;
   }
 }
 
 /** The activity a runtime hook event means, before freshness or generation checks. The one mapping behind
  *  ingest, the send gate and the wake ladder. `seatRuntime` is the managed seat's runtime: runtime_error is
- *  an OMP runner signal, and a hook claiming OMP on another runtime's seat must not escalate it. */
-export function hookEventState(rawEvent: string | null | undefined, rawSubtype: string | null | undefined, seatRuntime: string | null): AgentActivity["state"] {
+ *  an OMP runner signal, and a hook claiming OMP on another runtime's seat must not escalate it. OpenRig's hosted
+ *  Pi-protocol runner raises it too for a `protocol: pi-rpc` fork (`piRpc`, its launch record), when the fork reports
+ *  no session file; a preset's own runner (`runner: true`) only records it (harness-runner-contract). */
+export function hookEventState(rawEvent: string | null | undefined, rawSubtype: string | null | undefined, seatRuntime: string | null, communityRunner = false, piRpc = false): AgentActivity["state"] {
   if (rawEvent === "UserPromptSubmit" || rawEvent === "PreToolUse" || rawEvent === "active") return "running";
-  // OPR.0.4.1.10 — Codex's official approval hook (openai/codex PR #17563). A PermissionRequest
-  // means the agent is BLOCKED waiting on a command / patch / network approval = needs_input. This is
-  // the HOOK-PRIMARY signal for Codex, which emits no Claude-style Notification; classifySendReadiness
-  // already prefers a fresh runtime_hook needs_input runtime-agnostically, so wiring this event makes
-  // the Codex rig-send guard hook-primary by construction (capture-pane scan stays as the fallback).
-  // The official payload carries session_id/turn_id/cwd/model/permission_mode/tool_name/tool_input;
-  // the relay forwards tool_name as the subtype, so `evidence` names the tool being approved.
-  if (rawEvent === "PermissionRequest") return "needs_input";
+  if (rawEvent === "PermissionRequest") return seatRuntime === "codex" ? "unknown" : "needs_input";
+  if (rawEvent === "PermissionPromptConfirmed") return "needs_input";
   if (rawEvent === "Notification") {
-    if (rawSubtype === "permission_prompt" || rawSubtype === "elicitation_dialog" || (seatRuntime === "omp" && rawSubtype === "runtime_error")) return "needs_input";
+    if (rawSubtype === "permission_prompt" || rawSubtype === "elicitation_dialog" || ((seatRuntime === "omp" || piRpc) && rawSubtype === "runtime_error")) return "needs_input";
     return rawSubtype === "idle_prompt" ? "idle" : "unknown";
   }
+  // The runner posts Stop when its child process exits: nothing is at a prompt, so it isn't idle.
+  if (rawEvent === "Stop" && isRunnerExit(rawSubtype, seatRuntime, communityRunner)) return "unknown";
   if (rawEvent === "Stop" || rawEvent === "SessionEnd" || rawEvent === "stop" || rawEvent === "idle") return "idle";
   return "unknown";
+}
+
+/** Whether hook `a` comes before hook `b` in the emitter's own order: event time, then the emitter's sequence. Records
+ *  without a sequence are ordered by time alone; equal times without both sequences aren't ordered. */
+export function hookPrecedes(a: { eventAt?: string | null; sourceSequence?: number | null }, b: { eventAt?: string | null; sourceSequence?: number | null }): boolean {
+  const at = a.eventAt ? Date.parse(a.eventAt) : NaN;
+  const bt = b.eventAt ? Date.parse(b.eventAt) : NaN;
+  if (!Number.isFinite(at) || !Number.isFinite(bt)) return false;
+  if (at !== bt) return at < bt;
+  return !!a.sourceSequence && !!b.sourceSequence && a.sourceSequence < b.sourceSequence;
+}
+
+/** The runner's Stop for its child's process exit (`pi_exited`, `omp_exited`), on that runtime's seat. A community app's
+ *  `<runtime>_exited` means the same only on a session recorded as launched for a runner; any other seat keeps its
+ *  existing reading. */
+export function isRunnerExit(rawSubtype: string | null | undefined, seatRuntime: string | null, communityRunner = false): boolean {
+  return (seatRuntime === "pi" || seatRuntime === "omp" || (communityRunner && !!seatRuntime))
+    && rawSubtype === `${seatRuntime}_exited`;
 }
 
 /** A runtime hook that leaves the agent waiting on a person: an approval, a picker or an elicitation. */
@@ -347,16 +807,24 @@ export function hookMeansNeedsInput(rawEvent: string | null | undefined, rawSubt
 
 /** What the store's latest hook for a seat says: its current state, or, past the freshness window, what its
  *  retained raw event means. Generation-mismatched or unresolvable evidence says nothing ("unknown"). */
-function latestHookState(activity: AgentActivity | null | undefined, seatRuntime: string | null): AgentActivity["state"] {
+export function latestHookState(activity: AgentActivity | null | undefined, seatRuntime: string | null): AgentActivity["state"] {
   if (activity?.evidenceSource !== "runtime_hook") return "unknown";
   if (activity.stale !== true) return activity.state;
-  return activity.reason === "stale_runtime_hook" ? hookEventState(activity.rawEvent, activity.rawSubtype, seatRuntime) : "unknown";
+  return activity.reason === "stale_runtime_hook"
+    ? hookEventState(activity.rawEvent, activity.rawSubtype, seatRuntime, activity.communityRunner === true, activity.piRpc === true) : "unknown";
 }
 
 /** The store's latest hook still says the seat waits on a person. Nothing newer was recorded, so nothing
  *  answered it. Shared by the send gate and the wake ladder. */
 export function latestHookWaitsOnPerson(activity: AgentActivity | null | undefined, seatRuntime: string | null): boolean {
   return latestHookState(activity, seatRuntime) === "needs_input";
+}
+
+export function latestHookPermissionPending(activity: AgentActivity | null | undefined, seatRuntime: string | null): boolean {
+  return seatRuntime === "codex" && activity?.evidenceSource === "runtime_hook" && (
+    (activity.reason === "permission_request_pending" && activity.stale !== true) ||
+    (activity.reason === "stale_runtime_hook" && activity.rawEvent === "PermissionRequest")
+  );
 }
 
 /** The store's latest hook shows the seat moved on after `since`: observed after it, generation-valid, and
@@ -372,6 +840,10 @@ function normalizeHookActivity(input: {
   runtime: string | null;
   /** The managed seat's runtime, never a hook's claim. */
   seatRuntime: string | null;
+  /** The session was recorded as launched for a community runner (its own launch fact, never a hook's claim). */
+  communityRunner?: boolean;
+  /** That runner is OpenRig's hosted Pi-protocol runner for a `protocol: pi-rpc` preset (its launch record). */
+  piRpc?: boolean;
   hookEvent: string;
   subtype: string | null;
   sampledAt: string;
@@ -382,10 +854,21 @@ function normalizeHookActivity(input: {
   const rawSubtype = input.subtype;
   const reason = normalizeReason(rawSubtype ?? rawEvent);
   const runtime = input.runtime;
-  const state = hookEventState(rawEvent, rawSubtype, input.seatRuntime);
+  const state = hookEventState(rawEvent, rawSubtype, input.seatRuntime, input.communityRunner === true, input.piRpc === true);
   let normalizedReason = reason;
+  // Claude's other StopFailure errors keep a typed reason (#3571), on the seat's own runtime as rate_limit does.
+  const providerFailure = runtime === input.seatRuntime ? claudeProviderFailureReason(runtime, rawEvent, rawSubtype) : null;
   if (rawEvent === "PermissionRequest") {
-    normalizedReason = "permission_request";
+    normalizedReason = input.seatRuntime === "codex" ? "permission_request_pending" : "permission_request";
+  } else if (rawEvent === "PermissionPromptConfirmed") {
+    normalizedReason = "permission_prompt";
+  } else if (rawEvent === "PermissionPromptCleared") {
+    normalizedReason = "permission_prompt_cleared";
+  } else if (rawEvent === "at_limit"
+    || (runtime === input.seatRuntime && isClaudeRateLimitHook(runtime, rawEvent, rawSubtype))) {
+    normalizedReason = "usage_limit";
+  } else if (providerFailure) {
+    normalizedReason = providerFailure;
   } else if (rawEvent === "Notification") {
     if (state === "unknown") normalizedReason = rawSubtype ? reason : "notification";
   } else if (rawEvent === "SessionStart") {
@@ -407,6 +890,8 @@ function normalizeHookActivity(input: {
     fallback: false,
     stale: false,
     generation: input.generation ?? null,
+    ...(input.communityRunner ? { communityRunner: true } : {}),
+    ...(input.piRpc ? { piRpc: true } : {}),
   };
 }
 
@@ -416,6 +901,56 @@ function normalizeReason(value: string): string {
     .replace(/[^a-zA-Z0-9]+/g, "_")
     .replace(/^_+|_+$/g, "")
     .toLowerCase();
+}
+
+/** RFC3339 calendar/time validation for new reports; legacy hook timestamp behavior is unchanged. */
+function runnerTimestamp(raw: unknown): string | null {
+  if (typeof raw !== "string" || !/^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.test(raw)) return null;
+  const date = Date.parse(`${raw.slice(0, 10)}T00:00:00Z`);
+  if (!Number.isFinite(date) || new Date(date).toISOString().slice(0, 10) !== raw.slice(0, 10)) return null;
+  return parseTimestamp(raw);
+}
+
+function normalizeRunnerObservations(raw: unknown, grant: ActivityGrant): RunnerObservations | null {
+  const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
+  const only = (value: Record<string, unknown>, keys: string[]): boolean => Object.keys(value).every(key => keys.includes(key));
+  if (!object(raw) || !Object.keys(raw).length || !only(raw, ["session", "model", "context"])) return null;
+  const out: RunnerObservations = {};
+  if (raw.session !== undefined) {
+    if (!object(raw.session) || !only(raw.session, ["nativeRef"])) return null;
+    const ref = raw.session.nativeRef;
+    if (grant.binding?.runtime === "pi" || grant.binding?.runtime === "omp" || grant.binding?.runner === AGENT_RUNNER_HOSTED_PI_RPC) {
+      const valid = validateSessionFileFormat(ref, grant.binding?.runtime, { allowFormatCharacters: true });
+      if (!valid.ok) return null;
+      out.session = { nativeRef: valid.token };
+    } else {
+      if (!usableCommunityNativeRef(ref)) return null;
+      out.session = { nativeRef: ref };
+    }
+  }
+  if (raw.model !== undefined) {
+    if (!object(raw.model) || !only(raw.model, ["id"]) || !usableCommunityNativeRef(raw.model.id)) return null;
+    out.model = { id: raw.model.id };
+  }
+  if (raw.context !== undefined) {
+    const keys = ["usedTokens", "windowTokens", "usedPercentage", "inputTokens", "outputTokens"];
+    if (!object(raw.context) || !Object.keys(raw.context).length || !only(raw.context, keys)) return null;
+    const context: NonNullable<RunnerObservations["context"]> = {};
+    for (const key of keys as Array<keyof typeof context>) {
+      const value = raw.context[key];
+      if (value === undefined) continue;
+      if (typeof value !== "number" || !Number.isFinite(value) || value < 0
+        || (key === "windowTokens" && value === 0) || (key === "usedPercentage" && value > 100)) return null;
+      context[key] = value;
+    }
+    if (!Object.keys(context).length) return null;
+    if (context.usedTokens !== undefined && context.windowTokens !== undefined) {
+      const derived = context.usedTokens / context.windowTokens * 100;
+      if (derived > 100 || (context.usedPercentage !== undefined && Math.abs(derived - context.usedPercentage) > Number.EPSILON * 100)) return null;
+    }
+    out.context = context;
+  }
+  return Object.keys(out).length ? out : null;
 }
 
 function parseTimestamp(value: string | null | undefined): string | null {

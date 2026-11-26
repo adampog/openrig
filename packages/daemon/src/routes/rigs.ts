@@ -4,11 +4,13 @@ import { Hono } from "hono";
 import { observeInventoryHandler, observeInventoryQuery } from "../domain/request-phase-observer.js";
 import type Database from "better-sqlite3";
 import type { RigRepository } from "../domain/rig-repository.js";
+import { resolveRigRepresentativeById } from "../domain/queue-owner.js";
 import type { SessionRegistry } from "../domain/session-registry.js";
 import type { EventBus } from "../domain/event-bus.js";
 import { summarizeSnapshot, type SnapshotRepository } from "../domain/snapshot-repository.js";
 import type { SnapshotCapture } from "../domain/snapshot-capture.js";
 import type { RestoreOrchestrator } from "../domain/restore-orchestrator.js";
+import { joinAutomaticRestore, JOINED_AUTOMATIC_RESTORE_WARNING } from "../domain/existing-rig-restore.js";
 import { projectRigToGraph, type InventoryOverlay, type CurrentQitemSummary } from "../domain/graph-projection.js";
 import {
   getNodeInventory,
@@ -16,13 +18,16 @@ import {
   getNodeInventoryWithContext,
   attachAgentActivity,
   attachTerminalActivityAndWork,
+  countAssignedWorkForEntry,
+  readAssignedWorkBySession,
 } from "../domain/node-inventory.js";
 import { projectionLane } from "../domain/projection-lane.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
 import type { AgentActivityStore } from "../domain/agent-activity-store.js";
 import type { SeatActivityService } from "../domain/seat-activity-service.js";
 import type { SeatStructuralActivityService } from "../domain/seat-structural-activity-service.js";
-import { deriveRigLifecycleState } from "../domain/ps-projection.js";
+import { deriveRigLifecycleState, deriveRigLifecycleFromInventory } from "../domain/ps-projection.js";
+import { identityVerdictConfirmsSessionMissing } from "../domain/types.js";
 import { assessCurrentStateRehydrateEligibility, snapshotMatchesCurrentOccupants } from "../domain/rehydrate-eligibility.js";
 import { buildRestorePlanPreview, collectPreviewSessionRows } from "../domain/restore-plan-preview.js";
 import { readFreshOccupantRelations } from "../domain/fresh-occupant-relation.js";
@@ -32,13 +37,14 @@ import type { KernelBootTracker, KernelState } from "../domain/kernel-boot-track
 import type { RecoveryPlan } from "../domain/restore-check-service.js";
 import type { ContextUsageStore } from "../domain/context-usage-store.js";
 import type { TranscriptStore } from "../domain/transcript-store.js";
-import type { Pod, ExpansionPodFragment } from "../domain/types.js";
+import type { Pod, ExpansionPodFragment, RestoreOutcome, Snapshot } from "../domain/types.js";
 import type { RigExpansionService } from "../domain/rig-expansion-service.js";
 import type { PodRigInstantiator } from "../domain/rigspec-instantiator.js";
 import { convergeOp } from "../domain/topology-converge.js";
+import type { EdgeOpOutcome } from "../domain/rig-edge-ops.js";
 import type { RigLifecycleService } from "../domain/rig-lifecycle-service.js";
 import type { SelfAttachService } from "../domain/self-attach-service.js";
-import type { TerminalService } from "../domain/terminal/terminal-service.js";
+import { reserveOperation, validOperationId } from "../domain/operation-correlation.js";
 
 export const rigsRoutes = new Hono();
 
@@ -90,99 +96,9 @@ function normalizeExpansionPodFragment(raw: Record<string, unknown>): ExpansionP
     id,
     label: typeof label === "string" ? label : id,
     summary: typeof raw["summary"] === "string" ? raw["summary"] : undefined,
-    members: members.map((member) => {
-      const m = (member ?? {}) as Record<string, unknown>;
-      // OPR.0.5.6.3 presence invariant: track KEY PRESENCE, not value shape —
-      // any present sessionSource/session_source (null, primitive, mode-only,
-      // ref:null, unknown mode, malformed ref fields) must reach the ONE
-      // canonical validator; only a truly absent key stays absent (the
-      // permission_policy R2 precedent, applied to session_source).
-      const hasSessionSource = "sessionSource" in m || "session_source" in m;
-      const rawSessionSource: unknown = "sessionSource" in m ? m["sessionSource"] : m["session_source"];
-      let sessionSource: import("../domain/types.js").SessionSourceSpec | undefined;
-      if (rawSessionSource !== undefined && rawSessionSource !== null && typeof rawSessionSource === "object") {
-        const ss = rawSessionSource as Record<string, unknown>;
-        const mode = ss["mode"];
-        const ref = ss["ref"];
-        if (ref !== null && typeof ref === "object") {
-          const refRec = ref as Record<string, unknown>;
-          const kind = refRec["kind"];
-          if (mode === "fork" && (kind === "native_id" || kind === "artifact_path" || kind === "name" || kind === "last")) {
-            const value = typeof refRec["value"] === "string" ? (refRec["value"] as string) : undefined;
-            sessionSource = { mode: "fork", ref: { kind, ...(value !== undefined ? { value } : {}) } };
-          } else if (mode === "rebuild" && kind === "artifact_set" && Array.isArray(refRec["value"])) {
-            const paths: string[] = [];
-            for (const p of refRec["value"] as unknown[]) {
-              if (typeof p === "string" && p.trim() !== "") paths.push(p);
-            }
-            if (paths.length > 0) {
-              sessionSource = { mode: "rebuild", ref: { kind: "artifact_set", value: paths } };
-            }
-          } else if (mode === "agent_image") {
-            // OPR.0.5.6.3 repair: agent_image rides the ingress like fork/rebuild.
-            // Valid v0 shape (image_name kind, non-empty string value, string|number
-            // version) constructs typed with SCHEMA-PARITY String() coercion, exactly
-            // like rigspec-schema.ts normalize (YAML `version: 3` arrives as a JSON
-            // number; omitting it would recreate the silent-default defect).
-            const versionRaw = refRec["version"];
-            const validValue = kind === "image_name"
-              && typeof refRec["value"] === "string" && refRec["value"].trim() !== "";
-            const validVersion = versionRaw === undefined
-              || typeof versionRaw === "string" || typeof versionRaw === "number";
-            if (validValue && validVersion) {
-              const version = versionRaw === undefined ? undefined : String(versionRaw);
-              sessionSource = {
-                mode: "agent_image",
-                ref: { kind: "image_name", value: refRec["value"] as string, ...(version !== undefined ? { version } : {}) },
-              };
-            }
-          }
-        }
-      }
-      // Presence fallthrough: a present value that did not normalize to a valid
-      // typed shape carries RAW so the canonical validator rejects it structurally
-      // — never converted to absence.
-      if (hasSessionSource && sessionSource === undefined) {
-        sessionSource = rawSessionSource as import("../domain/types.js").SessionSourceSpec;
-      }
-      return {
-        id: typeof m["id"] === "string" ? m["id"] : "",
-        runtime: typeof m["runtime"] === "string" ? m["runtime"] : "",
-        agentRef:
-          typeof m["agentRef"] === "string"
-            ? m["agentRef"]
-            : typeof m["agent_ref"] === "string"
-              ? m["agent_ref"]
-              : undefined,
-        profile: typeof m["profile"] === "string" ? m["profile"] : undefined,
-        codexConfigProfile:
-          typeof m["codexConfigProfile"] === "string"
-            ? m["codexConfigProfile"]
-            : typeof m["codex_config_profile"] === "string"
-              ? m["codex_config_profile"]
-              : undefined,
-        cwd: typeof m["cwd"] === "string" ? m["cwd"] : undefined,
-        model: typeof m["model"] === "string" ? m["model"] : undefined,
-        // R2 (4ac243c3): PRESERVE raw presence — a present-invalid value (null, number,
-        // object, …) must reach the canonical RigSpec validator as-is and reject there;
-        // only a truly ABSENT key stays absent. No route-local validation, no coercion.
-        ...("permissionPolicy" in m
-          ? { permissionPolicy: m["permissionPolicy"] }
-          : "permission_policy" in m
-            ? { permissionPolicy: m["permission_policy"] }
-            : {}),
-        restorePolicy:
-          typeof m["restorePolicy"] === "string"
-            ? m["restorePolicy"]
-            : typeof m["restore_policy"] === "string"
-              ? m["restore_policy"]
-              : undefined,
-        label: typeof m["label"] === "string" ? m["label"] : undefined,
-        // Presence-governed, never truthiness: null/false/primitive raw values
-        // must survive to canonical validation, not vanish at a truthy check.
-        ...(hasSessionSource ? { sessionSource } : {}),
-      };
-    }),
+    // Preserve the member as authored; the service translates legacy aliases and
+    // the canonical RigSpec validator decides its shape and accepted fields.
+    members: members as ExpansionPodFragment["members"],
     edges: Array.isArray(raw["edges"])
       ? raw["edges"].map((edge) => {
           const e = (edge ?? {}) as Record<string, unknown>;
@@ -229,14 +145,17 @@ rigsRoutes.get("/summary", (c) => {
   return projectionLane.run(() => {
     const summaries = repo.getRigSummaries({ includeArchived, archivedOnly });
     const invByRig = getNodeInventoryForRigs(repo.db, new Set(summaries.map((s) => s.id)));
+    const assignedByDest = readAssignedWorkBySession(repo.db);
     const enriched = summaries.map((s) => {
       const inventory = invByRig.get(s.id) ?? [];
-      const lifecycleState = deriveRigLifecycleState(inventory.map((e) => e.lifecycleState));
+      const lifecycleState = deriveRigLifecycleFromInventory(inventory, (node) => countAssignedWorkForEntry(node, assignedByDest).assignedWorkCount);
+      // Restore eligibility still accounts for every seat, including intentional stops.
+      const restoreLifecycleState = deriveRigLifecycleState(inventory.map((entry) => entry.lifecycleState));
       const agents = inventory.filter((e) => e.nodeKind === "agent");
       // Presence is separate from lifecycle/attention, and uses this same inventory fold.
       const hasLiveAgents = agents.some((e) => e.sessionStatus === "running" || e.sessionStatus === "idle")
         ? true : agents.every((e) => e.sessionStatus === null || e.sessionStatus === "stopped" || e.sessionStatus === "exited") ? false : null;
-      return { ...s, lifecycleState, hasLiveAgents };
+      return { ...s, lifecycleState, restoreLifecycleState, hasLiveAgents };
     });
     return c.json(enriched);
   });
@@ -315,13 +234,22 @@ rigsRoutes.post("/:id/launch-plan", async (c) => {
 });
 
 rigsRoutes.post("/", async (c) => {
+  const header = c.req.header("X-OpenRig-Operation-Id");
+  if (!validOperationId(header)) return c.json({ error: "Invalid X-OpenRig-Operation-Id" }, 400);
   const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
+  const text = await c.req.text();
   const name = body["name"];
   if (!name || typeof name !== "string") {
     return c.json({ error: "name is required" }, 400);
   }
-  const rig = getRepo(c).createRig(name);
-  return c.json(rig, 201);
+  const repo = getRepo(c);
+  const operation = reserveOperation(repo.db, header, "rig.create", [], text);
+  if (operation.state === "conflict") return c.json({ code: "operation_id_conflict" }, 409);
+  if (operation.state === "replay") return c.json({ replayed: true, operation: operation.operation }, 200);
+  const rig = operation.state === "fresh"
+    ? repo.db.transaction(() => { const created = repo.createRig(name); operation.recordCreated(created.id); return created; })()
+    : repo.createRig(name);
+  return c.json(operation.state === "fresh" ? { ...rig, operation: operation.read() } : rig, 201);
 });
 
 rigsRoutes.get("/", observeInventoryHandler, (c) => {
@@ -333,11 +261,13 @@ rigsRoutes.get("/", observeInventoryHandler, (c) => {
 });
 
 rigsRoutes.get("/:id", (c) => {
-  const rig = getRepo(c).getRig(c.req.param("id"));
+  const repo = getRepo(c);
+  const rig = repo.getRig(c.req.param("id"));
   if (!rig) {
     return c.json({ error: "rig not found" }, 404);
   }
-  return c.json(rig);
+  // The rig's one delegates_to root at its session: null when there's none or several, or the root has no session.
+  return c.json({ ...rig, representative: resolveRigRepresentativeById(repo.db, rig.rig.id) });
 });
 
 rigsRoutes.get("/:id/graph", async (c) => {
@@ -379,6 +309,7 @@ rigsRoutes.get("/:id/graph", async (c) => {
   const inventoryWithActivity = attachTerminalActivityAndWork(inventoryWithActivityOnly, {
     db: getRepo(c).db,
     seatActivity: seatActivityService,
+    agentActivity: agentActivityStore,
   });
 
   // PL-019 item 5: read-side join for active-qitem enrichment. Cheap by
@@ -406,6 +337,7 @@ rigsRoutes.get("/:id/graph", async (c) => {
     contextAvailability: n.contextUsage?.availability ?? "unknown",
     contextTotalInputTokens: n.contextUsage?.totalInputTokens ?? null,
     contextTotalOutputTokens: n.contextUsage?.totalOutputTokens ?? null,
+    needsAttention: n.needsAttention,
     agentActivity: n.agentActivity ?? null,
     currentQitems: n.canonicalSessionName
       ? currentQitemsBySession.get(n.canonicalSessionName) ?? []
@@ -479,10 +411,13 @@ rigsRoutes.post("/:id/archive", async (c) => {
   const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
   const force = body["force"] === true;
 
-  // AC-6 running-rig guard (daemon-layer, so every client inherits it): a
-  // running/degraded rig requires --force, with a 3-part honest error.
-  const inventory = getNodeInventory(repo.db, rigId);
-  const lifecycleState = deriveRigLifecycleState(inventory.map((e) => e.lifecycleState));
+  // Preserve main's action decision: only a stored running session with
+  // confirmed absence was attention_required before this read projection.
+  const lifecycleState = deriveRigLifecycleState(getNodeInventory(repo.db, rigId).map((entry) =>
+    entry.storedSessionStatus === "running" && identityVerdictConfirmsSessionMissing(entry.identityVerdict)
+      ? "attention_required"
+      : entry.lifecycleState
+  ));
   if ((lifecycleState === "running" || lifecycleState === "degraded") && !force) {
     return c.json({
       error: {
@@ -575,6 +510,7 @@ rigsRoutes.post("/:id/attach-self", async (c) => {
   const tmuxSession = typeof body["tmuxSession"] === "string" ? body["tmuxSession"].trim() : "";
   const tmuxWindow = typeof body["tmuxWindow"] === "string" ? body["tmuxWindow"].trim() : "";
   const tmuxPane = typeof body["tmuxPane"] === "string" ? body["tmuxPane"].trim() : "";
+  const tmuxSocketPath = typeof body["tmuxSocketPath"] === "string" ? body["tmuxSocketPath"] : undefined;
 
   const hasNodeTarget = logicalId.length > 0;
   const hasPodFields = podNamespace.length > 0 || memberName.length > 0;
@@ -601,6 +537,7 @@ rigsRoutes.post("/:id/attach-self", async (c) => {
         tmuxSession,
         tmuxWindow: tmuxWindow || undefined,
         tmuxPane: tmuxPane || undefined,
+        tmuxSocketPath,
       }
     : undefined;
 
@@ -619,10 +556,12 @@ rigsRoutes.post("/:id/attach-self", async (c) => {
       return c.json(result, 404);
     case "runtime_required":
       return c.json(result, 400);
+    case "address_conflict":
     case "already_bound":
     case "duplicate_logical_id":
     case "invalid_member_name":
     case "runtime_mismatch":
+    case "tmux_server_mismatch":
       return c.json(result, 409);
     default:
       return c.json(result, 500);
@@ -651,6 +590,15 @@ rigsRoutes.post("/:id/up", async (c) => {
 
   const snapshotRepo = c.get("snapshotRepo" as never) as SnapshotRepository;
   const snapshotCapture = c.get("snapshotCapture" as never) as SnapshotCapture;
+  // The same restore daemon start is running, or has just run, for a kernel a reboot left down: its
+  // outcome, as `rig up <rig> --existing` reports it (routes/up.ts).
+  if (!plan && !freshLogicalIds?.length) {
+    const joined = await joinAutomaticRestore({ rigRepo: repo, snapshotRepo }, rigId);
+    if (joined) {
+      if (!joined.ok) return c.json(joined.choice.body, joined.choice.status);
+      return renderExplorerRestore(c, repo, rig.rig.name, rigId, joined.snapshot, joined.capturedCurrentState, joined.staleSnapshot, joined.result, true);
+    }
+  }
   const automaticSelection = snapshotRepo.selectRestoreUsable(rigId);
   let snapshot = automaticSelection.ok ? automaticSelection.snapshot : null;
   let snapshotSelection = automaticSelection.ok ? automaticSelection.selection : undefined;
@@ -675,7 +623,7 @@ rigsRoutes.post("/:id/up", async (c) => {
   // OPR.0.3.4.4 — read-only plan gate BEFORE the auto-rehydrate capture
   // (the capture is itself a mutation) and before restoreOrch.restore().
   if (plan) {
-    return c.json(buildRestorePlanPreview(rig, snapshot ?? null, collectPreviewSessionRows(repo.db, rig, snapshot ?? null), undefined, Date.now(), readFreshOccupantRelations(repo.db, rig.rig.id)), 200);
+    return c.json(buildRestorePlanPreview(rig, snapshot ?? null, collectPreviewSessionRows(repo.db, rig, snapshot ?? null, true), freshLogicalIds, Date.now(), readFreshOccupantRelations(repo.db, rig.rig.id)), 200);
   }
 
   if (!snapshot) {
@@ -700,14 +648,25 @@ rigsRoutes.post("/:id/up", async (c) => {
     adapters: adapters ?? {},
     fsOps: { exists: (p: string) => fs.existsSync(p) },
     freshLogicalIds,
+    preserveStoppedInitial: true,
     snapshotSelection,
   });
+  return renderExplorerRestore(c, repo, rig.rig.name, rigId, snapshot, capturedCurrentState, staleSnapshot, result, false);
+});
+
+async function renderExplorerRestore(
+  c: { json: (data: unknown, status?: number) => Response },
+  repo: RigRepository, rigName: string, rigId: string, snapshot: Snapshot, capturedCurrentState: boolean, staleSnapshot: boolean,
+  result: RestoreOutcome | { ok: false; code: "restore_unavailable"; message: string }, joined: boolean,
+) {
+  const joinedWarning = joined ? [JOINED_AUTOMATIC_RESTORE_WARNING] : [];
   if (!result.ok) {
+    if (result.code === "restore_unavailable") return c.json({ error: result.message }, 500);
     if (result.code === "pre_restore_validation_failed") {
       return c.json({
         status: "not_attempted",
         rigId,
-        rigName: rig.rig.name,
+        rigName,
         error: result.message,
         code: result.code,
         snapshotKind: snapshot.kind,
@@ -715,7 +674,7 @@ rigsRoutes.post("/:id/up", async (c) => {
         remediation: result.result.blockers?.map((blocker) => blocker.remediation) ?? [],
       }, 409);
     }
-    return c.json({ error: result.message, code: result.code }, result.code === "rig_not_stopped" ? 409 : 400);
+    return c.json({ error: result.message, code: result.code, ...(joined ? { warnings: joinedWarning } : {}) }, result.code === "rig_not_stopped" ? 409 : 400);
   }
 
   // Compute attach command from first running/resumed node (same logic as /api/up)
@@ -727,19 +686,21 @@ rigsRoutes.post("/:id/up", async (c) => {
   return c.json({
     status: "restored",
     rigId,
-    rigName: rig.rig.name,
+    rigName,
     snapshotId: snapshot.id,
     snapshotKind: snapshot.kind,
     rigResult: result.result.rigResult,
     nodes: result.result.nodes,
-    warnings: capturedCurrentState
+    // Seats this restore left stopped on purpose (a drained seat pool agent), outside `nodes` and the rig result.
+    keptDown: result.result.keptDown,
+    warnings: [...joinedWarning, ...(capturedCurrentState
       ? [staleSnapshot
           ? "Existing restore snapshots named an older occupant; captured current DB state as auto-rehydrate snapshot for reboot recovery."
           : "No restore-usable snapshot existed; captured current DB state as auto-rehydrate snapshot for reboot recovery.", ...result.result.warnings]
-      : result.result.warnings,
+      : result.result.warnings)],
     attachCommand,
   }, 200);
-});
+}
 
 // POST /api/rigs/:rigId/expand — dynamic rig expansion
 rigsRoutes.post("/:rigId/expand", async (c) => {
@@ -784,6 +745,8 @@ rigsRoutes.post("/:rigId/expand", async (c) => {
 // the converge interface; identity-migration-free. The member fragment uses the
 // spec snake_case field names (id, runtime, agent_ref, profile, cwd, ...).
 rigsRoutes.post("/:rigId/pods/:podNamespace/members", async (c) => {
+  const header = c.req.header("X-OpenRig-Operation-Id");
+  if (!validOperationId(header)) return c.json({ error: "Invalid X-OpenRig-Operation-Id" }, 400);
   const rigId = c.req.param("rigId")!;
   const podNamespace = c.req.param("podNamespace")!;
   const podInstantiator = c.get("podInstantiator" as never) as PodRigInstantiator | undefined;
@@ -792,6 +755,7 @@ rigsRoutes.post("/:rigId/pods/:podNamespace/members", async (c) => {
   }
 
   const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
+  const text = await c.req.text();
   const member = body["member"];
   if (!member || typeof member !== "object" || Array.isArray(member)) {
     return c.json({ error: "member is required (a member fragment with id, runtime, agent_ref)" }, 400);
@@ -810,11 +774,16 @@ rigsRoutes.post("/:rigId/pods/:podNamespace/members", async (c) => {
     ? (rawEdges as Array<{ from: string; to: string; kind: string }>)
     : undefined;
 
+  const operation = reserveOperation(getRepo(c).db, header, "member.add", [rigId, podNamespace], text);
+  if (operation.state === "conflict") return c.json({ code: "operation_id_conflict" }, 409);
+  if (operation.state === "replay") return c.json({ replayed: true, operation: operation.operation }, 200);
+
   const converged = await convergeOp(
     { instantiator: podInstantiator },
     rigId,
     { kind: "add_member", pod: podNamespace, member: member as Record<string, unknown>, edges },
     rigRoot,
+    operation.state === "fresh" ? { recordCreated: operation.recordCreated } : undefined,
   );
   // This route is the add_member sugar over the converge interface.
   if (converged.kind !== "add_member" || !converged.supported) {
@@ -826,40 +795,68 @@ rigsRoutes.post("/:rigId/pods/:podNamespace/members", async (c) => {
     switch (outcome.code) {
       case "rig_not_found":
       case "pod_not_found":
-        return c.json(outcome, 404);
+        return c.json(operation.state === "fresh" ? { ...outcome, operation: operation.read() } : outcome, 404);
       case "member_conflict":
-        return c.json(outcome, 409);
+        return c.json(operation.state === "fresh" ? { ...outcome, operation: operation.read() } : outcome, 409);
       case "edge_unresolved":
       case "validation_failed":
       case "preflight_failed":
-        return c.json(outcome, 400);
+        return c.json(operation.state === "fresh" ? { ...outcome, operation: operation.read() } : outcome, 400);
       default:
-        return c.json(outcome, 500);
-    }
-  }
-
-  // Best-effort additive view work happens only after the seat launched. Never
-  // reopen a pod/rig here: that creates a second workspace and duplicates seats.
-  if (body["noView"] !== true && outcome.result.node.status === "launched" && outcome.result.node.sessionName) {
-    const terminalService = c.get("terminalService" as never) as TerminalService | undefined;
-    const rig = getRepo(c).getRig(rigId);
-    if (terminalService && rig) {
-      const warnings = outcome.result.warnings ??= [];
-      try {
-        const joined = await terminalService.joinRigWall(rig.rig.name, outcome.result.node.sessionName);
-        if (!joined.ok) {
-          warnings.push(`Seat added; Herdr wall join incomplete: ${joined.error ?? [...joined.absent, ...joined.degraded].map(s => s.reason).join("; ")}`);
-        }
-        if (joined.notes?.length) warnings.push(...joined.notes);
-      } catch (err) {
-        warnings.push(`Seat added; Herdr wall join failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
+        return c.json(operation.state === "fresh" ? { ...outcome, operation: operation.read() } : outcome, 500);
     }
   }
 
   // 201 created. The node may still be failed/attention_required at launch; that
   // is carried in outcome.result.node.status (mirrors expand's per-node status).
-  return c.json(outcome, 201);
+  return c.json(operation.state === "fresh" ? { ...outcome, operation: operation.read() } : outcome, 201);
+});
+
+function edgeOpStatus(outcome: EdgeOpOutcome): 200 | 201 | 400 | 404 | 500 {
+  if (outcome.ok) return outcome.outcome === "added" ? 201 : 200;
+  if (outcome.code === "rig_not_found" || outcome.code === "edge_not_found") return 404;
+  return outcome.code === "unavailable" ? 500 : 400;
+}
+
+// POST /api/rigs/:rigId/edges — add one typed edge between two seats, by rig-scoped logical ids (same-pod
+// edges included). A repeat returns the existing edge. `plan: true` writes nothing.
+rigsRoutes.post("/:rigId/edges", async (c) => {
+  const rigId = c.req.param("rigId")!;
+  const raw: unknown = await c.req.json().catch(() => null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return c.json({ ok: false, code: "validation_failed", message: "body must be an object { from, to, kind }" }, 400);
+  }
+  const { from, to, kind, plan } = raw as Record<string, unknown>;
+  if (plan !== undefined && typeof plan !== "boolean") {
+    return c.json({ ok: false, code: "validation_failed", message: "plan must be a boolean" }, 400);
+  }
+  if (typeof from !== "string" || typeof to !== "string" || typeof kind !== "string") {
+    return c.json({ ok: false, code: "validation_failed", message: "from, to and kind are required strings" }, 400);
+  }
+  const converged = await convergeOp(
+    { instantiator: c.get("podInstantiator" as never) as PodRigInstantiator, rigRepo: getRepo(c) },
+    rigId,
+    { kind: "add_edge", from, to, edgeKind: kind, plan },
+    ".",
+  );
+  if (converged.kind !== "add_edge" || !converged.supported) return c.json({ error: "Unexpected converge result for add_edge" }, 500);
+  return c.json(converged.outcome, edgeOpStatus(converged.outcome));
+});
+
+// DELETE /api/rigs/:rigId/edges/:edgeId — remove exactly that edge. `?plan=1` writes nothing.
+rigsRoutes.delete("/:rigId/edges/:edgeId", async (c) => {
+  const plan = c.req.query("plan");
+  if (plan !== undefined && plan !== "0" && plan !== "1") {
+    return c.json({ ok: false, code: "validation_failed", message: "plan must be 0 or 1" }, 400);
+  }
+  const converged = await convergeOp(
+    { instantiator: c.get("podInstantiator" as never) as PodRigInstantiator, rigRepo: getRepo(c) },
+    c.req.param("rigId")!,
+    { kind: "remove_edge", edgeId: c.req.param("edgeId")!, plan: plan === "1" },
+    ".",
+  );
+  if (converged.kind !== "remove_edge" || !converged.supported) return c.json({ error: "Unexpected converge result for remove_edge" }, 500);
+  return c.json(converged.outcome, edgeOpStatus(converged.outcome));
 });
 
 // DELETE /api/rigs/:rigId/pods/:podRef

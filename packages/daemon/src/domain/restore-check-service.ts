@@ -1,10 +1,15 @@
+import { selectedCorePluginDir, pluginPathsOf } from "./claude-core-plugin-env.js";
+import type { DesiredClaudeActivityHooks } from "./desired-claude-activity-hooks.js";
+import { deriveRelayEvents, parseManagedClaudeNodeCommand } from "./claude-activity-hooks.js";
 import { claudeActivityRelayPath } from "./claude-activity-hooks.js";
 import { existsSync, accessSync, constants } from "node:fs";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { getCompatibleOpenRigPath } from "../openrig-compat.js";
-import { shellQuote as quoteShellArgument } from "../adapters/shell-quote.js";
 import { reanchorBuiltinStartupFile, reanchorShippedProjectionEntry } from "./builtin-startup-files.js";
-import { validatePreRestore } from "./restore-preconditions.js";
+import { SEAT_STARTUP_BLOCKERS, validatePreRestore } from "./restore-preconditions.js";
+import { resolveSeatKind, seatProcessOwner } from "./seat-kinds.js";
+import { resolveSnapshotRestoreTopology } from "./restore-topology.js";
+import { compareConversations, describeSharedConversation, describeUnavailable, holdsRecordedConversation } from "./shared-conversation.js";
 import type { CurrentStateRehydrateEligibility } from "./rehydrate-eligibility.js";
 import type { Snapshot, RigServicesRecord, SeatIdentityVerdict } from "./types.js";
 
@@ -126,6 +131,8 @@ export interface StartupContextProjectionEntry {
   category?: string | null;
   sourcePath?: string | null;
   resourceType?: string | null;
+  /** The resource as the spec named it; a plugin selected under the OpenRig home reads `openrig-home:<path>`. */
+  resourcePath?: string | null;
 }
 
 export interface QueueStoreProbeResult {
@@ -174,6 +181,7 @@ export interface RestoreCheckOpts {
 // --- Deps (framework-free per ADR-0001; reads from existing projections per ADR-0002) ---
 
 export interface NodeInventoryEntry {
+  codexConfigProfile?: string | null;
   nodeId?: string | null;
   rigId: string;
   rigName: string;
@@ -190,6 +198,25 @@ export interface NodeInventoryEntry {
   tmuxAttachCommand: string | null;
   latestError: string | null;
   cwd?: string | null;
+  /** An external CLI attachment is kept by restore (left_attached), not restarted. */
+  attachmentType?: string | null;
+  /** The seat's recorded restore choice and resume token (the inventory carries them). */
+  restorePolicy?: string | null;
+  resumeType?: string | null;
+  resumeToken?: string | null;
+}
+
+/** The restore's own resume rule: a seat with a resume token, a resume type and the resume policy resumes. */
+function seatResumes(node: NodeInventoryEntry): boolean {
+  return !!node.resumeToken && !!node.resumeType && node.resumeType !== "none" && node.runtime !== "terminal"
+    && (node.restorePolicy ?? "resume_if_possible") === "resume_if_possible";
+}
+
+/** Restore's pre-launch stop: a resume-policy seat that had a session but has no resume token stops for a decision before
+ *  anything starts, whatever its saved startup context. A terminal seat starts fresh instead. */
+function restoreStopsWithoutResumeToken(node: NodeInventoryEntry): boolean {
+  return !!node.sessionStatus && !node.resumeToken && node.runtime !== "terminal"
+    && (node.restorePolicy ?? "resume_if_possible") === "resume_if_possible";
 }
 
 export interface RestoreCheckDeps {
@@ -204,9 +231,14 @@ export interface RestoreCheckDeps {
   /** Get the newest snapshot for exact restore planning when available */
   getLatestSnapshot?: (rigId: string) => { id: string; kind: string } | null;
   /** Exact ordinary-restore input; never captures an auto-rehydrate snapshot. */
+  /** The latest recorded topology roster (node ids), which a current-state restore uses; null when none is recorded. It
+   *  throws when the recorded roster is malformed, and the rig's restore inputs read as unknown. */
+  getMaterializedRoster?: (rigId: string) => string[] | null;
   getRestoreInputs: (rigId: string) =>
     | { snapshot: Pick<Snapshot, "id" | "kind" | "data">; servicesRecord: RigServicesRecord | null }
-    | { currentStateRehydrate: CurrentStateRehydrateEligibility; reason: string }
+    | { currentStateRehydrate: CurrentStateRehydrateEligibility; reason: string;
+      /** The members outside the rig's recorded roster, which a current-state rehydrate leaves as they are. */
+      notRestoredNodeIds?: string[] }
     | { unavailable: string };
   /** Probe daemon health: returns { healthy: boolean; evidence: string } */
   probeDaemonHealth: () => { healthy: boolean; evidence: string };
@@ -220,6 +252,8 @@ export interface RestoreCheckDeps {
   probeQueueStore?: () => QueueStoreProbeResult;
   /** Configured OpenRig instance root, matching the Claude adapter stateDir. */
   stateDir?: string;
+  /** Read-only current authored selection, invoked only where hook detail is inspected. */
+  getDesiredClaudeActivityHooks?: (nodeId: string) => DesiredClaudeActivityHooks;
   /** Relay-backed Claude hook events derived from the shipped hook manifest. */
   getClaudeActivityHookEvents?: () => string[];
 }
@@ -256,6 +290,10 @@ export class RestoreCheckService {
     this.deps = deps;
   }
 
+  /**
+   * Compute scoped restore checks and recovery guidance from daemon, rig and
+   * seat evidence without launching occupants.
+   */
   check(opts: RestoreCheckOpts): RestoreCheckResult {
     const checks: CheckEntry[] = [];
     // rev1-r2 no-false-ready: ready-seat caveat signals that default compact
@@ -294,6 +332,7 @@ export class RestoreCheckService {
       ]);
     }
 
+    const allRigs = rigs;
     if (opts.rig) {
       rigs = rigs.filter((r) => r.name === opts.rig);
       if (rigs.length === 0) {
@@ -331,19 +370,23 @@ export class RestoreCheckService {
       // No added snapshot/history read on a routine status poll for an all-ready rig.
       // Explicit restore-check still assesses its next restore, even while it is running.
       let preconditionError: string | undefined;
+      let notRestored: ReadonlySet<string> | undefined;
+      let restoreRoster: Set<string> | null | undefined;
       const allReady = nodes.length > 0 && nodes.every((node) =>
         Boolean(node.canonicalSessionName) && node.sessionStatus === "running" && node.startupStatus === "ready"
       );
       if (!opts.recoveryOnly || !allReady) {
-        const preconditions = this.checkRestorePreconditions(rig);
+        const preconditions = this.checkRestorePreconditions(rig, nodes);
         checks.push(preconditions.check);
         rigChecks.push(preconditions.check);
         preconditionError = preconditions.error;
+        notRestored = preconditions.notRestored;
+        restoreRoster = preconditions.roster;
         restoreInputsByRig.set(rig.rigId, { snapshot: preconditions.snapshot, error: preconditions.error });
       }
 
       for (const node of nodes) {
-        const readinessCheck = this.checkSeatReadiness(node);
+        const readinessCheck = this.checkSeatReadiness(node, rig.name, restoreRoster, preconditionError !== undefined);
         checks.push(readinessCheck);
         rigChecks.push(readinessCheck);
 
@@ -357,20 +400,25 @@ export class RestoreCheckService {
         // are not skipping (full, --ready/includeReady, or a non-ready seat).
         const omitReadyDetail = opts.compact && !opts.includeReady && readinessCheck.status === "green";
 
-        const startupContextCheck = this.checkStartupContext(node);
+        const startupContextCheck = this.checkStartupContext(node, rig.name, notRestored);
         if ("unknownChecks" in startupContextCheck) {
           return this.buildUnknown([
             ...checks,
             ...startupContextCheck.unknownChecks,
           ]);
         }
-        rigChecks.push(startupContextCheck.check);
+        // Restore doesn't launch a seat it leaves as it is, so that seat's missing startup inputs are a caveat, not a blocker.
+        const leaves = this.restoreLeaves(node, restoreRoster);
+        const contextCheck: CheckEntry = leaves && startupContextCheck.check.status === "red"
+          ? { ...startupContextCheck.check, status: "yellow", evidence: `${startupContextCheck.check.evidence}. Restore doesn't launch this seat (${leaves}), so this doesn't block a restore.` }
+          : startupContextCheck.check;
+        rigChecks.push(contextCheck);
         if (omitReadyDetail) {
           // Not emitted (AC-4 token-safe), but counts toward the top-level
           // verdict/readiness/counts (rev1-r2 no-false-ready).
-          deferredAssessmentChecks.push(startupContextCheck.check);
+          deferredAssessmentChecks.push(contextCheck);
         } else {
-          checks.push(startupContextCheck.check);
+          checks.push(contextCheck);
         }
 
         // AC-4 / FR-3: default compact does NOT assemble the rest of the
@@ -383,7 +431,7 @@ export class RestoreCheckService {
         checks.push(transcriptCheck);
         rigChecks.push(transcriptCheck);
 
-        const resumeCheck = this.checkResumePath(node);
+        const resumeCheck = this.checkResumePath(node, rig.name);
         checks.push(resumeCheck);
         rigChecks.push(resumeCheck);
 
@@ -400,6 +448,10 @@ export class RestoreCheckService {
       }
 
       rigRollupInputs.push({ rig, nodes, checks: rigChecks, preconditionError });
+    }
+
+    if (!opts.recoveryOnly) {
+      checks.push(...this.checkSharedConversations(rigRollupInputs, allRigs));
     }
 
     const rigRollups = rigRollupInputs.map((input) => this.buildRigRollup(input));
@@ -419,9 +471,13 @@ export class RestoreCheckService {
     return this.buildResult(checks, rigRollups, hostInfraCheck.hostInfra, recoveryRigInputs, deferredAssessmentChecks);
   }
 
-  private checkRestorePreconditions(rig: { rigId: string; name: string }): {
+  private checkRestorePreconditions(rig: { rigId: string; name: string }, inventory: NodeInventoryEntry[]): {
     check: CheckEntry;
     snapshot: { id: string; kind: string } | null;
+    /** The members outside the snapshot's roster: restore leaves them as they are. */
+    notRestored?: ReadonlySet<string>;
+    /** The node ids restore would start from (its intended roster); null when every current seat is in it, or unknown. */
+    roster?: Set<string> | null;
     error?: string;
   } {
     const check = `rig.${rig.name}.restore-preconditions`;
@@ -429,14 +485,20 @@ export class RestoreCheckService {
       const input = this.deps.getRestoreInputs(rig.rigId);
       if ("unavailable" in input) throw new Error(input.unavailable);
       if ("currentStateRehydrate" in input) {
-        const { ok, blockers } = input.currentStateRehydrate;
+        const { ok, blockers, awaitingDecision, noSeatStarts } = input.currentStateRehydrate;
+        const recorded = this.deps.getMaterializedRoster?.(rig.rigId) ?? null;
+        const waiting = !awaitingDecision?.length ? ""
+          : noSeatStarts ? ` It would start no seat; every seat would wait for a decision: ${awaitingDecision.join("; ")}.`
+          : ` It would not start every seat: ${awaitingDecision.join("; ")}.`;
         return {
           snapshot: null,
+          ...(input.notRestoredNodeIds ? { notRestored: new Set(input.notRestoredNodeIds) } : {}),
+          roster: recorded ? new Set(recorded) : null,
           check: {
             check,
             status: ok ? "yellow" : "red",
             evidence: ok
-              ? `${input.reason}; restore inputs not inspected. Current-state rehydrate is eligible to attempt: ordinary rig up would capture current state. This does not validate that future snapshot or prove native continuity.`
+              ? `${input.reason}; restore inputs not inspected. Current-state rehydrate is eligible to attempt: ordinary rig up would capture current state. This does not validate that future snapshot or prove native continuity.${waiting}`
               : `${input.reason}; current-state rehydrate is not eligible: ${blockers.join("; ")}`,
             remediation: "Inspect the rig's persisted state before choosing manual recovery",
             remediationSafe: true,
@@ -446,10 +508,30 @@ export class RestoreCheckService {
       const validation = validatePreRestore(input.snapshot.data, {
         fsOps: { exists: this.deps.exists },
         servicesRecord: input.servicesRecord,
+        currentRuntimes: Object.fromEntries(inventory.map((current) => [current.logicalId, current.runtime])),
+        currentCodexProfiles: Object.fromEntries(inventory.filter((current) => current.codexConfigProfile !== undefined)
+          .map((current) => [current.logicalId, current.codexConfigProfile!])),
+        // the shared-conversation report names the seats a restore would resume by their current record, as it names
+        // every other agent (the maintainer's review of #3250)
+        currentStatuses: Object.fromEntries(inventory.map((current) => [current.logicalId, current.sessionStatus ?? null])),
+        // a seat kept attached to an external CLI is not launched by restore: it is not one of the seats it resumes
+        attachedLogicalIds: inventory.filter((current) => seatProcessOwner(resolveSeatKind(current.attachmentType)) === "external")
+          .map((current) => current.logicalId),
       });
-      const { blockers, warnings } = validation;
+      // The membership restore itself uses: the snapshot's roster, or a pre-roster snapshot's own nodes.
+      const roster = new Set(resolveSnapshotRestoreTopology(input.snapshot.data).intendedRoster.map((entry) => entry.nodeId));
+      // A seat's own startup blocker holds only a seat restore launches. For one restore leaves as it is, it's a caveat.
+      const leftNodeIds = new Set(inventory.filter((node) => node.nodeId && this.restoreLeaves(node, roster)).map((node) => node.nodeId));
+      const leftBlockers = validation.blockers.filter((blocker) => SEAT_STARTUP_BLOCKERS.has(blocker.code) && !!blocker.nodeId && leftNodeIds.has(blocker.nodeId));
+      const blockers = validation.blockers.filter((blocker) => !leftBlockers.includes(blocker));
+      const warnings = [
+        ...validation.warnings,
+        ...leftBlockers.map((blocker) => `${blocker.code}: ${blocker.message} (restore doesn't launch this seat, so this doesn't block a restore)`),
+      ];
       return {
         snapshot: { id: input.snapshot.id, kind: input.snapshot.kind },
+        roster,
+        notRestored: new Set(inventory.flatMap((current) => current.nodeId && !roster.has(current.nodeId) ? [current.nodeId] : [])),
         check: {
           check,
           status: blockers.length > 0 ? "red" : warnings.length > 0 ? "yellow" : "green",
@@ -823,7 +905,31 @@ export class RestoreCheckService {
     };
   }
 
-  private checkSeatReadiness(node: NodeInventoryEntry): CheckEntry {
+  /** Why restore leaves a seat as it is, if it does: an external CLI attachment it keeps, or a seat outside the roster it
+   *  restores. Restore doesn't launch such a seat. */
+  private restoreLeaves(node: NodeInventoryEntry, roster: Set<string> | null | undefined): string | null {
+    if (node.attachmentType === "external_cli") return "it's attached as an external CLI, and restore keeps that attachment";
+    if (roster && node.nodeId && !roster.has(node.nodeId)) {
+      return "it isn't in the roster this restore uses (it was added or claimed after that roster was recorded)";
+    }
+    return null;
+  }
+
+  /** What restore does with a seat that isn't running and ready: leaves it as it is, brings it back (saved startup context,
+   *  or a resume), can't be told because restore's inputs couldn't be read, or none of these (null). */
+  private restoreFate(node: NodeInventoryEntry, roster: Set<string> | null | undefined, inputsUnknown: boolean):
+    { leaves: string } | { brings: string } | { unknown: string } | null {
+    if (node.attachmentType === "external_cli") return { leaves: this.restoreLeaves(node, roster)! };
+    if (inputsUnknown) return { unknown: "restore's inputs couldn't be read, so what restore does with this seat is unknown" };
+    const leaves = this.restoreLeaves(node, roster);
+    if (leaves) return { leaves };
+    if (restoreStopsWithoutResumeToken(node)) return null;
+    if (node.nodeId && this.deps.getStartupContext(node.nodeId).status === "ok") return { brings: "restore brings it back from its saved startup context" };
+    if (seatResumes(node)) return { brings: "restore tries its saved conversation" };
+    return null;
+  }
+
+  private checkSeatReadiness(node: NodeInventoryEntry, rigName: string, roster?: Set<string> | null, inputsUnknown = false): CheckEntry {
     const session = node.canonicalSessionName ?? node.logicalId;
     const check = `seat.${session}.readiness`;
 
@@ -853,6 +959,37 @@ export class RestoreCheckService {
 
     if (node.sessionStatus !== "running" || node.startupStatus !== "ready") {
       const latestError = node.latestError ? ` latestError=${node.latestError}` : "";
+      // A seat restore leaves or brings back is named here, not a blocker for the whole rig; only a seat restore itself
+      // can't bring back stays red.
+      // A running seat that isn't ready (a failed start, attention, an identity question) isn't restore's to restart.
+      const fate = node.sessionStatus === "running" ? null : this.restoreFate(node, roster, inputsUnknown);
+      if (fate && "leaves" in fate) {
+        return {
+          check,
+          status: "yellow",
+          evidence: `Seat not running/ready: sessionStatus=${node.sessionStatus ?? "unknown"} startupStatus=${node.startupStatus ?? "unknown"}${latestError}. Restore leaves this seat as it is: ${fate.leaves}.`,
+          remediation: "Restore won't start this seat; start or reattach it yourself if you need it running",
+          remediationSafe: false,
+        };
+      }
+      if (fate && "unknown" in fate) {
+        return {
+          check,
+          status: "yellow",
+          evidence: `Seat not running/ready: sessionStatus=${node.sessionStatus ?? "unknown"} startupStatus=${node.startupStatus ?? "unknown"}${latestError}; ${fate.unknown}.`,
+          remediation: "Inspect the rig's restore snapshot and persisted inputs, then rerun rig restore-check",
+          remediationSafe: true,
+        };
+      }
+      if (fate && "brings" in fate) {
+        return {
+          check,
+          status: "yellow",
+          evidence: `Seat not running/ready: sessionStatus=${node.sessionStatus ?? "unknown"} startupStatus=${node.startupStatus ?? "unknown"}${latestError}; ${fate.brings}.`,
+          remediation: `Preview what restore would do for this seat with: rig up ${shellQuote(rigName)} --existing --plan`,
+          remediationSafe: true,
+        };
+      }
       return {
         check,
         status: "red",
@@ -862,6 +999,17 @@ export class RestoreCheckService {
       };
     }
 
+    // Running and ready now; name what restore would do when it leaves this seat as it is.
+    const leaves = this.restoreLeaves(node, roster);
+    if (leaves) {
+      return {
+        check,
+        status: "yellow",
+        evidence: `Seat running and ready: ${node.canonicalSessionName}. Restore leaves this seat as it is: ${leaves}.`,
+        remediation: "Nothing to fix now. Restore won't start or restart this seat.",
+        remediationSafe: true,
+      };
+    }
     return {
       check,
       status: "green",
@@ -870,7 +1018,11 @@ export class RestoreCheckService {
     };
   }
 
-  private checkResumePath(node: NodeInventoryEntry): CheckEntry {
+  /**
+   * Report available seat attachment or a read-only restore-plan command.
+   * Missing attachment does not establish whether an earlier token can resume.
+   */
+  private checkResumePath(node: NodeInventoryEntry, rigName: string): CheckEntry {
     const session = node.canonicalSessionName ?? node.logicalId;
     if (node.tmuxAttachCommand) {
       return { check: `seat.${session}.resume-path`, status: "green", evidence: node.tmuxAttachCommand, remediation: "" };
@@ -878,12 +1030,14 @@ export class RestoreCheckService {
     return {
       check: `seat.${session}.resume-path`, status: "yellow",
       evidence: "No attach command available",
-      remediation: "Session will be created fresh on restore",
+      // Whether restore resumes, starts fresh or stops for a decision is per seat; the plan says which.
+      remediation: `No live session to attach. Preview what restore would do for this seat with: rig up ${shellQuote(rigName)} --existing --plan`,
       remediationSafe: true,
     };
   }
 
-  private checkStartupContext(node: NodeInventoryEntry): { check: CheckEntry } | { unknownChecks: CheckEntry[] } {
+  private checkStartupContext(node: NodeInventoryEntry, rigName: string, notRestored?: ReadonlySet<string>):
+    { check: CheckEntry } | { unknownChecks: CheckEntry[] } {
     const session = node.canonicalSessionName ?? node.logicalId;
     const check = `seat.${session}.startup-context`;
     const runningReady = node.sessionStatus === "running" && node.startupStatus === "ready";
@@ -894,6 +1048,7 @@ export class RestoreCheckService {
           check,
           runningReady,
           `Startup context cannot be inspected because node id is missing for ${session}`,
+          rigName,
         ),
       };
     }
@@ -911,9 +1066,39 @@ export class RestoreCheckService {
           }],
         };
       case "missing":
+        // A seat that only ever resumed or was attached has a resume token and no saved startup context. Restore tries its
+        // saved conversation without replaying a saved startup plan, as on any resume (a resume replays no startup context).
+        // A pod-aware seat's restore names the gap; a legacy seat's resume path is unchanged and names none.
+        // A member outside the restore snapshot's roster (joined later with `rig attach --self`, say) isn't restored:
+        // restore leaves it attached as it is, so its saved conversation isn't tried.
+        if (seatResumes(node) && notRestored?.has(node.nodeId)) {
+          return {
+            check: {
+              check,
+              status: "yellow",
+              evidence: `${probe.evidence}. Restore leaves ${session} attached and doesn't restore it: it isn't in this rig's restore roster.`,
+              remediation: "No startup-context repair is needed: restore doesn't touch this member.",
+              remediationSafe: false,
+            },
+          };
+        }
+        if (seatResumes(node)) {
+          return {
+            check: {
+              check,
+              status: "yellow",
+              evidence: `${probe.evidence}. Restore tries ${session}'s saved conversation without replaying a saved startup plan${node.podId ? ", and names this gap" : ""}.`,
+              remediation: "No startup-context repair is needed to restore it.",
+              remediationSafe: false,
+            },
+          };
+        }
+        return {
+          check: this.buildStartupContextAvailabilityCheck(check, runningReady, probe.evidence, rigName),
+        };
       case "malformed":
         return {
-          check: this.buildStartupContextAvailabilityCheck(check, runningReady, probe.evidence),
+          check: this.buildStartupContextAvailabilityCheck(check, runningReady, probe.evidence, rigName),
         };
       case "ok":
         break;
@@ -930,7 +1115,7 @@ export class RestoreCheckService {
       )),
       projectionEntries: probe.projectionEntries.map((entry) => (
         typeof entry.sourcePath === "string"
-          ? reanchorShippedProjectionEntry({ ...entry, sourcePath: entry.sourcePath }, undefined, this.deps.exists)
+          ? reanchorShippedProjectionEntry({ ...entry, sourcePath: entry.sourcePath }, undefined, this.deps.exists, this.deps.stateDir)
           : entry
       )),
     };
@@ -994,12 +1179,14 @@ export class RestoreCheckService {
     check: string,
     runningReady: boolean,
     evidence: string,
+    rigName: string,
   ): CheckEntry {
     return {
       check,
       status: runningReady ? "yellow" : "red",
       evidence,
-      remediation: "Recreate the seat startup context from the rig or agent spec before trusting replay inputs",
+      // A fresh seat launch reads the saved startup context and refuses without one, so it isn't offered here.
+      remediation: `No command records startup context for this seat yet. To see what restore would do for it, preview with: rig up ${shellQuote(rigName)} --existing --plan (read-only; it records nothing).`,
       remediationSafe: false,
     };
   }
@@ -1053,11 +1240,7 @@ export class RestoreCheckService {
     if (startup?.status === "ok" && !startup.projectionEntries.some((entry) => (
       entry.category === "runtime_resource" && entry.resourceType === "claude_activity_hooks"
     ))) {
-      return {
-        check: `seat.${session}.hooks`, status: "green",
-        evidence: "Claude activity hooks are not selected for this seat; hook inspection is not applicable",
-        remediation: "",
-      };
+      return this.checkOtherHookChannels(node, startup);
     }
     if (startup?.status === "ok") {
       if (!node.cwd) {
@@ -1070,7 +1253,7 @@ export class RestoreCheckService {
       }
       const settingsPath = join(node.cwd, ".claude", "settings.local.json");
       const relayPath = claudeActivityRelayPath(this.deps.stateDir);
-      const events = this.deps.getClaudeActivityHookEvents?.() ?? [];
+      const events = this.requiredClaudeActivityHookEvents();
       if (events.length === 0) {
         return {
           check: `seat.${session}.hooks`, status: "yellow",
@@ -1108,9 +1291,10 @@ export class RestoreCheckService {
       }
       const missingEvents = events.filter((event) => !this.hasActivityRelayHook(settings, event, relayPath));
       if (missingEvents.length === 0) {
+        const plugin = this.inspectCorePlugin(startup.projectionEntries);
         return {
-          check: `seat.${session}.hooks`, status: "green",
-          evidence: `Selected Claude activity hooks are projected in ${settingsPath}, with relay present at ${relayPath}; hook execution is not verified`,
+          check: `seat.${session}.hooks`, status: plugin?.status ?? "green",
+          evidence: `Selected Claude activity hooks are projected in ${settingsPath}, with relay present at ${relayPath}; hook execution is not verified${plugin ? `; ${plugin.evidence}` : ""}`,
           remediation: "",
         };
       }
@@ -1132,6 +1316,70 @@ export class RestoreCheckService {
     };
   }
 
+  private requiredClaudeActivityHookEvents(): string[] {
+    // PermissionRequest and the elicitation pair are optional observations. Older same-version plugin/settings bytes
+    // remain authoritative until normal release/projection; retain all prior readiness duties.
+    const optional = new Set(["PermissionRequest", "Elicitation", "ElicitationResult"]);
+    return (this.deps.getClaudeActivityHookEvents?.() ?? []).filter(event => !optional.has(event));
+  }
+
+  private inspectCorePlugin(entries: StartupContextProjectionEntry[]): { status: "green" | "yellow"; evidence: string } | null {
+    // A plugin selected under the OpenRig home is read in this instance's home, as restore will launch it.
+    const dir = selectedCorePluginDir(pluginPathsOf(entries.map(entry => ({
+      category: entry.category ?? "", absolutePath: entry.absolutePath, resourcePath: entry.resourcePath, sourcePath: entry.sourcePath,
+    })), this.deps.stateDir), this.deps.stateDir ? join(this.deps.stateDir, "plugins") : undefined);
+    if (!dir) return null;
+    try {
+      const manifest: unknown = JSON.parse(this.deps.readFile(join(dir, ".claude-plugin", "plugin.json")));
+      if (!isRecord(manifest) || manifest["name"] !== "openrig-core" || typeof manifest["hooks"] !== "string") {
+        throw new Error("plugin manifest does not declare the core hook manifest");
+      }
+      const events = deriveRelayEvents(this.deps, join(dir, manifest["hooks"]));
+      const expected = this.requiredClaudeActivityHookEvents();
+      if (!expected.length || expected.some(event => !events.some(actual => actual.event === event))
+        || !this.deps.exists(join(dir, "hooks", "scripts", "activity-relay.cjs"))) {
+        throw new Error("activity relay or manifest events are missing/uninspectable");
+      }
+      this.deps.readFile(join(dir, "hooks", "scripts", "activity-relay.cjs"));
+      return { status: "green", evidence: "Saved openrig-core plugin channel is selected and locally available; native plugin loading and hook execution are unverified; its relay suppresses duplicate events handled by the same settings relay" };
+    } catch (err) {
+      return { status: "yellow", evidence: `Saved openrig-core plugin channel is selected but its assets could not be trusted: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  private checkOtherHookChannels(node: NodeInventoryEntry, startup: Extract<StartupContextProbeResult, { status: "ok" }>): CheckEntry {
+    const check = `seat.${node.canonicalSessionName ?? node.logicalId}.hooks`;
+    const plugin = this.inspectCorePlugin(startup.projectionEntries);
+    if (plugin) {
+      if (!node.cwd) return { check, status: "yellow", evidence: `${plugin.evidence}; seat cwd unavailable for hook-disable inspection`, remediation: "" };
+      const settingsPath = join(node.cwd, ".claude", "settings.local.json");
+      try {
+        if (this.deps.exists(settingsPath)) {
+          const settings: unknown = JSON.parse(this.deps.readFile(settingsPath));
+          if (!isRecord(settings)) throw new Error("settings are not an object");
+          if (settings["disableAllHooks"] === true) return { check, status: "yellow", evidence: `${plugin.evidence}; hooks explicitly disabled in ${settingsPath}`, remediation: "" };
+        }
+      } catch {
+        return { check, status: "yellow", evidence: `${plugin.evidence}; hook-disable settings could not be inspected at ${settingsPath}`, remediation: "" };
+      }
+      return { check, ...plugin, remediation: "" };
+    }
+    let desired: ReturnType<NonNullable<RestoreCheckDeps["getDesiredClaudeActivityHooks"]>>;
+    try {
+      desired = node.nodeId && this.deps.getDesiredClaudeActivityHooks
+        ? this.deps.getDesiredClaudeActivityHooks(node.nodeId)
+        : { status: "unknown", evidence: "Current desired selection metadata is unavailable" };
+    } catch {
+      desired = { status: "unknown", evidence: "Current desired selection metadata could not be read" };
+    }
+    const evidence = desired.status === "unknown"
+      ? `No saved explicit activity resource or selected core-plugin channel; current desired activity-hook selection is unknown: ${desired.evidence}`
+      : desired.selected
+        ? "Current desired activity hooks are selected, but neither OpenRig channel is saved for this conversation (stale selection); restore preserves the saved selection and does not adopt the current profile"
+        : "No saved explicit activity resource or selected core-plugin channel, and current desired activity hooks are not selected; inspection is not applicable to these known OpenRig channels (other user hooks are not inspected). Without openrig-core, OpenRig's refocus and compaction-restore hooks don't run in this seat; rig seat status shows what its refocus hook has recorded";
+    return { check, status: desired.status === "known" && !desired.selected ? "green" : "yellow", evidence, remediation: "" };
+  }
+
   private hasActivityRelayHook(settings: unknown, eventName: string, relayPath: string): boolean {
     if (!isRecord(settings) || !isRecord(settings["hooks"])) return false;
     const eventEntries = settings["hooks"][eventName];
@@ -1151,10 +1399,11 @@ export class RestoreCheckService {
         }
         catch { return false; }
       }
-      return entry["hooks"].some((hook) => (
-        isRecord(hook) && hook["type"] === "command" && typeof hook["command"] === "string" &&
-        hook["command"] === `node ${quoteShellArgument(relayPath)}`
-      ));
+      return entry["hooks"].some((hook) => {
+        if (!isRecord(hook) || hook["type"] !== "command" || typeof hook["command"] !== "string") return false;
+        const parsed = parseManagedClaudeNodeCommand(hook["command"]);
+        return parsed?.args.length === 1 && parsed.args[0] === relayPath;
+      });
     }));
   }
 
@@ -1495,6 +1744,59 @@ export class RestoreCheckService {
       return `${actions.length} ${pluralize(actions.length, "rig")} can be recovered by known OpenRig command; ${blocked.length} ${pluralize(blocked.length, "rig")} blocked; ${unknown.length} unknown.`;
     }
     return `${blocked.length} ${pluralize(blocked.length, "rig")} blocked; ${actions.length} actionable; ${unknown.length} unknown.`;
+  }
+
+  /**
+   * #3218 item 3: agents with the same recorded conversation (running, whatever their policy, or not running and
+   * resumable), each named with its recorded status as it is ("unknown" when there is none),
+   * named on each evaluated agent with the others (also those of a rig left out by --rig). A caveat with no remediation:
+   * restore is not refused, no agent is stopped and none is picked. A rig whose agents cannot be read, or an agent whose saved resume
+   * data is not readable, is named as an unavailable comparison.
+   */
+  private checkSharedConversations(inputs: RigRollupInput[], allRigs: Array<{ rigId: string; name: string }>): CheckEntry[] {
+    const label = (node: NodeInventoryEntry) => node.canonicalSessionName ?? `${node.logicalId}@${node.rigName}`;
+    const evaluated = new Set(inputs.map((input) => input.rig.rigId));
+    const seats: Array<{ node: NodeInventoryEntry; input?: RigRollupInput }> = [];
+    const out: CheckEntry[] = [];
+    for (const input of inputs) {
+      for (const node of input.nodes) if (holdsRecordedConversation(node)) seats.push({ node, input });
+    }
+    for (const rig of allRigs) {
+      if (evaluated.has(rig.rigId)) continue;
+      let nodes: NodeInventoryEntry[];
+      try {
+        nodes = this.deps.getNodeInventory(rig.rigId);
+      } catch (err) {
+        out.push({
+          check: `rig.${rig.name}.shared-conversation`,
+          status: "yellow",
+          evidence: `The shared-conversation comparison with ${rig.name}'s agents is unavailable: ${err instanceof Error ? err.message : String(err)}`,
+          remediation: "",
+        });
+        continue;
+      }
+      for (const node of nodes) if (holdsRecordedConversation(node)) seats.push({ node });
+    }
+    const { groups, unavailable } = compareConversations(seats.map(({ node }) => ({
+      seat: label(node),
+      state: node.sessionStatus ?? "unknown",
+      resumeType: node.resumeType,
+      resumeToken: node.resumeToken,
+    })));
+    const emit = (node: NodeInventoryEntry, input: RigRollupInput | undefined, evidence: string) => {
+      const check: CheckEntry = { check: `seat.${node.canonicalSessionName ?? node.logicalId}.shared-conversation`, status: "yellow", evidence, remediation: "" };
+      input?.checks.push(check);
+      out.push(check);
+    };
+    for (const group of groups) {
+      for (const { node, input } of seats) {
+        if (input && group.seats.some((entry) => entry.seat === label(node))) emit(node, input, describeSharedConversation(group));
+      }
+    }
+    for (const { node, input } of seats) {
+      if (unavailable.includes(label(node))) emit(node, input, describeUnavailable([label(node)]));
+    }
+    return out;
   }
 
   private buildRigRollup(input: RigRollupInput): RigRestoreRollup {

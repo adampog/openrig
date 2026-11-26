@@ -17,6 +17,7 @@ export interface BundleResolvedSource {
   packageRefMap: Record<string, ResolvedPackage>;
   manifest: BundleManifest;
   tempDir: string;
+  warnings?: string[];
 }
 
 /**
@@ -40,7 +41,7 @@ export class LegacyBundleSourceResolver {
 
     try {
       // Extract + verify (archive digest + content integrity)
-      await unpack(bundlePath, tempDir);
+      const unpacked = await unpack(bundlePath, tempDir);
 
       // Parse bundle manifest
       const manifestPath = nodePath.join(tempDir, "bundle.yaml");
@@ -98,7 +99,7 @@ export class LegacyBundleSourceResolver {
         packageRefMap[`./${entry.path}`] = result.resolved;
       }
 
-      return { specPath, resolvedPackages, packageRefMap, manifest, tempDir };
+      return { specPath, resolvedPackages, packageRefMap, manifest, tempDir, warnings: unpacked?.warnings };
     } catch (err) {
       // Clean up on failure
       this.cleanup(tempDir);
@@ -118,13 +119,14 @@ export class LegacyBundleSourceResolver {
 
 // -- Pod-aware bundle source resolver (AgentSpec reboot) --
 
-import { parsePodBundleManifest, validatePodBundleManifest, type PodBundleManifest } from "./bundle-types.js";
+import { parsePodBundleManifest, validatePodBundleManifest, normalizeIncludedLoginFiles, type PodBundleManifest } from "./bundle-types.js";
 
 /** Result of resolving a pod-aware bundle */
 export interface PodBundleResolvedSource {
   specPath: string;
   manifest: PodBundleManifest;
   tempDir: string;
+  warnings?: string[];
 }
 
 /**
@@ -137,7 +139,7 @@ export class PodBundleSourceResolver {
 
     try {
       // Safe unpack with digest/symlink/integrity verification
-      await unpack(bundlePath, tempDir);
+      const unpacked = await unpack(bundlePath, tempDir);
 
       const manifestPath = nodePath.join(tempDir, "bundle.yaml");
       if (!fs.existsSync(manifestPath)) {
@@ -174,6 +176,7 @@ export class PodBundleSourceResolver {
             : [],
         })),
         cultureFile: m["culture_file"] as string | undefined,
+        includedLoginFiles: normalizeIncludedLoginFiles(m["included_login_files"]),
       };
 
       const specPath = nodePath.join(tempDir, manifest.rigSpec);
@@ -181,7 +184,7 @@ export class PodBundleSourceResolver {
         throw new Error(`Bundle missing rig spec at ${manifest.rigSpec}`);
       }
 
-      return { specPath, manifest, tempDir };
+      return { specPath, manifest, tempDir, warnings: unpacked?.warnings };
     } catch (err) {
       this.cleanup(tempDir);
       throw err;
@@ -212,6 +215,8 @@ export function materializePodBundle(
   extractedDir: string,
   targetRoot: string,
   preserveConflicts = false,
+  /** Run the same target checks for a plan, without copying or backing up anything. */
+  dryRun = false,
 ): { ok: true; backupPath?: string } | { ok: false; conflicts: string[] } {
   const files: string[] = [];
   (function walk(dir: string, prefix: string) {
@@ -256,6 +261,7 @@ export function materializePodBundle(
     }
   }
   if (conflicts.size > 0 && !preserveConflicts) return { ok: false, conflicts: [...conflicts] };
+  if (dryRun) return { ok: true };
 
   let backupPath: string | undefined;
   let roots: string[] = [];

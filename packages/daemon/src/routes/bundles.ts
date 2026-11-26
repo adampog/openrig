@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import { SettingsStore } from "../domain/user-settings/settings-store.js";
+import { readSeatEnvOverride } from "../domain/seat-env.js";
 import os from "node:os";
 import nodePath from "node:path";
 import { Hono } from "hono";
@@ -8,7 +10,7 @@ import type { BootstrapOrchestrator } from "../domain/bootstrap-orchestrator.js"
 import type { BootstrapRepository } from "../domain/bootstrap-repository.js";
 import { LegacyBundleAssembler as BundleAssembler, type AssemblerFsOps } from "../domain/bundle-assembler.js";
 import { PodBundleAssembler, type PodAssemblerFsOps } from "../domain/pod-bundle-assembler.js";
-import { computeIntegrity, writeIntegrity, verifyIntegrity, type IntegrityFsOps } from "../domain/bundle-integrity.js";
+import { computeIntegrity, verifyIntegrity, isHarnessLoginPath, harnessLoginMessage, type IntegrityFsOps } from "../domain/bundle-integrity.js";
 import { pack, unpack, verifyArchiveDigest, collectUnsafeArchiveEntries, unsafeArchiveEntryReason } from "../domain/bundle-archive.js";
 import { resolvePackage } from "../domain/package-resolve-helper.js";
 import {
@@ -19,12 +21,13 @@ import { LegacyRigSpecCodec } from "../domain/rigspec-codec.js";
 import { LegacyRigSpecSchema } from "../domain/rigspec-schema.js";
 import { RigSpecCodec } from "../domain/rigspec-codec.js";
 import { RigSpecSchema } from "../domain/rigspec-schema.js";
-import { parseLegacyBundleManifest as parseBundleManifest, normalizeLegacyBundleManifest as normalizeBundleManifest, serializePodBundleManifest, parsePodBundleManifest, validatePodBundleManifest, validateLegacyBundleManifest, normalizeProvenanceBlock, normalizeBundleSource, normalizeCompatibilityBlock, isRelativeSafePath } from "../domain/bundle-types.js";
+import { parseLegacyBundleManifest as parseBundleManifest, normalizeLegacyBundleManifest as normalizeBundleManifest, serializePodBundleManifest, parsePodBundleManifest, validatePodBundleManifest, validateLegacyBundleManifest, normalizeProvenanceBlock, normalizeBundleSource, normalizeCompatibilityBlock, isRelativeSafePath, normalizeIncludedLoginFiles } from "../domain/bundle-types.js";
 import type { PodBundleManifest, BundleProvenance, BundleCompatibility, BundlePluginReference } from "../domain/bundle-types.js";
 import { detectBundleConflicts, type BundleConflict } from "../domain/bundle-conflict-detector.js";
 import { bundleInstallContext, bundleInstallContextLines } from "../domain/bundle-install-context.js";
 import type { RigRepository } from "../domain/rig-repository.js";
 import { BundleAuditReader, BundleAuditWriter, type BundleAuditFsOps, type BundleAuditRecord } from "../domain/bundle-audit.js";
+import { timeBoundAdvisory } from "../domain/time-bound-advisory.js";
 import { getDefaultOpenRigPath } from "../openrig-compat.js";
 import { routingFailureWarnings, type BundleContentRouting } from "../domain/bundle-content-routing.js";
 import { configurationId, packageDigest } from "../domain/bundle-identity.js";
@@ -35,6 +38,7 @@ import { inspectBundleBehaviour } from "../domain/bundle-behaviour-inspect.js";
 import type { BundleBehaviour } from "../domain/bundle-behaviour.js";
 import { normalizePreconditionsBlock, type BundlePrecondition } from "../domain/bundle-types.js";
 import { assertShippableSubstance } from "../domain/agent-resolver.js";
+import { SeatPoolSlotsRepository } from "../domain/seat-pool-slots.js";
 
 /**
  * Compare two dotted numeric version strings (semver-ish). Returns -1 if
@@ -119,16 +123,17 @@ async function extractManifestForCompatCheck(bundlePath: string): Promise<Record
 async function extractInstallTimeMetadata(bundlePath: string): Promise<{
   bundleManifest: Record<string, unknown>;
   rigName: string | undefined;
+  warnings?: string[];
 }> {
   const tmpDir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "bundle-meta-"));
   try {
-    await unpack(bundlePath, tmpDir);
+    const unpacked = await unpack(bundlePath, tmpDir);
     const manifestPath = nodePath.join(tmpDir, "bundle.yaml");
     if (!fs.existsSync(manifestPath)) throw new Error("Bundle missing bundle.yaml");
     const manifestYaml = fs.readFileSync(manifestPath, "utf-8");
     const bundleManifest = parsePodBundleManifest(manifestYaml) as Record<string, unknown>;
 
-    // B1 safety repair (slice-05 Checkpoint 4.2 / qitem-20260518204906): validate
+    // B1 safety repair (slice-05 Checkpoint 4.2): validate
     // the parsed manifest BEFORE trusting any of its fields. The validators
     // reject unsafe rig_spec values (isRelativeSafePath: no absolute, no ../,
     // no backslash, no empty segments). Schema-version-aware: v2 uses pod-aware
@@ -174,7 +179,7 @@ async function extractInstallTimeMetadata(bundlePath: string): Promise<{
         // rig.yaml malformed — leave rigName undefined; conflict check skips
       }
     }
-    return { bundleManifest, rigName };
+    return { bundleManifest, rigName, ...(unpacked?.warnings ? { warnings: unpacked.warnings } : {}) };
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -294,9 +299,12 @@ export function assessSpecLiveDrift(rawParsed: unknown, rigRepo: RigRepository |
   const rig = rigRepo.listRigs().find((r) => r.name === rigName);
   if (!rig) return null;
   const rows = rigRepo.db
-    .prepare("SELECT logical_id FROM nodes WHERE rig_id = ?")
-    .all(rig.id) as Array<{ logical_id: string | null }>;
-  const liveIds = rows.map((r) => r.logical_id);
+    .prepare("SELECT id, logical_id FROM nodes WHERE rig_id = ?")
+    .all(rig.id) as Array<{ id: string; logical_id: string | null }>;
+  // #3395: a seat pool's agents are added and drained by the pool, not declared, so they are left out of the live list
+  // as the export leaves them out (every phase, `drained` included); a failed read of the slots propagates like any other.
+  const poolAgents = new Set(new SeatPoolSlotsRepository(rigRepo.db).poolAgentNodeIds(rig.id));
+  const liveIds = rows.filter((r) => !poolAgents.has(r.id)).map((r) => r.logical_id);
   return isPodAware
     ? compareSpecToLive(topologyFromRigSpec(spec as never), topologyFromLiveLogicalIds(liveIds))
     : compareSpecToLive(topologyFromLegacyRigSpec(spec as never), topologyFromLiveNodeIds(liveIds));
@@ -812,7 +820,7 @@ bundleRoutes.post("/create", async (c) => {
       const tmpStaging = fs.mkdtempSync(nodePath.join(os.tmpdir(), "pod-bundle-create-"));
       try {
         const assembler = new PodBundleAssembler({ fsOps: podAssemblerFsOps() });
-        const result = assembler.assemble({ rigRoot: effectiveRigRoot, rigSpecPath: nodePath.resolve(specPath), outputDir: tmpStaging, bundleName, bundleVersion, provenance, compatibility });
+        const result = assembler.assemble({ servicesEnabled: new SettingsStore().resolveOne("bundle.services_enabled").value === true, rigRoot: effectiveRigRoot, rigSpecPath: nodePath.resolve(specPath), outputDir: tmpStaging, bundleName, bundleVersion, provenance, compatibility });
 
         // Item 6 / Checkpoint 7.5 (QA-20260601 A2 repair): auto-detect
         // author bundle.yaml at the rig source root; vendor declared
@@ -837,14 +845,16 @@ bundleRoutes.post("/create", async (c) => {
         if (carriedPacks.length > 0) result.manifest.contextPacks = [...(result.manifest.contextPacks ?? []), ...carriedPacks];
         if (projectDir) result.manifest.project = vendorProjectDir(nodePath.resolve(projectDir), tmpStaging);
 
-        const integrity = computeIntegrity(tmpStaging, integrityFsOps());
+        const included = body["includeLoginFiles"] === true ? integrityFsOps().walkFiles(tmpStaging).filter(isHarnessLoginPath).sort() : [];
+        if (included.length) result.manifest.includedLoginFiles = included;
+        const integrity = computeIntegrity(tmpStaging, integrityFsOps(), included);
         result.manifest.integrity = integrity;
         fs.writeFileSync(nodePath.join(tmpStaging, "bundle.yaml"), serializePodBundleManifest(result.manifest), "utf-8");
 
         assertShippableStagingTree(tmpStaging);
         const archiveHash = await pack(tmpStaging, nodePath.resolve(outputPath));
         eventBus.emit({ type: "bundle.created", bundleName, bundleVersion, archiveHash });
-        const warning = [driftWarning, ...(result.warnings ?? []), ...(authorPrimitives.warnings ?? [])].filter(Boolean).join("; ");
+        const warning = [driftWarning, ...(result.warnings ?? []), ...(authorPrimitives.warnings ?? []), ...included.map(file => harnessLoginMessage(file, true))].filter(Boolean).join("; ");
         return c.json({ ...bundleBuildIdentity(result.manifest, archiveHash), bundleName, bundleVersion, archiveHash, schemaVersion: 2, agents: result.manifest.agents.length, ...(warning ? { warning } : {}) }, 201);
       } finally {
         fs.rmSync(tmpStaging, { recursive: true, force: true });
@@ -921,14 +931,17 @@ bundleRoutes.post("/create", async (c) => {
         fs.writeFileSync(nodePath.join(tmpStaging, "bundle.yaml"), serializeLegacyBundleManifest(manifest), "utf-8");
       }
 
-      const integrity = computeIntegrity(tmpStaging, integrityFsOps());
-      writeIntegrity(tmpStaging, integrity, integrityFsOps());
+      const included = body["includeLoginFiles"] === true ? integrityFsOps().walkFiles(tmpStaging).filter(isHarnessLoginPath).sort() : [];
+      if (included.length) manifest.includedLoginFiles = included;
+      const integrity = computeIntegrity(tmpStaging, integrityFsOps(), included);
       manifest.integrity = integrity;
+      const { serializeLegacyBundleManifest } = await import("../domain/bundle-types.js");
+      fs.writeFileSync(nodePath.join(tmpStaging, "bundle.yaml"), serializeLegacyBundleManifest(manifest), "utf-8");
 
       assertShippableStagingTree(tmpStaging);
       const archiveHash = await pack(tmpStaging, nodePath.resolve(outputPath));
       eventBus.emit({ type: "bundle.created", bundleName, bundleVersion, archiveHash });
-      const warning = [driftWarning, ...(legacyAuthorPrimitives.warnings ?? [])].filter(Boolean).join("; ");
+      const warning = [driftWarning, ...(legacyAuthorPrimitives.warnings ?? []), ...included.map(file => harnessLoginMessage(file, true))].filter(Boolean).join("; ");
       return c.json({ ...bundleBuildIdentity(manifest, archiveHash), bundleName, bundleVersion, archiveHash, packages: manifest.packages.length, ...(warning ? { warning } : {}) }, 201);
     } finally {
       fs.rmSync(tmpStaging, { recursive: true, force: true });
@@ -989,7 +1002,7 @@ bundleRoutes.post("/inspect", async (c) => {
       const generator = { openrigVersion: getDaemonVersion() };
       const source = identity.source ? { ...identity.source } : null;
       try {
-        return inspectBundleBehaviour(tmpDir, { manifest: rawParsed, ...identity, source, generator, digestValid, filesVerified });
+        return inspectBundleBehaviour(tmpDir, { manifest: rawParsed, ...identity, source, generator, digestValid, filesVerified, servicesEnabled: new SettingsStore().resolveOne("bundle.services_enabled").value === true });
       } catch {
         return {
           schema: "openrig.bundle-behaviour/v1", state: "not_generated",
@@ -1014,6 +1027,7 @@ bundleRoutes.post("/inspect", async (c) => {
       const integritySection = rawParsed["integrity"] as { algorithm?: string; files?: Record<string, string> } | undefined;
       const podManifest = {
         schemaVersion: 2 as const,
+        includedLoginFiles: normalizeIncludedLoginFiles(rawParsed["included_login_files"]),
         name: rawParsed["name"] as string,
         version: rawParsed["version"] as string,
         createdAt: rawParsed["created_at"] as string,
@@ -1068,6 +1082,7 @@ bundleRoutes.post("/inspect", async (c) => {
         createdAt: podManifest.createdAt,
         rigSpec: podManifest.rigSpec,
         packages: [],
+        includedLoginFiles: podManifest.includedLoginFiles,
         integrity: { algorithm: "sha256" as const, files: integritySection.files ?? {} },
       } : undefined;
       const integrityResult = integrityCompat
@@ -1078,7 +1093,13 @@ bundleRoutes.post("/inspect", async (c) => {
       return c.json({ ...identity, manifest: podManifest, digestValid, integrityResult, behaviour }, 200);
     }
 
-    const manifest = normalizeBundleManifest(parseBundleManifest(manifestYaml));
+    let manifest: ReturnType<typeof normalizeBundleManifest>;
+    try {
+      manifest = normalizeBundleManifest(parseBundleManifest(manifestYaml));
+    } catch (err) {
+      // Like v2, malformed v1 manifests are inspect diagnostics, not server failures.
+      return c.json({ error: `Invalid v1 manifest: ${(err as Error).message}`, digestValid }, 200);
+    }
     const integrityResult = manifest.integrity
       ? verifyIntegrity(tmpDir, manifest, integrityFsOps())
       : { passed: false, mismatches: [], missing: [], extra: [], errors: ["no integrity section"] };
@@ -1108,7 +1129,9 @@ bundleRoutes.get("/history", async (c) => {
     rig: typeof rig === "string" && rig.length > 0 ? rig : undefined,
     since: typeof since === "string" && since.length > 0 ? since : undefined,
   });
-  return c.json({ records, total: records.length }, 200);
+  // since is compared as text against installedAt; say so when it doesn't read as a date or time.
+  const advisory = timeBoundAdvisory("since", since, "installedAt");
+  return c.json({ records, total: records.length, ...(advisory ? { advisories: [advisory] } : {}) }, 200);
 });
 
 // POST /api/bundles/install — reuses full bootstrap lifecycle
@@ -1121,6 +1144,7 @@ bundleRoutes.post("/install", async (c) => {
   const nonInterruptive = typeof body["nonInterruptive"] === "boolean" ? body["nonInterruptive"] : undefined;
   const targetRoot = typeof body["targetRoot"] === "string" ? body["targetRoot"] : undefined;
   const cwdOverride = typeof body["cwdOverride"] === "string" ? body["cwdOverride"] : undefined;
+  const envOverride = readSeatEnvOverride(body["envOverride"]);
   // Item 2 / slice-05 Checkpoint 3.3: install-time compatibility check inputs
   const skipVersionCheck = body["skipVersionCheck"] === true;
   const clientCliVersion = typeof body["cliVersion"] === "string" ? body["cliVersion"] : undefined;
@@ -1144,7 +1168,7 @@ bundleRoutes.post("/install", async (c) => {
   // source resolver validates them again later — so it runs unconditionally:
   // --skip-version-check and --force override the Item-2 compat check and
   // the Item-3 conflict check, not the safety validation.
-  let installMeta: { bundleManifest: Record<string, unknown>; rigName: string | undefined };
+  let installMeta: { bundleManifest: Record<string, unknown>; rigName: string | undefined; warnings?: string[] };
   try {
     installMeta = await extractInstallTimeMetadata(bundlePath);
   } catch (err) {
@@ -1207,11 +1231,11 @@ bundleRoutes.post("/install", async (c) => {
     // Plan mode: no run lifecycle
     try {
       const result = await bootstrapOrchestrator.bootstrap({
-        mode: "plan", sourceRef: bundlePath, sourceKind: "rig_bundle", cwdOverride,
+        mode: "plan", sourceRef: bundlePath, sourceKind: "rig_bundle", targetRoot, cwdOverride,
       });
       if (result.status === "planned") {
         eventBus.emit({ type: "bootstrap.planned", runId: result.runId, sourceRef: bundlePath, stages: result.stages.length });
-        return c.json(result, 200);
+        return c.json({ ...result, ...(installMeta.warnings ? { warnings: [...installMeta.warnings.filter(w => !result.warnings?.includes(w)), ...(result.warnings ?? [])] } : {}) }, 200);
       }
       // Plan failed — structured mapping (same as bootstrap plan route)
       eventBus.emit({ type: "bootstrap.failed", runId: result.runId, sourceRef: bundlePath, error: result.errors[0] ?? "plan failed" });
@@ -1230,7 +1254,7 @@ bundleRoutes.post("/install", async (c) => {
   try {
     const result = await bootstrapOrchestrator.bootstrap({
       mode: "apply", sourceRef: bundlePath, sourceKind: "rig_bundle",
-      autoApprove, nonInterruptive, targetRoot, cwdOverride, runId: run.id,
+      autoApprove, nonInterruptive, targetRoot, cwdOverride, envOverride, runId: run.id,
     });
 
     if (result.status === "completed" || result.status === "partial") {
@@ -1244,7 +1268,9 @@ bundleRoutes.post("/install", async (c) => {
       const routing: BundleContentRouting | undefined = bundleRouting
         ?? (result.status === "completed" ? await bootstrapOrchestrator.routeBundleContents(bundlePath) : undefined);
       // The hook already put its failures in warnings; the legacy fallback adds its own here.
-      const warnings = bundleRouting ? (result.warnings ?? []) : [...(result.warnings ?? []), ...routingFailureWarnings(routing)];
+      const warnings = [...(result.warnings ?? [])];
+      if (!bundleRouting) warnings.push(...(routing?.warnings ?? []).filter(w => !warnings.includes(w)), ...routingFailureWarnings(routing));
+      warnings.unshift(...(installMeta.warnings ?? []).filter(w => !warnings.includes(w)));
       const responseBody = routing ? { ...bootstrapResult, ...routing, warnings } : { ...bootstrapResult, warnings };
       if (result.status === "completed") {
         eventBus.emit({ type: "bootstrap.completed", runId: result.runId, rigId: result.rigId!, sourceRef: bundlePath });

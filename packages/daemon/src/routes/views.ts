@@ -1,9 +1,10 @@
-import { selectedProject, projectMission, projectReadResponse } from "../domain/workspace/project-read.js";
+import { listProjects, projectIds, selectedProject, projectMission, projectReadResponse } from "../domain/workspace/project-read.js";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import type { EventBus } from "../domain/event-bus.js";
 import type { ViewProjector } from "../domain/view-projector.js";
 import { ViewProjectorError } from "../domain/view-projector.js";
+import { queryLimit } from "./query-limit.js";
 
 /**
  * Coordination L5 — View HTTP routes (PL-004 Phase B).
@@ -112,17 +113,25 @@ export function viewsRoutes(): Hono {
   app.get("/:viewName", async (c) => {
     const viewName = c.req.param("viewName");
     const rig = c.req.query("rig") || undefined;
-    const limit = c.req.query("limit") ? Number.parseInt(c.req.query("limit")!, 10) : undefined;
+    // The projector clamps the limit to 1-1000 itself, so only NaN fails, and
+    // only on a view that binds it.
+    const parsed = queryLimit(c, { boundIntoSql: false, used: getProjector(c).bindsLimit(viewName) });
+    if (!parsed.ok) return parsed.response;
+    const limit = parsed.limit;
     // S27 — the execution view scopes by mission (release-scoped default derived
     // in the module; --mission widens/narrows).
     const mission = c.req.query("mission") || undefined;
     try {
       let project;
+      let cataloguedProjectIds: string[] | undefined;
       try {
         project = viewName === "execution" ? selectedProject(c) : null;
         if (project && mission) projectMission(project, mission);
+        // Every id a catalogued project claims, current or former, so the view can count the rows none of them claims.
+        if (project) cataloguedProjectIds = listProjects(c).projects.flatMap(projectIds);
       } catch (err) { return projectReadResponse(err); }
-      const result = await getProjector(c).show(viewName, { rig, limit, mission, project });
+      // The request's signal aborts when the client closes the connection first, so an abandoned execution read stops.
+      const result = await getProjector(c).show(viewName, { rig, limit, mission, project, cataloguedProjectIds, signal: c.req.raw.signal });
       return c.json(result);
     } catch (err) {
       return errorResponse(c, err);

@@ -211,17 +211,16 @@ Skills ship from three copies in this repository (the "edges"), listed in
 Each skill in the layout file lists which edges carry it. At this commit, 33 skills are in `spec`
 and `canonical`, 17 only in `plugin`, and 2 in all three.
 
+- Each skill has one editable home: its `spec` copy when it has a `spec` edge, otherwise its
+  `plugin` copy. Its other edges are generated from that home.
 - `npm run mirror-skills:check` (part of `npm test`) hashes every file in each edge and compares the
   hashes with `scripts/skill-edge-digests.generated.json`. It also fails on a `SKILL.md` the layout
-  does not list.
-- The full apply, `npm run mirror-skills`, regenerates all three edges from the maintainers' skill
-  source, which lives outside this repository. It needs `OPENRIG_SKILL_CANON_ROOT` and three
-  authority-file environment variables, so an outside contributor cannot run it.
-- **To fix a skill:** edit the file in every edge that carries it (same bytes), run
-  `node scripts/regen-edge-digests.mjs` to refresh the hashes from disk, then run
-  `npm run mirror-skills:check`. Say in the pull request that you edited mirrored skill files: the
-  next full apply regenerates these copies from the maintainers' source, so the change has to land
-  there too.
+  does not list, on a generated copy that differs from its home, and on a home holding text the
+  public copies would drop.
+- The full apply, `npm run mirror-skills`, regenerates every generated copy from its home and
+  refreshes the digests. It reads nothing outside the repository and never writes to a home.
+- **To fix a skill:** edit its home, run `npm run mirror-skills`, then run
+  `npm run mirror-skills:check`.
 - **To add a skill:** open an issue first. Its layout entry is generated from files that are not
   in this repository.
 - Every shipped skill also becomes a context pack at package time (next recipe).
@@ -291,9 +290,10 @@ packages.
   package, and the daemon copies its Markdown files to `$OPENRIG_HOME/reference/` when it
   starts. Files in `docs/as-built/` carry a `last-verified-against-source` commit in their
   frontmatter.
-- **Internal-leak guard** (`scripts/internal-leak-scanner.mjs`, with rules in
-  `scripts/internal-tokens.generated.json`). It refuses maintainer-internal names and paths in
-  content that ships. It runs in `generate-context-packs.mjs` (static pack sources, on every
+- **Internal-leak guard** (`scripts/internal-leak-scanner.mjs`). Its term lists come from an
+  optional local file that `OPENRIG_LEAK_GUARD_RULES` names (`scripts/leak-guard-rules.mjs`);
+  without one the term checks are skipped and every other check runs, and the release-time
+  substance gate requires it. It runs in `generate-context-packs.mjs` (static pack sources, on every
   `npm test`), in the full skill mirror apply (each public skill), in `scripts/build-package.sh`
   (the daemon `specs/` tree before it is copied into the package), and in the release-time
   substance gate (`scripts/check-substance-gate.mjs`, `npm run gate:substance`) over the packed
@@ -303,15 +303,23 @@ packages.
   machine-specific values: credentials, home and temporary paths, network addresses, email
   addresses. It never fails the job; you read it and decide.
 - **Generated files.** Do not hand-edit `scripts/*.generated.json` or anything under
-  `packages/daemon/context-packs/`. The skill-edge digests are the one generated file a contributor
-  refreshes, with `node scripts/regen-edge-digests.mjs` (see "A shipped skill").
+  `packages/daemon/context-packs/`. The skill-edge digests are refreshed by
+  `npm run mirror-skills` (see "A shipped skill").
   The internal-token rules support optional `allowed_context_lines` for reviewed generic
   examples: the complete line must match exactly, including indentation and case. Unlike
   `allowed_context_substrings`, this does not exempt a line with added or substituted text;
   internal-path checks and the substance gate's human-review dispositions still apply.
 - **Hosted CI** (`.github/workflows/tests.yml`): `build-and-package`, `typecheck`, `repo-checks`,
-  `package-tests` (macOS; daemon, CLI, TUI and UI suites with no credentials and no external
-  network) and `installed-scenario`.
+  `package-tests` (daemon and CLI suites on macOS from `macos-package-tests.yml`, for a head a
+  maintainer approved; TUI and UI suites on Ubuntu on every push; each suite
+  runs with a scrubbed environment and no provider credentials, and its external network is
+  blocked: by a `sandbox-exec` profile on macOS, and on Ubuntu by a private network namespace
+  with loopback only. On Ubuntu, the filesystem, pathname Unix sockets, and the runner user's
+  processes and `/proc` stay shared; see `docs/as-built/test-layers.md`),
+  `daemon-ubuntu` (the daemon suite again on Ubuntu under that confinement, with a summary of
+  the tests that failed or did not run and the full JSON report as an artifact; macOS daemon
+  coverage is unchanged), `linux-seat-environment` and
+  `installed-scenario`.
 
 ## Pointers
 

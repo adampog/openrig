@@ -23,6 +23,7 @@ describe("ClaimService", () => {
   let claimService: ClaimService;
   let mockTmux: TmuxAdapter;
   let setSessionOptionSpy: ReturnType<typeof vi.fn>;
+  let setSessionEnvSpy: ReturnType<typeof vi.fn>;
   let sendTextSpy: ReturnType<typeof vi.fn>;
   let sendKeysSpy: ReturnType<typeof vi.fn>;
   let startPipePaneSpy: ReturnType<typeof vi.fn>;
@@ -37,16 +38,22 @@ describe("ClaimService", () => {
     eventBus = new EventBus(db);
     discoveryRepo = new DiscoveryRepository(db);
     setSessionOptionSpy = vi.fn(async () => ({ ok: true as const }));
+    setSessionEnvSpy = vi.fn(async () => undefined);
     sendTextSpy = vi.fn(async () => ({ ok: true as const }));
     sendKeysSpy = vi.fn(async () => ({ ok: true as const }));
     startPipePaneSpy = vi.fn(async () => ({ ok: true as const }));
     ensureContextCollectorSpy = vi.fn();
     mockTmux = {
       setSessionOption: setSessionOptionSpy,
+      setSessionEnv: setSessionEnvSpy,
       getSessionOption: vi.fn(async () => null),
       sendText: sendTextSpy,
       sendKeys: sendKeysSpy,
       startPipePane: startPipePaneSpy,
+      // The identity hint goes through the session transport, which probes the session and reads the pane first.
+      probeSession: vi.fn(async () => ({ state: "present" })),
+      hasSession: vi.fn(async () => true),
+      capturePaneContent: vi.fn(async () => ""),
     } as unknown as TmuxAdapter;
     transcriptStore = new TranscriptStore({ transcriptsRoot: "/tmp/openrig-claim-service-transcripts", enabled: true });
     claimService = new ClaimService({
@@ -164,6 +171,8 @@ describe("ClaimService", () => {
     expect(metaMap.get("@rigged_rig_id")).toBe(rig.id);
     expect(metaMap.get("@rigged_rig_name")).toBe("test-rig");
     expect(metaMap.get("@rigged_logical_id")).toBe("orch.lead");
+    // An adopted session never gets the seat's OPENRIG_NODE_ID marker: OpenRig didn't launch it, so rig down releases it.
+    expect(setSessionEnvSpy).not.toHaveBeenCalled();
   });
 
   // T16: createAndBindToPod sets tmux metadata
@@ -183,6 +192,7 @@ describe("ClaimService", () => {
     const calls = setSessionOptionSpy.mock.calls as [string, string, string][];
     const metaMap = new Map(calls.map((c) => [c[1], c[2]]));
     expect(metaMap.get("@rigged_node_id")).toBe(result.nodeId);
+    expect(setSessionEnvSpy).not.toHaveBeenCalled();
     expect(metaMap.get("@rigged_session_name")).toBe("dev-coder@host");
     expect(metaMap.get("@rigged_rig_id")).toBe(rig.id);
     expect(metaMap.get("@rigged_rig_name")).toBe("test-rig");

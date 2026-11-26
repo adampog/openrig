@@ -1,10 +1,14 @@
 import { Command } from "commander";
 import fs from "node:fs";
+import { createServer } from "node:net";
 import { randomUUID } from "node:crypto";
-import { acquireDaemonStartLock } from "../daemon-start-lock.js";
+import { acquireDaemonStartLock, archiveSpentReservation, bootedAtMs, currentBootId, markReservationRetained, processStartToken } from "../daemon-start-lock.js";
 import { formatDaemonHostForUrl } from "../client.js";
 import { execFileSync, spawn } from "node:child_process";
 import { fetchWithTimeout } from "../fetch-with-timeout.js";
+import { daemonFetch } from "../daemon-transport.js";
+import { personRegistrationOffer } from "../person-registration-offer.js";
+import { ensureDefaultWorkspace } from "@openrig/daemon/instance-initialization";
 import {
   startDaemon,
   stopDaemon,
@@ -16,6 +20,7 @@ import {
   OPENRIG_DIR,
   STATE_FILE,
   resolveBindIntent,
+  statusGuardMessage,
 } from "../daemon-lifecycle.js";
 
 interface ProcessAliveDeps {
@@ -36,14 +41,16 @@ export function createIsProcessAlive(deps: ProcessAliveDeps): (pid: number) => b
 
 export type SignalOutcome = "sent" | "missing" | "not-permitted";
 
-/** kill(pid, 0) as an outcome. POSIX: only ESRCH means no such process; EPERM means the process
- *  EXISTS but this shell may not signal it (another user's process, or a sandbox such as Codex's). */
+/** kill(pid, 0) as an outcome. POSIX: kill(pid, 0) fails only with ESRCH (no such process) or EPERM
+ *  (the process EXISTS but this shell may not signal it: another user's process, or a sandbox such as
+ *  Codex's). Only ESRCH is "missing"; any other error is not evidence of death, so it reads as
+ *  "not-permitted" (uninspectable), never as a dead process. */
 export function signalProbe(pid: number, kill: (pid: number, signal: 0) => unknown = process.kill): SignalOutcome {
   try {
     kill(pid, 0);
     return "sent";
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM" ? "not-permitted" : "missing";
+    return (error as NodeJS.ErrnoException).code === "ESRCH" ? "missing" : "not-permitted";
   }
 }
 
@@ -56,10 +63,12 @@ export function createProcessLiveness(deps: {
   readProcessState: (pid: number) => string | null;
 }): (pid: number) => ProcessLiveness {
   return (pid: number) => {
-    if (deps.signal(pid) === "missing") return "dead";
+    const signal = deps.signal(pid);
+    if (signal === "missing") return "dead";
     const state = deps.readProcessState(pid)?.trim();
     if (!state) return "unknown";
-    return state.startsWith("Z") ? "dead" : "alive";
+    if (state.startsWith("Z")) return "dead";
+    return signal === "not-permitted" ? "unknown" : "alive";
   };
 }
 
@@ -89,18 +98,75 @@ export function realDeps(): LifecycleDeps {
     readProcessState: (pid) => readProcessState(pid),
   });
 
+  // #3953: a process's stdout and stderr, read as the daemon's own database-holder check reads them (lsof, fds 1 and 2).
+  const writesOutputTo = (pid: number, file: string): boolean | { failure: string } => {
+    let real: string;
+    try { real = fs.realpathSync(file); } catch { return { failure: `${file} can't be resolved` }; }
+    if (process.platform === "linux") {
+      // Linux names each open file under /proc without lsof; a link that can't be read leaves the answer to lsof.
+      const links = [1, 2].map((fd) => {
+        try { return fs.readlinkSync(`/proc/${pid}/fd/${fd}`); }
+        catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? null : undefined; }
+      });
+      if (links.every((link) => link !== undefined)) return links.includes(real);
+    }
+    try {
+      const listed = execFileSync("lsof", ["-a", "-p", String(pid), "-d", "1,2", "-Fn"], { encoding: "utf-8", timeout: 2_000, maxBuffer: 64 * 1024 });
+      return listed.split("\n").some((line) => line.startsWith("n") && (line.slice(1) === real || line.slice(1) === file));
+    } catch (error) {
+      const err = error as { status?: number | null; code?: string; signal?: string | null };
+      // Exit status 1 is an answer: none of those files is open (or the process is gone).
+      if (err.status === 1) return false;
+      return { failure: err.code === "ENOENT" ? "lsof isn't installed" : err.signal ? "lsof timed out" : "lsof failed" };
+    }
+  };
+
+  // #2860: where the OS has pid namespaces (Linux), a missing pid is only proof from the daemon's own.
+  const pidNamespace = (): string | undefined => {
+    if (process.platform !== "linux") return "host";
+    try { return fs.readlinkSync("/proc/self/ns/pid"); } catch { return undefined; }
+  };
+
   return {
     processLiveness,
-    acquireStartLock: () => acquireDaemonStartLock(OPENRIG_DIR),
+    acquireStartLock: () => {
+      const lock = acquireDaemonStartLock(OPENRIG_DIR, { bootId: currentBootId(), bootedAtMs: bootedAtMs(), processLiveness, pidNamespace: pidNamespace() });
+      if (lock.archived) console.error(`An abandoned start reservation (from before this boot, or whose recorded launcher and child are both gone) was archived as ${lock.archived}`);
+      return lock;
+    },
     spawn: (cmd, args, opts) => spawn(cmd, args, opts as Parameters<typeof spawn>[2]),
-    fetch: async (url) => {
-      const res = await fetchWithTimeout(globalThis.fetch, url, {}, {
+    fetch: async (url, init) => {
+      let body = "";
+      // #3957: each health probe on a connection of its own. With `connection: close`, undici closes the socket after the
+      // response, so no later probe reuses one the daemon has since closed: a stopped listener reads refused, not reset.
+      const probeInit: RequestInit = { headers: { connection: "close" }, ...(init?.signal ? { signal: init.signal } : {}) };
+      const res = await fetchWithTimeout(daemonFetch(url, globalThis.fetch), url, probeInit, {
         timeoutMs: 1_500,
         timeoutMessage: `Daemon health probe timed out for ${url}`,
+        consumeResponse: async (response) => { body = await response.text(); },
       });
-      // OPR.0.4.3.21 — expose json() so getDaemonStatus can read the enriched
-      // /healthz event-loop evidence. Bound to this Response instance.
-      return { ok: res.ok, json: () => res.json() };
+      // Read the finite health body inside the deadline, then expose its cached JSON to lifecycle evidence readers.
+      return { ok: res.ok, json: async () => JSON.parse(body) as unknown };
+    },
+    isPortOccupied: (host, port) => new Promise((resolve) => {
+      const server = createServer();
+      server.once("error", (error: NodeJS.ErrnoException) => resolve(error.code === "EADDRINUSE"));
+      try {
+        server.listen({ host, port, exclusive: true }, () => server.close(() => resolve(false)));
+      } catch { resolve(false); }
+    }),
+    fileSize: (p) => { try { return fs.statSync(p).size; } catch { return 0; } },
+    readFileFrom: (p, offset) => {
+      let fd: number | undefined;
+      try {
+        fd = fs.openSync(p, "r");
+        const size = fs.fstatSync(fd).size;
+        const start = size < offset ? 0 : offset; // The log may have been truncated.
+        const buffer = Buffer.alloc(size - start);
+        const read = fs.readSync(fd, buffer, 0, buffer.length, start);
+        return buffer.toString("utf-8", 0, read);
+      } catch { return null; }
+      finally { if (fd !== undefined) fs.closeSync(fd); }
     },
     kill: (pid, signal) => { process.kill(pid, signal as NodeJS.Signals); return true; },
     readFile: (p) => { try { return fs.readFileSync(p, "utf-8"); } catch { return null; } },
@@ -132,6 +198,13 @@ export function realDeps(): LifecycleDeps {
     isProcessAlive,
     // RULING 1ae863d2 — sibling-home scan (home-resolution honesty).
     listDir: (p) => { try { return fs.readdirSync(p); } catch { return []; } },
+    pidNamespace,
+    // #3315: what the start records and stop checks to confirm a start reservation still names its child.
+    bootId: currentBootId,
+    processStartToken,
+    releaseStartReservation: archiveSpentReservation,
+    retainStartReservation: markReservationRetained,
+    writesOutputTo,
   };
 }
 
@@ -142,10 +215,11 @@ export function daemonCommand(depsOverride?: LifecycleDeps): Command {
   cmd
     .command("start")
     .description("Start the daemon")
-    .addHelpText("after", "\nStartup reserves this local instance before initialization and verifies the spawned child PID on every required listener.\nMissing/mismatched identity or child exit fails startup; failed publication withdraws only this launch's matching state. Use a matching CLI/daemon installation.\nA concurrent start fails without spawning another child. Inspect daemon-start.lock for launcher/child PIDs after an interrupted start;\nonly archive an abandoned reservation after proving both processes absent. A failed cleanup retains it and reports the child PID.\n")
+    .addHelpText("after", "\nStartup reserves this local instance before initialization and verifies the spawned child PID on every required listener.\nMissing/mismatched identity or child exit fails startup; failed publication withdraws only this launch's matching state. Use a matching CLI/daemon installation.\nA concurrent start fails without spawning another child. Inspect daemon-start.lock for launcher/child PIDs after an interrupted start;\nonly archive an abandoned reservation after proving both processes absent. A failed cleanup retains it and reports the child PID.\nA reservation from an earlier boot is archived as daemon-start.lock.abandoned-<time> and the start goes on; so is one from\nthis boot whose recorded launcher and child are both gone in this shell's pid namespace and that no stop retained.\n")
     .option("--port <port>", "Port to listen on")
     .option("--host <host>", "Host to bind on")
     .option("--db <path>", "Database path")
+    .option("--allow-db-conflict", "Proceed for this start when another live daemon is confirmed using the database")
     // V0.3.1 slice 05 kernel-rig-as-default — skip the kernel auto-boot
     // path. Used by test fixtures, headless CI, and operators who want
     // a no-kernel daemon for ad-hoc topology work. The daemon proceeds
@@ -160,14 +234,20 @@ export function daemonCommand(depsOverride?: LifecycleDeps): Command {
     // weaker "daemon-ready". Default 60s; override with --wait-for-kernel-ms.
     .option("--wait-for-kernel", "After daemon binds, also wait for kernel-agent readiness (default timeout 60s)")
     .option("--wait-for-kernel-ms <ms>", "Override --wait-for-kernel timeout in milliseconds")
-    .action(async (opts: { port?: string; host?: string; db?: string; kernel?: boolean; waitForKernel?: boolean; waitForKernelMs?: string }) => {
+    .action(async (opts: { port?: string; host?: string; db?: string; allowDbConflict?: boolean; kernel?: boolean; waitForKernel?: boolean; waitForKernelMs?: string }) => {
       try {
         const { ConfigStore } = await import("../config-store.js");
-        const { SystemPreflight } = await import("../system-preflight.js");
-        const { execSync } = await import("node:child_process");
+        const { SystemPreflight, quietPreflightExec } = await import("../system-preflight.js");
         const configStore = new ConfigStore();
         const config = configStore.resolve();
         const effectivePort = opts.port ? parseInt(opts.port, 10) : config.daemon.port;
+        // --port abc or --port 99999 reached the preflight port check and died
+        // with Node's raw ERR_SOCKET_BAD_PORT. Refuse only ports that cannot be
+        // bound, with the same parseInt and range as the daemon.port config key,
+        // so every --port value that starts a daemon today still does.
+        if (Number.isNaN(effectivePort) || effectivePort < 0 || effectivePort > 65535) {
+          throw new Error(`Invalid --port: must be an integer in [0, 65535], got "${opts.port}"`);
+        }
         // bug-fix slice auth-bearer-tailscale-trust: distinguish
         // user-explicit from default-fallback so the daemon can
         // multi-bind (loopback + tailscale auto-detect) when the operator
@@ -189,7 +269,7 @@ export function daemonCommand(depsOverride?: LifecycleDeps): Command {
 
         // Run preflight before starting
           const preflight = new SystemPreflight({
-            exec: async (cmd) => execSync(cmd, { encoding: "utf-8" }),
+            exec: quietPreflightExec,
             configStore,
             getDaemonStatus: () => getDaemonStatus(getDeps()),
             openrigHome: OPENRIG_DIR,
@@ -224,10 +304,18 @@ export function daemonCommand(depsOverride?: LifecycleDeps): Command {
             // OPENRIG_NO_KERNEL env var so the daemon's kernel-boot
             // check in startup.ts honors the flag.
             skipKernelBoot: skipKernel,
+            allowDbConflict: opts.allowDbConflict,
+            readinessWaitSeconds: config.daemon.startReadinessWaitSeconds,
           },
           getDeps(),
         );
         console.log(`Daemon started on port ${state.port} (pid ${state.pid})`);
+        // The daemon leaves a workspace.root that holds a project of its own as it is, and its log says so; so does this
+        // output, from the same read-only check.
+        const workspace = ensureDefaultWorkspace({ root: config.workspace.root, dryRun: true });
+        if (workspace.existingProject) {
+          console.log(`workspace.root holds a project of its own (${workspace.existingProject}); OpenRig left it as it is and reads that project's own id.`);
+        }
 
         // V0.3.1 slice 05 forward-fix #3 architectural — --wait-for-kernel
         // post-bind polling. Kernel boot is fire-and-forget after the
@@ -235,14 +323,24 @@ export function daemonCommand(depsOverride?: LifecycleDeps): Command {
         // know whether the kernel itself reached ready. Operators who
         // need a kernel-ready signal opt in here.
         if (opts.waitForKernel) {
-          const { waitForKernelReady } = await import("../daemon-lifecycle.js");
+          const { waitForKernelReady, skippedKernelMessage } = await import("../daemon-lifecycle.js");
+          const { attentionLines, checkKernelAttention } = await import("../seat-attention.js");
+          const { DaemonClient } = await import("../client.js");
           const timeoutMs = opts.waitForKernelMs && /^\d+$/.test(opts.waitForKernelMs)
             ? parseInt(opts.waitForKernelMs, 10)
             : 60_000;
           const baseUrl = `http://${formatDaemonHostForUrl(state.host ?? "127.0.0.1")}:${state.port}`;
           const result = await waitForKernelReady(baseUrl, timeoutMs);
+          // A kernel seat held at a startup prompt or sign-in keeps the kernel short of ready: name it and why.
+          const heldLines = result.kernelState !== "ready" && result.kernelState !== "skipped"
+            ? attentionLines(await checkKernelAttention(new DaemonClient(baseUrl)), "pane").map(line => `  ${line}`) : [];
           if (result.ok) {
             console.log(`Kernel ${result.kernelState}; variant=${result.variant ?? "(none)"}`);
+            for (const line of heldLines) console.log(line);
+          } else if (result.kernelState === "skipped") {
+            // Skipped on purpose, so neither a timeout nor an auth problem: say why, and the way back.
+            console.error(skippedKernelMessage(result.detail));
+            process.exitCode = 1;
           } else {
             // Honest 3-part error per banked discipline.
             console.error(
@@ -252,9 +350,11 @@ export function daemonCommand(depsOverride?: LifecycleDeps): Command {
                 "\n" +
                 "Fix: inspect `rig ps --rig kernel` for stalled agents, or run `claude auth status` / `codex login status` to confirm runtime auth.",
             );
+            for (const line of heldLines) console.error(line);
             process.exitCode = 1;
           }
         }
+        if (process.exitCode !== 1) for (const line of await personRegistrationOffer()) console.log(line);
       } catch (err) {
         console.error(err instanceof Error ? err.message : String(err));
         process.exitCode = 1;
@@ -264,7 +364,7 @@ export function daemonCommand(depsOverride?: LifecycleDeps): Command {
   cmd
     .command("stop")
     .description("Stop the daemon (10s shutdown budget; 12s process wait; incomplete drain exits nonzero)")
-    .addHelpText("after", "\nSends at most one SIGTERM to a live target and verifies the original PID and listener. Repeated signals join shutdown.\nFor a recorded target, missing/stale receipts and incomplete drains exit nonzero, including retries.\nTarget state is retained until a matching clean receipt; status reads preserve unverified state.\nNo target is a distinct no-op, never clean-drain certification; unbound incomplete evidence stays unverified.\nInspect OPENRIG_HOME/daemon-shutdown.json and daemon.log for the phase and outcome.\nThe bound covers asynchronous shutdown; an event-loop wedge still requires operator recovery.\n")
+    .addHelpText("after", "\nSends at most one SIGTERM to a live target and verifies the original PID and listener. Repeated signals join shutdown.\nFor a recorded target, missing/stale receipts and incomplete drains exit nonzero, including retries.\nTarget state is retained until a matching clean receipt; status reads preserve unverified state.\nNo target is a distinct no-op, never clean-drain certification; unbound incomplete evidence stays unverified.\nInspect OPENRIG_HOME/daemon-shutdown.json and daemon.log for the phase and outcome.\nThe bound covers asynchronous shutdown; an event-loop wedge still requires operator recovery.\nWith no recorded target, the child of a start that ended pending is signalled only when its reservation still names it\n(same boot, launcher gone, same process, its endpoint checked) and its listener names it or does not answer in time.\n")
     .action(async () => {
       try {
         const outcome = await stopDaemon(getDeps());
@@ -312,13 +412,25 @@ export function daemonCommand(depsOverride?: LifecycleDeps): Command {
           console.log("Daemon PID is absent (stale state)");
           break;
         case "unverified":
+          // T2: a live start reservation names a launch in progress (listener not up yet).
+          if (status.startPending) {
+            const since = status.startPending.since ? ` since ${status.startPending.since}` : "";
+            console.log(`Daemon starting: launch reserved by pid ${status.startPending.pid}${since}; not listening yet`);
+          }
           // 1ae863d2 — C3 semantics: we could NOT confirm up or down; never claim stopped.
           if (status.siblingHint) {
             console.log("Daemon state UNVERIFIED — the resolved OPENRIG_HOME has no daemon state, but a live daemon appears under a sibling home:");
             console.log(`  resolved: ${status.siblingHint.resolvedHome}`);
             console.log(`  sibling:  ${status.siblingHint.siblingHome}`);
             console.log("  Fix: point OPENRIG_HOME at the right home (or check your shell env) — this CLI is likely resolving the wrong home.");
-          } else {
+          } else if (status.pidUnseen) {
+            // #2860: the same words as the command guard.
+            const unseen = statusGuardMessage(status);
+            console.log(unseen.fact);
+            console.log(`  ${unseen.consequence}`);
+            console.log(`  ${unseen.action}`);
+          } else if (!status.startPending) {
+            // A pending start's probe was refused, not inconclusive; its line above says what is known.
             console.log("Daemon state UNVERIFIED — the probe timed out or was inconclusive (this is NOT evidence the daemon is down).");
             console.log("  Re-check with: rig daemon status  ·  direct: curl the daemon /healthz");
           }

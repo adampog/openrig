@@ -2,22 +2,30 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type Database from "better-sqlite3";
 import { createFullTestDb } from "./helpers/test-app.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
-
-function setupDb(): Database.Database {
-  return createFullTestDb();
-}
+import { readSeatLaunchWrapper } from "../src/domain/launch-wrapper.js";
 
 describe("RigRepository", () => {
   let db: Database.Database;
   let repo: RigRepository;
 
   beforeEach(() => {
-    db = setupDb();
+    db = createFullTestDb();
     repo = new RigRepository(db);
   });
 
   afterEach(() => {
     db.close();
+  });
+
+  it("reads one node input route with a typed fallback for missing nodes and older schemas", () => {
+    const rig = repo.createRig("routes");
+    const node = repo.addNode(rig.id, "worker", { runtime: "pi" });
+    expect(repo.getNodeInputRoute(node.id)).toBe("typed");
+    repo.setNodeInputRoute(node.id, "native");
+    expect(repo.getNodeInputRoute(node.id)).toBe("native");
+    expect(repo.getNodeInputRoute("missing")).toBe("typed");
+    db.exec("ALTER TABLE nodes DROP COLUMN input_route");
+    expect(new RigRepository(db).getNodeInputRoute(node.id)).toBe("typed");
   });
 
   it("createRig persists and returns typed Rig with id", () => {
@@ -42,6 +50,53 @@ describe("RigRepository", () => {
     expect(node.role).toBe("orchestrator");
     expect(node.runtime).toBe("claude-code");
     expect(node.model).toBe("opus");
+  });
+
+  it.each(["rig.yaml", "rig-claude-only.yaml", "rig-codex-only.yaml"])(
+    "does not label a custom project path as the built-in %s", (variant) => {
+      const rig = repo.createRig("kernel");
+      db.prepare("INSERT INTO bootstrap_runs (id, source_kind, source_ref, rig_id) VALUES (?, ?, ?, ?)")
+        .run("custom", "rig_spec", "/workspace/project/rigs/launch/kernel/" + variant, rig.id);
+      expect(repo.getKernelVariantFromBootstrap(rig.id, "/opt/openrig/specs")).toBeNull();
+    }
+  );
+
+  it.each([
+    ["/opt/openrig/specs/rigs/launch/kernel/rig.yaml", "rig.yaml"],
+    ["/opt/openrig/specs/rigs/launch/kernel/rig-claude-only.yaml", "rig-claude-only.yaml"],
+    ["/opt/openrig/specs/rigs/launch/kernel/rig-codex-only.yaml", "rig-codex-only.yaml"],
+    ["C:\\OpenRig\\specs\\rigs\\launch\\kernel\\rig-codex-only.yaml", "rig-codex-only.yaml"],
+    ["rigs/launch/kernel/rig.yaml", null],
+    ["/custom/rig.yaml", null],
+    ["/custom/kernel/rig.yaml", null],
+    ["/opt/openrig/specs/rigs/launch/kernel/custom.yaml", null],
+    ["/opt/openrig/specs/rigs/launch/kernel/rig.yaml.bak", null],
+    ["/opt/openrig/specs/rigs/launch/kernel/../rig.yaml", null],
+    ["/opt/openrig/specs/rigs/launch/kernel/rig.yaml/extra", null],
+  ])("reads only a built-in kernel template from %s", (source, expected) => {
+    const rig = repo.createRig("kernel");
+    db.prepare("INSERT INTO bootstrap_runs (id, source_kind, source_ref, rig_id, status) VALUES (?, ?, ?, ?, ?)")
+      .run("boot", "rig_spec", source, rig.id, "partial");
+    const specsDir = source.startsWith("C:") ? "C:/OpenRig/specs" : "/opt/openrig/specs";
+    expect(repo.getKernelVariantFromBootstrap(rig.id, specsDir)).toBe(expected);
+  });
+
+  it("reads the latest rig-spec history for exactly this rig, without falling back past a custom spec", () => {
+    const rig = repo.createRig("kernel");
+    const other = repo.createRig("other");
+    expect(repo.getKernelVariantFromBootstrap(rig.id, "/opt/openrig/specs")).toBeNull();
+    const insert = db.prepare("INSERT INTO bootstrap_runs (id, source_kind, source_ref, rig_id, created_at) VALUES (?, ?, ?, ?, ?)");
+    const path = "/opt/openrig/specs/rigs/launch/kernel/";
+    insert.run("old", "rig_spec", path + "rig.yaml", rig.id, "2026-01-01");
+    insert.run("new", "rig_spec", path + "rig-codex-only.yaml", rig.id, "2026-01-02");
+    insert.run("other", "rig_spec", path + "rig-claude-only.yaml", other.id, "2026-01-03");
+    insert.run("bundle", "bundle", path + "rig-claude-only.yaml", rig.id, "2026-01-03");
+    insert.run("older-inserted-last", "rig_spec", path + "rig-claude-only.yaml", rig.id, "2026-01-01");
+    expect(repo.getKernelVariantFromBootstrap(rig.id, "/opt/openrig/specs")).toBe("rig-codex-only.yaml");
+    // Match BootstrapRepository's deterministic insertion-order tie breaker.
+    insert.run("custom", "rig_spec", "/custom/rig.yaml", rig.id, "2026-01-02");
+    expect(repo.getKernelVariantFromBootstrap(rig.id, "/opt/openrig/specs")).toBeNull();
+    expect(repo.getKernelVariantFromBootstrap(other.id, "/opt/openrig/specs")).toBe("rig-claude-only.yaml");
   });
 
   it("addNode to nonexistent rig throws", () => {
@@ -217,7 +272,7 @@ describe("RigRepository.findLatestUsableSnapshot (L2)", () => {
   let repo: RigRepository;
 
   beforeEach(() => {
-    db = setupDb();
+    db = createFullTestDb();
     repo = new RigRepository(db);
   });
 
@@ -308,5 +363,288 @@ describe("RigRepository.findLatestUsableSnapshot (L2)", () => {
     const result = repo.findLatestUsableSnapshot(rig.id);
     expect(result).not.toBeNull();
     expect(result!.id).toBe("snap-new");
+  });
+});
+
+describe("RigRepository launch_wrapper persistence (#2328)", () => {
+  let db: Database.Database;
+  let repo: RigRepository;
+
+  beforeEach(() => {
+    db = createFullTestDb();
+    repo = new RigRepository(db);
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  it.each(["pi", "codex", "claude-code", "synth"])("persists non-empty launchWrapper on %s seat and omits when absent or []", (runtime) => {
+    const rig = repo.createRig("wrapper-rig");
+    const wrapped = repo.addNode(rig.id, `wrapped-${runtime}`, {
+      runtime,
+      launchWrapper: ["mtn", "sandbox", "exec", "", "--seat", "miles", "--"],
+    });
+    expect(wrapped.launchWrapper).toEqual(["mtn", "sandbox", "exec", "", "--seat", "miles", "--"]);
+    expect(readSeatLaunchWrapper(db, wrapped.id)).toEqual(["mtn", "sandbox", "exec", "", "--seat", "miles", "--"]);
+
+    const explicitEmpty = repo.addNode(rig.id, `empty-${runtime}`, {
+      runtime,
+      launchWrapper: [],
+    });
+    expect(explicitEmpty.launchWrapper).toBeUndefined();
+    expect("launchWrapper" in explicitEmpty).toBe(false);
+    expect(readSeatLaunchWrapper(db, explicitEmpty.id)).toBeUndefined();
+    const rawEmptyRow = db.prepare("SELECT launch_wrapper FROM nodes WHERE id = ?").get(explicitEmpty.id) as { launch_wrapper: string | null };
+    expect(rawEmptyRow.launch_wrapper).toBeNull();
+
+    const absent = repo.addNode(rig.id, `absent-${runtime}`, { runtime });
+    expect(absent.launchWrapper).toBeUndefined();
+    expect("launchWrapper" in absent).toBe(false);
+    expect(readSeatLaunchWrapper(db, absent.id)).toBeUndefined();
+  });
+
+  it.each(["codex", "synth"])("supports setNodeLaunchWrapper update and clear (via null or []) to canonical SQL NULL on %s", runtime => {
+    const rig = repo.createRig("wrapper-set-rig");
+    const node = repo.addNode(rig.id, "worker", { runtime });
+    expect(repo.setNodeLaunchWrapper(node.id, ["mtn", "--"])).toBe(true);
+    expect(repo.getRig(rig.id)!.nodes[0]!.launchWrapper).toEqual(["mtn", "--"]);
+    expect(readSeatLaunchWrapper(db, node.id)).toEqual(["mtn", "--"]);
+
+    expect(repo.setNodeLaunchWrapper(node.id, [])).toBe(true);
+    const afterEmptyClear = repo.getRig(rig.id)!.nodes[0]!;
+    expect(afterEmptyClear.launchWrapper).toBeUndefined();
+    expect("launchWrapper" in afterEmptyClear).toBe(false);
+    expect((db.prepare("SELECT launch_wrapper FROM nodes WHERE id = ?").get(node.id) as { launch_wrapper: string | null }).launch_wrapper).toBeNull();
+
+    expect(repo.setNodeLaunchWrapper(node.id, ["/usr/bin/env", "--"])).toBe(true);
+    expect(repo.getRig(rig.id)!.nodes[0]!.launchWrapper).toEqual(["/usr/bin/env", "--"]);
+    expect(repo.setNodeLaunchWrapper(node.id, null)).toBe(true);
+    expect(readSeatLaunchWrapper(db, node.id)).toBeUndefined();
+  });
+
+  it.each(["omp", "terminal", "stub", "openshell-claude"])("rejects launchWrapper on %s at addNode and setNodeLaunchWrapper", (runtime) => {
+    const rig = repo.createRig("bad-runtime-rig");
+    expect(() => repo.addNode(rig.id, "bad-nonempty", { runtime, launchWrapper: ["mtn"] })).toThrow(/pi|codex/i);
+    expect(() => repo.addNode(rig.id, "bad-empty", { runtime, launchWrapper: [] })).toThrow(/pi|codex/i);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM nodes WHERE rig_id = ?").get(rig.id)).toEqual({ count: 0 });
+
+    const node = repo.addNode(rig.id, "existing", { runtime });
+    expect(() => repo.setNodeLaunchWrapper(node.id, ["mtn"])).toThrow(/pi|codex/i);
+    expect(() => repo.setNodeLaunchWrapper(node.id, [])).toThrow(/pi|codex/i);
+  });
+
+  it("rejects invalid launchWrapper argv at addNode and setNodeLaunchWrapper", () => {
+    const rig = repo.createRig("bad-argv-rig");
+    const node = repo.addNode(rig.id, "good-node", { runtime: "pi" });
+    for (const bad of [
+      [""],
+      ["   "],
+      ["./relative"],
+      ["../relative"],
+      ["a/b"],
+      ["bad\narg"],
+      ["bad\0arg"],
+      ["bad\rarg"],
+      ["mtn", "bad\narg"],
+    ]) {
+      expect(() => repo.addNode(rig.id, "bad-node", { runtime: "pi", launchWrapper: bad }), JSON.stringify(bad)).toThrow();
+      expect(() => repo.setNodeLaunchWrapper(node.id, bad), JSON.stringify(bad)).toThrow();
+    }
+  });
+
+  it.each(["pi", "codex", "claude-code", "synth"].flatMap(runtime => [
+    "[]",
+    "corrupt-json",
+    '{"cmd":"mtn"}',
+    '"mtn"',
+    "null",
+    '[""]',
+    '["./rel"]',
+    '["mtn","bad\\narg"]',
+  ].map(corrupt => [runtime, corrupt] as const)))("throws on malformed or non-canonical stored %s launch_wrapper %s instead of silently unwrapping", (runtime, corrupt) => {
+    const rig = repo.createRig("corrupt-rig");
+    const node = repo.addNode(rig.id, "worker", { runtime, launchWrapper: ["mtn"] });
+    db.prepare("UPDATE nodes SET launch_wrapper = ? WHERE id = ?").run(corrupt, node.id);
+    expect(() => readSeatLaunchWrapper(db, node.id)).toThrow();
+    expect(() => repo.getRig(rig.id)).toThrow();
+  });
+
+  it("throws when stored launch_wrapper is present on an unsupported runtime row", () => {
+    const rig = repo.createRig("corrupt-runtime-rig");
+    const node = repo.addNode(rig.id, "terminal-worker", { runtime: "terminal" });
+    db.prepare("UPDATE nodes SET launch_wrapper = ? WHERE id = ?").run('["mtn","--"]', node.id);
+    expect(() => readSeatLaunchWrapper(db, node.id)).toThrow(/pi|codex/i);
+    expect(() => repo.getRig(rig.id)).toThrow(/pi|codex/i);
+  });
+
+  it.each(["codex", "synth"])("validates launchWrapper in stored %s launch_recipe_json via getNodeLaunchRecipe", runtime => {
+    const rig = repo.createRig("recipe-rig");
+    const baseSpec = {
+      version: "0.2",
+      name: "recipe-rig",
+      pods: [{
+        id: "dev",
+        label: "Dev",
+        members: [{
+          id: "worker",
+          agentRef: "local:agents/worker",
+          profile: "default",
+          runtime,
+          cwd: ".",
+          launchWrapper: ["mtn", "--"],
+        }],
+        edges: [],
+      }],
+      edges: [],
+    };
+    const node = repo.addNode(rig.id, "dev.worker", {
+      runtime,
+      launchWrapper: ["mtn", "--"],
+      launchRecipe: { version: 1, rigRoot: "/tmp", rigSpec: baseSpec },
+    });
+    expect(repo.getNodeLaunchRecipe(node.id)?.rigSpec.pods[0]!.members[0]!.launchWrapper).toEqual(["mtn", "--"]);
+
+    const badRuntimeSpec = structuredClone(baseSpec);
+    badRuntimeSpec.pods[0]!.members[0]!.runtime = "terminal";
+    db.prepare("UPDATE nodes SET launch_recipe_json = ? WHERE id = ?")
+      .run(JSON.stringify({ version: 1, rigRoot: "/tmp", rigSpec: badRuntimeSpec }), node.id);
+    expect(repo.getNodeLaunchRecipe(node.id)).toBeNull();
+  });
+});
+
+describe("RigRepository process_limits persistence (#3253)", () => {
+  let db: Database.Database;
+  let repo: RigRepository;
+
+  beforeEach(() => {
+    db = createFullTestDb();
+    repo = new RigRepository(db);
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  it.each(["codex", "claude-code", "pi", "terminal"])("round-trips tasks_max on a %s seat and reads none when absent", (runtime) => {
+    const rig = repo.createRig("limits-rig");
+    const limited = repo.addNode(rig.id, "limited", { runtime, processLimits: { tasksMax: 512 } });
+    expect(limited.processLimits).toEqual({ tasksMax: 512 });
+    expect(repo.getNodeProcessLimits(limited.id)).toEqual({ tasksMax: 512 });
+    expect((db.prepare("SELECT process_limits FROM nodes WHERE id = ?").get(limited.id) as { process_limits: string })
+      .process_limits).toBe('{"tasks_max":512}');
+    const plain = repo.addNode(rig.id, "plain", { runtime });
+    expect("processLimits" in plain).toBe(false);
+    expect(repo.getNodeProcessLimits(plain.id)).toBeUndefined();
+  });
+
+  it("replaces and clears a stored limit", () => {
+    const rig = repo.createRig("limits-rig");
+    const node = repo.addNode(rig.id, "seat", { runtime: "codex", processLimits: { tasksMax: 512 } });
+    expect(repo.setNodeProcessLimits(node.id, { tasksMax: 1024 })).toBe(true);
+    expect(repo.getNodeProcessLimits(node.id)).toEqual({ tasksMax: 1024 });
+    expect(repo.getRig(rig.id)!.nodes[0]!.processLimits).toEqual({ tasksMax: 1024 });
+    expect(repo.setNodeProcessLimits(node.id, null)).toBe(true);
+    expect(repo.getNodeProcessLimits(node.id)).toBeUndefined();
+    expect("processLimits" in repo.getRig(rig.id)!.nodes[0]!).toBe(false);
+  });
+
+  it("round-trips memory_max alone and with tasks_max, stored in bytes in a fixed key order", () => {
+    const rig = repo.createRig("limits-rig");
+    const column = (id: string) => (db.prepare("SELECT process_limits FROM nodes WHERE id = ?").get(id) as { process_limits: string })
+      .process_limits;
+    const memory = repo.addNode(rig.id, "memory", { runtime: "codex", processLimits: { memoryMax: 4294967296 } });
+    expect(memory.processLimits).toEqual({ memoryMax: 4294967296 });
+    expect(repo.getNodeProcessLimits(memory.id)).toEqual({ memoryMax: 4294967296 });
+    expect(column(memory.id)).toBe('{"memory_max":4294967296}');
+    const both = repo.addNode(rig.id, "both", { runtime: "codex", processLimits: { memoryMax: 1073741824, tasksMax: 512 } });
+    expect(repo.getNodeProcessLimits(both.id)).toEqual({ tasksMax: 512, memoryMax: 1073741824 });
+    expect(column(both.id)).toBe('{"tasks_max":512,"memory_max":1073741824}');
+  });
+
+  it("replaces only the memory limit, and clears both with null", () => {
+    const rig = repo.createRig("limits-rig");
+    const node = repo.addNode(rig.id, "seat", { runtime: "codex", processLimits: { tasksMax: 512, memoryMax: 1073741824 } });
+    expect(repo.setNodeProcessLimits(node.id, { tasksMax: 512, memoryMax: 2147483648 })).toBe(true);
+    expect(repo.getNodeProcessLimits(node.id)).toEqual({ tasksMax: 512, memoryMax: 2147483648 });
+    expect(repo.getRig(rig.id)!.nodes[0]!.processLimits).toEqual({ tasksMax: 512, memoryMax: 2147483648 });
+    expect(repo.setNodeProcessLimits(node.id, null)).toBe(true);
+    expect(repo.getNodeProcessLimits(node.id)).toBeUndefined();
+    expect(() => repo.setNodeProcessLimits(node.id, { memoryMax: 1000 })).toThrow(/memory_max/);
+  });
+
+  it("refuses a limit with neither key instead of storing '{}', on a node and at creation", () => {
+    const rig = repo.createRig("limits-rig");
+    const node = repo.addNode(rig.id, "seat", { runtime: "codex", processLimits: { tasksMax: 512 } });
+    const noLimit = { tasksMax: undefined, memoryMax: undefined };
+    expect(() => repo.setNodeProcessLimits(node.id, noLimit)).toThrow(/tasks_max or memory_max is required \(pass null to clear\)/);
+    expect((db.prepare("SELECT process_limits FROM nodes WHERE id = ?").get(node.id) as { process_limits: string })
+      .process_limits).toBe('{"tasks_max":512}');
+    expect(() => repo.addNode(rig.id, "partial", { runtime: "codex", processLimits: noLimit })).toThrow(/tasks_max or memory_max is required/);
+    expect(repo.getRig(rig.id)!.nodes.map((n) => n.logicalId)).toEqual(["seat"]);
+  });
+
+  it("refuses an out-of-range limit, and a malformed stored value throws for that seat's own read", () => {
+    const rig = repo.createRig("limits-rig");
+    const node = repo.addNode(rig.id, "seat", { runtime: "codex" });
+    expect(() => repo.setNodeProcessLimits(node.id, { tasksMax: 0 })).toThrow(/tasks_max/);
+    for (const raw of ["not json", "{}", '{"tasks_max":0}', '{"memory_max":0}', '{"memory_max":"lots"}',
+      '{"tasks_max":256,"cpu_quota":"50%"}']) {
+      db.prepare("UPDATE nodes SET process_limits = ? WHERE id = ?").run(raw, node.id);
+      expect(() => repo.getNodeProcessLimits(node.id), raw).toThrow(/process_limits/);
+    }
+  });
+
+  it("a malformed stored value doesn't break the rig read: that node says why, the others read, the value is kept", () => {
+    const rig = repo.createRig("limits-rig");
+    const bad = repo.addNode(rig.id, "bad", { runtime: "codex", processLimits: { tasksMax: 512 } });
+    const good = repo.addNode(rig.id, "good", { runtime: "codex", processLimits: { tasksMax: 256 } });
+    const plain = repo.addNode(rig.id, "plain", { runtime: "codex" });
+    db.prepare("UPDATE nodes SET process_limits = ? WHERE id = ?").run("not json", bad.id);
+    const nodes = repo.getRig(rig.id)!.nodes;
+    const byId = (id: string) => nodes.find((n) => n.id === id)!;
+    expect(byId(bad.id).processLimitsError).toMatch(/process_limits: stored value is not valid JSON/);
+    expect("processLimits" in byId(bad.id)).toBe(false);
+    expect(byId(good.id).processLimits).toEqual({ tasksMax: 256 });
+    expect("processLimitsError" in byId(plain.id)).toBe(false);
+    expect((db.prepare("SELECT process_limits FROM nodes WHERE id = ?").get(bad.id) as { process_limits: string })
+      .process_limits).toBe("not json");
+  });
+});
+
+describe("RigRepository keep_alive persistence (#2940)", () => {
+  let db: Database.Database;
+  let repo: RigRepository;
+
+  beforeEach(() => {
+    db = createFullTestDb();
+    repo = new RigRepository(db);
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  it.each(["codex", "claude-code", "pi", "terminal"])("stores keep_alive on a %s seat; absent is off and leaves the node unchanged", (runtime) => {
+    const rig = repo.createRig("keep-rig");
+    const kept = repo.addNode(rig.id, "kept", { runtime, keepAlive: true });
+    expect(kept.keepAlive).toBe(true);
+    expect(db.prepare("SELECT keep_alive FROM nodes WHERE id = ?").get(kept.id)).toEqual({ keep_alive: 1 });
+    const plain = repo.addNode(rig.id, "plain", { runtime });
+    const off = repo.addNode(rig.id, "off", { runtime, keepAlive: false });
+    for (const node of [plain, off]) {
+      expect("keepAlive" in node).toBe(false);
+      expect(db.prepare("SELECT keep_alive FROM nodes WHERE id = ?").get(node.id)).toEqual({ keep_alive: 0 });
+    }
+  });
+
+  it("turns keep_alive on and off on an existing seat", () => {
+    const rig = repo.createRig("keep-rig");
+    const node = repo.addNode(rig.id, "seat", { runtime: "codex" });
+    expect(repo.setNodeKeepAlive(node.id, true)).toBe(true);
+    expect(repo.getRig(rig.id)!.nodes[0]!.keepAlive).toBe(true);
+    expect(repo.setNodeKeepAlive(node.id, false)).toBe(true);
+    expect("keepAlive" in repo.getRig(rig.id)!.nodes[0]!).toBe(false);
+    expect(repo.setNodeKeepAlive("no-such-node", true)).toBe(false);
   });
 });

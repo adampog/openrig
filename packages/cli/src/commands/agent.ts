@@ -41,11 +41,11 @@ export function agentCommand(depsOverride?: AgentDeps): Command {
       }
 
       const status = await getDaemonStatus(deps.lifecycleDeps);
-      if (!daemonStatusGuard(status)) return;
+      if (!daemonStatusGuard(status, { json: opts.json })) return;
 
       const client = deps.clientFactory(getDaemonUrl(status));
 
-      const res = await client.postText<{ valid?: boolean; errors?: string[] }>("/api/agents/validate", yaml);
+      const res = await client.postText<{ valid?: boolean; errors?: string[]; advisories?: string[] }>("/api/agents/validate", yaml);
 
       if (opts.json) {
         console.log(JSON.stringify(res.data));
@@ -65,6 +65,8 @@ export function agentCommand(depsOverride?: AgentDeps): Command {
       }
 
       const data = res.data;
+      // Advisories are printed whether or not the spec is valid; they never make it invalid.
+      for (const advisory of data.advisories ?? []) console.error(`⚠ agent spec advisory: ${advisory}`);
       if (data.valid) {
         const name = yamlScalar(yaml, "name") ?? "unknown";
         const version = yamlScalar(yaml, "version") ?? "unknown";

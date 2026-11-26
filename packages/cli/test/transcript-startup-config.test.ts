@@ -14,7 +14,7 @@ vi.mock("../src/daemon-lifecycle.js", async (original) => {
   const actual = await original<typeof import("../src/daemon-lifecycle.js")>();
   return { ...actual, getDaemonStatus: vi.fn(async () => ({ state: "stopped" })), startDaemon: vi.fn(async () => { throw new Error("startup options captured"); }) };
 });
-vi.mock("../src/system-preflight.js", () => ({ SystemPreflight: class { async run() { return { ready: true, checks: [] }; } } }));
+vi.mock("../src/system-preflight.js", () => ({ SystemPreflight: class { async run() { return { ready: true, checks: [] }; } }, quietPreflightExec: async () => "" }));
 let home: string;
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "transcript-startup-"));
@@ -50,4 +50,31 @@ it.each(["daemon", "start", "up"])("%s startup leaves file settings live and pre
   vi.stubEnv("OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS", explicit["OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS"]);
   await vi.advanceTimersByTimeAsync(1000);
   expect(resolve()).toEqual({ lines: 60, pollIntervalMs: 5000 });
+});
+
+it.each(["daemon", "start", "up"])("%s startup passes the resolved daemon.start_readiness_wait_seconds as the start's readiness wait", async (entry) => {
+  vi.stubEnv("OPENRIG_DAEMON_START_READINESS_WAIT_SECONDS", undefined);
+  new ConfigStore(join(home, "config.json")).set("daemon.start_readiness_wait_seconds", "420");
+  const deps = { lifecycleDeps: {} as never, clientFactory: vi.fn() as never };
+  const command = entry === "daemon" ? daemonCommand(deps.lifecycleDeps) : entry === "start" ? startCommand(deps) : upCommand(deps);
+  await command.parseAsync(entry === "daemon" ? ["start"] : entry === "start" ? ["--all"] : ["fixture.yaml"], { from: "user" });
+  expect(startDaemon).toHaveBeenCalledTimes(1);
+  expect(vi.mocked(startDaemon).mock.calls[0]![0].readinessWaitSeconds).toBe(420);
+  // Not a child setting: it isn't passed to the daemon process.
+  expect(Object.keys(buildDaemonEnv({}, { ...vi.mocked(startDaemon).mock.calls[0]![0], port: 7433, db: "fixture.sqlite" }))
+    .some((name) => name.includes("READINESS_WAIT"))).toBe(false);
+});
+
+it("daemon start --allow-db-conflict applies to its child only, not a later unflagged start", async () => {
+  vi.stubEnv("OPENRIG_ALLOW_DB_CONFLICT", undefined);
+  await daemonCommand({} as never).exitOverride().parseAsync(["start", "--allow-db-conflict"], { from: "user" });
+  const options = vi.mocked(startDaemon).mock.calls[0]![0];
+  const base = { KEEP: "parent" };
+  expect(buildDaemonEnv(base, { ...options, port: 7433, db: "fixture.sqlite" }).OPENRIG_ALLOW_DB_CONFLICT).toBe("1");
+  expect(base).toEqual({ KEEP: "parent" });
+  expect(process.env.OPENRIG_ALLOW_DB_CONFLICT).toBeUndefined();
+  vi.mocked(startDaemon).mockClear();
+  await daemonCommand({} as never).parseAsync(["start"], { from: "user" });
+  const next = vi.mocked(startDaemon).mock.calls[0]![0];
+  expect(buildDaemonEnv({}, { ...next, port: 7433, db: "fixture.sqlite" }).OPENRIG_ALLOW_DB_CONFLICT).toBeUndefined();
 });

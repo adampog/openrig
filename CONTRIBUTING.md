@@ -40,7 +40,12 @@ repository, and we're happy to link to it.
 
 ## Setting up
 
-Node `^22 || ^24` and a working `tmux` are required. Then:
+Node `^22.14.0 || ^24`, a working `tmux` and `rsync` are required. Node 22 must be at least
+22.14.0 for better-sqlite3's Node-API 10 binding. macOS includes `rsync`; many Linux
+installs don't (`sudo apt-get install rsync` on Debian or Ubuntu). `npm test` and `npm run mirror-skills`
+use it. Use the npm that comes with your Node, which is npm 10 or newer (`npm --version` shows which you
+have). A separately packaged npm 9, such as Debian or Ubuntu's `npm` package, fails a fresh `npm ci` with
+`ENOENT` on `chmod` of `node_modules/@openrig/tui/dist/main.js`. Then:
 
 ```bash
 git clone https://github.com/mvschwarz/openrig.git
@@ -55,17 +60,36 @@ npm run lint           # typecheck every package
 runs too. Use `npm install <package>` only when you're adding or changing a dependency, and commit
 the lockfile change with it.
 
+With npm 12, dependency install scripts are blocked unless the root
+`package.json` permits them in `allowScripts`. That field approves the locked
+esbuild versions so their postinstall binary checks run. better-sqlite3 13.0.3 has
+no install script (`gypfile: false`) and bundles
+prebuilt binaries for x64 and arm64 on macOS, Windows and Linux (glibc or musl), so
+it needs no install-script approval. On other platforms, install the native
+build tools required by [node-gyp](https://github.com/nodejs/node-gyp#installation),
+then explicitly build with `npm --prefix node_modules/better-sqlite3 run build-release`;
+this runs the package's build script without adding an install-script approval.
+When updating esbuild, review its script and run
+[`npm install-scripts approve esbuild`](https://docs.npmjs.com/cli/v12/commands/npm-install-scripts/)
+to update the pinned entries alongside the lockfile, then run `npm rebuild esbuild`
+to execute any postinstall checks skipped before approval. Other dependency
+scripts remain blocked. Keep these approvals in the project, without changing
+user or global npm settings.
+
 `npm test` builds the daemon and runs repository checks before the package suites. Read the
-specific failure. A shipped skill may exist in more than one copy (see ARCHITECTURE.md): edit every copy, then run
-`node scripts/regen-edge-digests.mjs` and commit the digest file it changes (the full
-`npm run mirror-skills` apply needs maintainer-only inputs; see "A shipped skill" in
-[ARCHITECTURE.md](ARCHITECTURE.md#a-shipped-skill)). The repository checks include a docs guard: a
+specific failure. Each shipped skill has one editable home in this repository (see
+["A shipped skill" in ARCHITECTURE.md](ARCHITECTURE.md#a-shipped-skill)). Edit its home, run
+`npm run mirror-skills` to regenerate its other copies and refresh the digests, then run
+`npm run mirror-skills:check` and commit the result. The apply reads nothing outside the repository.
+The repository checks include a docs guard: a
 tracked file under `docs/` must be in `docs/as-built/`, `docs/reference/` or `docs/releases/`
 (`docs/DESIGN.md` is the one exception). They check that shipped first-run text names only teams, skills and
 commands that exist, and they validate the context-pack sources;
 `npm run generate-context-packs` rebuilds the generated packs locally, which aren't committed.
 The UI unit-test suite is separate from `npm test`: run `npm run test:ui`. CI runs it on every pull
-request as `package-tests (ui)`, so a change has to pass it.
+request as `package-tests (ui)`, so a change has to pass it. The macOS `package-tests (daemon)` and
+`package-tests (cli)` checks start when a maintainer approves your pull request's current head, so
+they show as expected until then, and a later push needs a new approval to run them.
 [docs/as-built/test-layers.md](docs/as-built/test-layers.md) lists every test layer, what CI runs,
 and what each layer can and cannot prove.
 

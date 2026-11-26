@@ -1,9 +1,13 @@
+import { physicalSessionName } from "./session-registry.js";
 import { resolveNodeFile } from "./scope/node-file.js";
-import { belongsToProject } from "./workspace/project-catalog.js";
+import { belongsToProject, projectTagIds } from "./workspace/project-catalog.js";
 import { inspectGraph } from "./workflow-reconciliation.js";
-import { createProofPolicyRead, readMissionReadiness, readProjectReadiness } from "./proof/judgments.js";
-import { lifecycleObligations, requiredLifecycleSteps } from "./lifecycle-obligations.js";
+import { createProofPolicyRead, readMissionReadiness, readProjectReadinessAsync } from "./proof/judgments.js";
+import { lifecycleObligations } from "./lifecycle-obligations.js";
+import { renderWorkflowProjectCommand } from "./workflow-projector.js";
 import { QueueWakeRepository } from "./queue-wake-repository.js";
+import { readWithCurrentParkBoundary } from "./current-park-arm.js";
+import { isTypedGateBlocker } from "./queue-repository.js";
 // S27 (OPR.0.5.6.27) — the execution view: one JSON document answering the six
 // execution questions (who-where, sequencing, care-dial, done-ness-by-rung, park
 // honesty, parallelism health), EVERY field derived at read time.
@@ -16,6 +20,8 @@ import { QueueWakeRepository } from "./queue-wake-repository.js";
 //   "INDETERMINATE" (with a named basis), never idle/dead/done/false.
 // - THE LADDER IS THE SCHEMA: done-ness is five named rungs
 //   (locked/built/reviewed/folded/adopted); a single "done" boolean does not exist.
+//   What a team recorded about a slice (its `status:` word, a `merged:<pr>` report)
+//   is shown beside the rungs as labelled testimony and never sets one.
 // - PROJECTION, NOT AUTHORITY: every cell carries the row/artifact/command that
 //   makes it one command from source.
 //
@@ -35,14 +41,21 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { parse as parseYaml } from "yaml";
 import type Database from "better-sqlite3";
-import { shellQuote } from "../adapters/shell-quote.js";
-import { parseFrontmatter } from "./slices/slice-indexer.js";
+import { parseFrontmatter, sliceStatusBucket } from "./slices/slice-indexer.js";
 import { lastMeaningfulTransition } from "./queue-waiting.js";
 import { derivePickup } from "./queue-pickup.js";
+
+/** #2661 (c): the dep's answer for a seat, or null when absent or failing (a read never breaks the view). */
+export function compactionOwedSinceOf(deps: { compactionOwedSince?: (sessionName: string) => string | null }, session: string | null | undefined): string | null {
+  if (!session) return null;
+  try { return deps.compactionOwedSince?.(session) ?? null; } catch { return null; }
+}
 import { resolveWorkNodeDirs } from "./current-work.js";
 import { resolveLegacyTopologyRigsRoot } from "./user-settings/settings-store.js";
 import { BUILD_INFO, type BuildInfo } from "../build-info.js";
 import { validateMissionComposition } from "./lifecycle-manifest.js";
+import { cooperativeReadFile, readRowsCooperatively } from "./execution-candidate-reader.js";
+import { recordSlowDiagnostic } from "./sync-site-wrap.js";
 
 export const INDETERMINATE = "INDETERMINATE" as const;
 export type Indeterminate = typeof INDETERMINATE;
@@ -65,8 +78,11 @@ export interface ExecutionViewDeps {
       needsInput: { count: number; reason: string | null };
       decidedBy: string | null;
       changedAt: string;
+      backgroundWork?: { observedAt: string } | null;
     } | null;
   };
+  /** #2661 (c): since when (ISO) a seat's managed post-compaction restore is owed, or null (the pickup's grace). */
+  compactionOwedSince?: (sessionName: string) => string | null;
   now?: () => Date;
   buildInfo?: BuildInfo;
   /** Injectable for tests; synchronous fakes are also accepted. */
@@ -132,6 +148,11 @@ function parseArrayField(v: unknown): string[] | Indeterminate {
 
 const SLICE_TAG = /^slice:(.+)$/;
 const CANDIDATE_TAG = /^candidate:(.+)$/;
+/** A recorded merge report: `merged:<pr-number>` on a row bound to the slice. */
+const MERGED_TAG = /^merged:(\d+)$/;
+/** `recorded_at` is when the row recorded the merge, not when it happened. `linked`
+ *  is true when the same row's `candidate:<sha>` resolves to the slice's built commit. */
+interface MergeReport { pr: string; row: string; recorded_at: string; linked: boolean }
 
 /** Candidate identity is a COMMIT, not a string. Production carries mixed forms —
  *  abbreviated tags (`dced9edb0`), full 40-hex artifact fields, and annotated
@@ -190,6 +211,26 @@ function missionReferences(missionsRoot: string | null, mission: string): string
   return [...references];
 }
 
+/** The mission: tags a row carries, as written. */
+function missionTags(raw: string | null): string[] {
+  return parseTags(raw).filter((t) => t.startsWith("mission:")).map((t) => t.slice("mission:".length));
+}
+
+/** A row that carries a mission: tag binds only to the mission that tag names, by exact
+ *  match; a body mention binds only a row with no mission: tag at all. The SQL LIKE that
+ *  selects candidates is a substring match, so `mission:AB` and a body that merely
+ *  mentions `A` both reach this check and are decided here. */
+function rowBindsToMission(raw: string | null, references: readonly string[]): boolean {
+  const tagged = missionTags(raw);
+  return tagged.length === 0 || tagged.some((t) => namesMission(t, references));
+}
+
+/** Exact match, folding ASCII case the way the SQL LIKE that selects candidates does. */
+function namesMission(tag: string, references: readonly string[]): boolean {
+  const fold = (value: string): string => value.replace(/[A-Z]/g, (c) => c.toLowerCase());
+  return references.some((reference) => fold(reference) === fold(tag));
+}
+
 interface SliceFacts {
   dir: string;
   specPath: string;
@@ -229,8 +270,8 @@ function readMissionSlices(missionsRoot: string, mission: string): SliceFacts[] 
 }
 
 /** Locate the slice facts for a dep id, resolving out-of-mission deps to their
- *  own release dir by id prefix (OPR.0.5.5.x -> release-0.5.5). */
-function resolveDep(
+ *  own release dir by id prefix (OPR.0.5.5.x -> release-0.5.5). Exported for its test. */
+export function resolveDep(
   depId: string,
   current: SliceFacts[],
   missionsRoot: string | null,
@@ -240,7 +281,8 @@ function resolveDep(
   if (inMission) return inMission;
   if (cache.has(depId)) return cache.get(depId) ?? null;
   let found: SliceFacts | null = null;
-  const m = depId.match(/^OPR\.(\d+\.\d+\.\d+)\.\d+$/);
+  // Any project's prefix (dot-id's 2-3 uppercase letters), so a nested project's own release ids resolve too.
+  const m = depId.match(/^[A-Z]{2,3}\.(\d+\.\d+\.\d+)\.\d+$/);
   if (m && missionsRoot) {
     const releaseDir = `release-${m[1]}`;
     for (const s of readMissionSlices(missionsRoot, releaseDir)) {
@@ -305,20 +347,29 @@ function hasColumn(db: Database.Database, table: string, column: string): boolea
   return db.prepare(`PRAGMA table_info(${table})`).all().some((row) => (row as { name?: string }).name === column);
 }
 
+/** The packet's own renderer, so the view and the packet's Continuation print one command. */
 function lifecycleProjectAction(input: {
   instanceId: string;
   packetId: string;
-  owner: string;
+  stepId: string;
   acceptance: Record<string, unknown> | null;
-  receiptRequired?: boolean;
+  binding: Record<string, unknown> | null;
 }): string {
-  const base = `rig workflow project --instance ${input.instanceId} --current-packet ${input.packetId} --exit <handoff|waiting|done|failed> --actor-session ${input.owner}${input.receiptRequired ? " --evidence-ref <agent-judged-receipt>" : ""}`;
-  if (!input.acceptance) return base;
-  const verdicts = Array.isArray(input.acceptance["verdicts"])
-    ? input.acceptance["verdicts"].filter((value): value is string => typeof value === "string")
-    : [];
-  const verdict = verdicts.length === 1 ? verdicts[0]! : `<${verdicts.join("|")}>`;
-  return `${base} --acceptance-candidate ${shellQuote(String(input.acceptance["candidate"]))} --acceptance-verdict ${shellQuote(verdict)} --acceptance-evidence-ref ${shellQuote(String(input.acceptance["evidence_ref"]))}`;
+  const acceptance = input.acceptance
+    ? {
+        candidate: String(input.acceptance["candidate"]),
+        verdicts: Array.isArray(input.acceptance["verdicts"])
+          ? input.acceptance["verdicts"].filter((value): value is string => typeof value === "string")
+          : [],
+        evidence_ref: String(input.acceptance["evidence_ref"]),
+      }
+    : undefined;
+  return renderWorkflowProjectCommand({
+    instanceId: input.instanceId,
+    packetId: input.packetId,
+    step: { id: input.stepId, acceptance },
+    binding: input.binding,
+  });
 }
 
 /**
@@ -327,7 +378,7 @@ function lifecycleProjectAction(input: {
  * lifecycle_binding_json carries identity/provenance only. Older databases
  * have no migration-079 columns and therefore return an honest empty list.
  */
-function readLifecycleExecutions(db: Database.Database, mission: string, project?: string): Array<Record<string, unknown>> {
+function readLifecycleExecutions(db: Database.Database, mission: string, projectIds?: readonly string[]): Array<Record<string, unknown>> {
   if (!hasColumn(db, "workflow_instances", "lifecycle_binding_json")) return [];
   const rows = db.prepare(
     `SELECT wi.*, ws.spec_json
@@ -344,7 +395,7 @@ function readLifecycleExecutions(db: Database.Database, mission: string, project
   for (const row of rows) {
     const binding = parseJsonRecord(row["lifecycle_binding_json"]);
     const identity = isRecord(binding["identity"]) ? binding["identity"] as Record<string, unknown> : {};
-    if (identity["mission"] !== mission || (project && identity["project"] !== project)) continue;
+    if (identity["mission"] !== mission || (projectIds && !projectIds.includes(String(identity["project"])))) continue;
     const instanceId = String(row["instance_id"]);
     const frontier = parseJsonStringList(row["current_frontier_json"]);
     const specRoot = parseJsonRecord(row["spec_json"]);
@@ -392,7 +443,7 @@ function readLifecycleExecutions(db: Database.Database, mission: string, project
         gate: step && isRecord(step["gate"]) ? step["gate"] : null,
         acceptance,
         targeted_action: matches.length === 1 && packet
-          ? lifecycleProjectAction({ instanceId, packetId, owner: String(packet.destination_session), acceptance, receiptRequired: stepId !== null && requiredLifecycleSteps(binding).includes(stepId) })
+          ? lifecycleProjectAction({ instanceId, packetId, stepId: stepId!, acceptance, binding })
           : INDETERMINATE,
       };
     });
@@ -412,7 +463,7 @@ function readLifecycleExecutions(db: Database.Database, mission: string, project
             failure["status"] === "unresolved" &&
             row["status"] !== "completed" &&
             row["status"] !== "aborted"
-            ? `rig workflow resume ${instanceId} --occurrence ${String(failure["occurrence_id"])} --actor-session <you>`
+            ? `rig workflow resume ${instanceId} --occurrence ${String(failure["occurrence_id"])}`
             : null,
         }))
       : [];
@@ -585,16 +636,18 @@ function readArrangement(missionsRoot: string, mission: string, slices: SliceFac
   }
 }
 
-function readWaveMap(db: Database.Database, missions: string[], project?: string): WaveMapData {
-  const missionWhere = missions.map(() => "tags LIKE ?").join(" OR ");
-  const row = db
-    .prepare(
-      `SELECT qitem_id, body, tags FROM queue_items
-        WHERE tags LIKE '%format:wave-map-v1%' AND (${missionWhere})
-        ORDER BY ts_created DESC`,
-    )
-    .all(...missions.map((mission) => `%mission:${mission}%`)) as Array<{ qitem_id: string; body: string | null; tags: string | null }>;
-  const selectedRow = row.find(r => !project || belongsToProject(r.tags, project));
+/** The mission's wave-map row, chosen from the rows the candidate read already returned: those include every row whose
+ *  tags name the mission, so a second scan of the whole queue table isn't needed. Matching is case-insensitive, as LIKE
+ *  is, and the newest row wins. */
+function readWaveMap(candidates: readonly QueueRowLite[], missions: string[], projectIds?: readonly string[]): WaveMapData {
+  const needles = missions.map((mission) => `mission:${mission}`.toLowerCase());
+  const row = candidates
+    .filter((r) => {
+      const tags = r.tags?.toLowerCase() ?? "";
+      return tags.includes("format:wave-map-v1") && needles.some((needle) => tags.includes(needle));
+    })
+    .sort((a, b) => (a.ts_created < b.ts_created ? 1 : a.ts_created > b.ts_created ? -1 : 0));
+  const selectedRow = row.find(r => missionTags(r.tags).some((t) => namesMission(t, missions)) && (!projectIds || belongsToProject(r.tags, projectIds)));
   if (!selectedRow?.body) return { rowId: INDETERMINATE, waves: [] };
   const block = selectedRow.body.match(WAVE_MAP_BLOCK);
   if (!block) return { rowId: INDETERMINATE, waves: [] };
@@ -616,46 +669,78 @@ interface ReviewArtifactFact {
   artifactType: string | null;
 }
 
-/** Read review drops co-located with this slice, plus the legacy global registry
- * when no catalogued project was selected. Both sources keep the same slice and
- * built-commit join; unbound global artifacts cannot establish project review. */
-function scanReviewArtifacts(rigsRoot: string, sliceDirOrId: string[], proofDir: string, includeGlobal: boolean): ReviewArtifactFact[] | Indeterminate {
-  const out: ReviewArtifactFact[] = [];
-  let readable = false;
-  const scanDirectory = (dir: string, local: boolean) => {
-    let files: string[];
-    try {
-      files = fs.readdirSync(dir).filter((f) => f.endsWith(".md"));
-      readable = true;
-    } catch { return; }
-    for (const f of files) {
-      let raw: string;
-      try { raw = fs.readFileSync(path.join(dir, f), "utf8"); }
-      catch { continue; }
-      const fm = parseFrontmatter(raw);
-      const sliceVal = typeof fm["slice"] === "string" ? fm["slice"] : null;
-      if (!sliceVal || !sliceDirOrId.includes(sliceVal)) continue;
-      const artifactType = typeof fm["artifact_type"] === "string" ? fm["artifact_type"] : null;
-      // A local QA/guard drop does not become a review leg merely by living in proof/.
-      if (local && !["rev1-r1", "rev1-r2", "adjudication"].includes(artifactType ?? "")) continue;
-      out.push({ path: path.join(dir, f),
-        verdict: typeof fm["verdict"] === "string" ? fm["verdict"] : INDETERMINATE,
-        candidateSha: typeof fm["candidate_sha"] === "string" ? fm["candidate_sha"] : null,
-        artifactType });
-    }
-  };
-  scanDirectory(proofDir, true);
-  if (includeGlobal) {
-    let rigs: string[] = [];
-    try { rigs = fs.readdirSync(rigsRoot); readable = true; } catch { /* Local proof remains usable. */ }
-    for (const rig of rigs) {
-      const stateDir = path.join(rigsRoot, rig, "state");
-      let entries: string[];
-      try { entries = fs.readdirSync(stateDir); } catch { continue; }
-      for (const entry of entries.filter((e) => e.startsWith("review"))) scanDirectory(path.join(stateDir, entry), false);
+/** One parsed review drop, before it is joined to a slice. */
+interface ReviewDrop extends ReviewArtifactFact { slice: string | null }
+
+/** The legacy global registry, listed and parsed once per execution-view read. */
+interface ReviewRegistry { readable: boolean; drops: ReviewDrop[] }
+
+/** Files read, or time spent, before the registry read yields to the event loop. Both are soft. */
+const REGISTRY_SLICE_FILES = 32;
+const REGISTRY_SLICE_MS = 8;
+
+function readReviewDrop(file: string): ReviewDrop | null {
+  let raw: string;
+  try { raw = fs.readFileSync(file, "utf8"); }
+  catch { return null; }
+  const fm = parseFrontmatter(raw);
+  return { path: file,
+    verdict: typeof fm["verdict"] === "string" ? fm["verdict"] : INDETERMINATE,
+    candidateSha: typeof fm["candidate_sha"] === "string" ? fm["candidate_sha"] : null,
+    artifactType: typeof fm["artifact_type"] === "string" ? fm["artifact_type"] : null,
+    slice: typeof fm["slice"] === "string" ? fm["slice"] : null };
+}
+
+function listReviewFiles(dir: string): string[] | null {
+  try { return fs.readdirSync(dir).filter((f) => f.endsWith(".md")).map((f) => path.join(dir, f)); }
+  catch { return null; }
+}
+
+/** Every rig's `state/review*` drops, in the order a per-slice scan met them. Every slice of one read joins this same
+ *  list, so the registry is read once per read, not once per slice; it yields between files so other work runs. */
+async function readReviewRegistry(rigsRoot: string): Promise<ReviewRegistry> {
+  let rigs: string[];
+  try { rigs = fs.readdirSync(rigsRoot); } catch { return { readable: false, drops: [] }; }
+  const drops: ReviewDrop[] = [];
+  let read = 0;
+  let sliceStart = performance.now();
+  for (const rig of rigs) {
+    const stateDir = path.join(rigsRoot, rig, "state");
+    let entries: string[];
+    try { entries = fs.readdirSync(stateDir); } catch { continue; }
+    for (const entry of entries.filter((e) => e.startsWith("review"))) {
+      for (const file of listReviewFiles(path.join(stateDir, entry)) ?? []) {
+        if (read >= REGISTRY_SLICE_FILES || performance.now() - sliceStart >= REGISTRY_SLICE_MS) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          read = 0;
+          sliceStart = performance.now();
+        }
+        read++;
+        const drop = readReviewDrop(file);
+        if (drop) drops.push(drop);
+      }
     }
   }
-  return readable ? out : INDETERMINATE;
+  return { readable: true, drops };
+}
+
+/** Read review drops co-located with this slice, plus the legacy global registry
+ * when no catalogued project was selected (`registry` is null for a project-scoped read). Both sources keep the same slice and
+ * built-commit join; unbound global artifacts cannot establish project review. */
+function scanReviewArtifacts(registry: ReviewRegistry | null, sliceDirOrId: string[], proofDir: string): ReviewArtifactFact[] | Indeterminate {
+  const out: ReviewArtifactFact[] = [];
+  const join = (drops: ReviewDrop[], local: boolean) => {
+    for (const { slice, ...fact } of drops) {
+      if (!slice || !sliceDirOrId.includes(slice)) continue;
+      // A local QA/guard drop does not become a review leg merely by living in proof/.
+      if (local && !["rev1-r1", "rev1-r2", "adjudication"].includes(fact.artifactType ?? "")) continue;
+      out.push(fact);
+    }
+  };
+  const localFiles = listReviewFiles(proofDir);
+  join((localFiles ?? []).map(readReviewDrop).filter((drop): drop is ReviewDrop => drop !== null), true);
+  if (registry) join(registry.drops, false);
+  return localFiles !== null || registry?.readable ? out : INDETERMINATE;
 }
 
 type Rung =
@@ -677,7 +762,19 @@ async function gitAncestor(exec: ExecutionViewDeps["exec"], repoCtx: string, sha
   }
 }
 
-export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { mission?: string; rig?: string; project?: string }): Promise<Record<string, unknown>> {
+export async function buildExecutionView(deps: ExecutionViewDeps, opts?: {
+  mission?: string; rig?: string; project?: string;
+  /** The selected project's current and former ids (#3261); defaults to `project` alone. */
+  projectIds?: readonly string[];
+  /** Every current and former id the catalogued projects claim, so rows none of them claims are counted. */
+  cataloguedProjectIds?: readonly string[];
+  /** The selected project's former ids that can't apply, as the project read reports them. */
+  aliasWarnings?: readonly string[];
+  /** The caller's request: once it's aborted (the client went away), the read stops at its next window. */
+  signal?: AbortSignal;
+}): Promise<Record<string, unknown>> {
+  const projectionStarted = performance.now();
+  const membershipIds = opts?.project ? (opts.projectIds ?? [opts.project]) : undefined;
   const now = deps.now ?? (() => new Date());
   const exec = deps.exec ?? defaultExec;
   const buildInfo = deps.buildInfo ?? BUILD_INFO;
@@ -701,7 +798,7 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
       .prepare(`SELECT tags, body FROM queue_items WHERE state = 'in-progress' ORDER BY ts_updated DESC`)
       .all() as Array<{ tags: string | null; body: string | null }>;
     for (const row of active) {
-      if (opts?.project && !belongsToProject(row.tags, opts.project)) continue;
+      if (membershipIds && !belongsToProject(row.tags, membershipIds)) continue;
       const tag = parseTags(row.tags).find((value) => value.startsWith("mission:"));
       // Canonical tags win; the conventional handoff line keeps older/body-only batons visible.
       const bodyMissions = [...new Set(
@@ -729,25 +826,48 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
   const sliceIds = slices.map((s) => s.id).filter((x): x is string => x !== INDETERMINATE);
   const depCache = new Map<string, SliceFacts | null>();
 
-  // ---- queue rows bound to this mission (tag or body mention, per the binding law) ----
-  const missionLikes = mission === INDETERMINATE
-    ? ["%"]
-    : missionReferences(missionsRoot, mission).map((reference) => `%${reference}%`);
+  // ---- queue rows bound to this mission: its mission: tag by exact match, a body mention only for untagged rows ----
+  const missionRefs = mission === INDETERMINATE ? [] : missionReferences(missionsRoot, mission);
+  const missionLikes = mission === INDETERMINATE ? ["%"] : missionRefs.map((reference) => `%${reference}%`);
   const missionWhere = missionLikes.map(() => "(tags LIKE ? OR body LIKE ?)").join(" OR ");
-  const candidateRows = deps.db
-    .prepare(
-      `SELECT qitem_id, source_session, destination_session, state, tags, body, summary, claimed_at,
+  // post_claim_motion feeds only derivePickup's legacy fallback, which pending and in-progress rows reach: a blocked row
+  // returns parked and a closed row terminal before the count is read. Every row and body is still selected here (the
+  // ladder, EC-3 and wave-map evidence need historical rows); only their unused history count is skipped.
+  const candidateSelect = `SELECT qitem_id, source_session, destination_session, state, tags, body, summary, claimed_at,
               last_heartbeat, blocked_on, ts_created, ts_updated,
-              (SELECT COUNT(*) FROM queue_transitions t
+              CASE WHEN queue_items.state IN ('pending','in-progress') THEN (SELECT COUNT(*) FROM queue_transitions t
                  WHERE t.qitem_id = queue_items.qitem_id
                    AND t.ts > queue_items.claimed_at
-                   AND t.transition_note IS NOT 'claimed') AS post_claim_motion
-         FROM queue_items
-        WHERE (${missionWhere})`,
-    )
-    .all(...missionLikes.flatMap((like) => [like, like])) as QueueRowLite[];
+                   AND t.transition_note IS NOT 'claimed') ELSE 0 END AS post_claim_motion
+         FROM queue_items`;
+  const candidateBinds = missionLikes.flatMap((like) => [like, like]);
+  // On a WAL database file this full scan runs on its own readonly connection in rowid windows, yielding between
+  // windows so unrelated work can run even when few rows match; the same filter runs inside each window, so the rows
+  // are the ones the single statement returns. A native open, a large row or a window's matching rows can still
+  // block for a while, since the window bound is soft. It sees committed data as of its first read. Inside a
+  // transaction, or for a memory or non-WAL database, it stays one synchronous read on the main handle (no await on
+  // that branch).
+  const cooperativeFile = cooperativeReadFile(deps.db);
+  const candidateStarted = performance.now();
+  const candidateRead = cooperativeFile === null
+    ? null
+    : await readRowsCooperatively<QueueRowLite>(cooperativeFile, "queue_items",
+      `${candidateSelect} WHERE queue_items.rowid > ? AND queue_items.rowid <= ? AND (${missionWhere})`, candidateBinds,
+      undefined, undefined, { signal: opts?.signal });
+  const candidateRows = candidateRead
+    ? candidateRead.rows
+    : deps.db.prepare(`${candidateSelect} WHERE (${missionWhere})`).all(...candidateBinds) as QueueRowLite[];
+  const candidateMs = performance.now() - candidateStarted;
+  opts?.signal?.throwIfAborted();
 
-  const rows = candidateRows.filter(row => !opts?.project || belongsToProject(row.tags, opts.project));
+  const missionRows = candidateRows.filter(row => mission === INDETERMINATE || rowBindsToMission(row.tags, missionRefs));
+  const rows = missionRows.filter(row => !membershipIds || belongsToProject(row.tags, membershipIds));
+  // #3261: a row whose project tag no catalogued project claims (current or former id) is excluded above. It's counted, so
+  // a hidden row never reads as gone.
+  const catalogued = membershipIds && opts?.cataloguedProjectIds ? new Set(opts.cataloguedProjectIds) : null;
+  const uncatalogued = catalogued
+    ? missionRows.map(row => projectTagIds(row.tags)).filter(ids => ids.length > 0 && !ids.some(id => catalogued.has(id)))
+    : [];
 
   const sliceOfRow = (r: QueueRowLite): string | null => {
     for (const t of parseTags(r.tags)) {
@@ -778,7 +898,20 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
       /* unreachable candidate — keep scanning */
     }
   }
-  for (const r of rows.filter((r) => r.state === "in-progress")) {
+  // A lane is a row doing the slice's work. A row parked on `external:<what>`
+  // is also listed, as a waiting lane: `external:` records an outside dependency
+  // (a review, a decision, a capacity limit, a lifecycle step). It does not mean an
+  // outside party owns the work, or that the parked seat is the slice's builder.
+  // It stays marked `waiting` so it is never mistaken for active work, and it
+  // yields to an in-progress lane on the same slice. Rows parked on a qitem, a
+  // human seat, or a fold:/auth: gate are not lanes.
+  const sliceKey = (slice: string): string => slices.find((s) => s.id === slice || s.dir === slice)?.dir ?? slice;
+  const activeSlices = new Set(
+    rows.filter((r) => r.state === "in-progress").flatMap((r) => sliceOfRow(r) ?? []).map(sliceKey),
+  );
+  const isExternalPark = (r: QueueRowLite): boolean =>
+    r.state === "blocked" && isTypedGateBlocker(r.blocked_on) && r.blocked_on!.startsWith("external:");
+  for (const r of rows.filter((r) => r.state === "in-progress" || (isExternalPark(r) && !activeSlices.has(sliceKey(sliceOfRow(r) ?? ""))))) {
     const slice = sliceOfRow(r);
     if (!slice) continue;
     const wtMatch = r.body?.match(WORKTREE_LINE);
@@ -806,8 +939,10 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     const arbitrated = deps.seatActivity?.getSeatStateBySession(r.destination_session) ?? null;
     const pickup = derivePickup({
       state: r.state,
-      lastMeaningfulAt: lastMeaningfulTransition(deps.db, r.qitem_id)?.at,
-      activity: arbitrated?.activity, needsInput: arbitrated?.needsInput.count,
+      // A blocked row's pickup is parked before it reads its history, so that history is not read at all.
+      lastMeaningfulAt: r.state === "blocked" ? undefined : lastMeaningfulTransition(deps.db, r.qitem_id)?.at,
+      activity: arbitrated?.activity, needsInput: arbitrated?.needsInput.count, needsInputReason: arbitrated?.needsInput.reason,
+      backgroundWork: arbitrated?.backgroundWork ?? null, compactionOwedSince: compactionOwedSinceOf(deps, r.destination_session),
       claimedAt: r.claimed_at,
       lastHeartbeat: r.last_heartbeat,
       postClaimMotionCount: Number(r.post_claim_motion ?? 0),
@@ -836,6 +971,7 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
             source: "SeatActivityService arbitrated seat state (no answer floors INDETERMINATE, never idle/dead)",
           },
       pickup,
+      waiting: r.state === "blocked" ? { on: r.blocked_on } : null,
       source: { qitem_id: r.qitem_id },
     });
   }
@@ -843,7 +979,7 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
   // ---- arrangement authority: mission/slice YAML, with legacy EC-2 fallback ----
   const waveMap = mission === INDETERMINATE
     ? { rowId: INDETERMINATE as Indeterminate, waves: [] }
-    : readWaveMap(deps.db, missionReferences(missionsRoot, mission), opts?.project);
+    : readWaveMap(candidateRows, missionReferences(missionsRoot, mission), membershipIds);
   const arrangement = missionsRoot && mission !== INDETERMINATE
     ? readArrangement(missionsRoot, mission, slices)
     : null;
@@ -856,7 +992,7 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
   const targetRef = arrangement?.state === "valid" && arrangement.integrationRef
     ? arrangement.integrationRef
     : "main";
-  const lifecycleExecutions = mission === INDETERMINATE ? [] : readLifecycleExecutions(deps.db, mission, opts?.project);
+  const lifecycleExecutions = mission === INDETERMINATE ? [] : readLifecycleExecutions(deps.db, mission, membershipIds);
   const arrangementSlice = (id: string, dir?: string): ArrangementSlice | null => {
     if (arrangement?.state !== "valid") return null;
     return arrangement.byId.get(id) ?? (dir ? arrangement.byDir.get(dir) : undefined) ?? null;
@@ -887,11 +1023,21 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
   // ---- Q4 ladder (also feeds Q2's deps-folded) ----
   const rigsRoot = (deps.rigsRoot ?? resolveLegacyTopologyRigsRoot)();
   const commitCache = new Map<string, string | null>();
+  // Read on first use and shared by every slice of this read; the next read lists the registry again.
+  let registryRead: Promise<ReviewRegistry> | undefined;
   const ladderOf = async (facts: SliceFacts): Promise<Record<string, unknown>> => {
     const fm = facts.frontmatter;
     const locked: Rung = typeof fm["approved-spec-at"] === "string"
       ? { value: true, basis: `frontmatter approved-spec-at=${fm["approved-spec-at"]}` }
-      : { value: false, basis: "no approved-spec-at in frontmatter" };
+      : { value: false, basis: "no approved-spec-at in frontmatter; plan lock is a Part B step (rig scope slice approve --scope spec), so the default flow reads false here whatever the recorded status" };
+    // The team's own word for the slice: the node file's status:, as the scopes views read it (never PROGRESS.md),
+    // bucketed by the table `GET /api/slices` uses. Testimony: it never sets a rung or next-up.
+    const rawStatus = fm["status"];
+    const statusWord = typeof rawStatus === "string" && rawStatus.trim() ? rawStatus.trim() : null;
+    const nodeFile = path.basename(facts.specPath);
+    const recorded_status = statusWord
+      ? { word: statusWord, bucket: sliceStatusBucket(statusWord), basis: `${nodeFile} frontmatter status:, recorded by the team, not verified; it never sets a rung` }
+      : { word: null, bucket: null, basis: `no status: in ${nodeFile} frontmatter` };
     // built: latest candidate:<sha> tag on a row bound to this slice.
     const candRows = rows
       .filter((r) => sliceOfRow(r) === facts.id || sliceOfRow(r) === facts.dir)
@@ -899,6 +1045,8 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     let candidateSha: string | null = null;
     let candidateRow: string | null = null;
     for (const r of candRows) {
+      // A row carrying a merged: tag reports a merge; it is not a build, so it never picks the built candidate.
+      if (parseTags(r.tags).some((t) => MERGED_TAG.test(t))) continue;
       for (const t of parseTags(r.tags)) {
         const m = t.match(CANDIDATE_TAG);
         if (m?.[1]) {
@@ -926,7 +1074,8 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     // tags, full shas, annotated fields) join by RESOLVED commit; malformed,
     // ambiguous, or non-resolving inputs are excluded with the reason carried —
     // they neither clear nor poison.
-    const artifacts = scanReviewArtifacts(rigsRoot, [facts.dir, ...(typeof facts.id === "string" ? [facts.id] : [])], path.join(path.dirname(facts.specPath), "proof"), !opts?.project);
+    const registry = opts?.project ? null : await (registryRead ??= readReviewRegistry(rigsRoot));
+    const artifacts = scanReviewArtifacts(registry, [facts.dir, ...(typeof facts.id === "string" ? [facts.id] : [])], path.join(path.dirname(facts.specPath), "proof"));
     let reviewed: Record<string, unknown>;
     if (artifacts === INDETERMINATE) {
       reviewed = { value: INDETERMINATE, basis: opts?.project ? `slice-local review-artifact root unreadable (${path.dirname(facts.specPath)}/proof)` : `review-artifact roots unreadable (slice proof/ and ${rigsRoot})`, legs: [] };
@@ -968,21 +1117,51 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     // The selected project has no binding to the OpenRig daemon's source.
     // Missing Git objects cannot establish applicability. Keep daemon ancestry
     // only on the legacy unscoped view, with its existing unknown/false rules.
-    const folded: Rung = isUnusableDeclaration
+    const ancestry: Rung = isUnusableDeclaration
       ? { value: INDETERMINATE, basis: `declared integration_ref unusable (${declaredRef})` }
       : !candidateSha
         ? { value: INDETERMINATE, basis: "no candidate sha to test" }
         : !repoCtx
           ? { value: INDETERMINATE, basis: "no reachable repo context (no EC-3 worktree on the board)" }
           : await gitAncestor(exec, repoCtx, builtResolved ?? candidateSha, targetRef, declaredRef);
+    // A merge report (`merged:<pr-number>` on a row bound to the slice) is recorded,
+    // not verified: it carries no repository, commit or landed commit. So it is
+    // always shown as its own signal and never turns the answer ancestry gave. It
+    // changes the answer only when the SAME row also carries a `candidate:<sha>`
+    // that resolves, through the repo context and a usable integration ref, to the
+    // slice's built commit. Squash and rebase merges leave the candidate off the
+    // integration ref, so only that link reads such a merge as merged, and only
+    // from ancestry's false: an answer ancestry could not give is never turned true.
+    const reports: MergeReport[] = [];
+    for (const r of candRows) { // newest first
+      const tags = parseTags(r.tags);
+      const pr = tags.map((t) => t.match(MERGED_TAG)?.[1]).find((n): n is string => !!n);
+      if (!pr) continue;
+      const token = extractShaToken(tags.map((t) => t.match(CANDIDATE_TAG)?.[1]).find((n): n is string => !!n) ?? null);
+      const resolved = token && repoCtx ? await resolveCommit(exec, repoCtx, token, commitCache) : null;
+      reports.push({ pr, row: r.qitem_id, recorded_at: r.ts_created, linked: !!builtResolved && resolved === builtResolved });
+    }
+    const report = reports.find((r) => r.linked) ?? reports[0] ?? null;
+    const reportNote = report
+      ? `merged:${report.pr} recorded on row ${report.row} at ${report.recorded_at}${report.linked ? "; that row is linked to the built candidate, but only a false from ancestry is turned true, so the answer stays as ancestry gives it" : "; that row is not linked to the built candidate, so it does not change this answer"}`
+      : null;
+    const folded: Rung & { merge_report?: MergeReport } = !report
+      ? ancestry
+      : report.linked && ancestry.value === false
+        ? {
+            value: true,
+            basis: `reported merged in #${report.pr} for candidate ${(builtResolved ?? "").slice(0, 9)}, recorded on row ${report.row} at ${report.recorded_at}; candidate is not an ancestor of ${targetRef} (${ancestry.basis})`,
+            merge_report: report,
+          }
+        : { ...ancestry, basis: `${ancestry.basis}; ${reportNote}`, merge_report: report };
     const adopted: Rung = opts?.project
       ? { value: "NOT_APPLICABLE", basis: "selected project has no binding to the OpenRig daemon source; daemon adoption is not project progress" }
       : !candidateSha || !repoCtx
-        ? { value: INDETERMINATE, basis: folded.basis }
+        ? { value: INDETERMINATE, basis: ancestry.basis }
         : buildInfo.commit
           ? await gitAncestor(exec, repoCtx, builtResolved ?? candidateSha, buildInfo.commit)
           : { value: INDETERMINATE, basis: "daemon build stamp absent (dev run) — adopted rung underivable" };
-    return { slice_id: facts.id, dir: facts.dir, locked, built, reviewed, folded, adopted };
+    return { slice_id: facts.id, dir: facts.dir, recorded_status, locked, built, reviewed, folded, adopted };
   };
 
   const ladderCache = new Map<string, Record<string, unknown>>();
@@ -996,6 +1175,20 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
   // so mutable refs (HEAD/main) are observed again on the next request.
   const q4: Record<string, unknown>[] = [];
   for (const s of slices) q4.push(await ladderFor(s));
+  // #2761: say once what the mission records for the ladder, so missing records never read as missing work.
+  const withCandidate = q4.filter((l) => (l["built"] as { candidate_sha?: unknown }).candidate_sha !== INDETERMINATE).length;
+  const withMergeReport = q4.filter((l) => !!(l["folded"] as { merge_report?: unknown }).merge_report).length;
+  const q4Records = {
+    slices: q4.length,
+    with_candidate: withCandidate,
+    with_merge_report: withMergeReport,
+    repo_context: repoCtx ?? INDETERMINATE,
+    basis: q4.length === 0
+      ? "no slices in this mission"
+      : withCandidate === 0
+        ? "no slice in this mission has a candidate:<sha> row, so built, reviewed and merged read INDETERMINATE: not recorded, which is not the same as not done. The default flow (sdlc-conventions.md Part A) doesn't record them; each slice's recorded_status is the team's own word"
+        : `${withCandidate} of ${q4.length} slices have a candidate:<sha> row; ${repoCtx ? `merged is tested in repo context ${repoCtx}` : "no row carries worktree_path= (EC-3), so merged can't be tested"}`,
+  };
 
   // ---- Q2 sequencing ----
   const q2 = [];
@@ -1107,24 +1300,31 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     .map((r) => {
       const activity = deps.seatActivity?.getSeatStateBySession(r.destination_session);
       const pickup = derivePickup({
-        lastMeaningfulAt: lastMeaningfulTransition(deps.db, r.qitem_id)?.at,
-        activity: activity?.activity, needsInput: activity?.needsInput.count,
+        // As in Q1: a blocked row is parked before its history is read; its armed wake is still looked up below.
+        lastMeaningfulAt: r.state === "blocked" ? undefined : lastMeaningfulTransition(deps.db, r.qitem_id)?.at,
+        activity: activity?.activity, needsInput: activity?.needsInput.count, needsInputReason: activity?.needsInput.reason,
+        backgroundWork: activity?.backgroundWork ?? null, compactionOwedSince: compactionOwedSinceOf(deps, r.destination_session),
         state: r.state,
         claimedAt: r.claimed_at,
         lastHeartbeat: r.last_heartbeat,
         postClaimMotionCount: Number(r.post_claim_motion ?? 0),
         now: now(),
       });
-      const wake = deps.db
-        .prepare(`SELECT wake_ref, phase FROM queue_transition_wakes WHERE qitem_id = ? AND phase = 'armed' LIMIT 1`)
-        .get(r.qitem_id) as { wake_ref: string; phase: string } | undefined;
+      const wake = readWithCurrentParkBoundary(boundary => deps.db
+        .prepare(`SELECT w.wake_ref, w.phase FROM queue_transition_wakes w
+          WHERE w.qitem_id = ? AND w.phase = 'armed'
+            AND w.transition_id = (SELECT MAX(a.transition_id) FROM queue_transition_wakes a
+              WHERE a.qitem_id = w.qitem_id AND a.phase = 'armed')
+            ${boundary}
+          ORDER BY w.transition_id DESC LIMIT 1`)
+        .get(r.qitem_id)) as { wake_ref: string; phase: string } | undefined;
       // park_kind is a CLOSED enum from the DESIGN: deliberate-with-wake |
       // stalled | indeterminate. Nothing else may leak in (the live artifact
       // once emitted 'working' here), and the enum member is lowercase.
       let parkKind: "deliberate-with-wake" | "stalled" | "indeterminate";
       if (pickup.state === "parked" && wake) {
         parkKind = "deliberate-with-wake";
-      } else if (pickup.state === "stalled-after-claim") {
+      } else if (pickup.state === "stalled-after-claim" || pickup.stall) {
         parkKind = "stalled";
       } else {
         parkKind = "indeterminate";
@@ -1134,6 +1334,7 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
         qitem_id: r.qitem_id,
         pickup_state: pickup.state,
         ...(pickup.evidence ? { pickup_evidence: pickup.evidence } : {}),
+        ...(pickup.stall ? { pickup_stall: pickup.stall } : {}),
         park_kind: parkKind,
         park_kind_basis: wake
           ? `armed wake ${wake.wake_ref} on queue_transition_wakes`
@@ -1145,7 +1346,7 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     });
 
   // ---- Q6 parallelism health ----
-  const inProgressSeats = new Set(rows.filter((r) => r.state === "in-progress").map((r) => r.destination_session));
+  const inProgressSeats = new Set(rows.filter((r) => r.state === "in-progress").map((r) => physicalSessionName(deps.db, r.destination_session)));
   // Idle capacity: the ROSTER comes from sessions (names only); idleness comes
   // from the ACTIVITY ORACLE — sessions.status is not consulted (it labeled
   // live working lanes `superseded` on the real board).
@@ -1190,10 +1391,17 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     const derived = readiness?.slices.find(s => s.scope === sequenced.dir);
     if (!derived?.readiness.configured) continue;
     sequenced.next_up = derived.eligible === null ? INDETERMINATE : derived.eligible && derived.readiness.state !== "ready" && sequenced.work_rows.length === 0;
-    sequenced.next_up_basis = `Attributed proof readiness ${readiness!.revision}; dependency eligibility ${derived.eligible}`;
+    sequenced.next_up_basis = `Attributed proof readiness ${readiness!.revision}; dependency eligibility ${derived.eligible}`
+      + (derived.dependsOnBasis === "not-recorded"
+        ? "; no order recorded (depends_on INDETERMINATE, EC-1), so eligibility assumed no recorded edges"
+        : derived.dependsOnBasis === "frontmatter-advisory"
+          ? "; only the SPEC frontmatter lists depends_on, which readiness treats as advisory, so eligibility assumed no recorded edges"
+          : derived.dependsOnBasis === "frontmatter-unparsed"
+            ? "; only the SPEC frontmatter lists depends_on, in a form EC-1 doesn't define (not an inline JSON array), so eligibility assumed no recorded edges"
+            : "");
   }
   const q6 = {
-    lanes_live: lanes.length,
+    lanes_live: lanes.filter((l) => l.waiting === null).length,
     lanes_possible: q2.filter((s) => s.next_up === true).length,
     idle_seats_with_capacity: { value: idleSeats, basis: idleBasis },
     heavy_slot_holder: heavyRow
@@ -1202,11 +1410,13 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     df_margin: dfMargin,
   };
 
-  return {
-    ...(opts?.project ? { project: opts.project, membership: "exact project:<id> queue tags and lifecycle identity; unscoped rows excluded" } : {}),
+  const view = {
+    ...(opts?.project ? { project: opts.project, membership: "exact project:<id> queue tags and lifecycle identity, for the project's id or a former id its project.yaml declares under aliases; unscoped rows excluded" } : {}),
+    ...(catalogued ? { uncatalogued_project_tags: { rows: uncatalogued.length, ids: [...new Set(uncatalogued.flat())].sort() } } : {}),
+    ...(membershipIds && opts?.aliasWarnings?.length ? { alias_warnings: [...opts.aliasWarnings] } : {}),
     view: "execution",
     readiness,
-    project_readiness: missionsRoot ? readProjectReadiness(missionsRoot, readPolicy) : null,
+    project_readiness: missionsRoot ? await readProjectReadinessAsync(missionsRoot, readPolicy) : null,
     // Authored guidance is carried verbatim in meaning, never parsed into edges or acceptance.
     planning_guidance: arrangement?.state === "valid" ? arrangement.guidance : [],
     mission,
@@ -1251,7 +1461,23 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     q2_sequencing: q2,
     q3_care: q3,
     q4_ladder: q4,
+    q4_records: q4Records,
     q5_park: q5,
     q6_parallelism: q6,
   };
+  // Measurement only, for a slow projection: its elapsed time, the candidate read's elapsed time, and the candidate
+  // read's longest synchronous stretch, which a whole-view or awaited span cannot show. The main-handle read is one
+  // stretch. Counts and times only; no row content.
+  const projectionMs = performance.now() - projectionStarted;
+  recordSlowDiagnostic(projectionMs, {
+    schema: "openrig.execution-view/v1",
+    utc: new Date().toISOString(),
+    projectionMs,
+    candidateMs,
+    candidateRows: candidateRows.length,
+    candidateRead: candidateRead ? "windowed" : "main-handle",
+    candidateWindows: candidateRead?.windows ?? null,
+    candidateLongestStretchMs: candidateRead?.longestStretchMs ?? candidateMs,
+  });
+  return view;
 }

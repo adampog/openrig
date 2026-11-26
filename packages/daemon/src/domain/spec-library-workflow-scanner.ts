@@ -24,7 +24,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { WorkflowSpec, WorkflowExitKind, WorkflowAgentHarness, WorkflowGateSpec } from "./workflow-types.js";
-import { RETAINED_STATUS, type WorkflowSpecCache } from "./workflow-spec-cache.js";
+import { getFailedSpecRead, RETAINED_STATUS, type WorkflowSpecCache } from "./workflow-spec-cache.js";
 import type { EventBus } from "./event-bus.js";
 
 export interface SpecLibraryWorkflowEntry {
@@ -377,11 +377,13 @@ function isUnderDir(childPath: string, parentDir: string): boolean {
 // disappear since the last scan get removed via removeBySourcePath
 // (OQ-4 decision; deletion + audit log).
 //
-// OQ-3 mtime check: a file is skipped when its mtime is <= the cache row's
-// cached_at (no parse work needed). Otherwise it's re-parsed via the cache
-// (which itself hashes the content and returns the prior row when the
-// hash matches — second layer of skip for content-stable files whose
-// mtime nonetheless advanced, e.g., touch).
+// OQ-3 timestamp check: a file is skipped when its mtime/ctime precede the
+// persisted cache observation. This stat-only hit assumes filesystem timestamps
+// and the daemon clock are comparable and that edits advance mtime or ctime. A
+// restored/copied file can have an older mtime, so ctime is included. Files in
+// the same timestamp second still use the content hash; other newer files are
+// re-parsed via the cache (which itself hashes the content and returns the prior
+// row when the hash matches).
 
 export interface ScanWorkflowSpecFolderOpts {
   /** SQLite handle (used for direct lookups). */
@@ -400,6 +402,10 @@ export interface ScanWorkflowSpecFolderOpts {
    *  its source file disappeared (OQ-4 acceptance: deletion + audit log).
    *  Omitted in unit tests that don't care about emission. */
   eventBus?: EventBus;
+  /** A user file with the same bytes and identity as an existing built-in row. */
+  onBuiltinAlias?: (name: string, version: string, sourcePath: string, sourceHash: string) => void;
+  /** A valid source whose hash was just read or whose persisted stat observation is safely aged. */
+  onVerifiedSource?: (sourcePath: string, sourceHash: string) => void;
 }
 
 export interface ScanWorkflowSpecFolderResult {
@@ -411,7 +417,7 @@ export interface ScanWorkflowSpecFolderResult {
   errors: number;
   /** Cache rows removed because their source_path no longer exists. */
   removed: number;
-  /** Files skipped via mtime check (unchanged since last scan). */
+  /** Files skipped via timestamp check (unchanged since last scan). */
   skipped: number;
 }
 
@@ -442,50 +448,55 @@ export function scanWorkflowSpecFolder(
   for (const entry of entries) {
     if (!isWorkflowYamlFile(entry)) continue;
     const filePath = path.join(opts.folder, entry);
-    let mtimeMs = 0;
+    let changeMs = 0;
     try {
       const stat = statSync(filePath);
       if (!stat.isFile()) continue;
-      mtimeMs = stat.mtimeMs;
+      changeMs = Math.max(stat.mtimeMs, stat.ctimeMs);
     } catch {
       continue;
     }
     seenPaths.add(filePath);
     result.scanned += 1;
 
-    // mtime check (OQ-3): if the cache has a row at this source_path
-    // whose cached_at is at or after the file's mtime, the file is
-    // unchanged since last scan — skip the re-parse work entirely.
+    // Timestamp check (OQ-3): ctime protects the stat-only skip when a
+    // restored or copied file has an older mtime even though its content
+    // changed. Only the same timestamp second needs a content-hash check.
     //
     // Compare at second-resolution because some filesystems (HFS+, FAT)
-    // round mtime down to whole seconds while cached_at carries ms
-    // precision; without this floor a freshly-written file whose mtime
-    // is `T - 999ms` would always look "newer" than its cached_at at
+    // round mtime/ctime down to whole seconds while cached_at carries ms
+    // precision; without this floor a freshly-written file whose change
+    // time is `T - 999ms` would always look "newer" than its cached_at at
     // exactly `T` and never skip.
     // A path can hold several cached versions plus a diagnostic row (#503); the most
     // recently written row is the one that reflects the file's last scan.
     const cachedAt = opts.db
-      .prepare(`SELECT cached_at, source_hash FROM workflow_specs WHERE source_path = ? AND status != '${RETAINED_STATUS}' ORDER BY cached_at DESC, rowid DESC LIMIT 1`)
-      .get(filePath) as { cached_at: string; source_hash: string } | undefined;
+      .prepare(`SELECT cached_at, source_hash, status FROM workflow_specs WHERE source_path = ? AND status != '${RETAINED_STATUS}' ORDER BY cached_at DESC, rowid DESC LIMIT 1`)
+      .get(filePath) as { cached_at: string; source_hash: string; status: string } | undefined;
     if (cachedAt) {
       const cachedAtMs = Date.parse(cachedAt.cached_at);
       const cachedAtSec = Math.floor(cachedAtMs / 1000);
-      const mtimeSec = Math.floor(mtimeMs / 1000);
-      if (Number.isFinite(cachedAtMs) && cachedAtSec >= mtimeSec) {
-        let unchanged = cachedAtSec > mtimeSec;
-        if (!unchanged) {
-          // A same-second edit shares the timestamp bucket. Consult the
-          // cache's existing content hash before treating it as unchanged.
-          try {
-            // Hash the UTF-8 text exactly the way the cache hashes it on
-            // write (not the raw bytes): for files that are not clean UTF-8
-            // the two digests differ and every scan would re-parse.
-            unchanged = createHash("sha256").update(readFileSync(filePath, "utf-8")).digest("hex") === cachedAt.source_hash;
-          } catch { /* The existing readThrough path records the diagnostic. */ }
-        }
-        if (unchanged) {
+      const changeSec = Math.floor(changeMs / 1000);
+      if (Number.isFinite(cachedAtMs) && Number.isFinite(changeMs)) {
+        if (cachedAtSec > changeSec) {
+          if (cachedAt.status === "valid") opts.onVerifiedSource?.(filePath, cachedAt.source_hash);
           result.skipped += 1;
           continue;
+        }
+        if (cachedAtSec === changeSec) {
+          // Consult the cache's existing content hash before treating the file
+          // as unchanged. Hash the UTF-8 text exactly the way the cache
+          // hashes it on write (not the raw bytes): for files that are not
+          // clean UTF-8 the two digests differ and every scan re-parses.
+          let unchanged = false;
+          try {
+            unchanged = createHash("sha256").update(readFileSync(filePath, "utf-8")).digest("hex") === cachedAt.source_hash;
+          } catch { /* The existing readThrough path records the diagnostic. */ }
+          if (unchanged) {
+            if (cachedAt.status === "valid") opts.onVerifiedSource?.(filePath, cachedAt.source_hash);
+            result.skipped += 1;
+            continue;
+          }
         }
       }
     }
@@ -494,26 +505,34 @@ export function scanWorkflowSpecFolder(
     // validation error), record a diagnostic row keyed by source_path
     // so the Library UI can render the error inline.
     try {
-      opts.cache.readThrough(filePath);
+      const cached = opts.cache.readThrough(filePath);
+      if (opts.onBuiltinAlias && opts.builtinDir && cached.sourcePath !== filePath
+          && isUnderDir(cached.sourcePath, opts.builtinDir)) {
+        opts.onBuiltinAlias(cached.name, cached.version, filePath, cached.sourceHash);
+      }
+      if (cached.sourcePath === filePath) opts.onVerifiedSource?.(filePath, cached.sourceHash);
       result.valid += 1;
     } catch (err) {
-      // Diagnostic: hash the raw content best-effort so we can detect
-      // edits that fix the error (mtime alone is fine; this is for
-      // bookkeeping). Use the empty string when content is unreadable.
+      // Prefer the digest and timestamp captured by the failed read itself. A second path read here can observe a
+      // repair that raced parse handling and falsely describe those replacement bytes as the bytes that failed.
+      // Errors without captured text (missing/unreadable files) retain the previous best-effort path read.
       const message = err instanceof Error ? err.message : String(err);
-      let sourceHash = "";
-      try {
-        sourceHash = createHash("sha256").update(readFileSync(filePath, "utf-8")).digest("hex");
-      } catch {
-        // unreadable / disappeared between stat and read; treat as
-        // empty hash so the next scan re-evaluates
-        sourceHash = "";
+      const failedRead = getFailedSpecRead(err);
+      let sourceHash = failedRead?.sourceHash ?? "";
+      if (!failedRead) {
+        try {
+          sourceHash = createHash("sha256").update(readFileSync(filePath, "utf-8")).digest("hex");
+        } catch {
+          // unreadable / disappeared between stat and read; treat as empty so the next scan re-evaluates
+          sourceHash = "";
+        }
       }
       try {
         opts.cache.writeDiagnostic({
           sourcePath: filePath,
           sourceHash,
           errorMessage: message,
+          ...(failedRead ? { cachedAt: failedRead.cachedAt } : {}),
         });
       } catch (writeErr) {
         // One file's diagnostic must not end the scan of the rest of the folder (#511).

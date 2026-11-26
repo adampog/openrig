@@ -12,8 +12,8 @@ applies-when: |
   layer).
 siblings: [daemon-core.md, agent-spec-and-startup.md, lifecycle-snapshot-restore.md]
 prerequisite-reads: [../README.md, daemon-core.md]
-last-verified-against-source: 2caac7dd1bb16585138a6f7c1dd8b1f0752c49f7
-last-updated: 2026-10-05
+last-verified-against-source: e8f0ab340db773392ec8be75b072d1c0f3068a50
+last-updated: 2026-10-08
 ---
 
 # Adapters and Runtimes
@@ -27,7 +27,7 @@ adapters (`ClaudeResumeAdapter`, `CodexResumeAdapter`, `PiResumeAdapter` and
 this harness *actually* resume, or did it silently fresh-launch?" truthfully
 rather than optimistically.
 
-> Verified against source at main `2caac7dd1bb16585138a6f7c1dd8b1f0752c49f7`. Each count below sits beside the
+> Verified against source at main `e8f0ab340db773392ec8be75b072d1c0f3068a50`. Each count below sits beside the
 > command that produces it; run the command from the repository root to refresh
 > it.
 
@@ -82,11 +82,45 @@ optional `evidence` (last-N pane lines, flowed through to
 `RestoreNodeResult.attentionEvidence` for `attention_required` outcomes,
 `:99–102`). This is the honest-failure shape, not a smoothed optional `error`.
 
-Readiness has its own attention codes (`runtime-adapter.ts:74–87`):
+Readiness has its own attention codes (`ATTENTION_REQUIRED_READINESS_CODES` in `runtime-adapter.ts`):
 `trust_gate`, `hook_trust_gate`, `update_gate`, `login_required`, `mcp_gate`,
-`bypass_consent_gate`, `codex_auth_refusal` and `codex_client_incompatible`.
+`bypass_consent_gate`, `claude_resume_selection_prompt`, `claude_gated_grants_gate`,
+`codex_auth_refusal` and `codex_client_incompatible`.
 When `checkReady` reports one, the readiness wait returns at once and startup
 ends `attention_required`.
+
+### Evidence for a failed Claude resume
+
+Previously, a failed Claude launch recorded its error without the probe code or
+the captured input's identity, and a refused strict full-restore attention clear
+had no corresponding refusal event. Probe-backed Claude launch failures now
+carry an optional `probe` in `HarnessLaunchResult` and `node.startup_failed`.
+Strict full-restore refusals emit `seat.attention_clear_refused`; a
+`pane_not_usable` refusal includes that probe and the restore attempt ID.
+A missing strict reconciler emits `strict_reconciler_unavailable` without
+inventing an attempt ID or probe evidence, and still refuses the clear.
+
+`native-resume-probe-evidence.ts` records the status, code, a closed-set login
+refusal and row kind when matched, and the exact capture's line count, byte
+count and SHA-256. Its new fields contain no captured pane text or free-form
+probe detail. Existing attention evidence and recovery decisions keep their
+previous behavior. MCP approval detection still takes precedence over the
+login-refusal check.
+
+Pane dimensions are optional, observed after the capture. Their read has a
+250 ms deadline so a hung `listPanes` cannot indefinitely delay the failure
+result or its event. On timeout, error, ambiguous pane identity or invalid
+dimensions, the unavailable dimensions are `null`; late results are ignored.
+The deadline bounds this diagnostic wait, not the underlying tmux command.
+
+`native-resume-probe-evidence.test.ts` covers unavailable and late geometry;
+`startup-orchestrator.test.ts` and `restore-orchestrator.test.ts` exercise the
+real adapter/orchestrator and SQLite event paths with available, failing and
+never-settling geometry reads. `seat-attention-reconciler.test.ts` checks that
+a missing strict reconciler records its refusal without changing restore
+history or sending input. These use synthetic terminal captures, not a
+live Claude session. The stub scenario runtime cannot draw Claude's native
+login-refusal UI, and its scenario runner does not bind the restore action.
 
 ## 2. The runtime adapters
 
@@ -175,15 +209,27 @@ other rig gets `teamPermissionDefault` instead (`native-permission-store.ts:38`,
 `:56`), on the same launch paths. A Claude Code seat at the floor with no native
 permission mode keeps `--permission-mode acceptEdits` and gets
 `--settings` (`kernel-authority.ts:64–66`):
-`TEAM_CLAUDE_ALLOW` (`:25`) is `Skill`, `Read(./**)`, `Glob`, `Grep`,
+`TEAM_CLAUDE_ALLOW` (`:33`) is `Skill`, `Read(./**)`, `Glob`, `Grep`,
 `Bash(rig:*)`, eight read-only shell commands and 17 test-runner commands, and
-`TEAM_CLAUDE_ASK` (`:32`) asks before 41 `rig` lifecycle commands such as `up`,
-`down`, `seat stop` and `bundle install`. The settings carry the allow list and a
+`TEAM_CLAUDE_ASK` (`:40`) asks before 30 `rig` commands: the 23 that start, stop or
+remove teams or agents (such as `up`, `down`, `seat stop`, `seat restart` and `bundle install`),
+and seven kept for a person: `import` (its `--instantiate` mode launches nodes), `seat
+set-permissions`, `seat decide-permission` (it answers a seat's permission prompt, its own included)
+and `policy apply` under both spellings (an explicit permission choice),
+`setup` (kept for its `--policy` path, which records one; a prefix rule can't tell that path
+from ordinary setup, so ordinary setup prompts too), and `compact` (it replaces a peer's
+working context). Other `rig` commands fall under the `Bash(rig:*)` allowance. One seat skips
+the `seat decide-permission` ask (`RECEIVING_AGENT_NO_ASK`): the host's receiving agent, `agents.operator_session`,
+which settles the permission requests a person answered. When a command names `decide-permission`, the hook reads
+that setting through the seat's own `rig` and compares it with `OPENRIG_SESSION_NAME`; a setting it can't read keeps
+the ask. The list was
+42 before: 15 commands were removed and 2 added (`seat restart` and `policy permissions
+apply`), 13 fewer prompts. The settings carry the allow list and a
 `PreToolUse` Bash hook, `packages/daemon/assets/claude-team-permissions.cjs`, that applies
 both lists (`kernel-authority.ts:43–53`): it asks before a lifecycle command unless the
 command only asks for `--help` or `-h`, allows a simple literal command that matches an
-allow rule, and otherwise leaves the decision to Claude (`claude-team-permissions.cjs:234`,
-`:240`). Without the hook file, the settings carry both lists as plain `allow` and `ask`
+allow rule, and otherwise leaves the decision to Claude (`claude-team-permissions.cjs:235`,
+`:241`). Without the hook file, the settings carry both lists as plain `allow` and `ask`
 rules (`kernel-authority.ts:46`). A Codex seat launching at
 `-s workspace-write` gets `--add-dir` for the workspace root (`workspace.root`)
 and its pod's state directory, each created first and skipped with a warning if
@@ -198,22 +244,28 @@ resume launches (`codex-runtime-adapter.ts:378`, `codex-resume.ts:103`).
   `<cwd>/CLAUDE.md` by default (`:194`, `:501`; default at
   `domain/managed-blocks.ts:17`, and the rig may select `CLAUDE.local.md`
   instead with `managed_blocks: { claude-code: <file> }`,
-  `managed-blocks.ts:15`); `skill_install` → `<cwd>/.claude/skills/<name>/`
-  (`:200`, `:582`); subagents → `.claude/agents`, plugins →
+  `managed-blocks.ts:15`); `skill_install` and skill resources → the seat's
+  skill root, `binding.seatSkillsRoot`, which is the `skills/` folder of the
+  seat's generated plugin in its own storage
+  (`domain/startup-orchestrator.ts:353–369`), or
+  `<cwd>/.claude/skills/<name>/` for a seat without one (`:215–216`,
+  `:849`); subagents → `.claude/agents`, plugins →
   `.claude/plugins/<id>` (only plugins that apply to Claude), runtime
   resources → `.claude/extensions/<id>` (`:584–586`); settings fragments
   merged into `.claude/settings.local.json` (`:594`) and MCP fragments into
   `<cwd>/.mcp.json` (`:597`).
 - **Launches**: fresh = `claude <posture> --session-id <generatedId> --name
   <name>` (`:329`); resume = `claude <posture> --resume <token> --name <name>`
-  (`:328`); fork = `claude <posture> --resume <parentId> --fork-session --name
-  <seat>` (`:298`). `<posture>` is the flag above plus any non-interruptive,
+  (`:328`); fork = `claude <posture> --resume <parentId> --fork-session
+  --session-id <generatedId> --name <seat>`, which needs Claude Code 2.0.73 or
+  later. `<posture>` is the flag above plus any non-interruptive,
   kernel operational or team default argument. Each command may carry a `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1`
   env prefix (`yolo-mode.ts:101–103`; on by default, off with
   `OPENRIG_CLAUDE_DISABLE_ALTERNATE_SCREEN=0`), a `--model <model>` argument
-  (`:275`) and `--effort <effort>` (`:277`). A fresh launch returns the
-  generated `--session-id` as its `claude_id` token; a fork polls Claude's
-  session files for the new id.
+  (`:275`) and `--effort <effort>` (`:277`). A fresh launch and a fork both
+  return the generated `--session-id` as their `claude_id` token, so a forked
+  seat's process names its own conversation and strict proof can verify it.
+  Neither reads Claude's session files back.
 - **Managed launch.** When the binding selects a native permission mode, the
   command comes from `ClaudeManagedLaunch.prepare()`
   (`domain/claude-managed-launch.ts:97`), which resolves `claude` on the
@@ -235,14 +287,45 @@ resume launches (`codex-runtime-adapter.ts:378`, `codex-resume.ts:103`).
   `no_conversation_found` (`:429–434`) and with `recovery:
   "attention_required"` plus pane evidence on an `attention_required` probe
   (`:444–450`) — the adapter never relaunches on its own.
+- **Fresh in-place handover readiness.** `assessFreshInPlaceProbe` qualifies an
+  otherwise ready history probe only for the matching fresh launch, binding and
+  launch generation. The current pane must show a prompt, and `assessManagedProbe`
+  must confirm the new launch's exact session token in the same foreground process
+  across two observations, with the pane and launch still current. It reuses the
+  existing managed identity proof, including its process fingerprint. A process
+  label alone, old scrollback, an unavailable screen, an unreadable process list
+  or an unidentified Claude process cannot admit the handover. Those cases stay
+  `awaiting_runtime`; a positive identity conflict and visible approval or login
+  gates keep their specific results. The handover waits within its existing
+  readiness budget before sending the context packet.
+
+  The fresh path requires the last `❯` prompt to sit inside Claude's complete
+  input frame: its top rule directly above the prompt and a bottom rule below.
+  A shell's echoed launch command cannot borrow an earlier header or input
+  frame, even when the matching Claude process is already running. A header
+  and prompt alone, or a partially drawn frame, remain pending. This may delay
+  readiness until the full frame is visible; other launch paths keep their
+  existing screen predicates.
+
+  Previously, unavailable observations and ambiguous headerless prompts could
+  retain the old ready result. `claude-fresh-in-place-scope.test.ts` now checks
+  missing observations, unknown or changing process identity, retained UI above
+  direct and script launch commands, partial frames, recovery and normal prompt
+  controls. `claude-handover-readiness.test.ts` exercises the real handover
+  service with migrated SQLite, modeled pane/process observations and one synthetic
+  clock. Readiness and the later packet-submission receipt remain separate checks;
+  these tests do not run a live Claude account.
 
 ### CodexRuntimeAdapter (`codex-runtime-adapter.ts:65`)
 
 - `readonly runtime = "codex"` (`:66`).
 - **Projects** to `.agents/` targets: `guidance_merge` → `<cwd>/AGENTS.md`
-  (`:309`, `:576`); `skill_install` → `<cwd>/.agents/skills/<name>/` (`:315`);
-  skills resolve under `.agents/skills/<id>` (`:664`); plugins go to
-  `.codex/plugins/<id>` (`:667`).
+  (`:309`, `:576`); `skill_install` and skill resources → the seat's skill
+  root, `binding.seatSkillsRoot`, which is the `skills/` folder beside the
+  seat's catalog in its own storage
+  (`domain/startup-orchestrator.ts:360–369`), or
+  `<cwd>/.agents/skills/<name>/` for a seat without one (`:563–564`,
+  `:1060`); plugins go to `.codex/plugins/<id>` (`:1063`).
 - **Launches/resumes**: fresh = `codex[ --no-daemon]<posture>[<network>] -C
   <cwd> …` (`:442`), then capture a fresh thread id (`:460`); resume is built
   by `buildCodexResumeCore` (`:441`) as `codex<daemon><posture> resume
@@ -299,10 +382,85 @@ maps (`startup.ts:989`, `:1259`); see `daemon-core.md` §4 "Startup sequence".
 Opening a seat in a terminal app goes through `TerminalProvider`s under
 `packages/daemon/src/domain/terminal/`, served by `/api/terminal`:
 `HerdrAdapter` (`herdr-adapter.ts:351`), the default
-(`terminal-service.ts:55–56`), and `CmuxProviderAdapter`
+(`terminal-service.ts:55–58`), and `CmuxProviderAdapter`
 (`cmux-provider-adapter.ts:52`), which is best effort and refuses with
-`cmux_unavailable` when cmux is not connected. These place existing tmux
+`cmux_unavailable` when cmux is not connected. A request that names no
+provider takes the first of Herdr, then cmux, that is available and alive,
+and stays on Herdr when neither is (`providerNameFor`,
+`terminal-service.ts:175`); a named provider is used as named. These place existing tmux
 sessions in views; they do not launch harnesses.
+
+`RexAdapter` (`rex-adapter.ts`) opens a view as a new Rex session through
+the `rex` CLI (`rex --autostart=false api call <method> -`, `rex-transport.ts`):
+it creates an empty session (`session.create`), adds one window per grid page
+(`session.new_window`), and checks the tiles once after a short wait. It is used only when named;
+the CLI and TUI name it when they run inside Rex (`openRexView`,
+`packages/cli/src/terminal-window-rex.ts`), and an omitted provider never picks
+it. It refuses with `rex_unavailable` when the Rex server does not answer.
+Discovery (`server.version` and `server.status`) has a 1 s budget, and
+`status()` and `liveness()` share one probe. A request whose reply is lost (a
+timeout, a killed client, an unreadable reply) is `unknown`, not failed: the
+adapter never closes a session on it and reports `rex_outcome_unknown`.
+After the check, the local seats whose tiles opened go to `RexAgentStatusRelay`
+(`rex-agent-status.ts`), which writes an OSC 7501 report to the tty of each tmux
+client attached to the seat whose `client_termtype` (its XTVERSION reply) names
+Rex. Later activity changes (the same hook-or-pane resolution that recovers
+prompt wakes in `startup.ts`) are written to each Rex client that doesn't already
+have that report; an unknown activity is written as `state=clear`. Every report,
+a clear included, carries `id=openrig`, so it replaces and clears only OpenRig's
+own record and leaves the agent's own report (the record without an id) and its
+other records alone. A client the
+relay has no record for (after a daemon restart, or one that moved from another
+seat) gets the current report too, a clear included. After a partial write, the
+next write to that terminal starts with ST to close the unfinished OSC. The relay
+records what each client last took, and a sweep every 5 s lists a shown seat's
+clients again, so a new client or a failed write is caught up without another
+activity change. A seat found without a Rex client is looked at again when a Rex
+view opens it or after five minutes; a failed `list-clients` leaves it as it was.
+Herdr and Rex build their layout trees from one grid helper
+(`buildTileGrid`, `tile-layout.ts`).
+
+`HerdrAppProvider` (`herdr-app-provider.ts`) opens a view in a herdr-app
+window (one provider per app home, cached in `startup.ts`). In the daemon it is
+used only when named (`resolveHerdrAppProvider` in `terminal-service.ts`). Its
+transport (`herdr-app-transport.ts`) sends one JSON line per
+connection to `<app home>/herdr-app.sock` and reads the window's own "did not
+answer" as `unknown`. A view is a child of OpenRig's stack in a derived
+`layouts/rig.json` (`deriveRigLayout`, `herdr-app-layout.ts`), written
+atomically, with viewers started by `hc run --bg --no-parent` and journalled
+first (`herdr-app-state.ts`). Removal rewrites the file before a viewer ends,
+and ends it only after the `rig-strip` mod's acknowledgement
+(`<app home>/openrig/ack.json`) shows a layout without it. An `hc events`
+watcher (`startup.ts`) turns a viewer that ended elsewhere into an ended cell.
+Its four mods ship in `packages/daemon/assets/herdr-app/mods/` and are
+installed by `herdr-app-install.ts`.
+
+### Tmux server selection
+
+Before reconciliation, `startup.ts` calls `selectTmuxServer` in
+`domain/tmux-server-selection.ts`. `terminal.tmux_server` defaults to `inherit`;
+`isolated` selects a socket derived from the canonical OpenRig home. The effective
+choice is persisted in `tmux-server.json`. A registered live seat, or an
+uninspectable old server, defers a requested change until a later restart.
+The persisted `pinned` flag and active marker make isolation and migration records
+mandatory, while ordinary inherited records remain advisory. Returning to inheritance
+commits an unpinned record before clearing the marker, so offline cleanup cannot reuse
+a stale inherited socket or keep enforcing a completed isolation choice.
+
+`TmuxAdapter` receives the selection's `executionArgs` for both shell and argv
+transports, including its direct probe/cleanup calls. They are empty for ordinary
+`inherit` mode, preserving tmux's environment-based selection; `serverArgs` still
+names the server for attachments. The opt-in control client uses the same execution
+arguments for its connection, probes and fallback commands. The same startup choice feeds node
+inventory, `TerminalService.status()` and previews, composed panes, shared TUI attachment and
+CLI viewer management. Inherited SSH panes retain the remote-tmux replacement
+wrapper and plain recovery command without requiring remote OpenRig. Isolated
+SSH panes resolve the remote instance through its own `rig terminal attach`.
+For isolation, self-attachment checks the caller's socket before binding;
+offline destruction reads the persisted socket before removing state.
+
+See [tmux server selection](../../reference/tmux-servers.md) for configuration
+loading, first-upgrade migration, discovery scope and platform behavior.
 
 ## 3. Resume honesty
 
@@ -327,7 +485,8 @@ command + pane content and returns one of four honest statuses
   conversation"; it is *distinct* from `inconclusive` and `failed` (comment
   `:4–6`).
 
-Other codes include `bypass_consent_gate`, `mcp_gate`, `login_required` and
+Other codes include `bypass_consent_gate`, `claude_gated_grants_gate` (the
+"gated grants" trust check, which is never auto-driven), `mcp_gate`, `login_required` and
 `returned_to_shell` for Claude, and `codex_client_incompatible`,
 `no_saved_session`, `codex_auth_refusal` and `model_selection_gate` for Codex;
 an unknown runtime gets `unsupported_runtime`. For Claude, `assessManagedProbe`
@@ -345,7 +504,7 @@ never relaunches itself. Acting on that hint is the caller's choice:
 `StartupOrchestrator` retries once fresh on `retry_fresh` unless the caller
 passes `allowFreshFallback: false` (`startup-orchestrator.ts:319–330`), and the
 restore orchestrator passes `false` when a pod-aware node requested resume
-(`restore-orchestrator.ts:1217`).
+(`restore-orchestrator.ts:1224`).
 
 ### `resume-metadata-refresher.ts`
 
@@ -386,8 +545,8 @@ module.
 
 - **Rule 1** — §2: **0** files in `adapters/` import Hono.
 - **Rule 5** — restore picks a node's adapter by that node's own runtime: the
-  saved startup context's runtime, else the node's (`restore-orchestrator.ts:1108–1109`),
-  used to choose the replay adapter (`:1131`).
+  saved startup context's runtime, else the node's (`restore-orchestrator.ts:1115–1116`),
+  used to choose the replay adapter (`:1138`).
 - **Rule 13** — the readiness loop is `StartupOrchestrator.waitForReady`
   (`startup-orchestrator.ts:562`; 1 s doubling to a 16 s cap), which calls each
   adapter's `checkReady` (§2). The timeout comes from the
@@ -400,9 +559,9 @@ module.
   separate field that also allows `forked` (`startup-orchestrator.ts:101`).
 - **Rule 15** — adapters return `ok:false` and never relaunch (§2, §3);
   restore passes `allowFreshFallback: false` for pod-aware resume
-  (`restore-orchestrator.ts:1217`), and a resume that concludes failed rolls
-  back to zero sessions as `awaiting-decision` (`restore-orchestrator.ts:1048`,
-  `:1236`).
+  (`restore-orchestrator.ts:1224`), and a resume that concludes failed rolls
+  back to zero sessions as `awaiting-decision` (`restore-orchestrator.ts:1055`,
+  `:1243`).
 
 ## See also
 

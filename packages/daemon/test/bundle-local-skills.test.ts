@@ -16,6 +16,8 @@ import { inspectSkillDirectory, reconcileSkillLoadout, resolveSkillLoadout } fro
 import { planProjection } from "../src/domain/projection-planner.js";
 import { RigSpecSchema } from "../src/domain/rigspec-schema.js";
 import { RigSpecCodec } from "../src/domain/rigspec-codec.js";
+import { seatSkillPaths } from "../src/domain/seat-skill-storage.js";
+import { prepareSeatLaunchAdditions } from "../src/domain/seat-launch-additions.js";
 import { ClaudeCodeAdapter } from "../src/adapters/claude-code-adapter.js";
 import { CodexRuntimeAdapter } from "../src/adapters/codex-runtime-adapter.js";
 import { PiRuntimeAdapter } from "../src/adapters/pi-runtime-adapter.js";
@@ -71,6 +73,11 @@ describe("bundle-local skills", () => {
     fs.writeFileSync(dest, text);
     return dest;
   }
+  function commitCatalog(catalog: string) {
+    execFileSync("git", ["init", "-q", catalog]);
+    execFileSync("git", ["-C", catalog, "add", "."]);
+    execFileSync("git", ["-C", catalog, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "catalog"]);
+  }
   async function create() {
     const outputPath = path.join(root, "portable.rigbundle");
     const response = await app.request("/api/bundles/create", {
@@ -90,6 +97,41 @@ describe("bundle-local skills", () => {
     write("source/skills/undeclared/SKILL.md", skill("undeclared"));
     write("source/packages/legacy.txt", "Legacy single-file payload\n");
   }
+
+  it.each([undefined, "none"] as const)("carries Claude additions and MCP selection (%s) into the installed spec", async claudeMcp => {
+    const channels = ["plugin:example-channel@example", "plugin:second@example"];
+    write("source/rig.yaml", rigYaml.replace("runtime: pi", "runtime: claude-code\n        agent_file: claude/reviewer.md\n"
+      + "        append_system_prompt_file: claude/house.md\n        plugin_dirs: [claude/plugins/review]"
+      + `\n        plugin_channels: [${channels.join(", ")}]`
+      + (claudeMcp ? `\n        claude_mcp: ${claudeMcp}` : "")));
+    write("source/agents/worker/agent.yaml", `name: worker\nversion: "1.0"\nprofiles:\n  default:\n    uses: {}\n`);
+    write("source/claude/reviewer.md", "---\nname: reviewer\ndescription: Reviews\n---\nReview carefully.\n");
+    write("source/claude/house.md", "House rules.\n");
+    write("source/claude/plugins/review/skills/check/SKILL.md", skill("check"));
+    const mcp = '{"mcpServers":{"review":{"command":"fixture-only"}}}\n';
+    write("source/claude/plugins/review/.mcp.json", mcp);
+    const { response, outputPath } = await create();
+    expect(response.status, await response.text()).toBe(201);
+    const resolver = new PodBundleSourceResolver();
+    const extracted = await resolver.resolve(outputPath);
+    const installed = path.join(root, "installed");
+    expect(materializePodBundle(extracted.tempDir, installed)).toEqual({ ok: true });
+    resolver.cleanup(extracted.tempDir);
+    fs.rmSync(path.join(root, "source"), { recursive: true });
+    // What a launch does with the installed spec: resolve the member's paths beside it and copy them into the seat.
+    const member = RigSpecSchema.normalize(RigSpecCodec.parse(fs.readFileSync(path.join(installed, "rig.yaml"), "utf8")) as Record<string, unknown>).pods[0]!.members[0]!;
+    expect(member.claudeMcp).toBe(claudeMcp);
+    expect(member.pluginChannels).toEqual(channels);
+    const seat = seatSkillPaths({ rigId: "rig-installed", logicalId: "dev.worker", runtime: "claude-code" }, path.join(root, "home"));
+    const beside = (rel: string) => path.resolve(installed, rel);
+    const prepared = prepareSeatLaunchAdditions(seat, { agentFile: beside(member.agentFile!),
+      appendSystemPromptFile: beside(member.appendSystemPromptFile!), pluginDirs: member.pluginDirs!.map(beside), pluginChannels: member.pluginChannels! });
+    expect(prepared, JSON.stringify(prepared)).toMatchObject({ ok: true, additions: { agent: "openrig:reviewer", pluginChannels: channels } });
+    const additions = prepared.ok ? prepared.additions : undefined;
+    expect(fs.readFileSync(additions!.appendSystemPromptFile!, "utf8")).toBe("House rules.\n");
+    expect(fs.existsSync(path.join(additions!.pluginDirs[0]!, "skills/check/SKILL.md"))).toBe(true);
+    expect(fs.readFileSync(path.join(additions!.pluginDirs[0]!, ".mcp.json"), "utf8")).toBe(mcp);
+  });
 
   it("carries the full declared skill directory and legacy file, without an undeclared sibling", async () => {
     seed();
@@ -288,14 +330,123 @@ describe("bundle-local skills", () => {
     },
   );
 
-  it("discovers Pi bundle skills without importing Claude/Codex home or workspace pools", () => {
+  it("delivers no working-tree bytes of a catalog skill with uncommitted content on any runtime", async () => {
+    const specRoot = path.join(root, "source");
+    write("source/agents/worker/agent.yaml", `name: worker\nversion: "1.0"\nprofiles:\n  default:\n    uses:\n      skills: [edited]\n`);
+    write("source/agents/plain/agent.yaml", `name: plain\nversion: "1.0"\nprofiles:\n  default:\n    uses:\n      skills: []\n`);
+    const catalog = path.join(root, "catalog");
+    write("catalog/catalog.yaml", "schema: openrig.skill-catalog/v1\nsystem: []\n");
+    write("catalog/edited/SKILL.md", skill("edited"));
+    write("catalog/clean/SKILL.md", skill("clean"));
+    commitCatalog(catalog);
+    write("catalog/edited/SKILL.md", `${skill("edited")}\nUncommitted draft.\n`);
+    const rig = RigSpecSchema.normalize(RigSpecCodec.parse(rigYaml) as Record<string, unknown>);
+    const cwd = path.join(root, "work");
+    fs.mkdirSync(cwd, { recursive: true });
+    const tmux = {} as TmuxAdapter;
+    const pi = new PiRuntimeAdapter({ tmux, fsOps, stateRoot: path.join(root, "pi"), runnerEntryPath: "unused" });
+    for (const adapter of [new ClaudeCodeAdapter({ tmux, fsOps }), new CodexRuntimeAdapter({ tmux, fsOps }), pi] as RuntimeAdapter[]) {
+      // Claude and Codex discovery scans the catalog, so the profile selects the dirty skill by name. Pi discovers
+      // only its bundle, so there the System World selects it.
+      const viaProfile = adapter.runtime !== "pi";
+      const resolved = resolveAgentRef(viaProfile ? "local:agents/worker" : "local:agents/plain", specRoot, fsOps);
+      if (!resolved.ok) throw new Error(JSON.stringify(resolved));
+      const member = { ...rig.pods[0]!.members[0]!, runtime: adapter.runtime, cwd };
+      const result = resolveNodeConfig({ baseSpec: resolved.resolved, importedSpecs: resolved.imports, collisions: resolved.collisions,
+        profileName: "default", member, pod: rig.pods[0]!, rig, specRoot, homedir: path.join(root, "home"), skillsRoot: catalog,
+        systemSkills: viaProfile ? ["clean"] : ["clean", "edited"] });
+      expect(result.ok, JSON.stringify(result)).toBe(true);
+      if (!result.ok) throw new Error(result.errors.join("; "));
+      expect(result.config.selectedResources.skills.map(s => s.effectiveId)).toEqual(["clean"]);
+      expect(result.config.skillWarnings).toEqual([expect.stringMatching(/^selected_skill_skipped: 'edited' \(selected by (topology|system)\) /)]);
+      const session = `${adapter.runtime}@portable`;
+      const targetOf = (id: string) => adapter.runtime === "pi" ? pi.skillTargetPath(session, id)!
+        : path.join(cwd, adapter.runtime === "codex" ? ".agents" : ".claude", "skills", id, "SKILL.md");
+      const planned = planProjection({ config: result.config, collisions: resolved.collisions, fsOps, resolveTargetPath: (_category, id) => targetOf(id) });
+      expect(planned.ok).toBe(true);
+      if (!planned.ok) throw new Error(planned.errors.join("; "));
+      expect((await adapter.project(planned.plan, { tmuxSession: session, cwd } as NodeBinding)).failed).toEqual([]);
+      expect(fs.readFileSync(targetOf("clean"), "utf8")).toBe(skill("clean"));
+      expect(fs.existsSync(targetOf("edited"))).toBe(false);
+    }
+  });
+
+  it.each(["folder", "SKILL.md", "frontmatter name"] as const)(
+    "resolves a fresh seat whose profile selects a dirty catalog skill after its %s is deleted or renamed",
+    (change) => {
+      const specRoot = path.join(root, "source");
+      write("source/agents/worker/agent.yaml", `name: worker\nversion: "1.0"\nprofiles:\n  default:\n    uses:\n      skills: [edited]\n`);
+      const catalog = path.join(root, "catalog");
+      write("catalog/catalog.yaml", "schema: openrig.skill-catalog/v1\nsystem: []\n");
+      write("catalog/folder alias/SKILL.md", skill("edited"));
+      write("catalog/clean/SKILL.md", skill("clean"));
+      commitCatalog(catalog);
+      // Discovery can't see the committed name `edited` after any of these, so only the catalog recognizes it.
+      const dir = path.join(catalog, "folder alias");
+      if (change === "folder") fs.rmSync(dir, { recursive: true });
+      else if (change === "SKILL.md") fs.rmSync(path.join(dir, "SKILL.md"));
+      else write("catalog/folder alias/SKILL.md", skill("renamed"));
+      const cwd = path.join(root, "work");
+      fs.mkdirSync(cwd, { recursive: true });
+      const resolved = resolveAgentRef("local:agents/worker", specRoot, fsOps);
+      if (!resolved.ok) throw new Error(JSON.stringify(resolved));
+      const rig = RigSpecSchema.normalize(RigSpecCodec.parse(rigYaml) as Record<string, unknown>);
+      const member = { ...rig.pods[0]!.members[0]!, runtime: "codex", cwd };
+      const result = resolveNodeConfig({ baseSpec: resolved.resolved, importedSpecs: resolved.imports, collisions: resolved.collisions,
+        profileName: "default", member, pod: rig.pods[0]!, rig, specRoot, homedir: path.join(root, "home"), skillsRoot: catalog,
+        systemSkills: ["clean"] });
+      expect(result.ok, JSON.stringify(result)).toBe(true);
+      if (!result.ok) return;
+      expect(result.config.selectedResources.skills.map(s => s.effectiveId)).toEqual(["clean"]);
+      expect(result.config.skillWarnings).toEqual([expect.stringMatching(/^selected_skill_skipped: 'edited' \(selected by topology\) /)]);
+    },
+  );
+
+  it("delivers nothing from inside a dirty catalog skill, and still delivers a sibling that only shares its name prefix", async () => {
+    const specRoot = path.join(root, "source");
+    // The catalog sits in the agent's folder, so the agent can declare a source inside one of its skills.
+    write("source/agents/nested/agent.yaml", `name: nested\nversion: "1.0"\nresources:\n  skills:\n    - id: inner\n      path: skills/edited/inner\nprofiles:\n  default:\n    uses:\n      skills: [inner, edited-clean]\n`);
+    const catalog = path.join(specRoot, "agents", "nested", "skills");
+    write("source/agents/nested/skills/catalog.yaml", "schema: openrig.skill-catalog/v1\nsystem: []\n");
+    write("source/agents/nested/skills/edited/SKILL.md", skill("edited"));
+    write("source/agents/nested/skills/edited/inner/SKILL.md", skill("inner"));
+    write("source/agents/nested/skills/edited-clean/SKILL.md", skill("edited-clean"));
+    commitCatalog(catalog);
+    write("source/agents/nested/skills/edited/inner/SKILL.md", `${skill("inner")}\nUncommitted draft.\n`);
+    const cwd = path.join(root, "work");
+    fs.mkdirSync(cwd, { recursive: true });
+    const resolved = resolveAgentRef("local:agents/nested", specRoot, fsOps);
+    if (!resolved.ok) throw new Error(JSON.stringify(resolved));
+    const rig = RigSpecSchema.normalize(RigSpecCodec.parse(rigYaml) as Record<string, unknown>);
+    const member = { ...rig.pods[0]!.members[0]!, runtime: "codex", cwd };
+    const result = resolveNodeConfig({ baseSpec: resolved.resolved, importedSpecs: resolved.imports, collisions: resolved.collisions,
+      profileName: "default", member, pod: rig.pods[0]!, rig, specRoot, homedir: path.join(root, "home"), skillsRoot: catalog,
+      systemSkills: [] });
+    expect(result.ok, JSON.stringify(result)).toBe(true);
+    if (!result.ok) throw new Error(result.errors.join("; "));
+    expect(result.config.selectedResources.skills.map(s => s.effectiveId)).toEqual(["edited-clean"]);
+    expect(result.config.skillWarnings).toEqual([
+      expect.stringMatching(/^catalog_skill_skipped: 'edited' /),
+      expect.stringMatching(/^selected_skill_skipped: 'inner' \(selected by topology\) is inside .*edited, which has uncommitted content/),
+    ]);
+    const targetOf = (id: string) => path.join(cwd, ".agents", "skills", id, "SKILL.md");
+    const planned = planProjection({ config: result.config, collisions: resolved.collisions, fsOps, resolveTargetPath: (_category, id) => targetOf(id) });
+    expect(planned.ok).toBe(true);
+    if (!planned.ok) throw new Error(planned.errors.join("; "));
+    const adapter = new CodexRuntimeAdapter({ tmux: {} as TmuxAdapter, fsOps });
+    expect((await adapter.project(planned.plan, { tmuxSession: "codex@portable", cwd } as NodeBinding)).failed).toEqual([]);
+    expect(fs.existsSync(targetOf("inner"))).toBe(false);
+    expect(fs.readFileSync(targetOf("edited-clean"), "utf8")).toBe(skill("edited-clean"));
+  });
+
+  it("discovers Pi bundle skills without importing Claude/Codex home or workspace pools", async () => {
     for (const prefix of ["home/.agents", "home/.claude", "work/.agents", "work/.claude"]) {
       write(`${prefix}/skills/sibling/SKILL.md`, skill("sibling"));
     }
     write("installed/skills/portable/SKILL.md", skill("portable"));
     const paths = { runtime: "pi" as const, homedir: path.join(root, "home"), cwd: path.join(root, "work"), specInstallDir: path.join(root, "installed") };
     expect(discoverSkillsForRuntime(paths).skills.map(s => s.id)).toEqual(["portable"]);
-    expect(discoverSkillsWithProvenance(paths).skills.map(s => [s.id, s.sourceKind])).toEqual([["portable", "spec_install"]]);
+    expect((await discoverSkillsWithProvenance(paths)).skills.map(s => [s.id, s.sourceKind])).toEqual([["portable", "spec_install"]]);
     expect(discoverSkillsForRuntime({ ...paths, specInstallDir: undefined }).skills).toEqual([]);
   });
 

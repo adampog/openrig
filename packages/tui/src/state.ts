@@ -1,7 +1,8 @@
 import { fileTargetForPath } from "./reading.js";
 import { terminalExplorerRows } from "./terminals/terminal-model.js";
 import { CONFIG_CATEGORIES } from "./config/config-model.js";
-import { availableTabs } from "./commands/registry.js";
+import { availableTabs, COMMAND_REGISTRY } from "./commands/registry.js";
+import { filterPalette } from "./commands/palette.js";
 import { DEFAULT_TIME_ZONE, resolveTimeZone } from "./time.js";
 // ONE instance-scoped view-state with ONE mutation path (dispatch) — PIN 1.
 // No module-level state anywhere in this file (FR-13). The section set is a
@@ -25,6 +26,7 @@ import { SECTION_REGISTRY, SYSTEM_SECTIONS } from "./sections.js";
 import { scopesExplorerRows } from "./scopes/scopes-model.js";
 import { GRAPH_STYLE_NAMES } from "./topology/render-graph.js";
 import { rowStatusGlyph } from "./topology/glyphs.js";
+import { hostLabel, hostReachabilitySuffix } from "./topology/host-label.js";
 
 export function defaultSections(): SectionDef[] {
   return SECTION_REGISTRY.map((section) => ({ ...section }));
@@ -80,17 +82,19 @@ export function createViewState(options: CreateViewStateOptions): ViewStateStore
     project: null,
     scopesMission: null,
     scopesSelected: null,
+    fleetSelected: null,
     scopesCollapseReqs: false,
     scopesNarrative: false,
     executionOpen: null,
     healthOpen: null,
     attentionOpen: null,
+    attentionView: null,
   };
   const listeners = new Set<(s: ViewState) => void>();
 
   function dispatch(action: Action): ViewState {
     const previous = state;
-    if (["attention-category", "attention-open", "terminal-preview", "project-select", "jump", "drill", "cross", "tab", "scopes-mission-open", "scopes-open", "health-open", "execution-open", "recent-open", "timezone", "config-category", "config-setting"].includes(action.type)) state = { ...state, file: null, externalUrl: null, recentOpen: null, timeZoneHelp: false, attentionOpen: null, specLaunch: null, ...(state.pendingDrill ? { pendingDrill: null } : {}) };
+    if (["attention-category", "attention-open", "attention-view", "terminal-preview", "project-select", "jump", "drill", "cross", "tab", "scopes-mission-open", "scopes-open", "fleet-slice-open", "fleet-close", "health-open", "execution-open", "recent-open", "timezone", "config-category", "config-setting"].includes(action.type)) state = { ...state, file: null, externalUrl: null, recentOpen: null, timeZoneHelp: false, attentionOpen: null, specLaunch: null, ...(state.pendingDrill ? { pendingDrill: null } : {}) };
     state = reduce(state, action, getSnapshot());
     // A pending address belongs to the Topology landing it opened; leaving it cancels the address.
     if (state.pendingDrill && (state.section !== "topology" || state.drill.length > 0)) state = { ...state, pendingDrill: null };
@@ -141,6 +145,9 @@ function reduce(state: ViewState, action: Action, snap: FleetSnapshot): ViewStat
       return resetContent({ ...next, terminalPage: Math.max(0, Math.min(action.page, (snap.terminals?.preview?.composed.pages.length ?? 1) - 1)) });
     case "attention-category":
       return syncSelection({ ...resetContent({ ...next, section: "needs", attentionCategory: action.category, attentionOpen: null }), focusedPane: "content" }, snap);
+    case "attention-view":
+      // Whose queue the Feed shows; acts on it are still the primary user's.
+      return syncSelection({ ...resetContent({ ...next, section: "needs", attentionView: action.view === "default" ? null : action.view, attentionCategory: null, attentionOpen: null }), focusedPane: "content" }, snap);
     case "attention-open":
       return syncSelection({ ...resetContent({ ...next, section: "needs", attentionOpen: action.id, file: null, externalUrl: null, healthOpen: null }), focusedPane: "content" }, snap);
     case "attention-source": {
@@ -178,7 +185,7 @@ function reduce(state: ViewState, action: Action, snap: FleetSnapshot): ViewStat
       return { ...next, lastError: action.message };
     case "config-category": {
       if (!CONFIG_CATEGORIES.some((c) => c.id === action.category)) return { ...next, lastError: "Unknown CONFIG category" };
-      return syncSelection(resetContent({ ...next, section: "config", drill: [], viewTab: "table", configCategory: action.category, configKey: null, filter: "", healthOpen: null }), snap);
+      return syncSelection(resetContent({ ...next, section: "config", drill: [], viewTab: "table", configCategory: action.category, configKey: null, configFocus: action.focus ?? null, filter: "", healthOpen: null }), snap);
     }
     case "config-setting":
       return resetContent({ ...next, section: "config", drill: [], viewTab: "table", configKey: action.key, healthOpen: null });
@@ -195,6 +202,7 @@ function reduce(state: ViewState, action: Action, snap: FleetSnapshot): ViewStat
       next.healthOpen = null;
       next.configCategory = null;
       next.configKey = null;
+      next.configFocus = null;
       if (!state.sections.some((s) => s.name === action.section))
         return { ...next, lastError: `unknown section "${action.section}"` };
       return syncSelection(
@@ -224,6 +232,12 @@ function reduce(state: ViewState, action: Action, snap: FleetSnapshot): ViewStat
     }
     case "scopes-open":
       return syncSelection(resetContent({ ...next, section: "scopes", drill: [], runningOf: null, viewTab: "table", filter: "", scopesMission: action.mission, scopesSelected: { mission: action.mission, slice: action.slice }, scopesNarrative: false, executionOpen: null, healthOpen: null }), snap);
+    case "fleet-slice-open":
+      // Composite identity (origin host + native mission/slice) — the selection
+      // itself keeps the row distinct from an identically-named row elsewhere.
+      return syncSelection(resetContent({ ...next, section: "fleet", drill: [], runningOf: null, viewTab: "table", filter: "", fleetSelected: { hostId: action.hostId, mission: action.mission, slice: action.slice }, healthOpen: null }), snap);
+    case "fleet-close":
+      return resetContent({ ...next, fleetSelected: null });
     case "scopes-reqs":
       return { ...next, scopesCollapseReqs: !next.scopesCollapseReqs };
     case "scopes-narrative":
@@ -245,7 +259,10 @@ function reduce(state: ViewState, action: Action, snap: FleetSnapshot): ViewStat
       return next.palette ? { ...next, palette: { query: action.query, selection: 0 } } : next;
     case "palette-move": {
       if (!next.palette) return next;
-      const sel = Math.max(0, next.palette.selection + action.delta);
+      // Clamp to the matches Help shows (their count does not depend on context), so
+      // overshooting the last row cannot leave later up-presses with nothing to undo.
+      const last = Math.max(0, filterPalette(next.palette.query, COMMAND_REGISTRY, "").length - 1);
+      const sel = Math.min(last, Math.max(0, next.palette.selection + action.delta));
       return { ...next, palette: { ...next.palette, selection: sel } };
     }
     case "style": {
@@ -354,12 +371,12 @@ function reduce(state: ViewState, action: Action, snap: FleetSnapshot): ViewStat
 }
 
 function location(s: ViewState): string {
-  return JSON.stringify([s.attentionCategory, s.attentionOpen, s.project, s.terminalView, s.section, s.drill, s.runningOf, s.scopesMission, s.scopesSelected, s.executionOpen, s.recentOpen?.transitionId, s.timeZoneHelp, s.configCategory, s.configKey, s.file, s.externalUrl]);
+  return JSON.stringify([s.attentionCategory, s.attentionOpen, s.project, s.terminalView, s.section, s.drill, s.runningOf, s.scopesMission, s.scopesSelected, s.fleetSelected, s.executionOpen, s.recentOpen?.transitionId, s.timeZoneHelp, s.configCategory, s.configKey, s.file, s.externalUrl]);
 }
 
 function navigationFrame(s: ViewState): NavigationFrame {
-  const { attentionCategory, attentionOpen, project, terminalView, terminalPage, file, externalUrl, section, drill, filter, selection, runningOf, viewTab, contentOffset, contentMaxOffset, contentTargetCount, contentSelection, focusedPane, scopesMission, scopesSelected, scopesCollapseReqs, scopesNarrative, executionOpen, expanded, recentOpen, timeZoneHelp, configCategory, configKey } = s;
-  return { attentionCategory, attentionOpen, project, terminalView, terminalPage, file, externalUrl, section, drill, filter, selection, runningOf, viewTab, contentOffset, contentMaxOffset, contentTargetCount, contentSelection, focusedPane, scopesMission, scopesSelected, scopesCollapseReqs, scopesNarrative, executionOpen, expanded, recentOpen, timeZoneHelp, configCategory, configKey };
+  const { attentionCategory, attentionOpen, project, terminalView, terminalPage, file, externalUrl, section, drill, filter, selection, runningOf, viewTab, contentOffset, contentMaxOffset, contentTargetCount, contentSelection, focusedPane, scopesMission, scopesSelected, scopesCollapseReqs, scopesNarrative, fleetSelected, executionOpen, expanded, recentOpen, timeZoneHelp, configCategory, configKey, configFocus } = s;
+  return { attentionCategory, attentionOpen, project, terminalView, terminalPage, file, externalUrl, section, drill, filter, selection, runningOf, viewTab, contentOffset, contentMaxOffset, contentTargetCount, contentSelection, focusedPane, scopesMission, scopesSelected, scopesCollapseReqs, scopesNarrative, fleetSelected, executionOpen, expanded, recentOpen, timeZoneHelp, configCategory, configKey, configFocus };
 }
 
 function applyDrill(state: ViewState, next: ViewState, action: Extract<Action, { type: "drill" }>, snap: FleetSnapshot): ViewState {
@@ -618,7 +635,7 @@ export function computeExplorerRows(state: ViewState, snap: FleetSnapshot): Expl
   const rows: ExplorerRow[] = [];
   for (const section of state.sections) {
     const active = section.name === state.section || section.name === "system" && SYSTEM_SECTIONS.includes(state.section);
-    if (section.name === "config" || section.name === "connections") continue;
+    if (section.name === "config" || section.name === "connections" || section.name === "usage" || section.name === "usage-hosts" || section.name === "cost") continue;
     const label =
       section.name === "topology"
         ? "TOPOLOGY"
@@ -626,7 +643,7 @@ export function computeExplorerRows(state: ViewState, snap: FleetSnapshot): Expl
           ? "SPECS"
           : section.name === "needs"
             ? "FEED"
-            : section.name === "scopes" ? "PROJECTS" : section.name.toUpperCase();
+            : section.name === "scopes" ? "PROJECTS" : section.name === "fleet" ? "FLEET · PROJECTS" : section.name.toUpperCase();
     // A section changes view but has no independent collapse state. Do not draw
     // a disclosure glyph that cannot be toggled.
     rows.push({ label, action: { type: "jump", section: section.name }, key: `section:${section.name}` });
@@ -639,7 +656,10 @@ export function computeExplorerRows(state: ViewState, snap: FleetSnapshot): Expl
       rows.push({ label: "  Health", key: "system:health", action: { type: "jump", section: "system" } },
         { label: "  Configuration", key: "section:config", action: { type: "jump", section: "config" } });
       if (state.section === "config") rows.push(...CONFIG_CATEGORIES.map((c) => ({ label: "    " + c.label, key: `config:${c.id}`, action: { type: "config-category" as const, category: c.id } })));
-      rows.push({ label: "  Connections", key: "section:connections", action: { type: "jump", section: "connections" } });
+      rows.push({ label: "  Connections", key: "section:connections", action: { type: "jump", section: "connections" } },
+        { label: "  Usage", key: "section:usage", action: { type: "jump", section: "usage" } },
+        { label: "  Usage · all hosts", key: "section:usage-hosts", action: { type: "jump", section: "usage-hosts" } },
+        { label: "  Cost", key: "section:cost", action: { type: "jump", section: "cost" } });
       if (state.history?.length) rows.push({ label: "  Back", key: "system:back", action: { type: "back" } });
       continue;
     }
@@ -659,7 +679,7 @@ export function computeExplorerRows(state: ViewState, snap: FleetSnapshot): Expl
       const expanded = new Set(state.expanded);
       for (const host of snap.hosts) {
         rows.push({
-          label: `  ▾ ${host.name}${host.reachable ? "" : " (unreachable)"}`,
+          label: `  ▾ ${hostLabel(host)}${hostReachabilitySuffix(host)}`,
           action: { type: "drill", resource: "host", name: host.name },
           key: `host:${host.name}`,
         });

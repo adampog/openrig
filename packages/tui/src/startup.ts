@@ -163,6 +163,8 @@ export class StartupController {
       const failure = s.notice;
       await this.refresh();
       if (!confirmed) { s.notice = failure; s.detail = failure; this.changed(); }
+      // refresh() moves the page on; read it again rather than through the narrowed `s.page`.
+      else if (this.state.page === "rigs") { s.notice = daemonOnlyNotice(s.rigs); this.changed(); }
       return;
     }
     if (s.page === "rigs" && key === "k" && !s.rigs.some((r) => r.name === "kernel")) {
@@ -244,6 +246,14 @@ export class StartupController {
   }
 }
 
+/** After a daemon-only start: this start brought back no seat, and the existing way to bring one back is the rig list
+ *  here, where the kernel comes first. It says nothing about why any seat isn't running. */
+export function daemonOnlyNotice(rigs: Array<{ name: string }>): string {
+  return rigs.some((r) => r.name === "kernel")
+    ? "Daemon started; this start didn't start any seats. The kernel is listed first: choose it to see its seats and resume one."
+    : "Daemon started; this start didn't start any seats. Choose a rig, or press k to set up a kernel.";
+}
+
 export function startupLines(s: StartupState): Array<{ text: string; action?: Action }> {
   const button = (text: string, key: string) => ({ text, action: { type: "startup" as const, key } });
   const lines: Array<{ text: string; action?: Action }> = [
@@ -273,7 +283,7 @@ export function startupLines(s: StartupState): Array<{ text: string; action?: Ac
     if (seat) {
       lines.push({ text: "" }, { text: `${seat.logicalId} · ${seat.runtime} · model ${seat.model ?? "configured default"}` },
         { text: seat.prerequisite ?? (seat.observed.state === "running" && seat.contextPending
-          ? "This fresh conversation is waiting for its configured context. Press c to finish that delivery."
+          ? "This conversation is waiting for its configured context. Press c to finish that delivery."
           : ["running", "attention_required", "unverified"].includes(seat.observed.state) ? seat.observed.detail : seat.reason ?? seat.observed.detail) },
         button(seat.observed.state === "running" ? "Enter  Open live work" : seat.observed.state === "attention_required" ? "Enter  Inspect this existing runtime" : `Enter  ${seat.hasHistory ? "Resume previous conversation" : "Start this new seat"}`, "enter"));
       if (["running", "attention_required"].includes(seat.observed.state)) lines.push(button("o  Open native terminal here · detach to return (default Ctrl-b, d)", "o"));

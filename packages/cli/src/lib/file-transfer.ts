@@ -38,6 +38,7 @@
 // loud + revisitable, false negatives are the corruption class).
 
 import os from "node:os";
+import { isIPv6 } from "node:net";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { spawn as nodeSpawn } from "node:child_process";
@@ -261,7 +262,12 @@ export function planFileCopy(rawSrc: string, rawDst: string, opts: { dryRun?: bo
 
 function sideOperand(side: CopySide): string {
   if (side.kind === "local") return side.path;
-  return `${side.host!.target}:${side.path}`;
+  const target = side.host!.target;
+  const hostStart = target.lastIndexOf("@") + 1;
+  const host = target.slice(hostStart);
+  // rsync needs brackets to distinguish IPv6 colons from its host:path and host::module syntax.
+  const operandHost = isIPv6(host) ? `${target.slice(0, hostStart)}[${host}]` : target;
+  return `${operandHost}:${side.path}`;
 }
 
 /** The ONLY place rsync arguments are assembled. Properties (test-asserted):
@@ -309,7 +315,7 @@ const CONNECTION_FAILURE_PATTERNS = [
 ];
 
 function parseStats(stdout: string): { bytesTransferred?: number; filesTransferred?: number } {
-  const bytes = stdout.match(/Total transferred file size:\s*([\d,.]+)\s*bytes/i);
+  const bytes = stdout.match(/Total transferred file size:\s*([\d,.]+)\s*(?:bytes|B)\b/i);
   const files = stdout.match(/Number of (?:regular )?files transferred:\s*([\d,.]+)/i);
   const num = (m: RegExpMatchArray | null) => (m ? Number(m[1]!.replace(/[,.](?=\d{3})/g, "").replace(/,/g, "")) : undefined);
   return { bytesTransferred: num(bytes), filesTransferred: num(files) };

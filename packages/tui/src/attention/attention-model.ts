@@ -1,14 +1,21 @@
 import type { AttentionRead, AttentionItem } from "@openrig/daemon/attention";
-import type { FleetSnapshot, ViewState } from "../types.js";
+import type { Action, FleetSnapshot, ViewState } from "../types.js";
 import { listItem, wrapDetailLines, type ContentLine } from "../detail.js";
+import { displayTime } from "../time.js";
 
-/** The bounded, confirmed-delivery projection served by S02; no client classification. */
+/** The bounded, confirmed-delivery or bridge-acceptance projection served by S02; no client classification. */
 export interface DeliveredHumanUpdates {
   items: Array<{ qitemId: string; summary: string | null; body: string; humanDetail: string | null;
     destinationSession: string; sourceSession: string; tags: string[] | null; evidenceRef: string | null;
-    deliveredAt: string; deliveryReceipt: string }>;
+    deliveredAt: string; deliveryReceipt: string; deliveryOutcome?: "posted" | "accepted" | null }>;
   limit: number;
   truncated: boolean;
+}
+
+const BRIDGE_ACCEPTED_SCOPE = " · accepted by bridge";
+
+function isBridgeAcceptedUpdate(q: DeliveredHumanUpdates["items"][number]): boolean {
+  return q.deliveryOutcome === "accepted" || q.deliveryReceipt.startsWith("relay-owner-notification-accepted");
 }
 
 export function composeHumanUpdates(attention: AttentionRead | null, updates: DeliveredHumanUpdates | null, wanted?: string | null): AttentionRead | null {
@@ -17,23 +24,34 @@ export function composeHumanUpdates(attention: AttentionRead | null, updates: De
     scope: "instance", readAt: new Date().toISOString(), items: [], detail: null, detailError: null,
     sources: [{ source: "queue", state: "unavailable", detail: "Human requests have not answered." }, { source: "outcomes and health", state: "unavailable", detail: "Feed source unavailable." }],
   };
+  const hasAccepted = Boolean(updates?.items.some(isBridgeAcceptedUpdate));
+  const hasPosted = Boolean(updates?.items.some(q => !isBridgeAcceptedUpdate(q)));
+  const sourceDetail = !updates
+    ? "Delivered updates have not answered."
+    : hasAccepted && !hasPosted
+      ? `Latest ${updates.limit} updates accepted by the bridge; retained receipt window${updates.truncated ? ", more omitted" : ""}.`
+      : hasAccepted
+        ? `Latest ${updates.limit} confirmed delivered or accepted-by-bridge updates; retained receipt window${updates.truncated ? ", more omitted" : ""}.`
+        : `Latest ${updates.limit} confirmed delivered updates; retained receipt window${updates.truncated ? ", more omitted" : ""}.`;
   read.sources.push({ source: "delivered updates", state: !updates ? "unavailable" : updates.truncated ? "partial" : "available",
-    detail: updates ? `Latest ${updates.limit} confirmed delivered updates; retained receipt window${updates.truncated ? ", more omitted" : ""}.` : "Delivered updates have not answered." });
+    detail: sourceDetail });
   for (const q of updates?.items ?? []) {
+    const accepted = isBridgeAcceptedUpdate(q);
     const projects = [...new Set((q.tags ?? []).filter(t => t.startsWith("project:")).map(t => t.slice(8)))];
-    const item: AttentionItem = { id: `human-update:${q.qitemId}`, kind: "update", summary: q.summary || q.body.trim().split(/\r?\n/).find(Boolean) || "Delivered update",
+    const baseScope = projects.length === 1 ? `project ${projects[0]} (queue tag)` : "instance · project unknown";
+    const item: AttentionItem = { id: `human-update:${q.qitemId}`, kind: "update", summary: q.summary || q.body.trim().split(/\r?\n/).find(Boolean) || (accepted ? "Accepted by bridge" : "Delivered update"),
       recipient: q.destinationSession, urgency: "update", unblocks: null, at: q.deliveredAt,
-      scope: projects.length === 1 ? `project ${projects[0]} (queue tag)` : "instance · project unknown", project: null,
+      scope: accepted ? `${baseScope}${BRIDGE_ACCEPTED_SCOPE}` : baseScope, project: null,
       source: `/api/queue/${encodeURIComponent(q.qitemId)}` };
-    read.items.push(item);
-    if (wanted === item.id) {
+    if (!read.items.some(current => current.id === `queue-update:${q.qitemId}`)) read.items.push(item);
+    if (wanted === item.id && read.detail?.item.id !== item.id) {
       read.detailError = null;
       read.detail = { item, lines: [q.body, ...(q.humanDetail ? ["Supplemental detail:", q.humanDetail] : []),
-        `From: ${q.sourceSession}`, `Delivered: ${q.deliveredAt}`, `Delivery receipt: ${q.deliveryReceipt}`, `Queue: ${q.qitemId}`, `Evidence: ${q.evidenceRef ?? "none recorded"}`],
+        `From: ${q.sourceSession}`, `Delivery receipt: ${q.deliveryReceipt}`, `Queue: ${q.qitemId}`, `Evidence: ${q.evidenceRef ?? "none recorded"}`],
         files: q.evidenceRef?.startsWith("/") ? [{ label: "Update evidence", path: q.evidenceRef }] : [] };
     }
   }
-  read.items.sort((a, b) => a.kind.localeCompare(b.kind) || (b.at ?? "").localeCompare(a.at ?? "") || a.id.localeCompare(b.id));
+  read.items.sort((a, b) => a.kind.localeCompare(b.kind) || (a.kind === "update" ? ((b.id.startsWith("queue-update:") && b.urgency === "critical" ? 2 : b.urgency === "urgent" ? 1 : 0) - (a.id.startsWith("queue-update:") && a.urgency === "critical" ? 2 : a.urgency === "urgent" ? 1 : 0)) : 0) || (b.at ?? "").localeCompare(a.at ?? "") || a.id.localeCompare(b.id));
   if (wanted?.startsWith("human-update:") && read.detail?.item.id !== wanted) {
     read.detail = null;
     read.detailError = "Selected delivered update is unavailable or outside the retained window. Return to Feed and refresh.";
@@ -43,7 +61,8 @@ export function composeHumanUpdates(attention: AttentionRead | null, updates: De
 
 export function attentionLines(state: ViewState, snap: FleetSnapshot, width: number): ContentLine[] {
   const read = snap.attentionRead;
-  const lines: ContentLine[] = [{ text: "FEED · Instance / All humans" }];
+  const lines: ContentLine[] = [{ text: feedTitle(read?.perspective) }];
+  if (read?.perspective?.defaultSource === "none") lines.push({ text: "No default person is chosen: rig gateway default <id> chooses one." });
   if (!read) return wrapDetailLines([...lines, { text: "Unavailable: Feed sources have not answered." }, ...snap.readErrors.map(text => ({ text }))], width);
   if (state.attentionOpen) {
     const d = read.detail;
@@ -53,11 +72,46 @@ export function attentionLines(state: ViewState, snap: FleetSnapshot, width: num
       const title = read.items.some(i => i.id === d.item.id) ? d.item.kind === "action" ? "Human requests" : "Update" : "Source record";
       lines.push({ text: `${title} · ${d.item.urgency}` }, { text: d.item.summary });
       if (d.item.recipient) lines.push({ text: `To: ${d.item.recipient}` });
-      if (d.item.id.startsWith("human-update:")) lines.push({ text: "No action needed" });
+      if (d.item.id.startsWith("human-update:") || d.item.id.startsWith("queue-update:")) lines.push({ text: "No action needed" });
       if (d.item.unblocks) lines.push({ text: `Unblocks: ${d.item.unblocks}` });
-      lines.push({ text: `Scope: ${d.item.scope}` }, { text: `Observed: ${d.item.at ?? "unknown"}` });
+      // Times are drawn in the person's zone (ui.timezone), as the header's are; a delivered update's time is when it was
+      // delivered or accepted by the bridge.
+      const when = !d.item.id.startsWith("human-update:") ? "Observed" : d.item.scope.endsWith(BRIDGE_ACCEPTED_SCOPE) ? "Accepted by bridge" : "Delivered";
+      lines.push({ text: `Scope: ${d.item.scope}` }, { text: `${when}: ${displayTime(d.item.at, state.timeZone)}` });
+      lines.push(...questionLines(d.item).map(text => ({ text })));
       lines.push(...d.lines.map(text => ({ text })));
       for (const f of d.files) lines.push(listItem(f.label, { type: "attention-source", path: f.path }));
+      // Answer it here, on this row, as the person: Steering's Approve, or, for an ask with questions (Approve would close it
+      // without returning them), one act per open option, or, once every question is answered and the answers haven't gone
+      // back yet, the act that sends them. While a question is open, or with none, `reply` takes their own words.
+      const qitemId = d.item.id.startsWith("queue:") ? d.item.id.slice("queue:".length) : null;
+      if (d.item.answer && qitemId) {
+        const { verb, actorSession } = d.item.answer;
+        // Whoever's queue is shown, the act is the primary user's; it says whose ask it settles when that's someone else.
+        const actor = actingAs(read, actorSession);
+        const as = `as ${actor}${d.item.recipient && d.item.recipient !== actor && read.perspective ? ` on ${d.item.recipient}'s ask` : ""}`;
+        const open = (d.item.humanQuestions ?? []).filter(q => answerOf(d.item, q.id) == null);
+        if (verb === "resolve") {
+          lines.push({ text: `Resolve it in your own words: reply <your decision>, ${as} (it unparks the row for its owner).` });
+        } else if (verb === "approve") {
+          lines.push(listItem(`Approve ${as} (closes this request, as Steering's Approve does)`, { type: "act", act: "answer", qitemId, verb, actorSession }));
+        } else if (!open.length) {
+          lines.push(listItem(`Send the recorded answers back to ${d.item.asker ?? "the asker"} and close this request`, { type: "act", act: "answer", qitemId, verb, actorSession }));
+        } else {
+          for (const q of open)
+            for (const o of q.options) lines.push(listItem(`Answer "${q.question}": ${o.label}${o.recommended ? " (recommended)" : ""}`,
+              { type: "act", act: "answer", qitemId, verb, actorSession, questionId: q.id, optionId: o.id }));
+        }
+        if (verb !== "resolve" && (verb === "approve" || open.length)) {
+          lines.push({ text: `Or answer in your own words: reply <text>, ${as}${verb === "answer" ? " (it fills the first unanswered question and closes the request)" : ""}.` });
+        }
+      }
+      // The settings page that decides this request directly (a pairing request's Approve and Deny), opened on it.
+      if (d.item.settingsLink) lines.push(listItem(d.item.settingsLink.label, { type: "config-category", category: d.item.settingsLink.category, focus: d.item.settingsLink.focus }));
+      if (d.item.asker) {
+        lines.push(askerTerminalLink(snap, d.item.asker)
+          ?? { text: `Chat: ${d.item.asker} isn't in this instance's loaded topology.` });
+      }
       lines.push({ text: `Source: ${d.item.source}` });
     }
   } else {
@@ -70,14 +124,92 @@ export function attentionLines(state: ViewState, snap: FleetSnapshot, width: num
       if (!items.length) lines.push({ text: state.filter ? "  No matches in the served items." : bad.some(s => kind === "action" ? s.source === "queue" : s.source !== "queue") ? "  Unknown: a required source is unavailable or partial." : "  No current items in the available source window." });
       for (const i of items) {
         lines.push(listItem(`[${i.urgency}] ${i.summary}`, { type: "attention-open", id: i.id }));
+        if (i.asker) lines.push(askerTerminalLink(snap, i.asker, 4) ?? { text: `    From: ${i.asker}` });
         if (i.recipient) lines.push({ text: `    To: ${i.recipient}` });
-        if (i.id.startsWith("human-update:")) lines.push({ text: "    No action needed" });
+        if (i.humanQuestions?.length) lines.push({ text: `    Questions: ${i.humanQuestions.length}, ${unansweredCount(i)} unanswered` });
+        if (i.id.startsWith("human-update:") || i.id.startsWith("queue-update:")) lines.push({ text: "    No action needed" });
         if (i.unblocks) lines.push({ text: `    Unblocks: ${i.unblocks}` });
-        lines.push({ text: `    ${i.scope} · ${i.at ?? "time unknown"}` });
+        lines.push({ text: `    ${i.scope} · ${displayTime(i.at, state.timeZone)}` });
       }
     }
-    lines.push({ text: "" }, { text: `Read at ${read.readAt}` }, ...read.sources.map(s => ({ text: `${s.source}: ${s.state} · ${s.detail}` })));
+    lines.push({ text: "" }, { text: `Read at ${displayTime(read.readAt, state.timeZone)}` }, ...read.sources.map(s => ({ text: `${s.source}: ${s.state} · ${s.detail}` })));
   }
-  lines.push({ text: "" }, { text: "Viewing is not approval. Required Slack decisions still apply." });
+  lines.push({ text: "" }, { text: "Viewing is not approval. Each request's detail says whether it went to Slack and where to answer it." });
   return wrapDetailLines(lines, width);
+}
+
+/** The mission-control write for an answer act. Terminal acts carry the primary user's authority; the daemon records who
+ *  that is and whose ask it was. */
+export function answerRequest(action: Extract<Action, { type: "act"; act: "answer" }>) {
+  const { act: _act, type: _type, ...input } = action;
+  return { ...input, authority: "primary-user" as const };
+}
+
+/** What a terminal act is recorded as: the terminal names no responder, so it's unattributed. */
+const UNATTRIBUTED_AT_TERMINAL = "human@host (unattributed)";
+
+/** Who an act on the Feed is recorded as: unattributed, since the terminal names no responder (the served actor is the
+ *  asked person's address, not who typed), whoever is registered. */
+export function actingAs(_read: AttentionRead | null | undefined, _served: string): string {
+  return UNATTRIBUTED_AT_TERMINAL;
+}
+
+/** The TUI opens on the default person's Feed only when the participants file chose one, and only while the person hasn't
+ *  moved off the opening view. With none chosen it stays on the topology, as before. */
+export function opensOnDefaultFeed(read: AttentionRead | null | undefined, state: ViewState, untouched: boolean): boolean {
+  return untouched && state.section === "topology" && read?.perspective?.defaultSource === "chosen";
+}
+
+/** Whose queue the Feed shows, and who acts on it: the primary user, whichever queue is shown. */
+function feedTitle(p: AttentionRead["perspective"]): string {
+  if (!p) return "FEED · Instance / All humans";
+  const viewing = p.basis === "unknown" ? `no registered person "${p.requested}"` : p.viewing ?? "everyone";
+  // One person's queue leaves others' asks out of view: say how to see everyone's.
+  return `FEED · Viewing ${viewing} · you act as ${UNATTRIBUTED_AT_TERMINAL}${p.viewing ? " · whose all shows everyone" : ""}`;
+}
+
+/** The `reply` command on the open request: the person's own words, answered on that row as the person the Feed served. */
+export function replyAct(read: AttentionRead | null | undefined, openId: string | null | undefined, text: string): Action {
+  const item = read?.detail?.item;
+  if (!item?.answer || item.id !== openId || !item.id.startsWith("queue:") || !text.trim()) {
+    return { type: "notice", message: "reply answers the open request addressed to a person: open it in the Feed, then reply <your words>." };
+  }
+  return { type: "act", act: "answer", qitemId: item.id.slice("queue:".length), verb: item.answer.verb === "resolve" ? "resolve" : "answer",
+    actorSession: item.answer.actorSession, decision: text.trim() };
+}
+
+/** A question's recorded answer, by own key only (a question id like "constructor" isn't an answer). */
+function answerOf(item: AttentionItem, questionId: string) {
+  const answers = item.humanAnswers ?? {};
+  return Object.prototype.hasOwnProperty.call(answers, questionId) ? answers[questionId] : undefined;
+}
+
+function unansweredCount(item: AttentionItem): number {
+  return (item.humanQuestions ?? []).filter(q => answerOf(item, q.id) == null).length;
+}
+
+/** The row's questions and options, and what's recorded for each. */
+function questionLines(item: AttentionItem): string[] {
+  if (!item.humanQuestions?.length) return [];
+  return ["Questions:", ...item.humanQuestions.flatMap((q, n) => {
+    const answer = answerOf(item, q.id);
+    const state = answer == null ? "unanswered" : typeof answer === "string"
+      ? `answered: ${q.options.find(o => o.id === answer)?.label ?? answer}` : `answered in their words: ${answer.text}`;
+    return [`${n + 1}. ${q.question} (${state})`, `   Options: ${q.options.map(o => o.recommended ? `${o.label} (recommended)` : o.label).join(" · ")}`];
+  })];
+}
+
+function askerTerminalLink(snap: FleetSnapshot, asker: string, indent = 2): ContentLine | null {
+  const view = seatViewOf(snap, asker);
+  return view ? listItem(`Chat with ${asker} (opens its terminal)`, { type: "act", act: "open-terminal", view }, indent) : null;
+}
+
+/** The terminal view of one local seat, the same view as the agents table's own `term ▸`. */
+function seatViewOf(snap: FleetSnapshot, session: string): string | null {
+  for (const host of snap.hosts.filter(h => (h.id ?? "local") === "local"))
+    for (const rig of host.rigs) for (const pod of rig.pods) {
+      const agent = pod.agents.find(a => a.session === session);
+      if (agent) return `seat:${rig.name}/${agent.name}`;
+    }
+  return null;
 }

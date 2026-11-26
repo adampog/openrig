@@ -157,6 +157,20 @@ describe("mission-control routes Phase B (PL-005)", () => {
   });
 
   describe("POST /action client-error mapping", () => {
+    it.each(["external:qa", "fold:review", "auth:access"])("resolve accepts typed blocker %s through the existing action route", async (blockedOn) => {
+      const { app } = buildApp({ bus, queueRepo, bearerToken: "secret", withDispatcher: false });
+      const created = await queueRepo.create({ sourceSession: "s@r", destinationSession: "d@r", body: "x", nudge: false });
+      queueRepo.update({ qitemId: created.qitemId, actorSession: "d@r", state: "blocked", blockedOn });
+      const res = await app.request("/api/mission-control/action", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer secret", "X-OpenRig-Session": "operator@r" },
+        body: JSON.stringify({ verb: "resolve", qitemId: created.qitemId, decision: "condition verified", notify: false }),
+      });
+      expect(res.status).toBe(200);
+      expect(queueRepo.getById(created.qitemId)).toMatchObject({ state: "in-progress", destinationSession: "d@r", closureReason: null });
+      expect(queueRepo.transitionLog.listForQitem(created.qitemId).some((t) => t.transitionNote === `Blocker ${blockedOn} resolved: condition verified`)).toBe(true);
+    });
+
     it("resolve without decision returns 400 decision_required", async () => {
       const { app } = buildApp({ bus, queueRepo, bearerToken: null, withDispatcher: false });
       const created = await queueRepo.create({ sourceSession: "s@r", destinationSession: "d@r", body: "x" });
@@ -193,6 +207,29 @@ describe("mission-control routes Phase B (PL-005)", () => {
   });
 
   describe("GET /audit", () => {
+    it("pages out-of-order timestamps without repeating or skipping actions", async () => {
+      const { app, actionLog } = buildApp({ bus, queueRepo, bearerToken: null, withDispatcher: false });
+      const record = (actedAt: string) => actionLog.record({ actionVerb: "approve", qitemId: null, actorSession: "alice@r", actedAt });
+      const middle = record("2026-05-04T05:02:00Z");
+      const newest = record("2026-05-04T05:03:00Z");
+      const oldest = record("2026-05-04T05:01:00Z");
+      const tied = record("2026-05-04T05:02:00Z");
+      const seen: string[] = [];
+      let cursor: string | null = null;
+      for (let i = 0; i < 5; i++) {
+        const query = new URLSearchParams({ limit: "1", actor_session: "alice@r" });
+        if (cursor) query.set("before_id", cursor);
+        const response = await app.request(`/api/mission-control/audit?${query}`);
+        expect(response.status).toBe(200);
+        const page = await response.json() as { rows: Array<{ actionId: string }>; hasMore: boolean; nextBeforeId: string | null };
+        seen.push(...page.rows.map((row) => row.actionId));
+        if (!page.hasMore) { expect(page.nextBeforeId).toBeNull(); break; }
+        expect(page.nextBeforeId).toBeTruthy();
+        cursor = page.nextBeforeId;
+      }
+      expect(seen).toEqual([newest.actionId, tied.actionId, middle.actionId, oldest.actionId]);
+    });
+
     it("returns rows + pagination metadata", async () => {
       const { app, actionLog } = buildApp({ bus, queueRepo, bearerToken: null, withDispatcher: false });
       // Seed an action.

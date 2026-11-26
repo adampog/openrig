@@ -1,10 +1,32 @@
 import { Command } from "commander";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
+import { conversationKey } from "@openrig/daemon/conversation-key";
 import { DaemonClient } from "../client.js";
-import { getDaemonStatus, getDaemonUrl, type LifecycleDeps , daemonStatusGuard} from "../daemon-lifecycle.js";
-import { createMcpServer } from "../mcp-server.js";
+import { daemonMayAnswer, daemonStatusGuard, getDaemonStatus, getDaemonUrl, printStatusGuard, resolveConfiguredDaemonTarget } from "../daemon-lifecycle.js";
+import { createMcpServer, dropUnfilledSeat, toolForGrantOperation, unfilledSeatText, type UnfilledSeat } from "../mcp-server.js";
+import { addGrant, McpHttpConfigError, mcpTokenFilePath, readGrantServiceHeader, readGrants, revokeGrant, rotateGrant, startMcpHttpServer } from "../mcp-http.js";
+import { readOpenRigEnv } from "../openrig-compat.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
+
+function parseGrantAllow(values: string[]): Record<string, string[]> {
+  const objects = new Map<string, Set<string>>();
+  for (const value of values) {
+    const [object, actions, ...extra] = value.split(":");
+    if (!object || !actions || extra.length > 0) {
+      throw new Error(`--allow needs object:action[,action...], for example queue:list,show. Got ${JSON.stringify(value)}.`);
+    }
+    const allowed = objects.get(object) ?? new Set<string>();
+    for (const action of actions.split(",")) {
+      if (!toolForGrantOperation(object, action)) {
+        throw new Error(`--allow does not recognize ${JSON.stringify(`${object}:${action}`)} as a supported object and action.`);
+      }
+      allowed.add(action);
+    }
+    objects.set(object, allowed);
+  }
+  return Object.fromEntries([...objects].map(([object, actions]) => [object, [...actions]]));
+}
 
 /**
  * `rig mcp serve` — start MCP server wrapping the daemon API.
@@ -17,47 +39,245 @@ export function mcpCommand(depsOverride?: StatusDeps): Command {
 
   cmd
     .command("serve")
-    .description("Start MCP server (stdio transport)")
+    .description("Start MCP server (stdio transport, or Streamable HTTP with --http)")
     .option("--port <port>", "Daemon port override")
-    .action(async (opts: { port?: string }) => {
+    .option("--http", "Serve over Streamable HTTP at /mcp instead of stdio")
+    .option("--bind <host:port>", "With --http: where to listen (default 127.0.0.1:7437). Beyond loopback needs a grant (rig mcp token add)")
+    .option("--grant-service <url>", "With --http: check each request's key with the grant service at this URL instead of the token file")
+    .option("--grant-service-header-file <path>", "With --grant-service: a file holding one 'Name: value' header to send with each grant request")
+    .option("--task-destination <seat>", "With --http --grant-service: operator-configured local team seat for external requests that omit destination")
+    .option("--oauth-resource <url>", "With --grant-service and --oauth-issuer: the public https URL clients reach this server as (its path ends in /mcp), for OAuth discovery")
+    .option("--oauth-issuer <url>", "With --oauth-resource: the OAuth authorization server that issues the keys --grant-service checks")
+    .option("--front-door", "Serve a person's agent in their own app: it hands the team work and brings the team's questions to the person, instead of working its inbox as a member")
+    .addHelpText("after", `
+Both MCP protocol revisions are served, over stdio and --http alike: clients on 2026-07-28 (which may start with
+server/discover) and clients that open with 2025's initialize handshake.
+
+An empty OPENRIG_SESSION_NAME, or one an app passed on unfilled (such as \${user_config.seat}), means no seat: the
+server acts as none, never as a seat named after the placeholder or one inherited as RIGGED_SESSION_NAME. With no
+seat, messages, new tasks and chat still go through as an unknown sender, each with a note on what is known (why there's
+no seat, and how the MCP client describes itself); a task is followed by its qitemId, since there's no return address.
+Claiming, updating, handing off or deciding a task needs a seat.
+
+With --http and no token file, the server stays on loopback and acts as OPENRIG_SESSION_NAME, declared and not
+authenticated, like stdio. Once a grant exists (rig mcp token add), every request needs its bearer credential, loopback
+included, and each caller acts as its grant's seat within its rigs and roots. Add a grant before reaching the port
+through a tunnel or proxy: they arrive on loopback too. If the token file then goes missing or can't be read, every
+request is refused; serving unauthenticated again takes a restart with no token file. TLS comes from the tunnel or
+proxy, not from this server.
+
+With --grant-service, every request needs a key the grant service issued, checked with that service on each request
+for this daemon's instance (its self id); the token file isn't read. A caller acts as the seat its grant names, which
+must already exist here (created is enough; it needn't have been launched), and reaches only what the grant names. If
+the grant service can't answer, the request is refused.
+
+With --task-destination <member@rig>, external callers can send their first task without knowing a seat address.
+Supply the intended receiver from trusted operator configuration for this server, never from a caller's input.
+On every omitted destination, the receiver must be exactly one existing local node and within that request's grant.
+Missing, ambiguous or forbidden receivers cause no write. This option doesn't grant access or select a receiver from
+topology, names or task history. Explicit destinations keep their existing behavior; local and member calls still
+require destination. A server with multiple teams needs a receiver valid for the calling grant, or explicit destinations.
+
+With --grant-service, --oauth-resource and --oauth-issuer (both or neither) add OAuth discovery (RFC 9728) for clients
+that sign in with OAuth. The resource is the public URL this server is reached as, and the issuer is the authorization
+server that issues the keys --grant-service checks. GET /.well-known/oauth-protected-resource<resource path> then answers
+with both, exactly as given, without a credential or a call to the grant service, and every 401 points there. Both must
+be https with no userinfo, query or fragment, written as a URL writes them (a lowercase host, no default port). /mcp
+stays the endpoint; a proxy in front forwards the metadata path unchanged.`)
+    .action(async (opts: { port?: string; http?: boolean; bind?: string; grantService?: string; grantServiceHeaderFile?: string; taskDestination?: string; oauthResource?: string; oauthIssuer?: string; frontDoor?: boolean }) => {
       const deps = getDepsF();
+      const unfilledSeat = dropUnfilledSeat();
+      if (unfilledSeat) console.error(`rig mcp serve: ${unfilledSeatText(unfilledSeat)}; serving with no seat until it names this app's address on the team.`);
+
+      if (!opts.http && (opts.grantService || opts.grantServiceHeaderFile)) {
+        console.error("--grant-service and --grant-service-header-file need --http");
+        process.exitCode = 1;
+        return;
+      }
+      if (opts.grantServiceHeaderFile && !opts.grantService) {
+        console.error("--grant-service-header-file needs --grant-service");
+        process.exitCode = 1;
+        return;
+      }
+      if (opts.taskDestination !== undefined && !(opts.http && opts.grantService)) {
+        console.error("--task-destination needs --http --grant-service");
+        process.exitCode = 1;
+        return;
+      }
+      if ((opts.oauthResource === undefined) !== (opts.oauthIssuer === undefined)) {
+        console.error("--oauth-resource and --oauth-issuer go together: give both, or neither");
+        process.exitCode = 1;
+        return;
+      }
+      const oauth = opts.oauthResource !== undefined && opts.oauthIssuer !== undefined ? { resource: opts.oauthResource, issuer: opts.oauthIssuer } : undefined;
+      if (oauth && !(opts.http && opts.grantService)) {
+        console.error("--oauth-resource and --oauth-issuer need --http --grant-service");
+        process.exitCode = 1;
+        return;
+      }
 
       let daemonUrl: string;
       if (opts.port) {
         const daemonPort = parseInt(opts.port, 10);
-        if (isNaN(daemonPort)) {
+        if (Number.isNaN(daemonPort)) {
           console.error("Invalid port number");
           process.exitCode = 1;
           return;
         }
+        if (daemonPort < 1 || daemonPort > 65535) {
+          console.error(`Warning: daemon port ${daemonPort} is outside [1, 65535]; MCP will start, but daemon tool calls may fail. Check --port.`);
+        }
         daemonUrl = `http://127.0.0.1:${daemonPort}`;
       } else {
         const status = await getDaemonStatus(deps.lifecycleDeps);
-        if (!daemonStatusGuard(status)) return;
-        daemonUrl = getDaemonUrl(status);
+        if (daemonMayAnswer(status)) {
+          daemonUrl = getDaemonUrl(status);
+        } else if (opts.http || readOpenRigEnv("OPENRIG_URL", "RIGGED_URL") !== undefined) {
+          daemonStatusGuard(status);
+          return;
+        } else {
+          // An app starts its stdio server when the app starts, often before the daemon. Exiting would leave the app
+          // without these tools until it reconnects, so serve anyway: aimed at the endpoint the status names, else this
+          // home's configured one, each call reaches the daemon once it answers there.
+          printStatusGuard(status);
+          daemonUrl = getDaemonUrl(status.port !== undefined ? status : { state: status.state, ...resolveConfiguredDaemonTarget() });
+          console.error(`rig mcp serve: serving anyway. Tool calls go to the daemon at ${daemonUrl} and fail until it answers there.`);
+        }
       }
 
+      if (opts.http) {
+        await serveHttp(daemonUrl, opts.bind ?? "127.0.0.1:7437", opts.grantService, opts.grantServiceHeaderFile, oauth, opts.taskDestination, opts.frontDoor === true, unfilledSeat);
+        return;
+      }
       const client = deps.clientFactory(daemonUrl);
-      const server = createMcpServer(client);
-      const transport = new StdioServerTransport();
       let finish!: () => void;
       const closed = new Promise<void>((resolve) => { finish = resolve; });
-      server.server.onclose = finish;
       process.stdin.once("end", finish);
       process.once("SIGINT", finish);
       process.once("SIGTERM", finish);
+      // Serves the protocol revision the client opens with: 2026-07-28 per request, or 2025's initialize handshake.
+      // The stdio server runs as a child of the app's conversation, so it can derive that conversation's key (slice 15).
+      const served = serveStdio(() => createMcpServer(client, { frontDoor: opts.frontDoor === true, ...(unfilledSeat ? { unfilledSeat } : {}), conversationKey }), { onerror: (err) => console.error(`rig mcp serve: ${err.message}`) });
       try {
         // EOF is a normal stdio disconnect, not an unresolved top-level await.
-        await server.connect(transport);
         if (process.stdin.readableEnded) finish();
         await closed;
       } finally {
         process.stdin.removeListener("end", finish);
         process.removeListener("SIGINT", finish);
         process.removeListener("SIGTERM", finish);
-        await server.close();
+        await served.close();
+      }
+    });
+
+  const token = cmd.command("token").description("Grants for rig mcp serve --http: who may connect, as which seat, reaching what");
+  token
+    .command("add <name>")
+    .description("Add a grant and print its token once; only the token's hash is stored")
+    .requiredOption("--seat <session>", "The seat this caller acts as (its rows' source)")
+    .option("--rig <name...>", "Rigs whose seats and work this caller may reach")
+    .option("--root <name...>", "Shared file roots (OPENRIG_FILES_ALLOWLIST names) whose artifacts it may read")
+    .option("--workspace", "Also read the work tree and context (rig_slices, rig_mission, rig_context_*)")
+    .option("--owner", "An owner grant: every tool and object, like the local owner")
+    .option("--allow <object:actions>", "Offer only these object actions, for example queue:list,show (repeatable)",
+      (value: string, previous: string[] = []) => [...previous, value])
+    .option("--person <entity_id>", "The registered person (rig gateway human list) this connection may answer the team's questions for, with rig_question_list and rig_question_answer: only what they explicitly say. Never inferred from the seat or --owner")
+    .action(async (name: string, opts: { seat: string; rig?: string[]; root?: string[]; workspace?: boolean; owner?: boolean; person?: string; allow?: string[] }) => {
+      const file = mcpTokenFilePath();
+      try {
+        const objects = opts.allow ? parseGrantAllow(opts.allow) : undefined;
+        const issued = await addGrant(file, { name, seat: opts.seat, rigs: opts.rig ?? [], roots: opts.root ?? [], workspace: opts.workspace === true, owner: opts.owner === true,
+          ...(objects !== undefined ? { objects } : {}),
+          ...(opts.person !== undefined ? { person: opts.person } : {}) });
+        console.log(`Token for ${name}, shown once (only its hash is kept in ${file}):`);
+        console.log(issued);
+        console.log(`The client sends it as: Authorization: Bearer <token>. Revoke it with: rig mcp token revoke ${name}`);
+      } catch (err) {
+        console.error((err as Error).message);
+        process.exitCode = 1;
+      }
+    });
+  token
+    .command("list")
+    .description("List grants (never their tokens or hashes)")
+    .option("--json", "JSON output")
+    .action((opts: { json?: boolean }) => {
+      const file = mcpTokenFilePath();
+      let grants;
+      try { grants = readGrants(file); } catch (err) { console.error((err as Error).message); process.exitCode = 1; return; }
+      const shown = (grants ?? []).map(({ tokenSha256: _hash, ...grant }) => grant);
+      if (opts.json) { console.log(JSON.stringify({ configured: grants !== null, file, grants: shown }, null, 2)); return; }
+      if (grants === null) { console.log(`No grants: rig mcp serve --http serves loopback only, unauthenticated (${file} doesn't exist).`); return; }
+      if (shown.length === 0) console.log(`No grants left in ${file}: every HTTP request is refused until one is added.`);
+      for (const grant of shown) {
+        console.log(`${grant.name}: seat ${grant.seat}${grant.owner ? ", owner" : ""}; rigs ${grant.rigs.join(", ") || "(none)"}; roots ${grant.roots.join(", ") || "(none)"}${grant.workspace ? "; workspace" : ""}${grant.person ? `; answers for ${grant.person}@external` : ""}`);
+      }
+    });
+  token
+    .command("revoke <name>")
+    .description("Remove a grant: its next request is refused. Work it already handed over stays with its owners")
+    .action(async (name: string) => {
+      try {
+        if (!(await revokeGrant(mcpTokenFilePath(), name))) { console.error(`No grant named ${name}.`); process.exitCode = 1; return; }
+        console.log(`Revoked ${name}: its next request is refused. Its rows and records stay.`);
+      } catch (err) {
+        console.error((err as Error).message);
+        process.exitCode = 1;
+      }
+    });
+  token
+    .command("rotate <name>")
+    .description(
+      "Issue a new token for an existing file-backed grant, keeping its name, seat, scopes, flags and createdAt; clients must switch to the new token, the old one stops working at the next authentication, and rotation does not cancel work already authorized",
+    )
+    .action(async (name: string) => {
+      try {
+        const issued = await rotateGrant(mcpTokenFilePath(), name);
+        console.log(`New token for ${name}, shown once (only its hash is kept):`);
+        console.log(issued);
+        console.log("Clients must switch to it: the previous token stops matching at the next authentication, and rotation does not cancel work already authorized.");
+        console.log("File-backed grants only: tokens behind --grant-service and provider credentials are not rotated here.");
+        console.log(`Revoke with: rig mcp token revoke ${name}`);
+      } catch (err) {
+        console.error((err as Error).message);
+        process.exitCode = 1;
       }
     });
 
   return cmd;
+}
+
+async function serveHttp(daemonUrl: string, bind: string, grantService?: string, grantServiceHeaderFile?: string,
+  oauth?: { resource: string; issuer: string }, taskDestination?: string, frontDoor = false, unfilledSeat?: UnfilledSeat): Promise<void> {
+  const match = /^(\[[^\]]+\]|[^:]+):(\d+)$/.exec(bind);
+  if (!match) {
+    console.error(`--bind takes host:port (for example 127.0.0.1:7437 or [::1]:7437), not ${bind}`);
+    process.exitCode = 1;
+    return;
+  }
+  const host = match[1]!.replace(/^\[|\]$/g, "");
+  const tokenFile = mcpTokenFilePath();
+  let served;
+  try {
+    const header = grantServiceHeaderFile ? readGrantServiceHeader(grantServiceHeaderFile) : undefined;
+    served = await startMcpHttpServer({ daemonUrl, host, port: Number(match[2]), tokenFile, taskDestination, frontDoor,
+      ...(unfilledSeat ? { unfilledSeat } : {}),
+      ...(grantService ? { grantService: { url: grantService, ...(header ? { header } : {}) } } : {}), ...(oauth ? { oauth } : {}) });
+  } catch (err) {
+    console.error(err instanceof McpHttpConfigError ? err.message : `Can't serve on ${bind}: ${(err as Error).message}`);
+    process.exitCode = 1;
+    return;
+  }
+  const seat = readOpenRigEnv("OPENRIG_SESSION_NAME", "RIGGED_SESSION_NAME")?.trim();
+  console.error(grantService
+    ? `OpenRig MCP over HTTP at ${served.url}: each request needs a key from the grant service, checked with ${grantService}.`
+    : served.authenticated
+    ? `OpenRig MCP over HTTP at ${served.url}: each request needs a bearer credential from ${tokenFile}.`
+    : `OpenRig MCP over HTTP at ${served.url}: no grants, so loopback only, acting as ${seat || "no seat"}, declared and not authenticated. Add a grant (rig mcp token add) before reaching it through a tunnel or proxy.`);
+  if (oauth) console.error(`OAuth discovery names ${oauth.resource}, issued by ${oauth.issuer}.`);
+  await new Promise<void>((resolve) => {
+    process.once("SIGINT", resolve);
+    process.once("SIGTERM", resolve);
+  });
+  await served.close();
 }

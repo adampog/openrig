@@ -1,8 +1,11 @@
+import { resolveCurrentSessionAddress } from "./session-registry.js";
 import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
 import type { SessionRegistry } from "./session-registry.js";
 import type { TranscriptStore } from "./transcript-store.js";
 import { resolveWorkspaceContext, type WhoamiWorkspaceBlock } from "./workspace/workspace-resolver.js";
+import { rigStillBeingBuilt } from "./rigs-being-built.js";
+import { shownHubUrl } from "./network/network-requests.js";
 
 export interface WhoamiResult {
   resolvedBy: "node_id" | "session_name";
@@ -18,12 +21,17 @@ export interface WhoamiResult {
     memberId: string;
     memberLabel: string | null;
     sessionName: string | null;
+    senderAddress: string | null;
     runtime: string;
     cwd: string | null;
     agentRef: string | null;
     profile: string | null;
     resolvedSpecName: string | null;
     resolvedSpecVersion: string | null;
+    /** The seat's active network binding (`rig network connect`), present only while it has one: the binding id, the
+     *  seat's address on the hub, and the hub, with any query hidden as `rig network status` shows it. The peers it can
+     *  ask are `rig network peers`'. */
+    networkBinding?: { id: string; hubSeat: string; hubUrl: string };
   };
   peers: Array<{
     logicalId: string;
@@ -41,6 +49,9 @@ export interface WhoamiResult {
    * Additive note only — `peers[]` name and shape are unchanged.
    */
   peersNote: string;
+  /** Present only while `rig up` is still creating this rig's seats and edges (#2871): the peers and edges are the ones
+   *  created so far, and more may come. Absent once the rig is built, and for every rig not being built now. */
+  rosterState?: "building";
   edges: {
     outgoing: Array<{ kind: string; to: { logicalId: string; sessionName: string | null } }>;
     incoming: Array<{ kind: string; from: { logicalId: string; sessionName: string | null } }>;
@@ -58,7 +69,7 @@ export interface WhoamiResult {
   contextUsage?: import("./types.js").ContextUsage;
   /** PL-012 Token / Context Usage Surface v0 — runtime-specific context
    *  detail surfaced alongside the cross-runtime contextUsage primitive.
-   *  Codex: threadId from the per-pid logs DB. Claude Code: resumeToken
+   *  Codex: threadId from the stored resume token. Claude Code: resumeToken
    *  + current usage from the context-usage sample. Terminal: null. */
   runtimeContext?: RuntimeContext | null;
   /** PL-007 Workspace Primitive v0 — typed workspace block when the
@@ -139,6 +150,11 @@ interface WhoamiDeps {
   contextUsageStore?: import("./context-usage-store.js").ContextUsageStore;
 }
 
+/** Said first in `peersNote` while the rig is still being built, so a seat doesn't plan around a teammate that hasn't been
+ *  created yet. Exported for the CLI's bounded note. */
+export const ROSTER_BUILDING_NOTE = "rosterState = building: `rig up` is still creating this team's seats and edges, so the peers and edges "
+  + "below are only the ones created so far and more may come; run `rig whoami` again once `rig up` finishes. ";
+
 export class WhoamiService {
   private db: Database.Database;
   private rigRepo: RigRepository;
@@ -154,6 +170,21 @@ export class WhoamiService {
     this.contextUsageStore = deps.contextUsageStore ?? null;
   }
 
+  /** A node has at most one active binding (idx_network_bindings_active_node). A database from before the network
+   *  connector has no table, and so no binding. */
+  private activeNetworkBinding(nodeId: string): WhoamiResult["identity"]["networkBinding"] {
+    if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'network_bindings'").get()) return undefined;
+    const row = this.db.prepare("SELECT id, hub_seat AS hubSeat, hub_url AS hubUrl FROM network_bindings WHERE node_id = ? AND state = 'active'")
+      .get(nodeId) as { id: string; hubSeat: string; hubUrl: string } | undefined;
+    return row && { id: row.id, hubSeat: row.hubSeat, hubUrl: shownHubUrl(row.hubUrl) };
+  }
+
+  private senderAddress(sessionName: string, nodeId: string): string {
+    const current = resolveCurrentSessionAddress(this.db, sessionName);
+    return current && resolveCurrentSessionAddress(this.db, current.senderAddress)?.nodeId === nodeId
+      ? current.senderAddress : sessionName;
+  }
+
   resolve(query: { nodeId?: string; sessionName?: string; targetRepoOverride?: string; compact?: boolean }): WhoamiResult | null {
     let nodeRow: NodeRow | undefined;
     let resolvedBy: "node_id" | "session_name";
@@ -166,17 +197,27 @@ export class WhoamiService {
       currentSessionName = this.getCurrentSessionName(nodeRow.id, nodeRow.rig_id);
     } else if (query.sessionName) {
       // Find sessions matching this name — check for ambiguity across rigs
-      const sessionRows = this.db
-        .prepare("SELECT * FROM sessions WHERE session_name = ? ORDER BY id DESC")
-        .all(query.sessionName) as SessionRow[];
+      const current = resolveCurrentSessionAddress(this.db, query.sessionName);
+      const sessionRows = current && current.sessionName !== query.sessionName
+        ? this.db.prepare("SELECT * FROM sessions WHERE id=?").all(current.sessionId) as SessionRow[]
+        : this.db.prepare("SELECT * FROM sessions WHERE session_name = ? ORDER BY id DESC").all(query.sessionName) as SessionRow[];
 
       if (sessionRows.length === 0) return null;
 
       // Check distinct rigs
-      const rigIds = new Set<string>();
+      const rigBySession = new Map<string, string>();
       for (const sess of sessionRows) {
         const node = this.db.prepare("SELECT rig_id FROM nodes WHERE id = ?").get(sess.node_id) as { rig_id: string } | undefined;
-        if (node) rigIds.add(node.rig_id);
+        if (node) rigBySession.set(sess.id, node.rig_id);
+      }
+      let rigIds = new Set(rigBySession.values());
+      if (rigIds.size > 1) {
+        // An archived rig of the same name counts only when no active one has it,
+        // unless its session with this name is still running
+        const runningRigIds = new Set(sessionRows.filter((s) => s.status === "running").map((s) => rigBySession.get(s.id)));
+        const activeRigIds = new Set([...rigIds].filter((rigId) =>
+          this.db.prepare("SELECT 1 FROM rigs WHERE id = ? AND archived_at IS NULL").get(rigId) !== undefined));
+        if (activeRigIds.size > 0) rigIds = new Set([...rigIds].filter((rigId) => activeRigIds.has(rigId) || runningRigIds.has(rigId)));
       }
 
       if (rigIds.size > 1) {
@@ -185,7 +226,7 @@ export class WhoamiService {
         );
       }
 
-      const sess = sessionRows[0]!;
+      const sess = sessionRows.find((s) => rigIds.has(rigBySession.get(s.id) ?? "")) ?? sessionRows[0]!;
       nodeRow = this.db.prepare("SELECT * FROM nodes WHERE id = ?").get(sess.node_id) as NodeRow | undefined;
       if (!nodeRow) return null;
       resolvedBy = "session_name";
@@ -233,6 +274,7 @@ export class WhoamiService {
       memberId,
       memberLabel: nodeRow.label,
       sessionName: currentSessionName,
+      senderAddress: currentSessionName ? this.senderAddress(currentSessionName, nodeRow.id) : null,
       runtime: nodeRow.runtime ?? "unknown",
       cwd: nodeRow.cwd,
       agentRef: nodeRow.agent_ref,
@@ -240,6 +282,8 @@ export class WhoamiService {
       resolvedSpecName: nodeRow.resolved_spec_name,
       resolvedSpecVersion: nodeRow.resolved_spec_version,
     };
+    const networkBinding = this.activeNetworkBinding(nodeRow.id);
+    if (networkBinding) identity.networkBinding = networkBinding;
 
     // Build peers — other nodes in this rig with their current sessions
     const peers: WhoamiResult["peers"] = [];
@@ -337,11 +381,14 @@ export class WhoamiService {
       envOverride: query.targetRepoOverride ?? process.env["OPENRIG_TARGET_REPO"] ?? null,
     });
 
+    const building = rigStillBeingBuilt(this.db, nodeRow.rig_id);
     return {
       resolvedBy,
       identity,
       peers,
-      peersNote: "peers = this rig's roster excluding self (no edge filter); edges = directional relationships; use `rig ps --nodes` for node inventory including self + live state",
+      ...(building ? { rosterState: "building" as const } : {}),
+      peersNote: (building ? ROSTER_BUILDING_NOTE : "")
+        + "peers = this rig's roster excluding self (no edge filter); edges = directional relationships; use `rig ps --nodes` for node inventory including self + live state",
       edges: { outgoing, incoming },
       transcript,
       commands: { sendExamples, captureExamples },
@@ -371,34 +418,27 @@ export class WhoamiService {
     const lastSampledAt = contextUsage?.sampledAt ?? null;
 
     if (runtime === "codex") {
-      // Codex thread-id resolution requires a pid (codex-thread-id.ts is
-      // pid-keyed). Surface null at v0 — the operator drops to terminal
-      // for thread-id extraction. NAMED v0+1 trigger: dogfood reports
-      // needing UI-side thread-id without terminal drop.
+      // #122: launch captures the Codex thread id and stores it as the
+      // session's resume token (resume_type codex_id), the same value the
+      // context monitor reads usage by. Only a verified token is a thread id:
+      // an attempted resume (recordResumeAttempt) or a failed probe keeps a
+      // token whose probe status is not 'resumable'. conversationId has no
+      // source yet.
+      const latest = this.latestResumeRow(nodeId);
       return {
         runtime: "codex",
-        threadId: null,
+        threadId: latest?.resume_type === "codex_id" && latest.resume_last_probe_status === "resumable"
+          ? latest.resume_token
+          : null,
         conversationId: null,
         estimatedTokens,
         lastSampledAt,
       };
     }
     if (runtime === "claude-code") {
-      // resumeToken lives on sessions.resume_token (migration 006).
-      // Read the most-recent session for this node.
-      let resumeToken: string | null = null;
-      try {
-        const row = this.db
-          .prepare("SELECT resume_token FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1")
-          .get(nodeId) as { resume_token: string | null } | undefined;
-        resumeToken = row?.resume_token ?? null;
-      } catch {
-        // Migration absent (test harness) — surface null honestly.
-        resumeToken = null;
-      }
       return {
         runtime: "claude-code",
-        resumeToken,
+        resumeToken: this.latestResumeRow(nodeId)?.resume_token ?? null,
         estimatedTokens,
         lastSampledAt,
       };
@@ -406,6 +446,20 @@ export class WhoamiService {
     // Unknown runtime: surface null until the daemon learns the
     // runtime's context exposure shape. PL-005 honest-degradation.
     return null;
+  }
+
+  /** resumeToken lives on sessions.resume_token (migration 006).
+   *  Read the most-recent session for this node. */
+  private latestResumeRow(nodeId: string): { resume_token: string | null; resume_type: string | null; resume_last_probe_status: string | null } | null {
+    try {
+      const row = this.db
+        .prepare("SELECT resume_token, resume_type, resume_last_probe_status FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1")
+        .get(nodeId) as { resume_token: string | null; resume_type: string | null; resume_last_probe_status: string | null } | undefined;
+      return row ?? null;
+    } catch {
+      // Migration absent (test harness) — surface null honestly.
+      return null;
+    }
   }
 
   private getCurrentSessionName(nodeId: string, rigId: string): string | null {

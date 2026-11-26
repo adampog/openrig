@@ -1,0 +1,370 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { describe, expect, it } from "vitest";
+import { annotateInputBox, classifyPaneActivity, inspectComposerInput } from "../src/domain/session-transport.js";
+import { composerContainsOwnedText, ownCollapsedPaste, type ComposerSnapshot } from "../src/domain/composer-prompts.js";
+import { codexTwoRowComposer } from "./fixtures/codex-two-row-composer.js";
+
+function claude(body: string, cursor?: { x: number; y: number }, width = 80): ComposerSnapshot {
+  const rows = body.split("\n");
+  const last = rows.at(-1)!;
+  return { screen: ["Ready", "────────────────────", `❯ ${rows[0]}`, ...rows.slice(1).map(row => `  ${row}`), "────────────────────", "? for shortcuts", ""].join("\n"),
+    cursor: { x: 2 + last.length, y: 1 + rows.length, width, height: 24, ...cursor }, inMode: false };
+}
+
+describe("cursor-bound composer input", () => {
+  it.each(["", "\x1b[2mAsk Codex to do anything\x1b[22m"])("reads a supported two-row Codex footer without losing empty-input evidence (%s)", body => {
+    const frame = codexTwoRowComposer(body);
+    expect(inspectComposerInput(frame, "codex")).toMatchObject({ state: "empty", cursor: { x: 2, y: 6, width: 42, height: 10 } });
+    if (!body) expect(annotateInputBox(frame.screen, frame.cursor, "codex")).toMatchObject({ status: "empty", confidence: "high" });
+  });
+
+  it.each(["a real draft", "Ask Codex to do anything", "\n", "draft\n› nested prompt"])("keeps authored input with the same two-row footer (%s)", body => {
+    const frame = codexTwoRowComposer(body);
+    expect(inspectComposerInput(frame, "codex").state).toBe("text");
+  });
+
+  it("does not turn capture's unstyled placeholder heuristic into authority to close a tile", () => {
+    const frame = codexTwoRowComposer("Ask Codex to do anything");
+    expect(annotateInputBox(frame.screen, frame.cursor, "codex")).toMatchObject({ status: "empty", confidence: "high" });
+    expect(inspectComposerInput(frame, "codex").state).toBe("text");
+    const moved = codexTwoRowComposer("\x1b[2mAsk Codex to do anything\x1b[22m"); moved.cursor.x = 4;
+    expect(inspectComposerInput(moved, "codex").state).toBe("text");
+  });
+
+  it("keeps competing cursor-bound prompts ambiguous under the supported footer", () => {
+    const frame = codexTwoRowComposer("\n› "); frame.cursor.y = 7; frame.cursor.x = 4;
+    expect(inspectComposerInput(frame, "codex")).toMatchObject({ state: "unknown", unknownReason: "ambiguous_composer" });
+  });
+
+  it("does not read a numbered choice as an empty composer under the supported footer", () => {
+    expect(inspectComposerInput(codexTwoRowComposer("1. Approve action"), "codex").state).toBe("unknown");
+  });
+
+  it.each([
+    ["missing separator", (frame: ComposerSnapshot) => { frame.screen = frame.screen.replace("\n\n  Model", "\n  Model"); }],
+    ["unknown hint", (frame: ComposerSnapshot) => { frame.screen = frame.screen.replace("? for shortcuts                ⚠ 1 · f2", "unrecognized footer"); }],
+    ["third footer row", (frame: ComposerSnapshot) => { frame.screen += "  unexpected footer\n"; frame.cursor.height++; }],
+    ["copy mode", (frame: ComposerSnapshot) => { frame.inMode = true; }],
+    ["incomplete frame", (frame: ComposerSnapshot) => { frame.cursor.height = 8; }],
+    ["cursor outside composer", (frame: ComposerSnapshot) => { frame.cursor.y = 0; }],
+  ] as const)("keeps %s unknown with a two-row Codex footer", (_label, change) => {
+    const frame = codexTwoRowComposer(); change(frame);
+    expect(inspectComposerInput(frame, "codex").state).toBe("unknown");
+  });
+
+  // D18: while a turn runs, Codex 0.167 replaces the shortcuts hint with its queue hint once the box holds text, as
+  // it does right after our paste into a busy seat (Codex 0.167.1 and 0.167.2, banked); the narrow form drops "message".
+  it.each(["  tab to queue message", "  tab to queue", "  tab to queue message · Plan mode", "  tab to queue message   ⚠ 1 · f2"])
+  ("reads the input box above Codex's queue hint (%j)", hint => {
+    const frame = codexTwoRowComposer("a pasted message");
+    frame.screen = frame.screen.replace("  ? for shortcuts                ⚠ 1 · f2", hint);
+    expect(inspectComposerInput(frame, "codex")).toMatchObject({ state: "text", rows: ["a pasted message"] });
+  });
+
+  it.each(["  tab to queue messages", "  shift+tab to queue message", "  tab to queued", "  press tab to queue message"])
+  ("keeps a near miss of the queue hint unknown (%j)", hint => {
+    const frame = codexTwoRowComposer("a pasted message");
+    frame.screen = frame.screen.replace("  ? for shortcuts                ⚠ 1 · f2", hint);
+    expect(inspectComposerInput(frame, "codex")).toMatchObject({ state: "unknown", unknownReason: "unrecognized_composer" });
+  });
+
+  // #2605: Claude 2.1.319 prints "✔ Update installed · Restart to update" on its own row under the footer in a narrow
+  // pane. The draft-aware guard read every idle prompt there as unknown and held each wake as draft_input_unknown.
+  it("reads the input under Claude's own-row Restart to update banner, and nothing like it (#2605)", () => {
+    const banner = (body: string, row = "✔ Update installed · Restart to update") => {
+      const frame = claude(body);
+      frame.screen = frame.screen.replace("? for shortcuts\n", `? for shortcuts\n${row}\n`);
+      return frame;
+    };
+    expect(inspectComposerInput(banner(""), "claude-code").state).toBe("empty");
+    expect(inspectComposerInput(banner("a real draft"), "claude-code").state).toBe("text");
+    for (const nearMiss of ["✔ Update installed · Restart to update now", "Update installed · Restart to update", "✔ Update downloaded · Restart to update"]) {
+      expect(inspectComposerInput(banner("", nearMiss), "claude-code")).toMatchObject({ state: "unknown", unknownReason: "unrecognized_composer" });
+    }
+  });
+
+  // Claude's Remote Control indicator on its own row under the footer, below the update banner, in the geometry of a
+  // Claude 2.1.330 seat whose sends held as draft_input_unknown: 80x24, the indicator right-aligned in Claude's error
+  // pink, the cursor on the prompt. The rows above the box are synthetic. The labels are Claude's own.
+  describe("under Claude's Remote Control indicator", () => {
+    const pink = (label: string) => label.split(" ").map(word => `\x1b[38;5;211m${word}\x1b[39m`).join(" ");
+    const right = (label: string, drawn = label) => `${" ".repeat(78 - label.length)}${drawn}`;
+    const remoteControl = (body = "", indicator = "/rc failed", drawn = pink(indicator), modeBar = "  ⏵⏵ bypass permissions on · 1 shell · ↓ to manage"): ComposerSnapshot => {
+      const rows = body.split("\n");
+      const lead = 18 - rows.length;
+      return { screen: [...Array<string>(lead).fill(""), `${"─".repeat(64)} worker@rig ─`, body ? `❯ ${rows[0]}` : "❯\xa0",
+        ...rows.slice(1).map(row => `  ${row}`), "─".repeat(80), modeBar, right("✔ Update installed · /restart to apply"), right(indicator, drawn), "", ""].join("\n"),
+      cursor: { x: 2 + rows.at(-1)!.length, y: lead + rows.length, width: 80, height: 24 }, inMode: false };
+    };
+
+    it.each(["/rc failed", "/rc connecting…", "/rc active", "/rc reconnecting", "/rc"])("reads an empty prompt and a draft above %j", indicator => {
+      expect(inspectComposerInput(remoteControl("", indicator), "claude-code")).toMatchObject({ state: "empty", frame: JSON.stringify(["❯", 2, 80, "claude-composer"]) });
+      expect(inspectComposerInput(remoteControl("preserve this draft", indicator), "claude-code")).toMatchObject({ state: "text", rows: ["preserve this draft"], cursorAtEnd: true });
+    });
+
+    it("keeps a draft that quotes the footer and the indicator as its exact text", () => {
+      const body = "⏵⏵ bypass permissions on · 1 shell · ↓ to manage\n/rc failed";
+      expect(inspectComposerInput(remoteControl(body), "claude-code")).toMatchObject({ state: "text", rows: body.split("\n") });
+    });
+
+    it.each(["/rc failed · Enter to view", "/rc failed now", "rc failed", "/rc Failed", "/rc  failed", "/rcfailed", "/rc connecting...", "/rc disconnected", "/rc failed…"])(
+      "keeps a near miss %j unknown", indicator => {
+        expect(inspectComposerInput(remoteControl("", indicator), "claude-code")).toMatchObject({ state: "unknown", unknownReason: "unrecognized_composer" });
+      });
+
+    it.each(["/rc failed", "/rc"])("keeps %j drawn selected (inverse) unknown: Enter there opens its panel", indicator => {
+      for (const body of ["", "preserve this draft"]) {
+        expect(inspectComposerInput(remoteControl(body, indicator, `\x1b[7m${indicator}\x1b[27m`), "claude-code")).toMatchObject({ state: "unknown", unknownReason: "unrecognized_composer" });
+      }
+    });
+
+    it.each(["", "UNRECOGNIZED-FOOTER"])("does not skip the indicator without the mode footer above it (%j)", modeBar => {
+      expect(inspectComposerInput(remoteControl("", "/rc failed", undefined, modeBar), "claude-code")).toMatchObject({ state: "unknown", unknownReason: "unrecognized_composer" });
+    });
+  });
+
+  it.each([
+    "✘ Auto-update failed · Run claude doctor",
+    "✘ Auto-update failed: no write permission to npm prefix · Run claude doctor",
+    "✘ Auto-update failed: claude.exe in use (close other Claude Code sessions, including VS Code) · Run claude doctor",
+    "✘ Auto-update failed · Try claude doctor or npm i -g @anthropic-ai/claude-code",
+    "✘ Auto-update failed · Try claude doctor or cd ~/.claude/local && npm update @anthropic-ai/claude-code",
+  ])("reads a complete auto-update failure footer row (%s), preserving draft text", warning => {
+    const frame = (body: string, footer = warning) => {
+      const snapshot = claude(body, undefined, 200);
+      snapshot.screen = snapshot.screen.replace("? for shortcuts\n", `? for shortcuts\n${footer}\n`);
+      return snapshot;
+    };
+    expect(inspectComposerInput(frame(""), "claude-code").state).toBe("empty");
+    expect(inspectComposerInput(frame("person's draft"), "claude-code").state).toBe("text");
+    expect(inspectComposerInput(claude(warning, undefined, 200), "claude-code").state).toBe("text");
+    for (const nearMiss of [warning + " now", warning.replace("failed", "succeeded"), warning.replace("doctor", "doctors")]) {
+      expect(inspectComposerInput(claude(nearMiss, undefined, 200), "claude-code").state).toBe("text");
+      expect(inspectComposerInput(frame("", nearMiss), "claude-code").state).toBe("unknown");
+    }
+  });
+
+  it.each(["", "person's draft"])("reads the observed clipped auto-update footer with input %j", body => {
+    // A complete synthetic frame; the retained partial capture cannot supply physical cursor rows.
+    const snapshot = claude(body);
+    snapshot.screen = snapshot.screen.replace("? for shortcuts", "⏵⏵ accept edits on (shift+tab to cycle)\n✘ Auto-update failed · Try claude doctor or npm i -g @anthropic-ai/claude-c…");
+    expect(inspectComposerInput(snapshot, "claude-code").state).toBe(body ? "text" : "empty");
+  });
+
+  // D04 at full width: Claude 2.1.322 and 2.1.323 draw the paste hint and an auto-update failure on one footer row
+  // (200x50, as banked), where an 80-column pane gives the failure its own clipped row (above).
+  it.each([
+    "✘ Auto-update failed · Run claude doctor",
+    "✘ Auto-update failed: no write permission to npm prefix · Run claude doctor",
+    "✘ Auto-update failed · Try claude doctor or npm i -g @anthropic-ai/claude-code",
+    "✘ Auto-update failed · Try claude doctor or cd ~/.claude/local && npm update @anthropic-ai/claude-code",
+  ])("reads the paste hint and %s on one footer row", warning => {
+    const frame = (body: string, right = warning) => {
+      const snapshot = claude(body, undefined, 200);
+      snapshot.screen = snapshot.screen.replace("? for shortcuts", `  paste again to expand${" ".repeat(97)}${right}`);
+      return snapshot;
+    };
+    expect(inspectComposerInput(frame(""), "claude-code").state).toBe("empty");
+    expect(inspectComposerInput(frame("person's draft"), "claude-code").state).toBe("text");
+    // Only a known failure shares the row; a near miss, or one clipped at this width, keeps the input unknown.
+    for (const nearMiss of [warning + " now", warning.replace("failed", "succeeded"), warning.replace("doctor", "doctors"),
+      "✘ Auto-update failed · Try claude doctor or npm i -g @anthropic-ai/claude-c…"]) {
+      expect(inspectComposerInput(frame("", nearMiss), "claude-code")).toMatchObject({ state: "unknown", unknownReason: "unrecognized_composer" });
+    }
+  });
+
+  it("keeps near misses unknown below the footer and warning text inside a draft", () => {
+    const warning = "✘ Auto-update failed · Try claude doctor or npm i -g @anthropic-ai/claude-c…";
+    for (const nearMiss of [warning + " now", warning.replace("doctor", "doctors"), warning.replace("claude-c…", "other…")]) {
+      const snapshot = claude("");
+      snapshot.screen = snapshot.screen.replace("? for shortcuts", `? for shortcuts\n${nearMiss}`);
+      expect(inspectComposerInput(snapshot, "claude-code").state).toBe("unknown");
+    }
+    expect(inspectComposerInput(claude(warning, undefined, 100), "claude-code").state).toBe("text");
+  });
+
+  it("reads Claude's context hint below a named composer without skipping arbitrary rows", () => {
+    const frame = (body: string, styled = false, hint = "~66k uncached · /clear to start fresh"): ComposerSnapshot => ({
+      screen: [...Array<string>(22).fill(""),
+        "──────────────────────────────────────── dev-docs@moonjoy-workshop ─",
+        `❯\u00a0${body || (styled ? "\x1b[7m \x1b[0m" : "")}`,
+        "─".repeat(68),
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+        hint.padStart(66), "", "", "",
+      ].join("\n"),
+      cursor: { x: 2, y: 23, width: 68, height: 30 }, inMode: false,
+    });
+    for (const styled of [false, true]) {
+      for (const body of ["", "person's draft"]) {
+        const snapshot = frame(body, styled);
+        expect(inspectComposerInput(snapshot, "claude-code")).toMatchObject({ state: body ? "text" : "empty" });
+        if (!body) expect(annotateInputBox(snapshot.screen, snapshot.cursor, "claude-code")).toMatchObject({ status: "empty", confidence: "high" });
+      }
+    }
+    for (const hint of ["~66k uncached · /clear to start fresh now", "66k uncached · /clear to start fresh", "~66k uncached · /clear to approve", "unexpected hint"]) {
+      expect(inspectComposerInput(frame("", true, hint), "claude-code")).toMatchObject({ state: "unknown", unknownReason: "unrecognized_composer" });
+    }
+  });
+
+  it("keeps nested prompt examples inside the current draft, including when its head is clipped", () => {
+    const body = "intro\n────────────────────\n❯ \n────────────────────\n? for shortcuts\n────────────────────\n❯ ";
+    const snapshot = claude(body, { x: 4, y: 8 });
+    expect(inspectComposerInput(snapshot).state).toBe("text");
+    const clipped = { ...snapshot, screen: snapshot.screen.split("\n").slice(3).join("\n"), cursor: { ...snapshot.cursor, y: 5 } };
+    expect(inspectComposerInput(clipped).state).toBe("unknown");
+  });
+
+  it("uses the styled input read for opted-in readiness, while preserving default draft and permission checks", () => {
+    const snapshot = claude("\x1b[2msuggested follow-up\x1b[22m", { x: 2, y: 2 });
+    snapshot.screen = snapshot.screen.replace("? for shortcuts", "⏵⏵ accept edits on (shift+tab to cycle) · ← for agents\n✘ Auto-update failed: no write permission to npm prefix · Run claude doctor");
+    const plain = snapshot.screen.replace(/\x1b\[[0-9;]*m/g, "");
+    expect(classifyPaneActivity(plain)).toMatchObject({ state: "attention", reason: "prompt_draft" });
+    expect(classifyPaneActivity(plain, { composerSnapshot: snapshot })).toMatchObject({ state: "agent_idle" });
+    const permission = { ...snapshot, screen: snapshot.screen.replace("Ready", "Do you want to allow this command?") };
+    expect(classifyPaneActivity(plain, { composerSnapshot: permission })).toMatchObject({ state: "attention", reason: "permission_prompt" });
+  });
+
+  it("ignores a dim autocomplete suggestion at an empty cursor, preserving real drafts with the same spelling", () => {
+    const ghost = "Summarize the recent changes";
+    expect(inspectComposerInput(claude(`\x1b[2m${ghost}\x1b[22m`, { x: 2, y: 2 })).state).toBe("empty");
+    expect(inspectComposerInput(claude(ghost, { x: 2, y: 2 })).state).toBe("text");
+  });
+
+  it("ignores a suggestion whose words are dim and whose spaces aren't, as capture does, in a native Claude frame (#2428)", () => {
+    const lines = readFileSync(join(import.meta.dirname, "fixtures/input-box/claude-code-2.1.296/openrig-seat-accept-edits-idle.txt"), "utf8")
+      .replace(/\n$/, "").split("\n");
+    const row = lines.findLastIndex(line => line.startsWith("❯"));
+    const prompt = (text: string): ComposerSnapshot => {
+      const screen = [...lines]; screen[row] = `\x1b[0m❯ ${text}`;
+      return { screen: screen.join("\n"), cursor: { x: 2, y: row, width: 80, height: lines.length }, inMode: false };
+    };
+    const dim = (text: string) => `\x1b[2m${text}\x1b[22m`;
+    const suggestion = prompt(["fix", "typecheck", "errors"].map(dim).join(" "));
+    expect(annotateInputBox(suggestion.screen, suggestion.cursor, "claude-code")).toMatchObject({ status: "likely-suggestion", confidence: "high" });
+    expect(inspectComposerInput(suggestion)).toMatchObject({ state: "empty", suggestionRows: ["fix typecheck errors"] });
+    // A word the person typed among dim ones keeps it a draft.
+    expect(inspectComposerInput(prompt(`fix ${dim("typecheck")} ${dim("errors")}`)).state).toBe("text");
+  });
+
+  it("excludes only a wholly dim suffix after the cursor when identifying staged text", () => {
+    const input = inspectComposerInput(claude("owned\x1b[2m ghost suggestion\x1b[22m", { x: 7, y: 2 }));
+    expect(input.state).toBe("text");
+    expect(composerContainsOwnedText(input, "owned")).toBe(true);
+    expect(composerContainsOwnedText(input, "owned ghost suggestion")).toBe(false);
+    const mixed = inspectComposerInput(claude("owned\x1b[2m ghost\x1b[22m human", { x: 7, y: 2 }));
+    expect(composerContainsOwnedText(mixed, "owned")).toBe(false);
+  });
+
+  it("recognizes Claude's non-breaking prompt space without erasing draft content", () => {
+    for (const body of ["", "unfinished request"]) {
+      const snapshot = claude(body);
+      snapshot.screen = snapshot.screen.replace("❯ ", "❯\u00a0");
+      const input = inspectComposerInput(snapshot);
+      expect(input.state).toBe(body ? "text" : "empty");
+      if (body) expect(composerContainsOwnedText(input, body)).toBe(true);
+    }
+  });
+
+  it.each(["Ask Codex to do anything", "Press up to edit queued messages"])("preserves a literal %s draft at the start cursor", text => {
+    expect(inspectComposerInput(claude(text, { x: 2, y: 2 })).state).toBe("text");
+  });
+  it("distinguishes an empty input from a draft even while a work status is visible", () => {
+    const empty = claude(""); empty.screen = empty.screen.replace("Ready", "✻ Working… (2s · esc to interrupt)");
+    expect(inspectComposerInput(empty).state).toBe("empty");
+    expect(inspectComposerInput(claude("a half-written request")).state).toBe("text");
+    expect(inspectComposerInput(claude("", { x: 5, y: 2 })).state).toBe("text");
+    expect(inspectComposerInput(claude("\n")).state).toBe("text");
+    expect(inspectComposerInput(claude("\n", { x: 2, y: 2 })).state).toBe("text");
+    expect(inspectComposerInput(claude("   ", { x: 2, y: 2 })).state).toBe("text");
+  });
+
+  it.each(["›", "»"])("recognizes the empty Codex placeholder with marker %s only at the input cursor", marker => {
+    const s: ComposerSnapshot = { screen: `Working\n${marker} \x1b[2mAsk Codex to do anything\x1b[22m\n\ngpt-5 · 90% context left\n`, cursor: { x: 2, y: 1, width: 80, height: 24 }, inMode: false };
+    expect(inspectComposerInput(s).state).toBe("empty");
+    expect(inspectComposerInput({ ...s, cursor: { ...s.cursor, x: 12 } }).state).toBe("text");
+  });
+
+  it("does not infer an empty input from history, a selector, copy mode or an incomplete capture", () => {
+    expect(inspectComposerInput(null).state).toBe("unknown");
+    expect(inspectComposerInput({ ...claude(""), inMode: true }).state).toBe("unknown");
+    expect(inspectComposerInput({ ...claude(""), cursor: { x: 0, y: 0, width: 80, height: 24 } }).state).toBe("unknown");
+    expect(inspectComposerInput(claude("1. Approve this command")).state).toBe("unknown");
+    expect(inspectComposerInput({ ...claude(""), screen: "❯\n" }).state).toBe("unknown");
+  });
+
+  it("does not mistake color channel values for faint styling", () => {
+    for (const sgr of ["38;2;2;2;2", "38;5;2", "38;2;0;255;255;2", "2;38;5;2;22"]) {
+      const value = claude(`\x1b[${sgr}mAsk Codex to do anything\x1b[0m`, { x: 2, y: 2 });
+      expect(inspectComposerInput(value).state).toBe("text");
+    }
+    expect(inspectComposerInput(claude("\x1b[2;38;5;245mAsk Codex to do anything\x1b[0m", { x: 2, y: 2 })).state).toBe("empty");
+  });
+
+  it("recognizes only a single inverse-video Claude cursor blank at the prompt start", () => {
+    const cursor = { x: 2, y: 2 };
+    expect(inspectComposerInput(claude("\x1b[7m \x1b[0m", cursor))).toMatchObject({ state: "empty", rows: [""], cursorAtEnd: true });
+    for (const body of [" ", "\x1b[38;5;7m \x1b[0m", "\x1b[7m\x1b[27m ", "\x1b[7m \x1b[0mdraft"]) {
+      expect(inspectComposerInput(claude(body, cursor)).state).toBe("text");
+    }
+    expect(inspectComposerInput(claude("\x1b[7m \x1b[0m", { x: 3, y: 2 }))).toMatchObject({ state: "text", rows: [" "] });
+  });
+
+  it("requires the complete owned text and preserves significant spaces", () => {
+    const input = inspectComposerInput(claude("Run two commands\nthen report."));
+    expect(composerContainsOwnedText(input, "Run two commands\nthen report.")).toBe(true);
+    expect(composerContainsOwnedText(input, "Run twocommands\nthen report.")).toBe(false);
+    expect(composerContainsOwnedText(input, "Run two commands")).toBe(false);
+    expect(composerContainsOwnedText(inspectComposerInput(claude("owned plus a human draft")), "owned")).toBe(false);
+    expect(composerContainsOwnedText(inspectComposerInput(claude("owned", { x: 8, y: 2 })), "owned")).toBe(false);
+  });
+
+  it("accepts supported hard and word wrapping without deleting arbitrary whitespace", () => {
+    const hard = inspectComposerInput(claude("abcdefgh\nijkl", undefined, 10));
+    expect(composerContainsOwnedText(hard, "abcdefghijkl")).toBe(true);
+    const words = inspectComposerInput(claude("one two\nthree", undefined, 10));
+    expect(composerContainsOwnedText(words, "one two three")).toBe(true);
+    expect(composerContainsOwnedText(words, "one  two three")).toBe(false);
+    expect(composerContainsOwnedText(inspectComposerInput(claude("one\ntwo")), "one two")).toBe(false);
+  });
+
+  it("finds a delivery's own text in Claude's native wrapped rows, which wrap short of the box (#2429)", () => {
+    const fixtures = join(import.meta.dirname, "fixtures/input-box");
+    const lines = readFileSync(join(fixtures, "claude-code-2.1.296/staged-wrapped.raw.txt"), "utf8").replace(/\n$/, "").split("\n");
+    const text = readFileSync(join(fixtures, "texts/wrapped.txt"), "utf8").replace(/\n$/, "");
+    const last = lines.findLastIndex(line => line.startsWith("❯")) + 2;
+    const input = inspectComposerInput({ screen: lines.join("\n"), cursor: { x: lines[last]!.trimEnd().length, y: last, width: 120, height: lines.length }, inMode: false });
+    expect(input).toMatchObject({ state: "text", cursorAtEnd: true });
+    expect(input.rows).toHaveLength(3);
+    expect(composerContainsOwnedText(input, text)).toBe(true);
+    expect(composerContainsOwnedText(input, text.replace("asked", "ASKED"))).toBe(false);
+  });
+
+  it("matches Unicode cell widths and treats an opaque paste as separately owned evidence", () => {
+    const input = inspectComposerInput(claude("你好世界\nagain", { x: 7, y: 3 }, 10));
+    expect(composerContainsOwnedText(input, "你好世界again")).toBe(true);
+    const opaque = inspectComposerInput(claude("[Pasted text #4 +2 lines]"));
+    expect(ownCollapsedPaste(opaque, "one\ntwo\nthree")).toBe("[Pasted text #4 +2 lines]");
+    expect(ownCollapsedPaste(opaque, "one\ntwo")).toBeNull();
+    expect(composerContainsOwnedText(opaque, "one\ntwo\nthree")).toBe(false);
+    expect(ownCollapsedPaste(inspectComposerInput(claude("[Pasted text #4 +2 lines] foreign")), "one\ntwo\nthree")).toBeNull();
+  });
+
+  it("does not own a count-less label drawn beside the expected head unless the text spells it out (#2429)", () => {
+    const head = `reminder: ${"x".repeat(24)}`;
+    const quoting = `see [Pasted text #2] in ${head}`;
+    const matched = (drawn: string) => ({ ...inspectComposerInput(claude(drawn.replace("\n", ""))), collapsedPaste: drawn, pasteMatchesExpected: true });
+    // The base reads are the ones the transport would trust: text with the cursor at its end.
+    for (const drawn of [`[Pasted text #2] ${head}`, `[Pasted text #2] ${quoting}`]) expect(matched(drawn)).toMatchObject({ state: "text", cursorAtEnd: true });
+    expect(ownCollapsedPaste(matched(`[Pasted text #2] ${head}`), head)).toBeNull();
+    expect(ownCollapsedPaste(matched(`${head} [Pasted text #2]`), head)).toBeNull();
+    // A wrap may split the label.
+    expect(ownCollapsedPaste(matched(`[Pasted te\nxt #2] ${head}`), head)).toBeNull();
+    // A label our own text spells out is ours, but only as many times as it does.
+    expect(ownCollapsedPaste(matched(quoting), quoting)).toBe(quoting);
+    expect(ownCollapsedPaste(matched(`[Pasted text #2] ${quoting}`), quoting)).toBeNull();
+    // The bare label is still read by its count, and a counted label keeps the transport's identity check.
+    expect(ownCollapsedPaste(inspectComposerInput(claude("[Pasted text #1]")), `reminder: ${"x".repeat(1190)}`)).toBe("[Pasted text #1]");
+    expect(ownCollapsedPaste(matched(`[Pasted text #2 +3 lines] ${head}`), head)).toBe(`[Pasted text #2 +3 lines] ${head}`);
+  });
+});

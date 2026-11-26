@@ -92,7 +92,8 @@ function mockTmux(): TmuxAdapter {
     sendText: vi.fn(async () => ({ ok: true as const })),
     sendKeys: vi.fn(async () => ({ ok: true as const })),
     getPaneCommand: vi.fn(async () => "claude"),
-    capturePaneContent: vi.fn(async () => ""),
+    // A resumed Claude's drawn screen: Claude's process alone, with nothing drawn, only stands when the resume's wait runs out.
+    capturePaneContent: vi.fn(async () => `Claude Code v2.1.310\n${"─".repeat(60)}\n❯ \n${"─".repeat(60)}\n  ⏵⏵ accept edits on (shift+tab to cycle)`),
     listSessions: vi.fn(async () => []),
     listWindows: vi.fn(async () => []),
     listPanes: vi.fn(async () => []),
@@ -566,7 +567,7 @@ describe("GF2 — the COMPLETE production-altitude launch/restore matrix", () =>
     try {
       const { PiRuntimeAdapter } = await import("../src/adapters/pi-runtime-adapter.js");
       const { PiResumeAdapter } = await import("../src/adapters/pi-resume.js");
-      const piFs = { readFile: () => "{}", writeFile: () => {}, exists: () => true, mkdirp: () => {}, listFiles: () => [] };
+      const piFs = { readFile: () => "{}", writeFile: () => {}, exists: (file: string) => !file.endsWith("/.openrig-account"), mkdirp: () => {}, listFiles: () => [] };
       for (const [posture, expectedTrust] of [["full_bypass", "approve"], ["floor", "no-approve"]] as const) {
         const tmux = mockTmux();
         const adapter = new PiRuntimeAdapter({ tmux, fsOps: piFs as never, stateRoot: "/tmp/pi-state", runnerEntryPath: "/tmp/pi-runner.js", sleep: async () => {} });

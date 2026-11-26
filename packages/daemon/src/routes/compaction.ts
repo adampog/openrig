@@ -1,9 +1,12 @@
+import { transportSenderSession } from "./require-sender-identity.js";
+import { physicalSessionName } from "../domain/session-registry.js";
 import { Hono } from "hono";
 import { shellQuote } from "../adapters/shell-quote.js";
 import type Database from "better-sqlite3";
 import type { ClaudeCompactionEnforcer, ManualCompactionOutcome } from "../domain/claude-compaction-enforcer.js";
 import type { ContextUsageStore } from "../domain/context-usage-store.js";
 import type { SessionTransport } from "../domain/session-transport.js";
+import type { PiCompactionService } from "../domain/pi-compaction-service.js";
 import { authBearerTokenMiddleware } from "../middleware/auth-bearer-token.js";
 
 /**
@@ -20,7 +23,7 @@ import { authBearerTokenMiddleware } from "../middleware/auth-bearer-token.js";
  */
 export function compactionRoutes(opts?: { bearerToken?: string | null }): Hono {
   const router = new Hono();
-  router.use("*", authBearerTokenMiddleware({ expectedToken: opts?.bearerToken ?? null }));
+  router.use("*", authBearerTokenMiddleware({ expectedToken: opts?.bearerToken ?? null, diagnosticContext: "terminal" }));
 
   router.post("/trigger", async (c) => {
     const enforcer = c.get("compactionEnforcer" as never) as ClaudeCompactionEnforcer | undefined;
@@ -28,7 +31,7 @@ export function compactionRoutes(opts?: { bearerToken?: string | null }): Hono {
     const usageStore = c.get("contextUsageStore" as never) as ContextUsageStore | undefined;
     const db = c.get("db" as never) as Database.Database | undefined;
 
-    if (!enforcer || !transport || !usageStore || !db) {
+    if (!transport || !db) {
       return c.json({
         ok: false,
         reason: "compaction_unavailable",
@@ -36,12 +39,14 @@ export function compactionRoutes(opts?: { bearerToken?: string | null }): Hono {
       }, 503);
     }
 
-    const body = await c.req.json<{ session?: string; skipMap?: boolean }>().catch(() => ({} as { session?: string; skipMap?: boolean }));
+    type TriggerBody = { session?: string; skipMap?: boolean; earlyAck?: boolean };
+    const body: TriggerBody = await c.req.json<TriggerBody>().catch(() => ({}));
     if (!body.session) {
       return c.json({ ok: false, error: "Missing required field: session" }, 400);
     }
     if (body.skipMap !== undefined && typeof body.skipMap !== "boolean") return c.json({ ok: false, error: "skipMap must be boolean" }, 400);
-    const sessionName = body.session;
+    if (body.earlyAck !== undefined && typeof body.earlyAck !== "boolean") return c.json({ ok: false, error: "earlyAck must be boolean" }, 400);
+    const sessionName = physicalSessionName(db, body.session);
 
     // Ambiguity / existence check — mirror /send (409 ambiguous, 404 not found).
     const resolved = await transport.resolveSessions({ session: sessionName });
@@ -51,14 +56,7 @@ export function compactionRoutes(opts?: { bearerToken?: string | null }): Hono {
     }
 
     // Resolve the DB node id + runtime for the latest session row.
-    const row = db.prepare(`
-      SELECT n.id AS node_id, n.runtime AS runtime, n.cwd AS cwd
-      FROM sessions s
-      JOIN nodes n ON s.node_id = n.id
-      WHERE s.session_name = ?
-      ORDER BY s.id DESC
-      LIMIT 1
-    `).get(sessionName) as { node_id: string; runtime: string | null; cwd: string | null } | undefined;
+    const row = latestSeatNode(db, sessionName);
     if (!row) {
       return c.json({
         ok: false,
@@ -67,27 +65,58 @@ export function compactionRoutes(opts?: { bearerToken?: string | null }): Hono {
       }, 404);
     }
 
+    if (row.runtime === "pi") {
+      if (body.earlyAck) return c.json({ ok: false, session: sessionName, runtime: "pi",
+        reason: "early_ack_unsupported", error: "Early compaction acknowledgement is available only for Claude Code seats." }, 422);
+      const service = c.get("piCompactionService" as never) as PiCompactionService | undefined;
+      if (!service) return c.json({ ok: false, reason: "compaction_unavailable" }, 503);
+      // The caller's actor reaches the same terminal-policy check the Claude path uses.
+      const outcome = await service.trigger({ nodeId: row.node_id, sessionName, runtime: row.runtime },
+        { source: "caller", session: transportSenderSession(c) ?? null });
+      if (outcome.triggered) return c.json({ ok: true, session: sessionName, runtime: "pi",
+        attemptId: outcome.attemptId, stage: outcome.stage, ...(outcome.detail ? { error: outcome.detail } : {}) });
+      const status = outcome.reason === "unsupported" || outcome.reason === "runtime_filter"
+        || outcome.reason === "terminal_policy_refused" ? 422
+        : outcome.reason === "session_missing" || outcome.reason === "guard_target_unknown" ? 404
+        : outcome.reason === "tmux_unavailable" ? 503
+        : outcome.reason === "send_failed" || outcome.reason === "submit_failed" ? 502 : 409;
+      return c.json({ ok: false, session: sessionName, runtime: "pi", reason: outcome.reason,
+        ...(outcome.detail ? { error: outcome.detail } : {}) }, status);
+    }
+    if (!enforcer || !usageStore) return c.json({ ok: false, reason: "compaction_unavailable" }, 503);
+
     // Read the KNOWN context-usage projection BEFORE triggering. When usage is
-    // absent / stale / unknown we pass null (never invent a value); the enforcer
-    // returns an honest `no_usage_data` reason for a Claude seat.
+    // absent / stale / unknown we pass null (never invent a value); an explicit
+    // manual request doesn't depend on the threshold, so it proceeds without it.
     const usage = usageStore.getForNode(row.node_id, sessionName);
-    const outcome = await enforcer.triggerManualCompact(
-      {
-        sessionName,
-        runtime: row.runtime,
-        cwd: row.cwd,
-        usedPercentage: usage.availability === "known" ? usage.usedPercentage : null,
-        transcriptPath: usage.transcriptPath,
-        sessionId: usage.sessionId,
-      },
-      // This is the OPERATOR's manual-trigger verb (bearer-auth'd); the resulting sequence is
-      // drain-exempt while auto-compaction is disabled. GHOST-STAGE fix (a) actor-gate: automation
-      // paths that do NOT set this are NOT exempt, so they cannot launder a drain past the gate.
-      { operatorInitiated: true, skipMap: body.skipMap === true },
-    );
+    const input = {
+      nodeId: row.node_id, sessionName, runtime: row.runtime, cwd: row.cwd,
+      usedPercentage: usage.availability === "known" ? usage.usedPercentage : null,
+      transcriptPath: usage.transcriptPath, sessionId: usage.sessionId,
+    };
+    // This is the OPERATOR's manual-trigger verb (bearer-auth'd); the resulting sequence is
+    // drain-exempt while auto-compaction is disabled. GHOST-STAGE fix (a) actor-gate: automation
+    // paths that do NOT set this are NOT exempt, so they cannot launder a drain past the gate.
+    const options = { operatorInitiated: true, skipMap: body.skipMap === true,
+      actor: { source: "caller" as const, session: transportSenderSession(c) ?? null } };
+    let outcome: ManualCompactionOutcome;
+    if (body.earlyAck) {
+      const start = enforcer.startManualCompact(input, options);
+      if ("completion" in start) {
+        const { attemptId, completion } = start;
+        void completion.catch((error: unknown) => {
+          console.error("[compaction] manual attempt failed after acknowledgement",
+            { sessionName, attemptId, errorClass: error instanceof Error ? error.name : typeof error });
+        });
+        return c.json({ ok: true, session: sessionName, stage: "preparing", attemptId }, 202);
+      }
+      outcome = start;
+    } else {
+      outcome = await enforcer.triggerManualCompact(input, options);
+    }
 
     if (outcome.triggered) {
-      return c.json({ ok: true, session: sessionName, stage: outcome.stage });
+      return c.json({ ok: true, session: sessionName, stage: outcome.stage, compact: compactResultText("submitted_unconfirmed") });
     }
 
     const statusMap: Record<string, number> = {
@@ -110,7 +139,7 @@ export function compactionRoutes(opts?: { bearerToken?: string | null }): Hono {
       session: sessionName,
       stage: outcome.stage,
       reason: outcome.reason,
-      ...(outcome.preparation ? { preparation: outcome.preparation } : {}),
+      ...(outcome.preparation ? { preparation: outcome.preparation, compact: compactResultText(outcome.preparation.compact) } : {}),
       error: manualOutcomeMessage(sessionName, outcome),
     }, status);
   });
@@ -118,49 +147,122 @@ export function compactionRoutes(opts?: { bearerToken?: string | null }): Hono {
   router.post("/cancel", async (c) => {
     const enforcer = c.get("compactionEnforcer" as never) as ClaudeCompactionEnforcer | undefined;
     const transport = c.get("sessionTransport" as never) as SessionTransport | undefined;
-    if (!enforcer || !transport) return c.json({ ok: false, reason: "compaction_unavailable" }, 503);
+    if (!transport) return c.json({ ok: false, reason: "compaction_unavailable" }, 503);
     const body = await c.req.json<{ session?: string }>().catch(() => ({} as { session?: string }));
     if (!body.session) return c.json({ ok: false, error: "Missing required field: session" }, 400);
-    const resolved = await transport.resolveSessions({ session: body.session });
+    const db = c.get("db" as never) as Database.Database | undefined;
+    const seat = db ? resolveSeatNode(db, body.session) : undefined;
+    const resolved = await transport.resolveSessions({ session: seat?.sessionName ?? body.session });
     if (!resolved.ok) return c.json({ ok: false, error: resolved.error }, resolved.code === "ambiguous" ? 409 : 404);
-    return c.json({ ok: true, session: body.session, preparation: enforcer.cancelPreparation(body.session) });
+    if (seat?.node.runtime === "pi") return c.json({ ok: false, session: body.session, runtime: "pi", reason: "runtime_filter" }, 422);
+    if (!enforcer) return c.json({ ok: false, reason: "compaction_unavailable" }, 503);
+    const preparation = enforcer.cancelPreparation(body.session);
+    return c.json({ ok: true, session: body.session, preparation,
+      ...(preparation ? { compact: compactResultText(preparation.compact) } : {}),
+      guidance: "Managed preparation and pending restore/audit are disarmed. Cancellation sent no input. It cannot undo a submitted /compact or confirm whether it ran. No restore request follows cancellation: check the pane before retrying. If it compacted or you cannot tell, send a normal restore request naming preparation.mapPath from --state, asking it to skip reading if it did not compact; a retry would compact it again. An explicit retry still requires the live pane to be idle.",
+    });
   });
 
   router.get("/state", (c) => {
     const enforcer = c.get("compactionEnforcer" as never) as ClaudeCompactionEnforcer | undefined;
-    if (!enforcer) {
-      return c.json({ ok: false, reason: "compaction_unavailable" }, 503);
-    }
     const session = c.req.query("session");
     if (!session) {
       return c.json({ ok: false, error: "Missing required query param: session" }, 400);
     }
+    // After a restart, the first look at a seat picks up its record, as the context monitor's first poll would.
+    const db = c.get("db" as never) as Database.Database | undefined;
+    const resolved = db ? resolveSeatNode(db, session) : undefined;
+    const seat = resolved?.node;
+    if (resolved?.node.runtime === "pi") {
+      const service = c.get("piCompactionService" as never) as PiCompactionService | undefined;
+      if (!service) return c.json({ ok: false, reason: "compaction_unavailable" }, 503);
+      return c.json({ ok: true, session, runtime: "pi", state: service.getState(resolved.sessionName, resolved.node.node_id) });
+    }
+    if (!enforcer) return c.json({ ok: false, reason: "compaction_unavailable" }, 503);
+    if (seat) enforcer.recoverSeat({ sessionName: session, cwd: seat.cwd, runtime: seat.runtime });
     const preparation = enforcer.getPreparationState(session);
+    const stranded = enforcer.getStrandedCompaction(session);
+    const owedRestore = enforcer.getOwedRestore(session);
     return c.json({ ok: true, session, state: enforcer.getManualCompactionState(session), preparation,
+      ...(owedRestore ? { owedRestore } : {}),
+      ...(preparation ? { compact: compactResultText(preparation.compact) } : {}),
       ...(preparation?.reason === "occupant_generation_unavailable"
         ? { guidance: manualReasonMessage(session, preparation.reason) } : {}),
+      ...(stranded ? { stranded: { ...stranded, detail: "This seat's managed compaction is from before an OpenRig restart and too old for OpenRig to resume, so its restore steps may still be owed. If it compacted or you can't tell, send it a normal restore request naming mapPath, asking it to skip reading if it did not compact." } } : {}),
     });
   });
 
   return router;
 }
 
+/** The node behind a session's latest row: its id, runtime and launch workspace. */
+function latestSeatNode(db: Database.Database, sessionName: string): { node_id: string; runtime: string | null; cwd: string | null } | undefined {
+  return db.prepare(`
+    SELECT n.id AS node_id, n.runtime AS runtime, n.cwd AS cwd
+    FROM sessions s
+    JOIN nodes n ON s.node_id = n.id
+    WHERE s.session_name = ?
+    ORDER BY s.id DESC
+    LIMIT 1
+  `).get(sessionName) as { node_id: string; runtime: string | null; cwd: string | null } | undefined;
+}
+
+function resolveSeatNode(db: Database.Database, session: string) {
+  const direct = latestSeatNode(db, session);
+  if (direct) return { node: direct, sessionName: session };
+  const sessionName = physicalSessionName(db, session);
+  const node = sessionName !== session ? latestSeatNode(db, sessionName) : undefined;
+  return node ? { node, sessionName } : undefined;
+}
+
 function manualOutcomeMessage(sessionName: string, outcome: Extract<ManualCompactionOutcome, { triggered: false }>): string {
   const prep = outcome.preparation;
   if (!prep || prep.delivery === "not_sent") return manualReasonMessage(sessionName, outcome.reason);
   const effect = prep.delivery === "delivered" ? "Preparation was sent" : "Preparation may have reached the seat (delivery is unconfirmed)";
-  const detail = outcome.reason === "preparation_incomplete"
+  // An input-box hold names the box only when nothing of /compact was written; once it may have gone in, the owed restore
+  // below is what the person needs, and a retry is refused while it's owed.
+  const heldBeforeCompact = outcome.reason.startsWith("draft_input_") && prep.compact === "not_sent" && !outcome.restoreOwed;
+  const detail = (outcome.reason === "preparation_incomplete" || outcome.reason === "map_complete_seat_never_idle"
+    || outcome.reason === "preparation_needs_input" || heldBeforeCompact)
     ? manualReasonMessage(sessionName, outcome.reason)
-    : `/compact was not confirmed (${outcome.reason}). This attempt is disarmed.`;
+    : outcome.restoreOwed
+      ? `/compact was not confirmed (${outcome.reason}) and is never sent again. Its restore steps follow in case it ran; the restore request tells the seat to say so and skip if it didn't compact.`
+      : `/compact was not confirmed (${outcome.reason}). This attempt is disarmed.`;
   return `${effect} for '${sessionName}' (attempt ${prep.attemptId}). ${detail} Its map remains at ${prep.mapPath} if written. Inspect rig compact ${shellQuote(sessionName)} --state before an explicit retry.`;
+}
+
+/** The /compact command's result in words. `preparation.delivery` is the preparation prompt's delivery;
+ *  this is the command's, and it never claims that compaction ran. */
+export function compactResultText(compact: "not_sent" | "submitted_unconfirmed" | "uncertain"): string {
+  switch (compact) {
+    case "submitted_unconfirmed": return "submitted, unconfirmed: OpenRig sent /compact and Enter to the seat; it does not check whether Claude Code then started compacting.";
+    case "uncertain": return "uncertain: /compact may have reached the seat, possibly as text left in its input box without Enter; it was not retried.";
+    default: return "not sent: OpenRig has not sent /compact for this attempt.";
+  }
 }
 
 function manualReasonMessage(sessionName: string, reason: string): string {
   switch (reason) {
+    case "draft_input_busy":
+      return `Managed compaction for '${sessionName}' is waiting on its input box: there's text in it, or a person was typing moments ago, so it stopped before its next input and the draft stays as it is. Once the input box is empty, retry explicitly: rig compact ${shellQuote(sessionName)}. Read rig compact ${shellQuote(sessionName)} --state first. This attempt will not replay the held input.`;
+    case "draft_input_unknown":
+      return `Managed compaction for '${sessionName}' stopped before its next input: OpenRig couldn't read its input box, and the seat's input protection holds input it can't read. Look at the seat's pane, then retry explicitly once its input box reads empty: rig compact ${shellQuote(sessionName)}. Read rig compact ${shellQuote(sessionName)} --state first. This attempt will not replay the held input.`;
+    case "draft_input_changed":
+      return `Managed compaction for '${sessionName}' stopped before its next input: a person typed in its input box during the delivery, so nothing more was written. Once the input box is empty, retry explicitly: rig compact ${shellQuote(sessionName)}. Read rig compact ${shellQuote(sessionName)} --state first. This attempt will not replay the held input.`;
+    case "terminal_policy_refused":
+      return `Managed compaction for '${sessionName}' was refused by its terminal policy. Read rig seat status ${shellQuote(sessionName)}; an authorised policy change uses rig seat set-terminal-policy. The existing rig send --dangerously-interact --reason path is unchanged; prompt and interruption guards still apply.`;
+    case "terminal_policy_unavailable":
+      return `Could not read the selected terminal policy for '${sessionName}'; no new managed compaction is authorised. Inspect rig seat status ${shellQuote(sessionName)}.`;
     case "occupant_generation_unavailable":
       return `The occupant generation could not be resolved for '${sessionName}'; no preparation or compact was sent. For the confirmed live seat, run rig reconcile-session ${shellQuote(sessionName)} --no-launch, then explicitly retry rig compact ${shellQuote(sessionName)}. Reconciliation does not restart this attempt.`;
+    case "map_complete_seat_never_idle":
+      return `Compaction for '${sessionName}': map complete, seat never idle within the bounded wait; managed compaction is disarmed. Inspect rig compact ${shellQuote(sessionName)} --state before an explicit retry.`;
+    case "preparation_needs_input":
+      return `Compaction for '${sessionName}' waited for the seat to answer a prompt (a permission request in its preparation turn, say) and it didn't become idle within the bounded wait; managed compaction is disarmed. Answer the prompt in the seat, then retry explicitly: rig compact ${shellQuote(sessionName)}. Inspect rig compact ${shellQuote(sessionName)} --state first.`;
     case "preparation_incomplete":
-      return `Preparation (restore map and idle wait) did not finish in time for '${sessionName}'; managed compaction is disarmed. Inspect rig compact ${sessionName} --state, retry explicitly, or use --skip-map once.`;
+      return `The restore map was not completed in time for '${sessionName}'; managed compaction is disarmed. Inspect rig compact ${sessionName} --state, retry explicitly, or use --skip-map once.`;
+    case "pane_unknown_protected":
+      return `Refused: '${sessionName}' uses draft-aware input protection, and its tmux pane is not recorded. Input to a protected seat needs a known pane, so no preparation or /compact was sent. Both fixes refuse while protection is on, so with the person's agreement turn it off first (rig seat set-typing-guard ${shellQuote(sessionName)} --mode off --reason "<why>") and back on afterwards (--mode draft-aware). To keep the session and resume token, run rig reconcile-session ${shellQuote(sessionName)} --repair-missing-pane --no-launch. Otherwise rig reconcile-session ${shellQuote(sessionName)} --no-launch adopts: a new session row (any running row for the seat is superseded); it re-captures the resume token if it can, and conversation continuity stays unverified. Then explicitly retry rig compact ${shellQuote(sessionName)}; reconciliation does not restart this attempt. If the intended pane cannot be resolved, use rig context get help for operator recovery.`;
     case "preparation_cancelled":
       return `Preparation for '${sessionName}' was cancelled; no further compact is armed.`;
     case "disabled":
@@ -175,6 +277,8 @@ function manualReasonMessage(sessionName: string, reason: string): string {
       return `Refused: '${sessionName}' is at an interactive prompt; the pre-compact prep could not be sent safely.`;
     case "target_activity_unknown":
       return `Refused: '${sessionName}' activity could not be determined; failing closed so /compact cannot land on a prompt.`;
+    case "already_in_progress":
+      return `'${sessionName}' already has a managed compaction under way (an automatic attempt may be held with a completed map until an idle moment with an empty box). See it with rig compact ${shellQuote(sessionName)} --state; rig compact ${shellQuote(sessionName)} --cancel ends it before a new request.`;
     case "wait_for_idle_timeout":
       return `Prep was sent to '${sessionName}' but it did not go idle in time, so /compact was NOT sent. Retry once the prep turn completes.`;
     default:

@@ -1,11 +1,12 @@
+import { isAbsolute } from "node:path";
 import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
-import type { SessionRegistry } from "./session-registry.js";
+import { SessionAddressConflict, type SessionRegistry } from "./session-registry.js";
 import type { EventBus } from "./event-bus.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
 import type { TranscriptStore } from "./transcript-store.js";
 import type { PersistedEvent } from "./types.js";
-import { validateSessionName, deriveSessionName } from "./session-name.js";
+import { validateSessionName, deriveSessionName, boundSessionNameProblem } from "./session-name.js";
 import {
   startTranscriptRotation,
   getTranscriptRotationOptionsFromEnv,
@@ -14,14 +15,29 @@ import type { TmuxOptionDefaultsApplier } from "./tmux-option-defaults.js";
 import { observeSolePane, paneObservationVerdict } from "./pane-binding-observation.js";
 import { SeatIdentityStore } from "./seat-identity-store.js";
 import type { OccupantKind } from "./session-registry.js";
+import { mergeSeatEnv, seatEnvLaunchVars, type SeatEnv } from "./seat-env.js";
+import { withoutRuntimeHomes } from "./seat-runtime-home.js";
+import { SEAT_NODE_ENV, SEAT_PROJECT_DIR_ENV, seatCodexCorePluginDir, seatCorePluginDir, withPluginDirs } from "./claude-core-plugin-env.js";
+import { retireSeatCoreSkillCopiesForNode, seatSkillPluginDirForNode } from "./seat-skill-storage.js";
+import { seatLaunchAdditionsForLaunch } from "./seat-launch-additions.js";
+import { terminatePaneInPlace, type PaneCutoverTiming } from "./pane-cutover.js";
 
 import type { Session, Binding } from "./types.js";
 
 export type LaunchResult =
-  | { ok: true; sessionName: string; session: Session; binding: Binding; warnings?: string[] }
-  | { ok: false; code: string; message: string };
+  | { ok: true; sessionName: string; session: Session; binding: Binding; warnings?: string[];
+    /** #3253: a takeover that went ahead without the seat's requested process limit (the request stays stored). */
+    processLimits?: import("../adapters/tmux.js").SeatProcessLimitsNotice }
+  | { ok: false; code: string; message: string;
+    /** #3253: a refused launch's limit problem (`process_limits_*`), and whether a retry may succeed. */
+    retryable?: boolean; processLimits?: import("../adapters/tmux.js").SeatProcessLimitsProblem };
 
 interface LaunchOpts {
+  /** Startup selected-history only: refuse a same-name replacement. */
+  expectedNodeId?: string;
+  beforeEffect?: () => boolean;
+  /** Selected startup only: the seat must still have no claimant before its new row is registered. */
+  beforeRegistration?: () => boolean;
   sessionName?: string;
   cwd?: string;
   /**
@@ -33,6 +49,26 @@ interface LaunchOpts {
   silenceWindowSeconds?: number;
   /** A deliberate fresh occupant is distinct from initial rig boot in the tenure ledger. */
   occupantKind?: OccupantKind;
+  /** Told the new session's id as soon as its row is committed, before the launch goes on. */
+  onSessionRegistered?: (sessionId: string) => void;
+  /** One-off env for this launch only (`rig up --env`); wins over the spec's env and is not saved. */
+  env?: SeatEnv;
+  /** The seat's resolved plugin locations (what the profile resolver selected for it, or a snapshot saved). A Claude
+   *  seat whose selection includes the vendored openrig-core plugin loads it. Without this the node's saved startup
+   *  context is read. */
+  pluginPaths?: readonly string[];
+  /** Launch into this pane of the seat's existing session (named by `sessionName`) instead of a new session: its process
+   *  is ended in place and a shell started there, so the pane and its scrollback stay. */
+  keepPane?: string;
+  /** `sessionName` is the name this seat was bound to (restore keeps it). It is launched under that name even outside
+   *  OpenRig's naming pattern, as an adopted seat's own tmux session name is, when boundSessionNameProblem finds none. */
+  keepsBoundSessionName?: boolean;
+  /** #3253: how the new session treats the seat's process limit it can't apply (default "fresh": refused). A restore or
+   *  resume passes "recovery": it goes ahead without the limit, with a structured warning. */
+  processLimitsMode?: import("../adapters/tmux.js").ProcessLimitsMode;
+  /** A launch from a spec: create the member's declared working folder when it isn't there yet, before the terminal
+   *  starts in it. A restore or relaunch leaves this unset, so a saved folder missing on this machine isn't recreated. */
+  createCwd?: boolean;
 }
 
 interface NodeLauncherDeps {
@@ -46,6 +82,8 @@ interface NodeLauncherDeps {
   /** Extra launch env for one runtime only (OMP's provider keys), merged over
    *  sessionEnv so other runtimes' seats never receive it. */
   runtimeSessionEnv?: Record<string, Record<string, string | undefined>>;
+  /** Where the daemon vendors its plugins; default is `plugins` under the OpenRig home (tests). */
+  pluginsDir?: string;
   /** Default silence window (seconds). Currently used only as the
    *  SeatActivityService global default (3s). Per-seat override via
    *  LaunchOpts is currently inert. */
@@ -59,7 +97,29 @@ interface NodeLauncherDeps {
    * skips option application entirely.
    */
   tmuxOptionDefaults?: TmuxOptionDefaultsApplier;
+  /** How long a kept pane's process gets to exit, per signal (default: polled every 100 ms, 3 s each). */
+  paneExit?: PaneCutoverTiming;
+  /** Creates a folder and its parents, for `createCwd`. When omitted (most unit tests), a launch creates no folder. */
+  createFolder?: (path: string) => void;
 }
+
+/** For a kept pane: the failures that come before its takeover sent any signal, so this attempt stopped nothing. Every
+ *  later failure comes after TERM, and a death probe that fails reads as "not ended", so those stay unknown. */
+export const NOTHING_STOPPED_LAUNCH_CODES: ReadonlySet<string> = new Set([
+  "node_not_found", "selection_changed", "already_bound", "invalid_session_name", "address_conflict",
+  "pane_not_found",
+]);
+
+/** For a new terminal: the failures that leave none, the refusals before its creation and tmux reporting that none was
+ *  created. An unconfirmed creation, a failed write and every later failure stay unknown. */
+export const NO_TERMINAL_LAUNCH_CODES: ReadonlySet<string> = new Set([
+  "node_not_found", "selection_changed", "already_bound", "invalid_session_name", "address_conflict",
+  "session_not_created",
+  // #3253: refused by the scope check before tmux is asked for a session. `process_limits_unverified` is not here: it
+  // can also come after the session was made, when its scope start isn't confirmed, and that session's removal is
+  // best effort.
+  "process_limits_unsupported", "process_limits_setup", "process_limits_invalid",
+]);
 
 export class NodeLauncher {
   readonly db: Database.Database;
@@ -70,8 +130,11 @@ export class NodeLauncher {
   private transcriptStore: TranscriptStore | null;
   private sessionEnv: Record<string, string>;
   private runtimeSessionEnv: Record<string, Record<string, string | undefined>>;
+  private pluginsDir: string | undefined;
   private defaultSilenceWindowSeconds: number;
   private tmuxOptionDefaults: TmuxOptionDefaultsApplier | null;
+  private createFolder: ((path: string) => void) | null;
+  private paneExit: PaneCutoverTiming;
 
   constructor(deps: NodeLauncherDeps) {
     // Hard runtime invariant: all domain services must share the same db handle.
@@ -94,8 +157,11 @@ export class NodeLauncher {
     this.transcriptStore = deps.transcriptStore ?? null;
     this.sessionEnv = compactEnv(deps.sessionEnv ?? {});
     this.runtimeSessionEnv = deps.runtimeSessionEnv ?? {};
+    this.pluginsDir = deps.pluginsDir;
     this.defaultSilenceWindowSeconds = deps.defaultSilenceWindowSeconds ?? 3;
     this.tmuxOptionDefaults = deps.tmuxOptionDefaults ?? null;
+    this.createFolder = deps.createFolder ?? null;
+    this.paneExit = deps.paneExit ?? { pollMs: 100, timeoutMs: 3_000, sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)) };
   }
 
   async launchNode(
@@ -113,19 +179,33 @@ export class NodeLauncher {
     if (!node) {
       return { ok: false, code: "node_not_found", message: `Node ${logicalId} not found in rig` };
     }
+    const selectedRegistrationAllowed = () => !opts?.expectedNodeId || (
+      !!this.rigRepo.getRig(rigId)?.nodes.some(current => current.id === node.id && current.logicalId === logicalId)
+      && !!opts.beforeEffect?.() && !!opts.beforeRegistration?.()
+    );
+    if (opts?.expectedNodeId && (node.id !== opts.expectedNodeId || !opts.beforeEffect?.())) {
+      return { ok: false, code: "selection_changed", message: "The selected node or history changed before launch." };
+    }
 
     const guard = this.tmuxAdapter.deliveryGuard;
     if (guard && !guard.ownsLifecycle(node.id)) {
       return guard.lifecycle([node.id], () => this.launchNode(rigId, logicalId, opts));
     }
+    if (!selectedRegistrationAllowed()) {
+      return { ok: false, code: "selection_changed", message: "The selected node or history changed before launch." };
+    }
 
-    if (node.binding !== null) {
+    // A kept pane keeps its binding through the takeover, so the delivery guard can still resolve it.
+    const keptBinding = opts?.keepPane !== undefined && node.binding?.tmuxPane === opts.keepPane
+      && node.binding?.tmuxSession === (opts.sessionName ?? deriveSessionName(rig.rig.name, logicalId));
+    if (node.binding !== null && !keptBinding) {
       return { ok: false, code: "already_bound", message: `Node ${logicalId} is already bound` };
     }
 
     // 2. Derive or validate session name
     const sessionName = opts?.sessionName ?? deriveSessionName(rig.rig.name, logicalId);
-    if (!validateSessionName(sessionName)) {
+    const keptBoundName = opts?.keepsBoundSessionName === true && opts.sessionName !== undefined && boundSessionNameProblem(sessionName) === null;
+    if (!validateSessionName(sessionName) && !keptBoundName) {
       return {
         ok: false,
         code: "invalid_session_name",
@@ -133,39 +213,110 @@ export class NodeLauncher {
       };
     }
 
+    try { this.sessionRegistry.assertAddressAvailable(node.id, sessionName); }
+    catch (error) {
+      if (!(error instanceof SessionAddressConflict)) throw error;
+      return { ok: false, code: "address_conflict", message: error.message };
+    }
+
     // 3. Reserve the source-bound occupant generation before the process starts. Reservation is
     // side-effect-free and fail-open: an unavailable ledger yields null and the launch remains valid.
+    if (!selectedRegistrationAllowed()) {
+      return { ok: false, code: "selection_changed", message: "The selected node or history changed before launch." };
+    }
     const occupantGeneration = this.sessionRegistry.reserveOccupantGeneration();
 
     // Create tmux session with OpenRig identity env vars. A duplicate is a
     // collision, never authority to kill an unmanaged same-name session.
-    const openRigEnv = compactEnv({
+    const specEnv = this.rigRepo.getEffectiveSeatEnv(node.id);
+    const corePluginDir = seatCorePluginDir(node, this.db, opts?.pluginPaths, this.pluginsDir);
+    // #2426: a seat that loads the vendored plugin itself drops OpenRig's earlier copies of its skills before it starts.
+    // A kept pane's running occupant is stopped only inside takeOverPane, so there the copies wait until it has ended.
+    const retireCoreCopies = () => corePluginDir ? retireSeatCoreSkillCopiesForNode(this.db, node.id, corePluginDir) : [];
+    const coreCopyNotes: string[] = opts?.keepPane ? [] : retireCoreCopies();
+    // OPR.0.7.0.13 — the seat's own skills, from storage keyed by its rig and logical seat (every launch path).
+    const seatSkillDir = seatSkillPluginDirForNode(this.db, node.id);
+    // OPR.0.7.0.9: the seat's own plugin folders (copies in its seat storage), after its generated plugin.
+    const additionPluginDirs = seatLaunchAdditionsForLaunch(this.db, node.id).additions?.pluginDirs ?? [];
+    const codexCorePluginDir = seatCodexCorePluginDir(node, this.db, opts?.pluginPaths, this.pluginsDir);
+    const sessionCwd = opts?.cwd ?? node.cwd ?? undefined;
+    // A spec's member starts in the folder it declares: one that isn't there yet is created before the terminal starts,
+    // as the kernel creates its own. A failure is named and the launch goes on, in tmux's fallback folder.
+    const cwdNotes: string[] = [];
+    if (opts?.createCwd && sessionCwd && isAbsolute(sessionCwd) && this.createFolder) {
+      try { this.createFolder(sessionCwd); }
+      catch (err) { cwdNotes.push(`${logicalId}'s working directory ${sessionCwd} couldn't be created: ${(err as Error).message}`); }
+    }
+    const launchEnv = (oneOff?: SeatEnv) => compactEnv({
       OPENRIG_NODE_ID: node.id,
       OPENRIG_SESSION_NAME: sessionName,
       OPENRIG_RUNTIME: node.runtime ?? undefined,
       ...this.sessionEnv,
       ...(node.runtime ? this.runtimeSessionEnv[node.runtime] : undefined),
+      // A one-off CLAUDE_CONFIG_DIR or CODEX_HOME is left out: a seat's home comes from its stored env: alone.
+      ...seatEnvLaunchVars(withPluginDirs(mergeSeatEnv(specEnv, oneOff && withoutRuntimeHomes(oneOff)), [corePluginDir, seatSkillDir, ...additionPluginDirs])),
+      // The launch project of a seat that loads the plugin, so a Claude started elsewhere inside the seat is not taken for it.
+      // For a Codex seat it is also the selection signal its plugin hooks check, beside the interpreter they run with.
+      [SEAT_PROJECT_DIR_ENV]: corePluginDir || codexCorePluginDir ? sessionCwd : undefined,
+      [SEAT_NODE_ENV]: corePluginDir || codexCorePluginDir ? process.execPath : undefined,
       OPENRIG_OCCUPANT_GENERATION: occupantGeneration ?? undefined,
     });
-    const sessionCwd = opts?.cwd ?? node.cwd ?? undefined;
-    const tmuxResult = await this.tmuxAdapter.createSession(sessionName, sessionCwd, openRigEnv);
-    if (!tmuxResult.ok) {
-      return { ok: false, code: tmuxResult.code, message: tmuxResult.message };
+    const openRigEnv = launchEnv(opts?.env);
+    if (!selectedRegistrationAllowed()) {
+      return { ok: false, code: "selection_changed", message: "The selected node or history changed before launch." };
     }
+    const tmuxResult = opts?.keepPane
+      ? await this.takeOverPane(sessionName, opts.keepPane, sessionCwd, openRigEnv, node.id, node.runtime ?? null)
+      // #3253: the launch mode is passed only when there is one, so a launch without it calls createSession as before.
+      : opts?.processLimitsMode
+        ? await this.tmuxAdapter.createSession(sessionName, sessionCwd, openRigEnv, { processLimitsMode: opts.processLimitsMode })
+        : await this.tmuxAdapter.createSession(sessionName, sessionCwd, openRigEnv);
+    if (!tmuxResult.ok) {
+      return { ok: false, code: tmuxResult.code, message: tmuxResult.message,
+        ...(tmuxResult.retryable !== undefined ? { retryable: tmuxResult.retryable } : {}),
+        ...(tmuxResult.processLimits ? { processLimits: tmuxResult.processLimits } : {}) };
+    }
+    // A replacement during the awaited terminal creation must never receive
+    // this attempt's new session row. The pane's present owner cannot be
+    // proved after this await, so leave it for reconciliation rather than
+    // killing a same-name replacement.
+    if (!selectedRegistrationAllowed()) {
+      return { ok: false, code: "selection_changed_after_creation", message: "The selected node or history changed during terminal creation. The terminal outcome needs inspection." };
+    }
+    // The kept pane's process has ended in place and a bare shell runs there; nothing has launched into it yet.
+    if (opts?.keepPane) coreCopyNotes.push(...retireCoreCopies());
 
-    const launchWarnings: string[] = [];
+    // The session's own non-fatal warnings (#771: the parent-session identity cleanup).
+    const launchWarnings: string[] = [...coreCopyNotes, ...cwdNotes, ...(tmuxResult.warnings ?? [])];
+
+    // A one-off `rig up --env` value is on the first pane's command line and, because that is how
+    // `new-session -e` works, in the session environment, which a respawned pane (a handover
+    // successor) inherits. The first pane has already started with it, so take it back out of the
+    // session: the spec's or OpenRig's own value for a name they set, no value for the rest.
+    // A name that can't be taken out leaves this seat running as launched; the warning says what a
+    // later pane would inherit and how to put it back. It never carries a value or tmux's text.
+    if (opts?.env && Object.keys(opts.env).length > 0) {
+      for (const name of await this.dropOneOffFromSession(sessionName, Object.keys(opts.env), launchEnv())) {
+        launchWarnings.push(`The one-off --env setting ${name} could not be taken out of session "${sessionName}"'s environment. `
+          + `The seat runs as launched, but a pane that later respawns in this session, such as a handover successor, would start with it. `
+          + `Before that, put it back with \`tmux set-environment -t ${sessionName} ${name} <usual value>\`, or remove it with \`tmux set-environment -t ${sessionName} -u ${name}\`.`);
+      }
+    }
 
     // Observe the pane before the DB transaction. A concrete pane is committed
     // with session+binding; an unresolved pane gets a durable named verdict in
     // that same transaction rather than carrying an unexplained NULL forward.
-    const paneObservation = await observeSolePane(this.tmuxAdapter, sessionName);
+    const paneObservation = opts?.keepPane ? { ok: true as const, pane: opts.keepPane } : await observeSolePane(this.tmuxAdapter, sessionName);
+    if (!selectedRegistrationAllowed()) {
+      return { ok: false, code: "selection_changed_after_creation", message: "The selected node or history changed during pane observation. The terminal outcome needs inspection." };
+    }
 
     // 3a2. OPR.0.4.6.02 S1 — apply the daemon's tmux option defaults to the
     // JUST-CREATED session via the shared applier (mouse/status session-scope
     // + set-clipboard/copy-command server-scope). Touches only this new
     // session, never an existing one (BR-1 never-retro). Option-set failures
     // come back as non-fatal launch warnings.
-    if (this.tmuxOptionDefaults) {
+    if (this.tmuxOptionDefaults && !opts?.keepPane) {
       launchWarnings.push(...(await this.tmuxOptionDefaults.applyToFreshSession(sessionName)));
     }
 
@@ -191,15 +342,22 @@ export class NodeLauncher {
     }
 
     // 4. DB transaction: session + binding + event (atomic)
+    if (!selectedRegistrationAllowed()) {
+      return { ok: false, code: "selection_changed_after_creation", message: "The selected node or history changed before registration. The terminal outcome needs inspection." };
+    }
     let persistedEvent: PersistedEvent;
     let createdSessionId: string | null = null;
     try {
       const txn = this.db.transaction(() => {
+        // This synchronous check and the writes share one transaction. A self-attach
+        // that won an awaited boundary keeps its binding; it is never compensated.
+        if (!selectedRegistrationAllowed()) return null;
         const session = this.sessionRegistry.registerSession(
           node.id,
           sessionName,
           opts?.occupantKind ?? "initial",
           occupantGeneration,
+          { keptBoundName, ...(sessionCwd ? { launchedCwd: sessionCwd } : {}) },
         );
         createdSessionId = session.id;
         this.sessionRegistry.updateStatus(session.id, "running");
@@ -223,10 +381,14 @@ export class NodeLauncher {
           sessionName,
         });
       });
-      persistedEvent = txn();
+      const event = txn();
+      if (!event) return { ok: false, code: "selection_changed_after_creation", message: "The selected node gained another occupant before registration. The terminal outcome needs inspection." };
+      persistedEvent = event;
     } catch (err) {
       // DB failed — best-effort tmux cleanup
-      await this.tmuxAdapter.killSession(sessionName);
+      // Only a session this launch created is removed. A kept pane is the person's own, with its scrollback, so it's left
+      // for recovery.
+      if (!opts?.keepPane) await this.tmuxAdapter.killSession(sessionName);
       return {
         ok: false,
         code: "db_error",
@@ -234,6 +396,7 @@ export class NodeLauncher {
       };
     }
 
+    if (createdSessionId) opts?.onSessionRegistered?.(createdSessionId);
     this.tmuxAdapter.deliveryGuard?.rebindLifecycle(node.id);
     this.tmuxAdapter.finishLaunchBinding?.(sessionName);
 
@@ -251,7 +414,62 @@ export class NodeLauncher {
       session: session!,
       binding: binding!,
       warnings: launchWarnings.length > 0 ? launchWarnings : undefined,
+      ...(tmuxResult.ok && "processLimits" in tmuxResult && tmuxResult.processLimits ? { processLimits: tmuxResult.processLimits } : {}),
     };
+  }
+
+  /** A kept pane's takeover, as a handover's cutover does it: its process ends in place (the pane survives it, with its
+   *  scrollback; #3901: a Claude Code or Codex occupant exits through its own shutdown first), then a shell starts in it
+   *  with this launch's environment, for the runtime to launch into. Nothing is touched when the pane isn't in the session. */
+  private async takeOverPane(sessionName: string, pane: string, cwd: string | undefined, env: Record<string, string>, nodeId: string,
+    runtime: string | null):
+    Promise<{ ok: true; warnings?: string[]; processLimits?: import("../adapters/tmux.js").SeatProcessLimitsNotice }
+      | { ok: false; code: string; message: string; retryable?: boolean; processLimits?: import("../adapters/tmux.js").SeatProcessLimitsProblem }> {
+    let panes: Array<{ id: string }> = [];
+    try { panes = await this.tmuxAdapter.listPanes(sessionName); } catch { /* an unreadable session holds no pane to keep */ }
+    // #3901: the pane's terminal (its session's immutable id and the tmux server), which the stop's effects are held to.
+    const terminal = this.tmuxAdapter.paneTerminal ? await this.tmuxAdapter.paneTerminal(pane) : undefined;
+    if (!panes.some((candidate) => candidate.id === pane) || (terminal && terminal.sessionName !== sessionName)) {
+      return { ok: false, code: "pane_not_found", message: `Pane ${pane} isn't in tmux session "${sessionName}", so nothing was stopped.` };
+    }
+    // #3253: the seat's scope is checked before the running process is ended, so the respawn after the stop reuses that
+    // check. The respawn runs in recovery mode: a limit never stops the takeover after the stop, and a warning that it
+    // went on without the limit is logged only once it has.
+    await this.tmuxAdapter.seatProcessLimitsRecoveryPlan?.(nodeId);
+    // The guard resolves the selected seat before writing to its immutable pane id.
+    const inputTarget = this.tmuxAdapter.deliveryGuard ? nodeId : pane;
+    const ended = await terminatePaneInPlace(this.tmuxAdapter, pane, this.paneExit, "The seat's process", inputTarget,
+      { runtime, ...(terminal !== undefined ? { terminal } : {}) });
+    if (!ended.ok) return { ok: false, code: ended.code ?? "pane_process_not_ended", message: ended.message };
+    const shell = (await this.tmuxAdapter.getDefaultShell()) ?? "/bin/sh";
+    const respawned = await this.tmuxAdapter.respawnPane(inputTarget, shell, { ...(cwd ? { cwd } : {}), env, processLimitsMode: "recovery" });
+    if (!respawned.ok) {
+      return { ok: false, code: "pane_not_respawned", message: `The seat's process in pane ${pane} ended, but a shell couldn't start there: ${respawned.message}` };
+    }
+    return { ok: true, ...(respawned.warnings ? { warnings: respawned.warnings } : {}),
+      ...(respawned.ok && respawned.processLimits ? { processLimits: respawned.processLimits } : {}) };
+  }
+
+  /**
+   * Put each one-off name back to what the session would have had without it: `baseline` has the
+   * value the spec or OpenRig set for it, and a name with none is unset (the server's own value, if
+   * it has one, is what a later pane gets). `TMUX` and `TMUX_PANE` belong to tmux and are left alone.
+   * Returns the names that could not be restored (every name is tried). The warning built from them
+   * carries no value: tmux errors repeat the command line.
+   */
+  private async dropOneOffFromSession(session: string, names: string[], baseline: Record<string, string>): Promise<string[]> {
+    const failed: string[] = [];
+    for (const name of names) {
+      if (name === "TMUX" || name === "TMUX_PANE") continue;
+      try {
+        const value = baseline[name];
+        if (value !== undefined) await this.tmuxAdapter.setSessionEnv(session, name, value);
+        else await this.tmuxAdapter.unsetSessionEnv(session, name);
+      } catch {
+        failed.push(name);
+      }
+    }
+    return failed;
   }
 }
 

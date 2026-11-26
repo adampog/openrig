@@ -2,6 +2,7 @@ import type { ShadowCapture } from "../domain/shadow-capture.js";
 import type Database from "better-sqlite3";
 import type { StreamStore } from "../domain/stream-store.js";
 import { classifierOccupant, classificationSources } from "../domain/classification-sources.js";
+import { DispositionError, getDisposition, insertDisposition, markApplied, unappliedDispositions, validateDisposition } from "../domain/stream-dispositions.js";
 import { selectedProject } from "../domain/workspace/project-read.js";
 import { type Context, Hono } from "hono";
 import { streamSSE } from "hono/streaming";
@@ -14,6 +15,7 @@ import type { ClassificationAttemptLedger } from "../domain/classification-attem
 import { ClassificationAttemptError } from "../domain/classification-attempts.js";
 
 import { requireSenderIdentity, resolveRecordedProvenance } from "./require-sender-identity.js";
+import { queryLimit } from "./query-limit.js";
 
 /**
  * Coordination L2 — Project (Classifier) HTTP routes (PL-004 Phase B).
@@ -59,6 +61,7 @@ export function projectsRoutes(): Hono {
     if (err instanceof ProjectClassifierError) {
       const status = err.code === "idempotency_violation" ? 409
         : err.code === "project_not_found" ? 404
+        : err.code === "disposition_exists" ? 409
         : err.code === "attempt_mismatch" || err.code === "attempt_superseded" ? 409
         : err.code === "unknown_stream_item"
           || err.code === "invalid_field"
@@ -67,7 +70,8 @@ export function projectsRoutes(): Hono {
           || err.code === "invalid_needs_human"
           || err.code === "invalid_duplicate_of"
           || err.code === "candidate_set_version_required"
-          || err.code === "attempt_versions_required" ? 400
+          || err.code === "attempt_versions_required"
+          || err.code === "invalid_disposition" ? 400
         : 500;
       return c.json({ error: err.code, message: err.message, ...(err.meta ?? {}) }, status as 200);
     }
@@ -204,6 +208,7 @@ export function projectsRoutes(): Hono {
       classifierVersion?: string;
       taxonomyVersion?: string;
       candidateSetVersion?: string;
+      disposition?: unknown;
     }>().catch(() => ({} as never));
     if (!body.streamItemId) return c.json({ error: "streamItemId is required" }, 400);
     const actor = sender(c, body.classifierSession);
@@ -229,6 +234,7 @@ export function projectsRoutes(): Hono {
         classifierVersion: body.classifierVersion,
         taxonomyVersion: body.taxonomyVersion,
         candidateSetVersion: body.candidateSetVersion,
+        disposition: body.disposition,
       });
       return c.json(project, 201);
     } catch (err) {
@@ -279,8 +285,18 @@ export function projectsRoutes(): Hono {
           classifierSession: actor.session,
           reason: body.reason as string,
         };
-        return c.json(verb === "abstain" ? ledger.abstain(input) : ledger.fail(input));
+        if (verb === "fail") return c.json(ledger.fail(input));
+        if (body.disposition === undefined) return c.json(ledger.abstain(input));
+        // Slice 22: a deferral to intake is stored in the same transaction as the automatic attempt's abstention.
+        const deferral = validateDisposition(body.disposition, undefined, "deferred");
+        const db = c.get("db" as never) as Database.Database;
+        return c.json(db.transaction(() => {
+          const attempt = ledger.abstain(input);
+          insertDisposition(db, null, attempt.streamItemId, deferral, new Date().toISOString(), actor.session);
+          return attempt;
+        })());
       } catch (err) {
+        if (err instanceof DispositionError) return c.json({ error: err.code, message: err.message }, err.code === "disposition_exists" ? 409 : err.code === "disposition_not_found" ? 404 : 400);
         return errorResponse(c, err);
       }
     });
@@ -299,8 +315,34 @@ export function projectsRoutes(): Hono {
         evidenceEpoch: c.req.query("evidenceEpoch") ?? "",
         limit: Number.isFinite(limit) ? limit : undefined,
         afterSortKey: c.req.query("afterSortKey") || undefined,
+        excludeAbstainedElsewhere: c.req.query("excludeAbstainedElsewhere") === "1",
       }));
     } catch (err) {
+      return errorResponse(c, err);
+    }
+  });
+
+  // Slice 22: accepted routing judgments. The consumer applies unapplied ones at wake start, and
+  // only the active lease holder records an effect's outcome.
+  app.get("/dispositions/unapplied", (c) => {
+    const parsed = queryLimit(c);
+    if (!parsed.ok) return parsed.response;
+    const limit = Math.min(Math.max(parsed.limit ?? 50, 1), 100);
+    return c.json(unappliedDispositions(c.get("db" as never) as Database.Database, limit));
+  });
+  app.get("/dispositions/:streamItemId", (c) => {
+    const found = getDisposition(c.get("db" as never) as Database.Database, c.req.param("streamItemId"));
+    return found ? c.json(found) : c.json({ error: "disposition_not_found" }, 404);
+  });
+  app.post("/dispositions/:streamItemId/applied", async (c) => {
+    const body = await c.req.json<{ classifierSession?: string; leaseId?: string; applied?: unknown }>().catch(() => ({} as never));
+    const actor = sender(c, body.classifierSession);
+    if (!actor.ok) return actor.response;
+    try {
+      getLease(c).requireActiveHolder(actor.session, body.leaseId as string);
+      return c.json(markApplied(c.get("db" as never) as Database.Database, c.req.param("streamItemId"), body.applied, new Date().toISOString()));
+    } catch (err) {
+      if (err instanceof DispositionError) return c.json({ error: err.code, message: err.message }, err.code === "disposition_not_found" ? 404 : 400);
       return errorResponse(c, err);
     }
   });
@@ -330,8 +372,11 @@ export function projectsRoutes(): Hono {
       return c.json({ error: "needsHuman filter must be true, false or unknown" }, 400);
     }
     const needsHuman = needsHumanRaw as "true" | "false" | "unknown" | undefined;
-    const limit = c.req.query("limit") ? Number.parseInt(c.req.query("limit")!, 10) : undefined;
-    const items = getClassifier(c).list({ classifierSession, classificationDestination, area, scopeRef, needsHuman, limit });
+    const parsed = queryLimit(c);
+    if (!parsed.ok) return parsed.response;
+    const limit = parsed.limit;
+    const streamItemId = c.req.query("streamItemId") || undefined;
+    const items = getClassifier(c).list({ streamItemId, classifierSession, classificationDestination, area, scopeRef, needsHuman, limit });
     return c.json(items);
   });
 

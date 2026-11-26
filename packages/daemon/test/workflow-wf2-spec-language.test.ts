@@ -13,6 +13,7 @@ import type Database from "better-sqlite3";
 import { createDb } from "../src/db/connection.js";
 import { migrate } from "../src/db/migrate.js";
 import { coreSchema } from "../src/db/migrations/001_core_schema.js";
+import { rigArchiveSchema } from "../src/db/migrations/042_rig_archive.js";
 import { outboxEntriesSchema } from "../src/db/migrations/027_outbox_entries.js";
 import { bindingsSessionsSchema } from "../src/db/migrations/002_bindings_sessions.js";
 import { eventsSchema } from "../src/db/migrations/003_events.js";
@@ -25,6 +26,7 @@ import { queueItemSummarySchema } from "../src/db/migrations/044_queue_item_summ
 import { queueItemEvidenceRefSchema } from "../src/db/migrations/048_queue_item_evidence_ref.js";
 import { workflowInstanceVersionSchema } from "../src/db/migrations/049_workflow_instance_version.js";
 import { workflowSpecJsonSchema } from "../src/db/migrations/050_workflow_spec_json.js";
+import { workflowLifecycleParallelSchema } from "../src/db/migrations/079_workflow_lifecycle_parallel.js";
 import { missionControlActionsSchema } from "../src/db/migrations/037_mission_control_actions.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { OutboxHandler } from "../src/domain/outbox-handler.js";
@@ -187,7 +189,7 @@ describe("OPR.0.4.6.WF2 — spec language", () => {
     migrate(db, [
       outboxEntriesSchema,
       coreSchema,
-      bindingsSessionsSchema,
+      bindingsSessionsSchema, rigArchiveSchema,
       eventsSchema,
       queueItemsSchema,
       queueTransitionsSchema,
@@ -575,6 +577,23 @@ describe("OPR.0.4.6.WF2 — spec language", () => {
       ).rejects.toMatchObject({ code: "harness_pin_unsatisfied" });
     });
 
+    it("validate warns that a harness pin is unchecked instead of reporting a clean result (#3087)", () => {
+      const spec = parseWorkflowSpec(HARNESS_SPEC, "harness.yaml");
+      const result = new WorkflowValidator().validate(spec);
+      expect(result.ok).toBe(true);
+      const unchecked = result.issues.filter((i) => i.code === "harness_pin_unchecked");
+      expect(unchecked).toHaveLength(1);
+      expect(unchecked[0]).toMatchObject({ severity: "warning", field: "workflow.steps[0].harness" });
+      expect(unchecked[0]!.message).toContain('"codex"');
+      expect(unchecked[0]!.message).toContain("no rig is bound");
+    });
+
+    it("validate adds no pin warning to a spec without harness pins", () => {
+      const spec = parseWorkflowSpec(LINEAR_SPEC, "linear.yaml");
+      const result = new WorkflowValidator().validate(spec);
+      expect(result.issues.some((i) => i.code === "harness_pin_unchecked")).toBe(false);
+    });
+
     it("steps with no pin resolve preferred_targets[0] unchanged (zero regression)", async () => {
       const specPath = writeSpec(tmp, "linear.yaml", LINEAR_SPEC);
       const result = await runtime.instantiate({
@@ -659,6 +678,70 @@ describe("OPR.0.4.6.WF2 — spec language", () => {
         if (prevHome === undefined) delete process.env.OPENRIG_HOME;
         else process.env.OPENRIG_HOME = prevHome;
       }
+    });
+  });
+
+  describe("unanswered human gate advisories", () => {
+    async function parkedGate(graph: boolean) {
+      if (graph) {
+        migrate(db, [workflowLifecycleParallelSchema]);
+        runtime = new WorkflowRuntime({ db, eventBus: bus, queueRepo });
+      }
+      let source = GATED_HUMAN_SPEC.replace("allowed_exits: [done]", "allowed_exits: [done, handoff, waiting]") +
+        "    - id: follow\n      actor_role: prover\n      allowed_exits: [done]\n";
+      if (graph) source = source
+        .replace("    - id: build\n", "    - id: build\n      depends_on: []\n")
+        .replace("    - id: signoff\n", "    - id: signoff\n      depends_on: [build]\n")
+        .replace("    - id: follow\n", "    - id: follow\n      depends_on: [signoff]\n");
+      const started = await runtime.instantiate({ specPath: writeSpec(tmp, "gate-advisory.yaml", source),
+        rootObjective: "keep the decision distinct from advancing the workflow", createdBySession: "ops@rig" });
+      const gate = await runtime.project({ instanceId: started.instance.instanceId,
+        currentPacketId: started.entryQitemId, exit: "handoff", actorSession: "builder@rig" });
+      return { instanceId: started.instance.instanceId, currentPacketId: gate.nextQitemId!, actorSession: "prover@rig" };
+    }
+
+    it.each([
+      [false, "done"], [false, "handoff"], [true, "done"], [true, "handoff"],
+    ] as const)("warns and records, but still advances (graph=%s, exit=%s)", async (graph, exit) => {
+      const input = await parkedGate(graph);
+      expect(queueRepo.getById(input.currentPacketId)?.body).toContain("A response or resumed packet is not approval");
+      expect(queueRepo.getById(input.currentPacketId)?.body).toContain("--exit waiting --blocked-on human@kernel");
+      const result = await runtime.project({ ...input, exit, resultNote: "deliberate advance" });
+      expect(result.closureReason).toBe(exit);
+      expect(queueRepo.getById(input.currentPacketId)?.state).not.toBe("blocked");
+      expect(result.advisories).toEqual([expect.stringContaining("still blocked on human@kernel; advancing past an unanswered human gate")]);
+      expect(queueRepo.transitionLog.listForQitem(input.currentPacketId).at(-1)?.transitionNote).toContain(result.advisories![0]);
+      if (exit === "handoff") expect(result.nextQitemId).not.toBeNull();
+    });
+
+    it.each([false, true])("a response is retained without an unanswered warning (graph=%s)", async (graph) => {
+      const input = await parkedGate(graph);
+      const decision = "No, do not deploy; which target did you mean?";
+      const writeContract = new MissionControlWriteContract({ db, eventBus: bus, queueRepo,
+        actionLog: new MissionControlActionLog(db) });
+      await writeContract.act({ verb: "resolve", qitemId: input.currentPacketId,
+        actorSession: "human@kernel", decision, notify: false });
+      const result = await runtime.project({ ...input, exit: "done" });
+      expect(result.advisories).toBeUndefined();
+      expect(queueRepo.transitionLog.listForQitem(input.currentPacketId).some((t) => t.transitionNote === decision)).toBe(true);
+    });
+
+    it.each([false, true])("waiting preserves the person only when named explicitly (graph=%s)", async (graph) => {
+      const input = await parkedGate(graph);
+      const kept = await runtime.project({ ...input, exit: "waiting", blockedOn: "human@kernel" });
+      expect(kept.advisories).toBeUndefined();
+      expect(queueRepo.getById(input.currentPacketId)?.blockedOn).toBe("human@kernel");
+      await runtime.project({ ...input, exit: "waiting" });
+      expect(queueRepo.getById(input.currentPacketId)?.blockedOn).toBe("external-gate");
+      const result = await runtime.project({ ...input, exit: "done" });
+      expect(result.advisories).toBeUndefined();
+    });
+
+    it("the first human-gated packet carries the same response guidance", async () => {
+      const source = GATED_HUMAN_SPEC.replace("    - id: build\n      actor_role: builder\n      allowed_exits: [handoff, done]\n", "");
+      const started = await runtime.instantiate({ specPath: writeSpec(tmp, "entry-gate.yaml", source),
+        rootObjective: "human entry", createdBySession: "ops@rig" });
+      expect(queueRepo.getById(started.entryQitemId)?.body).toContain("Successful resolve records attribution, not consent or authority");
     });
   });
 

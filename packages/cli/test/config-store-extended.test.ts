@@ -44,7 +44,8 @@ function clearEnv(): () => void {
     // its custom home into default-path resolution; UNSETTING it would fall through
     // to the REAL ~/.openrig (foreign on-box state) — so tests set a fresh tmp home.
     "OPENRIG_HOME", "RIGGED_HOME",
-    "OPENRIG_PORT", "OPENRIG_HOST", "OPENRIG_DB",
+    "OPENRIG_PORT", "OPENRIG_HOST", "OPENRIG_DB", "OPENRIG_TMUX_SERVER", "OPENRIG_TERMINAL_FIXED_GEOMETRY", "OPENRIG_DAEMON_DB_CONFLICT",
+    "OPENRIG_DAEMON_START_READINESS_WAIT_SECONDS",
     "OPENRIG_TRANSCRIPTS_ENABLED", "OPENRIG_TRANSCRIPTS_PATH",
     "OPENRIG_TRANSCRIPTS_LINES", "OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS",
     "OPENRIG_WORKSPACE_ROOT", "OPENRIG_WORKSPACE_SLICES_ROOT",
@@ -65,6 +66,7 @@ function clearEnv(): () => void {
     "OPENRIG_FEED_SUBSCRIPTIONS_AUDIT_LOG",
     "OPENRIG_RUNTIME_CODEX_HOOKS_ENABLED",
     "OPENRIG_RUNTIME_READINESS_TIMEOUT_SECONDS",
+    "OPENRIG_POLICIES_CLAUDE_COMPACTION_PREPARATION_ROOT",
     "OPENRIG_POLICIES_CLAUDE_COMPACTION_ENABLED",
     "OPENRIG_POLICIES_CLAUDE_COMPACTION_THRESHOLD_PERCENT",
     "OPENRIG_POLICIES_CLAUDE_COMPACTION_PRE_COMPACT_INSTRUCTION",
@@ -108,9 +110,21 @@ describe("ConfigStore — extended namespaces (User Settings v0)", () => {
     restoreEnv();
   });
 
+  it("resolves tmux isolation from the shared config and environment with a strict mode", () => {
+    const store = new ConfigStore(configPath);
+    expect(store.resolve().terminal.tmuxServer).toBe("inherit");
+    store.set("terminal.tmux_server", "isolated");
+    expect(store.resolve().terminal.tmuxServer).toBe("isolated");
+    process.env.OPENRIG_TMUX_SERVER = "inherit";
+    expect(store.resolve().terminal.tmuxServer).toBe("inherit");
+    expect(() => store.set("terminal.tmux_server", "isolate")).toThrow('must be "inherit" or "isolated"');
+  });
+
   it("VALID_KEYS includes legacy, user-settings, ui.preview, recovery, agents, feed, and transcript-rotation keys", () => {
     const expected = [
-      "daemon.port", "daemon.host",
+      "daemon.port", "daemon.host", "daemon.db_conflict", "daemon.seat_poll_interval_ms", "daemon.identity_poll_interval_ms",
+      // #3637 — how long a start waits for its child's readiness.
+      "daemon.start_readiness_wait_seconds",
       // OPR.0.4.6.MH1 FR-1/FR-4 — host-selection pointer + own-host name.
       "host.selected",
       "host.name",
@@ -127,14 +141,21 @@ describe("ConfigStore — extended namespaces (User Settings v0)", () => {
       "topology.root",
       "context.root",
       "context.system_world",
+      "specs.builtins_visible",
       "skills.root",
+      "skills.router_line.enabled",
       "onboarding.default_pack.enabled",
       "launch.non_interruptive",
+      "launch.codex_login_shell",
       "health.context_pressure.warning_percent",
       "health.context_pressure.critical_percent",
       "files.allowlist", "progress.scan_roots",
       "ui.preview.refresh_interval_seconds", "ui.preview.max_pins", "ui.preview.default_lines", "ui.timezone",
       "ui.enabled",
+      "ui.topology_remote_seats",
+      // The legacy web client's cap on simultaneously-live terminals; the daemon store
+      // resolves it, so `rig config` must accept it too.
+      "ui.terminal.max_live_terminals",
       "recovery.auto_drive_provider_prompts",
       "recovery.provider_auth_env_allowlist",
       // V1 attempt-3 Phase 4 — Advisor/Operator placeholders.
@@ -153,6 +174,7 @@ describe("ConfigStore — extended namespaces (User Settings v0)", () => {
       "runtime.codex.hooks_enabled",
       "runtime.readiness_timeout_seconds",
       // Slice 27 — Claude auto-compaction policy. SC-29 EXCEPTION #10.
+      "policies.claude_compaction.preparation_root",
       "policies.claude_compaction.enabled",
       "policies.claude_compaction.threshold_percent",
       "policies.claude_compaction.pre_compact_instruction",
@@ -171,11 +193,43 @@ describe("ConfigStore — extended namespaces (User Settings v0)", () => {
       "snapshots.periodic.retention_keep",
       // OPR.0.4.6.02 S1 — inner-tmux status-bar launch default (static bool).
       "terminal.status_bar",
+      "terminal.tmux_server",
+      "terminal.history_limit",
+      "terminal.fixed_geometry",
+      "terminal.inherit_tmux_environment",
+      // Slice 15 (OPR.0.7.0.15) — compact command-output defaults switch.
+      "output.compact",
+      // Slice 15 P5 — the whoami peer bound under output.compact.
+      "output.whoami_peers",
+      "output.rebuild_recaps",
+      // Slice 01 (OPR.0.7.0.1) — Codex usage windows switch.
+      "provider.usage_windows",
+      // The providers chosen at rig setup --providers, which kernel boot honours.
+      "provider.selected",
+      "bundle.services_enabled",
+      "usage.pi_cost_facts",
+      "usage.pi_openrouter_charge",
+      "transport.verify_input_box",
+      "transport.local_user_guard",
+      "transport.draft_delivery",
+      // Slice 22 (OPR.0.7.2.22) — typed decisions, off by default.
+      "decisions.enabled",
+      "decisions.consumers",
+      "decisions.template_dir",
+      "acp.to",
       // OPR.0.4.6.FS-1 W2 — queue-retention maintenance knobs.
       "retention.enabled",
       "retention.transitions_days",
       "retention.watchdog_days",
+      "retention.usage_samples_days", // how long usage samples are kept
       "retention.watchdog_keep_per_job",
+      "retention.stream_days", // slice 22 outcome 9: stream retention
+      "retention.stream_max_items",
+      "retention.events_days", // the history-only event types of events
+      "retention.closed_content_days", // closed-work erasure: content
+      "retention.closed_metadata_days", // closed-work erasure: the row, keeping its id
+      "retention.erasure_ledger", // queue erasure's replay ledger file
+      "stream.intake",
       "retention.batch_size",
       "queue.pickup_stall_threshold_minutes",
       // S02 — standing-stuck-sweep cadence + unclaimed-obligation age.
@@ -186,8 +240,27 @@ describe("ConfigStore — extended namespaces (User Settings v0)", () => {
       "queue.wake_retry_cap",
       "queue.wake_unconfirmed_window_minutes",
       "queue.wake_swap_grace_seconds",
+      "queue.wake_human_rung",
     ];
     expect([...VALID_KEYS]).toEqual(expected);
+  });
+
+  it("defaults database conflict handling to warn and persists the optional stop", () => {
+    const store = new ConfigStore(configPath);
+    expect(store.get("daemon.db_conflict")).toBe("warn");
+    store.set("daemon.db_conflict", "stop");
+    expect(store.get("daemon.db_conflict")).toBe("stop");
+    expect(() => store.set("daemon.db_conflict", "always")).toThrow(/warn or stop/);
+  });
+
+  it("defaults stream.intake to queue.worker and validates destinations", () => {
+    const store = new ConfigStore(configPath);
+    expect(store.get("stream.intake")).toBe("queue.worker");
+    store.set("stream.intake", "off");
+    expect(store.get("stream.intake")).toBe("off");
+    store.set("stream.intake", "lead@kernel");
+    expect(store.get("stream.intake")).toBe("lead@kernel");
+    expect(() => store.set("stream.intake", "invalid-bare-seat")).toThrow(/Invalid value for stream.intake/);
   });
 
   it("resolves context.root from the canonical default and OPENRIG_CONTEXT_ROOT", () => {
@@ -204,6 +277,17 @@ describe("ConfigStore — extended namespaces (User Settings v0)", () => {
   it("defaults the advisor session to the kernel's advisor seat", () => {
     const store = new ConfigStore(configPath);
     expect(store.resolveWithSource("agents.advisor_session")).toMatchObject({ value: "advisor-lead@kernel", source: "default" });
+  });
+
+  it("defaults provider.selected to empty and accepts only claude, codex or both", () => {
+    const store = new ConfigStore(configPath);
+    expect(store.resolveWithSource("provider.selected")).toMatchObject({ value: "", source: "default" });
+    store.set("provider.selected", "codex");
+    expect(store.resolveWithSource("provider.selected")).toMatchObject({ value: "codex", source: "file" });
+    expect(store.resolve().provider.selected).toBe("codex");
+    for (const raw of ["gemini", "both", "claude,", "Claude", "claude codex"]) {
+      expect(() => store.set("provider.selected", raw)).toThrow(/provider\.selected/);
+    }
   });
 
   it("resolves context.system_world with visible default, file, and env provenance", () => {
@@ -245,6 +329,46 @@ describe("ConfigStore — extended namespaces (User Settings v0)", () => {
       "queue.pickup_stall_threshold_minutes" as never,
     );
     expect(setting).toMatchObject({ value: 3, source: "default", defaultValue: 3 });
+  });
+
+  it("local user guard is opt-in and resolves the file/env twins", () => {
+    const store = new ConfigStore(configPath);
+    expect(store.resolveWithSource("transport.local_user_guard")).toMatchObject({ value: false, source: "default" });
+    store.set("transport.local_user_guard", "true");
+    expect(store.resolve().transport.localUserGuard).toBe(true);
+    try {
+      process.env.OPENRIG_TRANSPORT_LOCAL_USER_GUARD = "false";
+      expect(store.resolveWithSource("transport.local_user_guard")).toMatchObject({ value: false, source: "env" });
+    } finally { delete process.env.OPENRIG_TRANSPORT_LOCAL_USER_GUARD; }
+  });
+
+  it("transport.verify_input_box defaults off, resolves its env twin, and appears in the resolved config", () => {
+    const store = new ConfigStore(configPath);
+    expect(store.resolveWithSource("transport.verify_input_box")).toMatchObject({ value: false, source: "default", defaultValue: false });
+    expect(store.resolve().transport).toEqual({ verifyInputBox: false, localUserGuard: false, draftDelivery: "deliver" });
+    try {
+      process.env.OPENRIG_TRANSPORT_VERIFY_INPUT_BOX = "1";
+      expect(store.resolveWithSource("transport.verify_input_box")).toMatchObject({ value: true, source: "env" });
+      expect(store.resolve().transport).toEqual({ verifyInputBox: true, localUserGuard: false, draftDelivery: "deliver" });
+    } finally {
+      delete process.env.OPENRIG_TRANSPORT_VERIFY_INPUT_BOX;
+    }
+  });
+
+  it("resolves the daemon start wait from default, file and env, accepts waits above 600 up to the Node timer bound, and refuses the rest", () => {
+    const store = new ConfigStore(configPath);
+    expect(store.resolveWithSource("daemon.start_readiness_wait_seconds")).toMatchObject({ value: 180, source: "default" });
+    expect(store.resolve().daemon.startReadinessWaitSeconds).toBe(180);
+    store.set("daemon.start_readiness_wait_seconds", "240");
+    expect(store.resolveWithSource("daemon.start_readiness_wait_seconds")).toMatchObject({ value: 240, source: "file" });
+    expect(store.resolve().daemon.startReadinessWaitSeconds).toBe(240);
+    process.env["OPENRIG_DAEMON_START_READINESS_WAIT_SECONDS"] = "30";
+    expect(store.resolveWithSource("daemon.start_readiness_wait_seconds")).toMatchObject({ value: 30, source: "env" });
+    // Above 600 (a 15-minute start), up to the Node timer bound on the TUI's budget.
+    for (const value of ["900", "2147464"]) expect(() => store.set("daemon.start_readiness_wait_seconds", value)).not.toThrow();
+    for (const value of ["0", "2147465", "1.5", "45junk", "abc"]) {
+      expect(() => store.set("daemon.start_readiness_wait_seconds", value)).toThrow(/Invalid value for daemon\.start_readiness_wait_seconds/);
+    }
   });
 
   it("configures the launch readiness window with strict bounds and env precedence", () => {
@@ -295,6 +419,60 @@ describe("ConfigStore — extended namespaces (User Settings v0)", () => {
     store.reset("health.context_pressure.warning_percent");
     store.reset("health.context_pressure.critical_percent");
     expect(store.resolve().health.contextPressure).toEqual({ warningPercent: 95, criticalPercent: 99 });
+  });
+
+  it("explains that saved context-pressure pair validation excludes environment overrides", () => {
+    const store = new ConfigStore(configPath);
+    process.env.OPENRIG_HEALTH_CONTEXT_PRESSURE_WARNING_PERCENT = "50";
+    expect(() => store.set("health.context_pressure.critical_percent", "80"))
+      .toThrow(/config-file pair: warning \(95\).*critical \(80\).*each process resolves configuration/);
+    expect(existsSync(configPath)).toBe(false);
+    store.set("health.context_pressure.critical_percent", "100");
+    store.set("health.context_pressure.warning_percent", "99");
+    const before = readFileSync(configPath, "utf8");
+    expect(() => store.reset("health.context_pressure.critical_percent"))
+      .toThrow(/config-file pair: warning \(99\).*critical \(99\).*each process resolves configuration/);
+    expect(readFileSync(configPath, "utf8")).toBe(before);
+  });
+
+  it("rig config set retention.events_days 3 succeeds and rig config get returns 3", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const oldExitCode = process.exitCode;
+    try {
+      process.exitCode = undefined;
+      await configCommand(configPath, { probeDaemonRunning: async () => false })
+        .parseAsync(["node", "rig", "set", "retention.events_days", "3"]);
+      expect(process.exitCode).toBeUndefined();
+      expect(error).not.toHaveBeenCalled();
+      log.mockClear();
+      await configCommand(configPath, { probeDaemonRunning: async () => false })
+        .parseAsync(["node", "rig", "get", "retention.events_days"]);
+      expect(process.exitCode).toBeUndefined();
+      expect(log.mock.calls.flat().join(" ")).toMatch(/\b3\b/);
+      expect(new ConfigStore(configPath).get("retention.events_days")).toBe(3);
+    } finally {
+      log.mockRestore();
+      error.mockRestore();
+      process.exitCode = oldExitCode;
+    }
+  });
+
+  it("shows the file-pair explanation through the config command", async () => {
+    process.env.OPENRIG_HEALTH_CONTEXT_PRESSURE_WARNING_PERCENT = "50";
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const oldExitCode = process.exitCode;
+    try {
+      process.exitCode = undefined;
+      await configCommand(configPath, { probeDaemonRunning: async () => false })
+        .parseAsync(["node", "rig", "set", "health.context_pressure.critical_percent", "80"]);
+      expect(process.exitCode).toBe(1);
+      expect(error.mock.calls.flat().join(" ")).toContain("config-file pair: warning (95)");
+      expect(existsSync(configPath)).toBe(false);
+    } finally {
+      error.mockRestore();
+      process.exitCode = oldExitCode;
+    }
   });
 
   it("S01 wake ladder exposes retry cadence, cap, unconfirmed window, and swap grace defaults", () => {
@@ -376,6 +554,21 @@ describe("ConfigStore — extended namespaces (User Settings v0)", () => {
         expect(() => store.set(key, raw), `${key} must reject ${raw}`)
           .toThrow(/positive integer/i);
       }
+    }
+  });
+
+  it("retention.events_days: set 3 then get 3, default 0 (keep), 0 accepted, negative and non-integer refused", () => {
+    const store = new ConfigStore(configPath);
+    expect(store.get("retention.events_days")).toBe(0);
+    expect(store.resolve().retention.eventsDays).toBe(0);
+    store.set("retention.events_days", "3");
+    expect(store.get("retention.events_days")).toBe(3);
+    expect(store.resolve().retention.eventsDays).toBe(3);
+    expect(JSON.parse(readFileSync(configPath, "utf-8")).retention.eventsDays).toBe(3);
+    store.set("retention.events_days", "0");
+    expect(store.get("retention.events_days")).toBe(0);
+    for (const raw of ["-1", "1.5"]) {
+      expect(() => store.set("retention.events_days", raw)).toThrow();
     }
   });
 
@@ -619,6 +812,47 @@ describe("ConfigStore — extended namespaces (User Settings v0)", () => {
     expect(existsSync(configPath)).toBe(false);
   });
 
+  it("reset(key) removes a section it leaves empty", () => {
+    const store = new ConfigStore(configPath);
+    store.set("transport.local_user_guard", "true");
+    store.reset("transport.local_user_guard");
+    const raw = JSON.parse(readFileSync(configPath, "utf8"));
+    expect(raw.transport).toBeUndefined();
+  });
+
+  it("reset(key) keeps the section when a sibling key remains", () => {
+    const store = new ConfigStore(configPath);
+    store.set("transport.local_user_guard", "true");
+    store.set("transport.verify_input_box", "true");
+    store.reset("transport.local_user_guard");
+    const raw = JSON.parse(readFileSync(configPath, "utf8"));
+    expect(raw.transport).toEqual({ verifyInputBox: true });
+  });
+
+  it("reset(key) leaves unrelated unknown keys elsewhere in the file alone", () => {
+    const store = new ConfigStore(configPath);
+    store.set("transport.local_user_guard", "true");
+    const raw1 = JSON.parse(readFileSync(configPath, "utf8"));
+    raw1.someOtherTool = { leaveMeAlone: true };
+    writeFileSync(configPath, JSON.stringify(raw1, null, 2) + "\n");
+    store.reset("transport.local_user_guard");
+    const raw2 = JSON.parse(readFileSync(configPath, "utf8"));
+    expect(raw2.someOtherTool).toEqual({ leaveMeAlone: true });
+    expect(raw2.transport).toBeUndefined();
+  });
+
+  it("reset(key) leaves a pre-existing unrelated empty object alone", () => {
+    const store = new ConfigStore(configPath);
+    store.set("transport.local_user_guard", "true");
+    const raw1 = JSON.parse(readFileSync(configPath, "utf8"));
+    raw1.unrelatedEmptySection = {};
+    writeFileSync(configPath, JSON.stringify(raw1, null, 2) + "\n");
+    store.reset("transport.local_user_guard");
+    const raw2 = JSON.parse(readFileSync(configPath, "utf8"));
+    expect(raw2.unrelatedEmptySection).toEqual({});
+    expect(raw2.transport).toBeUndefined();
+  });
+
   it("resolveAllWithSource returns every valid key with source + default", () => {
     const store = new ConfigStore(configPath);
     const all = store.resolveAllWithSource();
@@ -663,6 +897,13 @@ describe("ConfigStore — extended namespaces (User Settings v0)", () => {
     expect(store.get("ui.preview.default_lines")).toBe(50);
   });
 
+  it("ui.topology_remote_seats defaults off and accepts a boolean", () => {
+    const store = new ConfigStore(configPath);
+    expect(store.get("ui.topology_remote_seats")).toBe(false);
+    store.set("ui.topology_remote_seats", "true");
+    expect(store.get("ui.topology_remote_seats")).toBe(true);
+  });
+
   it("ui.preview.* keys coerce numeric values from set", () => {
     const store = new ConfigStore(configPath);
     store.set("ui.preview.refresh_interval_seconds", "5");
@@ -676,6 +917,99 @@ describe("ConfigStore — extended namespaces (User Settings v0)", () => {
   it("ui.preview.* keys reject non-numeric values", () => {
     const store = new ConfigStore(configPath);
     expect(() => store.set("ui.preview.refresh_interval_seconds", "soon")).toThrow(/expected a number/);
+  });
+
+  // Both keys below were resolved by the daemon store and served by `GET /api/config`,
+  // while `rig config get|set` rejected them as "Unknown config key". Their siblings in
+  // the same families — every other ui.* and retention.* key — were already settable, so
+  // this was drift between the two lockstep lists, not a deliberate CLI-only subset.
+  it("ui.terminal.max_live_terminals is settable, numeric and a positive integer", () => {
+    const store = new ConfigStore(configPath);
+    store.set("ui.terminal.max_live_terminals", "3");
+    expect(store.get("ui.terminal.max_live_terminals")).toBe(3);
+    expect(JSON.parse(readFileSync(configPath, "utf-8")).ui.terminal.maxLiveTerminals).toBe(3);
+    for (const raw of ["0", "-1", "2.5", "2abc"]) {
+      expect(() => store.set("ui.terminal.max_live_terminals", raw), `must reject ${raw}`).toThrow();
+    }
+  });
+
+  it("retention.usage_samples_days defaults to 14 and keeps an integer >= 1", () => {
+    const store = new ConfigStore(configPath);
+    expect(store.resolveWithSource("retention.usage_samples_days"))
+      .toMatchObject({ value: 14, source: "default", defaultValue: 14 });
+    store.set("retention.usage_samples_days", "30");
+    expect(store.get("retention.usage_samples_days")).toBe(30);
+    for (const raw of ["0", "-1", "1.5"]) {
+      expect(() => store.set("retention.usage_samples_days", raw), `must reject ${raw}`).toThrow();
+    }
+  });
+
+  it("both recovered keys honour their OPENRIG_* environment override", () => {
+    const store = new ConfigStore(configPath);
+    process.env.OPENRIG_UI_TERMINAL_MAX_LIVE_TERMINALS = "7";
+    process.env.OPENRIG_RETENTION_USAGE_SAMPLES_DAYS = "9";
+    try {
+      expect(store.resolveWithSource("ui.terminal.max_live_terminals")).toMatchObject({ value: 7, source: "env" });
+      expect(store.resolveWithSource("retention.usage_samples_days")).toMatchObject({ value: 9, source: "env" });
+    } finally {
+      delete process.env.OPENRIG_UI_TERMINAL_MAX_LIVE_TERMINALS;
+      delete process.env.OPENRIG_RETENTION_USAGE_SAMPLES_DAYS;
+    }
+  });
+
+  // Constraint gap (Slice 27 residue): daemon.port had no KEY_CONSTRAINTS
+  // entry, so `rig config set daemon.port 99999` stored 99999 and the next
+  // daemon start died with a raw ERR_SOCKET_BAD_PORT from serve(). The
+  // contract: refuse only ports that cannot be bound, checked on the value
+  // the runtime consumes (the same parseInt the boot path runs), never
+  // against a stricter input format than today's.
+  it("daemon.port refuses ports that cannot be bound; 0 and 65535 stay legal", () => {
+    const store = new ConfigStore(configPath);
+    for (const raw of ["-1", "65536", "99999"]) {
+      expect(() => store.set("daemon.port", raw), `daemon.port must reject ${raw}`)
+        .toThrow(/integer in \[0, 65535\]/);
+    }
+    store.set("daemon.port", "0");
+    expect(store.get("daemon.port")).toBe(0);
+    store.set("daemon.port", "65535");
+    expect(store.get("daemon.port")).toBe(65535);
+  });
+
+  it("daemon.port keeps resolving every input form that resolves today", () => {
+    const store = new ConfigStore(configPath);
+    for (const [raw, expected] of [
+      ["7433abc", 7433],
+      ["7433.5", 7433],
+      ["+7433", 7433],
+      ["1e4", 1],
+      ["0x1D11", 0],
+    ] as const) {
+      store.set("daemon.port", raw);
+      expect(store.get("daemon.port"), `${raw} must keep resolving to ${expected}`).toBe(expected);
+    }
+  });
+
+  it("unusable daemon.port in config.json falls back to the default instead of crashing the daemon at boot", () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      writeFileSync(configPath, JSON.stringify({ daemon: { port: 99999 } }));
+      const store = new ConfigStore(configPath);
+      expect(store.get("daemon.port")).toBe(7433);
+      const warns = stderrSpy.mock.calls.map((c) => String(c[0]));
+      expect(warns.some((w) => w.includes("file value for daemon.port rejected"))).toBe(true);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("a quoted in-range port in config.json keeps its port, and the CLI target and daemon bind agree", () => {
+    writeFileSync(configPath, JSON.stringify({ daemon: { port: "7434" } }));
+    const store = new ConfigStore(configPath);
+    // Used as-is, exactly as before this constraint existed: the CLI's
+    // target stays "7434" and the daemon binds parseInt of the same value.
+    expect(store.get("daemon.port")).toBe("7434");
+    expect(Number.parseInt(String(store.get("daemon.port")), 10)).toBe(7434);
+    expect(store.resolve().daemon.port).toBe("7434");
   });
 
   it("OPENRIG_UI_PREVIEW_* env vars override file values", () => {
@@ -713,6 +1047,24 @@ describe("ConfigStore — extended namespaces (User Settings v0)", () => {
     expect(cfg.ui.preview.refreshIntervalSeconds).toBe(3);
     expect(cfg.ui.preview.maxPins).toBe(4);
     expect(cfg.ui.preview.defaultLines).toBe(50);
+  });
+
+  it("RiggedConfig carries both recovered settings, saved values included", () => {
+    const store = new ConfigStore(configPath);
+    const defaults = store.resolve();
+    expect(defaults.ui.terminal.maxLiveTerminals).toBe(2);
+    expect(defaults.retention.usageSamplesDays).toBe(14);
+    store.set("ui.terminal.max_live_terminals", "5");
+    store.set("retention.usage_samples_days", "21");
+    const saved = store.resolve();
+    expect(saved.ui.terminal.maxLiveTerminals).toBe(5);
+    expect(saved.retention.usageSamplesDays).toBe(21);
+    // `rig config --json` prints exactly this object, so a saved value reaches the
+    // structured output and not only `rig config get`.
+    expect(JSON.parse(JSON.stringify(saved))).toMatchObject({
+      ui: { terminal: { maxLiveTerminals: 5 } },
+      retention: { usageSamplesDays: 21 },
+    });
   });
 
   it("recovery.auto_drive_provider_prompts defaults false and coerces booleans", () => {
@@ -1103,5 +1455,41 @@ describe("ConfigStore — GHOST-STAGE (d): write-canonical + verify-readback", (
     store.set("daemon.port", "9191");
     expect(store.get("daemon.port")).toBe(9191);
     expect((JSON.parse(readFileSync(join(home, "config.json"), "utf-8")) as { daemon?: { port?: number } }).daemon?.port).toBe(9191);
+  });
+});
+
+
+describe("compaction preparation root", () => {
+  let tmpDir: string, configPath: string;
+  let restoreEnv: () => void;
+  beforeEach(() => {
+    restoreEnv = clearEnv();
+    tmpDir = mkdtempSync(join(tmpdir(), "preparation-root-settings-"));
+    configPath = join(tmpDir, "config.json");
+  });
+  afterEach(() => { restoreEnv(); rmSync(tmpDir, { recursive: true, force: true }); });
+  const key = "policies.claude_compaction.preparation_root";
+  it("resolves file/env overrides consistently and resets to workspace-first preparation", () => {
+    const store = new ConfigStore(configPath);
+    const root = join(tmpDir, "maps with spaces");
+    expect(store.resolve().policies.claudeCompaction.preparationRoot).toBe("");
+    store.set(key, root);
+    expect(store.resolveWithSource(key)).toMatchObject({ value: root, source: "file" });
+    expect(new ConfigStore(configPath).resolve().policies.claudeCompaction.preparationRoot).toBe(root);
+    process.env.OPENRIG_POLICIES_CLAUDE_COMPACTION_PREPARATION_ROOT = join(root, "override");
+    try {
+      expect(store.resolveWithSource(key)).toMatchObject({ value: join(root, "override"), source: "env" });
+    } finally { delete process.env.OPENRIG_POLICIES_CLAUDE_COMPACTION_PREPARATION_ROOT; }
+    store.reset(key);
+    expect(store.resolve().policies.claudeCompaction.preparationRoot).toBe("");
+    store.set(key, "");
+    expect(store.resolve().policies.claudeCompaction.preparationRoot).toBe("");
+  });
+  it.each(["relative/maps", "~/maps", " /maps", "/maps\0invalid"])("rejects invalid root %j without replacing valid settings", (value) => {
+    const store = new ConfigStore(configPath);
+    const root = join(tmpDir, "maps");
+    store.set(key, root);
+    expect(() => store.set(key, value)).toThrow(/absolute path/);
+    expect(store.resolve().policies.claudeCompaction.preparationRoot).toBe(root);
   });
 });

@@ -12,6 +12,7 @@ import { streamItemsSchema } from "../src/db/migrations/023_stream_items.js";
 import { queueItemsSchema } from "../src/db/migrations/024_queue_items.js";
 import { SliceIndexer } from "../src/domain/slices/slice-indexer.js";
 import { scopeAuditRoutes } from "../src/routes/scope-audit.js";
+import { isPathInsideRoot } from "../src/domain/cwd-resolution.js";
 
 function buildApp(indexer: SliceIndexer): Hono {
   const app = new Hono();
@@ -84,6 +85,102 @@ describe("GET /api/scope/audit", () => {
     expect(res.status).toBe(404);
   });
 
+  // Content-surfaces discipline: a `?mission=` value must never leave the
+  // configured slices root. scope-approve.ts enforces the same containment for
+  // writes; the audit route must match it for reads. The check is lexical: the
+  // name is joined onto the root the way main already does, and only a target
+  // that lands outside the root is refused.
+  it("refuses a mission that escapes the slices root via .. traversal", async () => {
+    // A real, readable directory ONE level above the missions root, with an
+    // authored node file — exactly what a `../` value would reach.
+    const outside = path.join(cleanupRoot, "outside");
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, "SPEC.md"), "---\nid: OPR.1.2.3\n---\n# outside\n", "utf8");
+    fs.writeFileSync(path.join(outside, "PROGRESS.md"), "# Progress\n", "utf8");
+
+    const res = await app.request("/api/scope/audit?mission=..%2Foutside");
+    expect(res.status).toBe(404);
+    const body = await res.json() as { error?: string; mission?: unknown; slices?: unknown };
+    expect(body.error).toBe("mission_not_found");
+    // No audit data from the escaped directory leaks back.
+    expect(body.slices).toBeUndefined();
+  });
+
+  it("still audits a legitimate mission after the containment guard (no over-blocking)", async () => {
+    const missionDir = path.join(missionsRoot, "legit-mission");
+    fs.mkdirSync(missionDir, { recursive: true });
+    fs.writeFileSync(path.join(missionDir, "SPEC.md"), "---\nid: OPR.1.2.5\n---\n# legit\n", "utf8");
+    fs.writeFileSync(path.join(missionDir, "PROGRESS.md"), "# Progress\n", "utf8");
+
+    const res = await app.request("/api/scope/audit?mission=legit-mission");
+    expect(res.status).toBe(200);
+    const body = await res.json() as { mission: { name: string } };
+    expect(body.mission.name).toBe("legit-mission");
+  });
+
+  // A leading-slash name keeps its current meaning: `path.join(root, "/x")`
+  // stays under the root, so the mission named `x` is still audited.
+  it("keeps today's meaning for a leading-slash name that stays inside the root", async () => {
+    const missionDir = path.join(missionsRoot, "slash-mission");
+    fs.mkdirSync(missionDir, { recursive: true });
+    fs.writeFileSync(path.join(missionDir, "SPEC.md"), "---\nid: OPR.1.2.6\n---\n# slash\n", "utf8");
+    fs.writeFileSync(path.join(missionDir, "PROGRESS.md"), "# Progress\n", "utf8");
+
+    const res = await app.request("/api/scope/audit?mission=%2Fslash-mission");
+    expect(res.status).toBe(200);
+    const body = await res.json() as { mission: { name: string; railStatus: string } };
+    expect(body.mission.railStatus).toBe("present");
+  });
+
+  // A nested name under the root is a legitimate descendant and must audit.
+  it("audits a nested mission name that stays inside the root", async () => {
+    const missionDir = path.join(missionsRoot, "group", "nested-mission");
+    fs.mkdirSync(missionDir, { recursive: true });
+    fs.writeFileSync(path.join(missionDir, "SPEC.md"), "---\nid: OPR.1.2.7\n---\n# nested\n", "utf8");
+    fs.writeFileSync(path.join(missionDir, "PROGRESS.md"), "# Progress\n", "utf8");
+
+    const res = await app.request("/api/scope/audit?mission=group%2Fnested-mission");
+    expect(res.status).toBe(200);
+    const body = await res.json() as { mission: { railStatus: string } };
+    expect(body.mission.railStatus).toBe("present");
+  });
+
+  // A name with an inner `..` that stays inside the root keeps working.
+  it("audits a name whose inner .. still lands inside the root", async () => {
+    const missionDir = path.join(missionsRoot, "keep-mission");
+    fs.mkdirSync(missionDir, { recursive: true });
+    fs.writeFileSync(path.join(missionDir, "SPEC.md"), "---\nid: OPR.1.2.8\n---\n# keep\n", "utf8");
+    fs.writeFileSync(path.join(missionDir, "PROGRESS.md"), "# Progress\n", "utf8");
+
+    const res = await app.request("/api/scope/audit?mission=inner%2F..%2Fkeep-mission");
+    expect(res.status).toBe(200);
+    const body = await res.json() as { mission: { railStatus: string } };
+    expect(body.mission.railStatus).toBe("present");
+  });
+
+  // The separator-safe comparison must not over-refuse when the configured root
+  // is the filesystem root: every child under it is still inside the root. A
+  // naive `startsWith(root + path.sep)` refuses them all, because the root
+  // already ends in a separator. Driving the whole route with the root at `/`
+  // would enumerate the filesystem, so this checks the comparison directly.
+  it("does not over-refuse a child when the root is the filesystem root", () => {
+    const fsRoot = path.parse(process.cwd()).root;
+    expect(isPathInsideRoot(fsRoot, fsRoot)).toBe(true);
+    expect(isPathInsideRoot(path.join(fsRoot, "some", "nested", "child"), fsRoot)).toBe(true);
+    expect(isPathInsideRoot(path.join(fsRoot, "x"), fsRoot)).toBe(true);
+  });
+
+  // The same comparison still refuses a sibling that leaves an ordinary root.
+  it("refuses a sibling outside an ordinary root", () => {
+    const base = path.join(cleanupRoot, "contain-root");
+    const inside = path.join(base, "mission");
+    const sibling = path.join(cleanupRoot, "contain-root-neighbor");
+    expect(isPathInsideRoot(inside, base)).toBe(true);
+    expect(isPathInsideRoot(base, base)).toBe(true);
+    expect(isPathInsideRoot(sibling, base)).toBe(false);
+    expect(isPathInsideRoot(path.join(base, ".."), base)).toBe(false);
+  });
+
   it("uses one notes precedence across current-only, legacy-only, both, and neither", async () => {
     for (const [name, files, missing] of [
       ["current", ["NOTES.md"], false],
@@ -136,6 +233,21 @@ describe("GET /api/scope/audit", () => {
     expect(sl!.severity).toBe("low");
   });
 
+  it("says when another mission has a slice of the same name, which the slice list would hide", async () => {
+    for (const mission of ["alpha", "beta"]) {
+      const sliceDir = path.join(missionsRoot, mission, "slices", "01-login");
+      fs.mkdirSync(sliceDir, { recursive: true });
+      fs.writeFileSync(path.join(missionsRoot, mission, "SPEC.md"), "# mission\n", "utf8");
+      fs.writeFileSync(path.join(sliceDir, "SPEC.md"), "# login\n", "utf8");
+    }
+    fs.mkdirSync(path.join(missionsRoot, "alpha", "slices", "02-only-here"), { recursive: true });
+    const res = await app.request("/api/scope/audit?mission=alpha");
+    const body = await res.json() as { ok: boolean; slices: Array<{ name: string; findings: Array<{ kind: string; severity: string; message: string }> }> };
+    const shared = body.slices.find((s) => s.name === "01-login")!.findings.find((f) => f.kind === "slice_name_shared");
+    expect(shared).toMatchObject({ severity: "low", message: expect.stringContaining("beta") });
+    expect(body.slices.find((s) => s.name === "02-only-here")!.findings.some((f) => f.kind === "slice_name_shared")).toBe(false);
+  });
+
   it("says nothing about a node that has only ONE authored file", async () => {
     const missionDir = path.join(missionsRoot, "single-mission");
     fs.mkdirSync(missionDir, { recursive: true });
@@ -163,6 +275,32 @@ describe("GET /api/scope/audit", () => {
     expect(bare).toBeDefined();
     expect(bare!.findings.some((f) => f.kind === "missing_id")).toBe(true);
     expect(bare!.findings.some((f) => f.kind === "missing_progress")).toBe(true);
+  });
+
+  // Parity with the CLI audit (#1016): `rig scope slice create` numbers past 99, so the route accepts the 100-… and
+  // 1000-… directories it makes. A single-digit or non-numeric name is still flagged.
+  async function directoryNamingFinding(name: string): Promise<boolean> {
+    const missionDir = path.join(missionsRoot, "numbered-mission");
+    fs.mkdirSync(path.join(missionDir, "slices", name), { recursive: true });
+    fs.writeFileSync(path.join(missionDir, "README.md"), "---\nid: OPR.99.0.1\n---\n# numbered\n", "utf8");
+    fs.writeFileSync(path.join(missionDir, "PROGRESS.md"), "# Progress\n", "utf8");
+    fs.writeFileSync(path.join(missionDir, "slices", name, "README.md"),
+      "---\nid: OPR.99.0.1.100\nprogress_rail: readme-only\n---\n# numbered slice\n", "utf8");
+
+    const res = await app.request("/api/scope/audit?mission=numbered-mission");
+    expect(res.status).toBe(200);
+    const body = await res.json() as { slices: Array<{ name: string; findings: Array<{ kind: string; message: string }> }> };
+    const slice = body.slices.find((s) => s.name === name);
+    expect(slice).toBeDefined();
+    return slice!.findings.some((f) => f.kind === "id_convention_violation" && f.message.startsWith("Directory "));
+  }
+
+  it.each(["99-last-two-digit", "100-hundredth", "1000-thousandth"])("accepts the generated slice directory %s", async (name) => {
+    expect(await directoryNamingFinding(name)).toBe(false);
+  });
+
+  it.each(["9-single", "bad-name"])("still flags a malformed slice directory %s", async (name) => {
+    expect(await directoryNamingFinding(name)).toBe(true);
   });
 
   it("orphan_progress: slice with PROGRESS.md but no README.md", async () => {
@@ -427,5 +565,32 @@ describe("qitem-43d69e17 — audit route total queue-scan load contract", () => 
     // Pre-fix on 5c95a8ee: 40 uncached gets x 2 membership scans = 80.
     // Contract: constant.
     expect(scans()).toBeLessThanOrEqual(4);
+  });
+
+  it("#2727 treats an in-place status: done slice as satisfied in dependencyGraph.ready", async () => {
+    const missionDir = path.join(missionsRoot, "inplace-done-mission");
+    fs.mkdirSync(missionDir, { recursive: true });
+    fs.writeFileSync(path.join(missionDir, "SPEC.md"), `---\nid: OPR.99.0.10\n---\n${VALID_MISSION_BRIEF}`, "utf8");
+    fs.writeFileSync(path.join(missionDir, "PROGRESS.md"), "# Progress\n", "utf8");
+    fs.writeFileSync(path.join(missionDir, "NOTES.md"), "# Notes\n", "utf8");
+
+    const s1 = path.join(missionDir, "slices", "01-delivered");
+    fs.mkdirSync(path.join(s1, "proof"), { recursive: true });
+    fs.writeFileSync(path.join(s1, "SPEC.md"), validSliceReadme("---\nid: OPR.99.0.10.1\nstatus: done\n---", "01-delivered"), "utf8");
+    fs.writeFileSync(path.join(s1, "PROGRESS.md"), "# Progress\n", "utf8");
+    fs.writeFileSync(path.join(s1, "proof", "qa.md"), "QA pass\n", "utf8");
+
+    const s2 = path.join(missionDir, "slices", "02-next");
+    fs.mkdirSync(s2, { recursive: true });
+    fs.writeFileSync(path.join(s2, "SPEC.md"), validSliceReadme("---\nid: OPR.99.0.10.2\nstatus: active\ndepends_on: [OPR.99.0.10.1]\n---", "02-next"), "utf8");
+    fs.writeFileSync(path.join(s2, "PROGRESS.md"), "# Progress\n", "utf8");
+
+    const res = await app.request("/api/scope/audit?mission=inplace-done-mission");
+    expect(res.status).toBe(200);
+    const body = await res.json() as {
+      graph: { ready: string[]; waiting: Array<{ slice: string; waitingOn: string[] }> };
+    };
+    expect(body.graph.ready).toEqual(["OPR.99.0.10.2"]);
+    expect(body.graph.waiting).toEqual([]);
   });
 });

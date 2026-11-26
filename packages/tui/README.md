@@ -1,8 +1,8 @@
 # @openrig/tui — mission-control TUI
 
 The explorer / master-detail "k9s for rigs" surface: left Explorer (Topology ·
-Specs · Scopes · Terminals · Needs-You · System, Config and Connections, the
-last three grouped as System; `src/sections.ts`), right content pane, top
+Specs · Scopes · Terminals · Needs-You · System, Config, Connections, Usage,
+Usage across hosts and Cost, the last six grouped as System; `src/sections.ts`), right content pane, top
 command bar, ambient rig-stream footer. OBSERVE / NAVIGATE / DRIVE-STRUCTURE
 only — ACT / PRODUCE / REVIEW-ARTIFACT surfaces live in Studio, not here. One
 runtime dependency (`yaml`); it reads the daemon's EXISTING projections (two renderers, one projection —
@@ -50,6 +50,17 @@ through ONE path. Safe-core grammar: `:<section>` (any of the eight, e.g.
 `tab table|recent|overview|graph|health|topology|configuration|yaml|pulse` ·
 `spec-of <agent>` · `running <spec>`. Keys: arrows + Enter navigate the
 explorer, `F` toggles the footer, `q` quits.
+
+Topology shows this daemon's configured host name beside its identity, for
+example `Mac mini 2 (mac)` after `rig host rename "Mac mini 2"`. Explorer puts
+the identity first (`mac · Mac mini 2`) and shortens only the display name to
+leave room for the identity and reachability suffix. Detail pages retain the
+full display name. Terminal control sequences and Unicode bidirectional
+formatting controls in that name are removed before rendering. Host commands
+continue to use the identity (`host mac`); changing the name preserves the
+current selection and reads, even when it matches a registered remote host.
+When the cleaned name is absent, is the default `localhost`, or matches the identity,
+the identity appears once, as it does on an installation that has not been renamed.
 
 In Scopes, select a mission or use `mission <name>`; with a mission selected, `M`
 collapses its mini-requirements and `N` shows its narrative. Its workflow rows open the

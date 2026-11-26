@@ -1,21 +1,31 @@
 import fs from "node:fs";
 import { randomBytes } from "node:crypto";
 import { Command, InvalidArgumentError } from "commander";
-import { DaemonClient, DaemonConnectionError, DaemonTimeoutError, DaemonResponseError } from "../client.js";
-import { getDaemonStatus, getDaemonUrl , daemonStatusGuard} from "../daemon-lifecycle.js";
+import { DaemonClient, DaemonConnectionError, DaemonTimeoutError, DaemonResponseError, remoteDaemonClient, type DaemonResponse } from "../client.js";
+import { getDaemonStatus, getDaemonUrl , daemonStatusGuard, resolveOriginSelfHostId } from "../daemon-lifecycle.js";
 import { readOpenRigEnv } from "../openrig-compat.js";
-import { sessionRigOf, isHumanSeatSessionRef } from "../session-name.js";
+import { sessionRigOf, isHumanSeatSessionRef, parseSessionName } from "../session-name.js";
 import { realDeps } from "./daemon.js";
 import { enumArg, positiveIntArg } from "../cli-error.js";
 import type { StatusDeps } from "./status.js";
 import { resolveContextRef } from "../context-resolve.js";
 import { shellQuote } from "../cross-host-executor.js";
+import { bearerAuthHeaders, loadHostRegistry, resolveHost, resolveRemoteBearer } from "../host-registry.js";
+import { loadHostBindings } from "../host-bindings.js";
+import { eligibleQueueBindings, ineligibleBindingDetail } from "@openrig/daemon/learned-host-bindings";
+import { CONVERSATION_KEY_TAG_PREFIX, conversationKey, conversationKeyTag } from "@openrig/daemon/conversation-key";
 import { omittedReadField, readView } from "../read-view.js";
+import { buildWriteReceipt, compactOutputEnabled, type ReceiptContext } from "../queue-receipt.js";
+import { TRANSITIONS_SHOWN, compactShow, compactTransitions, showEmptyNotice, transitionsNotice } from "../queue-read-compact.js";
+import { codeResultOf, planItemArtifact, type FileRead, type SharedRoot } from "../queue-artifact.js";
+import { resolveSenderSession } from "../sender-identity.js";
+import { queueExportCommand } from "./queue-export.js";
+import { queueImportCommand, queueStagingCommand } from "./queue-import.js";
 
 /**
  * `rig queue` — coordination primitive L3/inbox/outbox commands (PL-004 Phase A).
  *
- * Backed by `/api/queue`. Operates only via the daemon HTTP API.
+ * Backed by `/api/queue`, except for the local read-only export.
  * Does NOT touch the POC `rigx-queue-proto` filesystem state.
  *
  * Hot-potato strict-rejection is enforced at the daemon; `update --state done`
@@ -30,76 +40,278 @@ export interface DeliveryVerifyDeps {
   now?: () => number;
 }
 
-export interface QueueDeps extends StatusDeps {
-  deliveryVerify?: DeliveryVerifyDeps;
+/** Tags a caller gave for a row, less any `conversation-key:` tag: that key is OpenRig's own record of which conversation
+ *  handed work over (slice 15), which the openrig plugin's hooks read, so only the key this command derives is recorded. A
+ *  given one (another conversation's, copied off a row) is dropped, never refused. */
+function withoutConversationKeys(tags: string[]): string[] {
+  return tags.filter((tag) => !tag.startsWith(CONVERSATION_KEY_TAG_PREFIX));
 }
 
-export interface VerifiedDeliveryResult {
-  outcome: "posted" | "transport-failed" | "never-posted" | "still-pending" | "indeterminate";
-  /** null means no receipt can presently settle connector acceptance. */
-  connectorAccepted: boolean | null;
-  /** A connector receipt can never prove that a person read the message. */
-  humanReadership: "unknown";
-  /** #96: present for a --reply-to update once posted; false = it posted top-level instead. */
-  threaded?: boolean;
+export interface QueueDeps extends StatusDeps {
+  deliveryVerify?: DeliveryVerifyDeps;
+  /** The host registry `--host` resolves against on the verbs that name an existing row; tests give their own. */
+  hostRegistryLoader?: () => ReturnType<typeof loadHostRegistry>;
+  /** The key of the conversation this command runs in (`@openrig/daemon/conversation-key`); tests give their own. */
+  conversationKey?: () => string | null;
+}
+
+interface DeliveryResultBase {
+  /** human: a human-seat or @external address, a row the gateway owns, or a seat the gateway also
+   *  posts to (a registered person with a pane). agent: any other seat. */
+  destinationKind: "agent" | "human";
+  /** Human destinations only. No receipt can prove that a person read the message. */
+  humanReadership?: "unknown";
   detail?: string;
   nextAction: string | null;
+}
+
+/** The gateway (Slack connector) owns delivery; its ledger is the receipt. */
+export interface GatewayDeliveryResult extends DeliveryResultBase {
+  receiptSource: "gateway";
+  /** not-alerted: an ask created without --alert to a person whose Slack subscription is urgent-only, so it's on Steering and the TUI and never sent to Slack. */
+  outcome: "posted" | "transport-failed" | "never-posted" | "still-pending" | "indeterminate" | "not-alerted";
+  /** null means no receipt can presently settle connector acceptance. */
+  connectorAccepted: boolean | null;
+  /** #96: present for a --reply-to update once posted; false = it posted top-level instead. */
+  threaded?: boolean;
+}
+
+/** A terminal wake: the row's lastNudgeResult is the receipt, and a claim is the pickup. */
+export interface TerminalDeliveryResult extends DeliveryResultBase {
+  receiptSource: "terminal";
+  /** The class of wakeResult: verified; delivered-ack-pending; claimed (a claimed row whose wake wasn't confirmed);
+   *  retained:*; failed:*, unroutable:* or awaiting-pickup:* (failed); indeterminate:* or an unrecognised value (indeterminate); none yet
+   *  (still-pending); or no wake requested by --no-nudge (not-requested). */
+  outcome: "verified" | "delivered-ack-pending" | "claimed" | "retained" | "failed" | "indeterminate" | "still-pending" | "not-requested";
+  /** The row's lastNudgeResult as recorded; null before any wake result. */
+  wakeResult: string | null;
+  /** A claim shows the seat took the item; it does not prove the body was read.
+   *  pickup is the daemon's derived pickup receipt state, as the row reports it. */
+  claim: { observed: boolean; claimedAt: string | null; pickup: string | null };
+  /** Present when the gateway may also post this row: a registered person who is also a seat with
+   *  its own pane. The Slack receipt, kept apart from the terminal side; posted is not read. */
+  gateway?: GatewayReceipt;
+}
+
+export type VerifiedDeliveryResult = GatewayDeliveryResult | TerminalDeliveryResult;
+
+export interface DeliveryVerifyTarget {
+  destinationSession?: string;
+  /** false when the create passed --no-nudge: no wake was requested, so none is awaited. */
+  nudge?: boolean;
+}
+
+type QueueRow = Record<string, unknown>;
+
+function stringField(row: QueueRow, key: string): string | null {
+  return typeof row[key] === "string" ? row[key] as string : null;
+}
+
+/** The row's own signals decide who owns delivery: the recorded wake result, then the daemon's
+ *  destination class (present before any wake, e.g. --no-nudge), then a gateway receipt. The
+ *  address pattern is only the fallback for a daemon that reports none of these. A gateway
+ *  receipt beside a terminal signal adds a gateway side (gatewayAlsoPosts); it doesn't replace it. */
+function receiptSourceOf(destination: string | null, row: QueueRow): "gateway" | "terminal" {
+  const wakeResult = stringField(row, "lastNudgeResult");
+  if (wakeResult !== null) return wakeResult.startsWith("gateway-owned:") ? "gateway" : "terminal";
+  const destinationClass = stringField(row, "destinationClass");
+  if (destinationClass !== null) return destinationClass === "gateway-routable" ? "gateway" : "terminal";
+  if (stringField(row, "deliveryOutcome") !== null) return "gateway";
+  return destination !== null && isHumanSeatSessionRef(destination) ? "gateway" : "terminal";
+}
+
+/** A terminal destination the gateway may also post to (a registered person who is also a seat
+ *  with a pane): the row carries the owner notification level the Slack selector keys on, or a
+ *  gateway receipt already exists. */
+function gatewayAlsoPosts(row: QueueRow): boolean {
+  const level = stringField(row, "ownerNotificationLevel");
+  return (level !== null && level !== "RECORD") || stringField(row, "deliveryOutcome") !== null;
+}
+
+/** A terminal destination is a person when the gateway also posts to it or its address is a human seat's. */
+function terminalDestinationKind(destination: string | null, gatewaySide: boolean): "agent" | "human" {
+  return gatewaySide || (destination !== null && isHumanSeatSessionRef(destination)) ? "human" : "agent";
+}
+
+/** The gateway (Slack connector) receipt on the row, in one place for both result shapes. */
+interface GatewayReceipt {
+  outcome: "posted" | "transport-failed" | "never-posted" | "still-pending";
+  connectorAccepted: boolean | null;
+  detail?: string;
+}
+
+function gatewayReceiptOf(row: QueueRow): GatewayReceipt {
+  const outcome = stringField(row, "deliveryOutcome");
+  if (outcome === "posted") return { outcome, connectorAccepted: true };
+  if (outcome === "transport-failed" || outcome === "never-posted") {
+    const detail = stringField(row, "deliveryFailureDetail");
+    return { outcome, connectorAccepted: false, ...(detail ? { detail } : {}) };
+  }
+  return { outcome: "still-pending", connectorAccepted: null };
+}
+
+function terminalWakeOutcome(wakeResult: string | null): TerminalDeliveryResult["outcome"] {
+  if (wakeResult === null) return "still-pending";
+  if (wakeResult === "verified" || wakeResult === "delivered-ack-pending" || wakeResult === "claimed") return wakeResult;
+  if (wakeResult.startsWith("failed:") || wakeResult.startsWith("unroutable:") || wakeResult.startsWith("awaiting-pickup:")) return "failed";
+  if (wakeResult.startsWith("retained:")) return "retained";
+  return "indeterminate";
+}
+
+/** Only these known states mean "not delivered yet, nothing went wrong". An unknown value never gets that label. */
+function isKnownUnconfirmed(wakeResult: string | null, outcome: TerminalDeliveryResult["outcome"]): boolean {
+  if (outcome === "not-requested" || wakeResult === null || wakeResult === "delivered-ack-pending") return true;
+  return wakeResult.startsWith("indeterminate:") || wakeResult.startsWith("retained:") || wakeResult.startsWith("wake-accepted:");
+}
+
+function terminalDeliveryResult(
+  qitemId: string,
+  destination: string | null,
+  row: QueueRow,
+  outcome: TerminalDeliveryResult["outcome"],
+  waitedMs: number | null,
+): TerminalDeliveryResult {
+  const wakeResult = stringField(row, "lastNudgeResult");
+  const claimedAt = stringField(row, "claimedAt");
+  const pickupState = typeof row.pickup === "object" && row.pickup !== null ? stringField(row.pickup as QueueRow, "state") : null;
+  const claim = { observed: claimedAt !== null, claimedAt, pickup: pickupState };
+  const seat = destination ?? "<destination>";
+  const receipt: Record<TerminalDeliveryResult["outcome"], string> = {
+    "verified": "Terminal receipt confirmed: the wake rendered in the destination pane.",
+    "delivered-ack-pending": "Terminal receipt unconfirmed (delivered-ack-pending): the wake was sent, but its render could not be confirmed.",
+    "claimed": "Terminal receipt unconfirmed, but the seat has claimed the item (claimed).",
+    "retained": wakeResult === "retained:draft_aware"
+      ? `The wake is held (${wakeResult}): nothing was typed into the pane. It's tried again when the seat next reports idle while it's still in draft-aware mode, within the wake retry cap; if it's still held past that cap or the unconfirmed window, its sender and the seat's owner are told once. Inspect it with rig seat held-messages ${seat}.`
+      : `The wake is held (${wakeResult}): nothing was typed into the pane. A held create wake is not retried automatically; if it's still held past the unconfirmed window, its sender and the seat's owner are told once. Inspect it with rig seat held-messages ${seat}.`,
+    // A hosted member with no wake trigger: no wake exists to fail, and the work waits to be read.
+    "failed": wakeResult?.startsWith("awaiting-pickup:")
+      ? `No wake is sent (${wakeResult}): the work waits in the member's queue until it reads it.`
+      : `The wake failed (${wakeResult}).`,
+    "indeterminate": wakeResult?.startsWith("wake-accepted:")
+      ? `The member's trigger accepted the ring (${wakeResult}). That isn't pickup: its claim is.`
+      : `Terminal receipt unconfirmed (${wakeResult}).`,
+    "still-pending": waitedMs === null ? "No terminal receipt was recorded before the claim." : `No terminal receipt was recorded within ${waitedMs}ms.`,
+    "not-requested": "No terminal wake was requested (--no-nudge).",
+  };
+  const claimText = claim.observed
+    ? `Claimed at ${claimedAt}${pickupState ? ` (pickup ${pickupState})` : ""}. A claim shows the seat took the item; it does not prove the body was read.`
+    : waitedMs === null ? "No claim observed yet." : `No claim observed within ${waitedMs}ms.`;
+  const gatewaySide = gatewayAlsoPosts(row);
+  const gateway = gatewaySide ? gatewayReceiptOf(row) : null;
+  const slackText = gateway === null ? ""
+    : gateway.outcome === "posted" ? " Slack receipt: posted."
+    : gateway.outcome === "still-pending" ? (waitedMs === null ? " No Slack receipt yet." : ` No Slack receipt within ${waitedMs}ms.`)
+    : ` Slack delivery ${gateway.outcome}${gateway.detail ? `: ${gateway.detail}` : ""}.`;
+  const gatewayFailed = gateway !== null && gateway.connectorAccepted === false;
+  const notFailed = !claim.observed && !gatewayFailed && isKnownUnconfirmed(wakeResult, outcome) ? " This is not a failed handoff." : "";
+  const destinationKind = terminalDestinationKind(destination, gatewaySide);
+  const settled = claim.observed && (gateway === null || gateway.outcome === "posted");
+  return {
+    receiptSource: "terminal",
+    destinationKind,
+    ...(destinationKind === "human" ? { humanReadership: "unknown" as const } : {}),
+    outcome,
+    wakeResult,
+    claim,
+    ...(gateway ? { gateway } : {}),
+    detail: `The qitem is saved. ${receipt[outcome]}${slackText} ${claimText}${notFailed}`,
+    nextAction: settled ? null : outcome === "retained" ? `rig seat held-messages ${seat}` : `rig queue show ${qitemId} --json`,
+  };
+}
+
+/** The receipt could not be read or correlated: say which part is unknown, nothing more. */
+export function unreadableDeliveryResult(
+  qitemId: string | null,
+  destination: string | null,
+  row: QueueRow,
+  reason: string,
+): VerifiedDeliveryResult {
+  const nextAction = qitemId ? `rig queue show ${qitemId} --json` : null;
+  if (receiptSourceOf(destination, row) === "gateway") {
+    return {
+      receiptSource: "gateway",
+      destinationKind: "human",
+      humanReadership: "unknown",
+      outcome: "indeterminate",
+      connectorAccepted: null,
+      detail: reason,
+      nextAction,
+    };
+  }
+  return { ...terminalDeliveryResult(qitemId ?? "", destination, row, "indeterminate", null), detail: reason, nextAction };
 }
 
 export async function waitForDeliveryOutcome(
   client: Pick<DaemonClient, "get">,
   qitemId: string,
   deps: DeliveryVerifyDeps = {},
+  target: DeliveryVerifyTarget = {},
 ): Promise<VerifiedDeliveryResult> {
   const timeoutMs = deps.timeoutMs ?? 30_000;
   const intervalMs = deps.intervalMs ?? 500;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const now = deps.now ?? (() => Date.now());
   const started = now();
+  let row: QueueRow = {};
   for (;;) {
     try {
-      const response = await client.get<Record<string, unknown>>(`/api/queue/${encodeURIComponent(qitemId)}`);
+      const response = await client.get<QueueRow>(`/api/queue/${encodeURIComponent(qitemId)}`);
       if (response.status !== 200) throw new Error(`receipt lookup returned HTTP ${response.status}`);
-      const outcome = response.data.deliveryOutcome;
+      row = response.data ?? {};
+    } catch (error) {
+      return unreadableDeliveryResult(qitemId, target.destinationSession ?? stringField(row, "destinationSession"), row,
+        `delivery receipt could not be read: ${(error as Error).message}`);
+    }
+    const destination = target.destinationSession ?? stringField(row, "destinationSession");
+    const timedOut = now() - started >= timeoutMs;
+    if (receiptSourceOf(destination, row) === "gateway") {
+      const outcome = row.deliveryOutcome;
+      const gateway = { receiptSource: "gateway" as const, destinationKind: "human" as const, humanReadership: "unknown" as const };
+      // An ask placed on Steering without an alert owes no post, so there's no receipt to wait for.
+      if (outcome == null && stringField(row, "ownerNotificationLevel") === "RECORD") {
+        return { ...gateway, outcome: "not-alerted", connectorAccepted: null,
+          detail: "created without --alert, and the person's Slack subscription is urgent-only, so it's not sent there; it's on Steering and the TUI for them", nextAction: null };
+      }
       if (outcome === "posted") {
         // #96: a --reply-to update reports whether it joined the earlier item's thread.
-        const replyTo = typeof response.data.replyTo === "string" ? response.data.replyTo : null;
-        const fallback = typeof response.data.replyToFallback === "string" ? response.data.replyToFallback : null;
+        const replyTo = stringField(row, "replyTo");
+        const fallback = stringField(row, "replyToFallback");
         return {
+          ...gateway,
           outcome,
           connectorAccepted: true,
-          humanReadership: "unknown",
           ...(replyTo ? { threaded: fallback === null } : {}),
           ...(replyTo && fallback ? { detail: `posted as a new top-level message, not in ${replyTo}'s thread: ${fallback}` } : {}),
           nextAction: null,
         };
       }
       if (outcome === "transport-failed" || outcome === "never-posted") {
+        const { detail } = gatewayReceiptOf(row);
+        return { ...gateway, outcome, connectorAccepted: false, ...(detail ? { detail } : {}), nextAction: `rig queue show ${qitemId} --json` };
+      }
+      if (timedOut) {
         return {
-          outcome,
-          connectorAccepted: false,
-          humanReadership: "unknown",
-          detail: typeof response.data.deliveryFailureDetail === "string" ? response.data.deliveryFailureDetail : undefined,
+          ...gateway,
+          outcome: "still-pending",
+          connectorAccepted: null,
+          detail: `no terminal connector receipt within ${timeoutMs}ms; the durable qitem remains intact`,
           nextAction: `rig queue show ${qitemId} --json`,
         };
       }
-    } catch (error) {
-      return {
-        outcome: "indeterminate",
-        connectorAccepted: null,
-        humanReadership: "unknown",
-        detail: `delivery receipt could not be read: ${(error as Error).message}`,
-        nextAction: `rig queue show ${qitemId} --json`,
-      };
-    }
-    if (now() - started >= timeoutMs) {
-      return {
-        outcome: "still-pending",
-        connectorAccepted: null,
-        humanReadership: "unknown",
-        detail: `no terminal connector receipt within ${timeoutMs}ms; the durable qitem remains intact`,
-        nextAction: `rig queue show ${qitemId} --json`,
-      };
+    } else {
+      // --no-nudge requested no wake: there is no terminal receipt to wait for.
+      const wakeResult = stringField(row, "lastNudgeResult");
+      const outcome = target.nudge === false ? "not-requested" : terminalWakeOutcome(wakeResult);
+      // Any recorded wake result (or an existing claim) settles the terminal side: a later pickup
+      // is `rig queue show`'s to report. When the gateway may also post the row, its receipt is
+      // awaited too. Only a missing receipt waits, up to the bound. Nothing here re-sends anything.
+      const gatewaySide = gatewayAlsoPosts(row);
+      const terminalSettled = outcome === "not-requested" || wakeResult !== null || stringField(row, "claimedAt") !== null;
+      const gatewaySettled = !gatewaySide || stringField(row, "deliveryOutcome") !== null;
+      if (terminalSettled && gatewaySettled) {
+        return terminalDeliveryResult(qitemId, destination, row, outcome, null);
+      }
+      if (timedOut) return terminalDeliveryResult(qitemId, destination, row, outcome, timeoutMs);
     }
     await sleep(intervalMs);
   }
@@ -116,8 +328,10 @@ async function withClient<T>(
   // RULING 1ae863d2 — status is 3-state: hard-block ONLY on positive evidence
   // (stopped/stale). UNVERIFIED (timeout/wedged/wrong-home) proceeds to the
   // configured-target request as the authority — never a down assertion.
+  // A running daemon whose health check failed or reported a starved loop is busy, not down: it gets
+  // the request, under the request's own timeout.
   const positiveDown = status.state === "stopped" || status.state === "stale";
-  if (positiveDown || (status.state === "running" && status.healthy === false)) {
+  if (positiveDown) {
     if (!attemptWhenProbeUnconfirmed) {
       // B8-1b: the ONE epistemic-matched guard renders both branches.
       daemonStatusGuard(status);
@@ -142,17 +356,25 @@ async function withClient<T>(
       // render owns the 3-part fact/consequence/action + the io exit (response-integrity
       // contract). One render authority, layered context — never a swallowed exit.
       const where = hostContext ? ` (routing to host '${hostContext}')` : "";
-      console.error(`queue transport failure${where}: ${err.message}`);
+      const what = err instanceof DaemonTimeoutError ? "queue request got no answer in time" : "queue transport failure";
+      console.error(`${what}${where}: ${err.message}`);
       console.error("The write outcome is INDETERMINATE if the request may have reached a daemon — reconcile by ID before any retry.");
     }
     throw err;
   }
 }
 
+/** GET /api/queue/list's page marker (#3572): the limit the daemon applied, and whether more rows matched than it
+ *  returned. null from a daemon that doesn't send it, or without an explicit 0 or 1, which says nothing either way. */
+function queueListPage(headers: Headers | undefined): { limit: number; truncated: boolean } | null {
+  const limit = headers?.get("X-OpenRig-Limit");
+  const truncated = headers?.get("X-OpenRig-Truncated");
+  if (!limit || !/^\d+$/.test(limit) || (truncated !== "0" && truncated !== "1")) return null;
+  return { limit: Number(limit), truncated: truncated === "1" };
+}
+
 function printResult(json: boolean, body: unknown, status: number): void {
-  if (status >= 400 && body && typeof body === "object"
-    && (body as { error?: unknown }).error === "remote_queue_write_failed"
-    && (body as { outcome?: unknown }).outcome === "indeterminate") {
+  if (isIndeterminateRemoteWrite(status, body)) {
     console.error("The write outcome is INDETERMINATE if the request may have reached a daemon — reconcile by ID before any retry.");
   }
   if (json) {
@@ -163,6 +385,355 @@ function printResult(json: boolean, body: unknown, status: number): void {
   if (status >= 400) process.exitCode = status >= 500 ? 2 : 1;
 }
 
+// Priority is matched exactly where it matters (the founder view, attention ranks), so "Critical" would quietly file
+// the row as ordinary work. The daemon stores what it's given, so a documented value is normalized here. Other values
+// are kept as given: `high`, `normal` and `background` are in real use, and the mission view ranks some of them.
+const QUEUE_PRIORITIES = ["routine", "urgent", "critical"];
+function queuePriorityArg(value: string): string {
+  const lower = value.toLowerCase();
+  if (QUEUE_PRIORITIES.includes(lower)) return lower;
+  console.error(`Note: --priority '${value}' is outside the documented choices (${QUEUE_PRIORITIES.join(", ")}); keeping it as given.`);
+  return value;
+}
+
+/** #2276: the daemon's checks of a new row's human-facing fields (missing summary or evidence for a person,
+ *  notification, questions, reply-to). The queue repository raises them before the row's first write, inside the
+ *  create's transaction. A remote host's refusal arrives as remote_queue_write_failed instead, so it isn't one of these. */
+const PRE_WRITE_CREATE_REFUSALS = new Set([
+  "human_route_fields_required", "invalid_human_notification", "invalid_human_questions", "reply_to_requires_update", "reply_to_not_found",
+]);
+
+/** #1642: why a create provably wrote nothing, for the refusals that come before any write: the
+ *  selected daemon refused the forward before contacting another host (its registry was unreadable,
+ *  the host unknown or SSH-declared), refused a local create to a rig it doesn't have, or refused the
+ *  new row's fields while validating it. Any other failure, including a timeout or a remote's error,
+ *  may follow a commit, so it returns null. */
+function provenCreateRefusal(status: number, body: unknown): string | null {
+  if (!body || typeof body !== "object") return null;
+  const { error, failureClass, hostId } = body as { error?: unknown; failureClass?: unknown; hostId?: unknown };
+  if (status === 502 && error === "remote_queue_write_failed"
+    && (failureClass === "unknown-host" || failureClass === "unsupported-transport" || failureClass === "registry")) {
+    return `the daemon refused to forward it to host '${String(hostId)}' (${failureClass}) before contacting that host.`;
+  }
+  if (status === 400 && error === "unknown_destination_rig") {
+    return "the daemon refused it because the destination's rig doesn't exist on that daemon.";
+  }
+  if (status === 400 && typeof error === "string" && PRE_WRITE_CREATE_REFUSALS.has(error)) {
+    return `the daemon refused it before writing anything (${error}).`;
+  }
+  return null;
+}
+
+/** #1642: after the daemon refuses a host token it doesn't know, the substitution this CLI's own
+ *  registry suggests, when it resolves the token (through an entry's declared hostId or a learned
+ *  binding, as `rig send` does) to another entry id. Only a hint: the registry of the daemon this
+ *  command reached may give that id to another host. Nothing is sent again. */
+function hostSubstitutionHint(
+  status: number,
+  body: unknown,
+  rawDestination: string,
+  explicitHost: string | undefined,
+  resolved: { destination: string; hostId?: string },
+  keep = "",
+): string | null {
+  const token = resolved.hostId;
+  const data = body as { error?: unknown; failureClass?: unknown; hostId?: unknown } | null;
+  if (token === undefined || token === "local" || status !== 502 || data?.error !== "remote_queue_write_failed"
+    || data.failureClass !== "unknown-host" || data.hostId !== token) return null;
+  const registry = loadHostRegistry();
+  const match = registry.ok ? resolveHost(registry.registry, token, loadHostBindings().bindings) : undefined;
+  const entryId = match?.ok ? match.host.id : undefined;
+  if (entryId === undefined || entryId === token) return null;
+  const forms = [
+    ...(rawDestination !== resolved.destination ? [`the destination ${shellQuote(`${resolved.destination}@${entryId}`)}`] : []),
+    ...(explicitHost !== undefined ? [`--host ${shellQuote(entryId)}`] : []),
+  ];
+  return `Host '${token}' resolves to '${entryId}' in this CLI's host registry. That doesn't prove '${entryId}' names the same host in the registry of the daemon this command reached, which OPENRIG_URL can select. If it does, send the write again to the same daemon with ${forms.join(" and ")}${keep}.`;
+}
+
+interface WorkChoiceCandidate {
+  qitemId?: string | null;
+  projects?: string[];
+  mission?: string;
+  slice?: string | null;
+  workNodePath?: string | null;
+  unresolved?: string | null;
+}
+
+/** After the plain answer, the candidates the agent must choose between, one line each, so a
+ *  refused current work is never just a count. Prints nothing when the daemon sent no choice
+ *  (current work is settled, nothing is in progress, or the daemon predates the field).
+ *  On stderr, so the answer on stdout still parses as JSON. */
+export function printCurrentWorkChoice(data: unknown): void {
+  const choice = (data as { currentWorkChoice?: { instruction?: string; candidates?: WorkChoiceCandidate[];
+    unknown?: Array<{ qitemId?: string | null; reason?: string }> } } | null)?.currentWorkChoice;
+  if (!choice) return;
+  console.error("");
+  console.error(choice.instruction ?? "OpenRig did not choose your current work.");
+  for (const [index, c] of (choice.candidates ?? []).entries()) {
+    const project = c.projects?.length ? `project ${c.projects.join(", ")}` : "no project tag";
+    const where = c.workNodePath ?? "no folder found";
+    const why = c.unresolved ? ` (${c.unresolved})` : "";
+    console.error(`  ${index + 1}. ${project} · mission ${c.mission ?? "?"} · slice ${c.slice ?? "none"} · ${where}${why} · from row ${c.qitemId ?? "unknown"}`);
+  }
+  for (const u of choice.unknown ?? []) {
+    console.error(`  - row ${u.qitemId ?? "unknown"}: work not named (${u.reason ?? "no reason given"})`);
+  }
+}
+
+/** Slice 15: the receipt context when a write should print its receipt — the
+ *  `output.compact` switch is on and `--full` was not given — else null (today's
+ *  output). Error responses always print whole, whatever this returns. */
+function writeReceipt(full: boolean | undefined, ctx: ReceiptContext): ReceiptContext | null {
+  return !full && compactOutputEnabled() ? ctx : null;
+}
+
+/** A cross-host handoff whose return route couldn't go with the work says so, as a warning beside the result. */
+function warnRouteNotCarried(status: number, data: unknown): void {
+  const advisories = status < 400 ? (data as { advisories?: unknown } | null)?.advisories : undefined;
+  for (const advisory of Array.isArray(advisories) ? advisories as Array<{ code?: unknown; message?: unknown }> : []) {
+    if (advisory.code === "return_route_not_carried" && typeof advisory.message === "string") console.error(`Warning: ${advisory.message}`);
+  }
+}
+
+/** A handoff whose outcome is unknown may have committed. This names the source row to read before any retry, on the
+ *  daemon the command used, and where a successor would be. It never says the handoff failed, names a successor id, or
+ *  asks for the handoff to be repeated. */
+function handoffRecoveryHint(qitemId: string, hostId: string | undefined): string {
+  const remote = remoteHostOf(hostId);
+  return `Before any retry, read source row ${qitemId} at the same endpoint and OPENRIG_HOME: `
+    + `rig queue show ${shellQuote(qitemId)} --full --json. Read its recorded outcome: a handed-off row names its successor`
+    + (remote ? ` on host ${shellQuote(remote)}` : "")
+    + ", or says why it can't. A row that still reads open doesn't show the handoff failed: it may still commit.";
+}
+
+/** A handoff whose answer was lost (no answer in time, a lost connection, or an unreadable response) carries the hint in
+ *  its error. A pre-header disconnect can follow a committed handoff, as it can a create, so the shared renderer must not
+ *  call it undelivered. */
+function withHandoffRecovery(error: unknown, qitemId: string, hostId: string | undefined): unknown {
+  if (!(error instanceof DaemonConnectionError || error instanceof DaemonResponseError)) return error;
+  if (error instanceof DaemonConnectionError) error.writeOutcome = "unknown";
+  error.message += ` ${handoffRecoveryHint(qitemId, hostId)}`;
+  return error;
+}
+
+/** The selected daemon's forward to another host lost the remote's answer: the write was sent and may still commit. */
+function isIndeterminateRemoteWrite(status: number, body: unknown): boolean {
+  return status >= 400 && !!body && typeof body === "object"
+    && (body as { error?: unknown }).error === "remote_queue_write_failed"
+    && (body as { outcome?: unknown }).outcome === "indeterminate";
+}
+
+/** A `--host` id that may name another daemon. Empty and `local` never do; one that
+ *  equals the selected daemon's own host id is settled by {@link settleReceiptHost}. */
+function remoteHostOf(hostId: string | undefined): string | undefined {
+  return hostId && hostId !== "local" ? hostId : undefined;
+}
+
+/** A cross-host queue write waits for the selected daemon's own answer. That daemon gives the remote 10 s
+ *  (`QUEUE_FORWARD_TIMEOUT_MS` in the daemon's routes/queue.ts), so waiting only the client's 5 s default
+ *  turns a slow remote's answer into an unknown outcome. */
+const CROSS_HOST_QUEUE_WRITE_TIMEOUT_MS = 15_000;
+const CLI_HANDOFF_SCOPE_ADVISORY_HEADER = "X-OpenRig-CLI-Handoff-Scope-Advisory";
+
+function crossHostWriteOptions(hostId: string | undefined): { timeoutMs: number } | undefined {
+  return remoteHostOf(hostId) ? { timeoutMs: CROSS_HOST_QUEUE_WRITE_TIMEOUT_MS } : undefined;
+}
+
+/** The daemon returns handoff scope advice only to this CLI diagnostic request; it is not in the write body. */
+function handoffScopeDiagnosticOptions(hostId: string | undefined) {
+  return {
+    ...(crossHostWriteOptions(hostId) ?? {}),
+    headers: { [CLI_HANDOFF_SCOPE_ADVISORY_HEADER]: "1" },
+  };
+}
+
+/** The daemon's own rule (`resolvesToLocalHost`): a `--host` naming the selected
+ *  daemon's selfHostId took the local path, so its receipt must not call the row
+ *  remote. Read only for a receipt; an unreadable id leaves the host unconfirmed. */
+async function settleReceiptHost(client: DaemonClient, receipt: ReceiptContext): Promise<ReceiptContext> {
+  if (!receipt.remoteHost) return receipt;
+  let selfHostId: string | undefined;
+  try {
+    const health = await client.get<{ selfHostId?: unknown }>("/healthz", { timeoutMs: 1_000 });
+    if (health.status === 200 && typeof health.data?.selfHostId === "string" && health.data.selfHostId.trim()) selfHostId = health.data.selfHostId;
+  } catch { /* An unreadable id must not change or fail the write's output. */ }
+  if (selfHostId === receipt.remoteHost) return { ...receipt, remoteHost: undefined };
+  return selfHostId === undefined ? { ...receipt, remoteHostUnconfirmed: true } : receipt;
+}
+
+/** How long the one read-back of a create with an unknown outcome waits for its answer. */
+const CREATE_READ_BACK_TIMEOUT_MS = 10_000;
+
+/** What a create sent, for telling its row from another with the same ID. `claimedSource` is the body's source, which the
+ *  daemon records only when the request carries no sender; `remoteHost` is the host it was sent to with `--host`. */
+interface SentCreate { destinationSession: string; claimedSource: string | undefined; body: string; remoteHost: string | undefined }
+
+/** The daemon's host id: null when it reports none, undefined when it can't be read. */
+async function daemonSelfHostId(client: DaemonClient): Promise<string | null | undefined> {
+  try {
+    const health = await client.get<{ selfHostId?: unknown }>("/healthz", { timeoutMs: 1_000 });
+    if (health.status !== 200) return undefined;
+    return typeof health.data?.selfHostId === "string" && health.data.selfHostId ? health.data.selfHostId : null;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The source the daemon this client reached stores for the create, by its own rules: the sender this client sent, trimmed and
+ *  without a trailing `@<that daemon's host id>` (canonicalSenderSession), or with no sender the body's claimed source, trimmed.
+ *  A forwarded create's source then gains the forwarding daemon's host id (stampSelfHostSuffix), unless its origin was marked
+ *  unknown. Undefined when that host id is needed and can't be read. */
+async function storedSourceOf(client: DaemonClient, sent: SentCreate): Promise<string | undefined> {
+  const { session, originUnknown } = await client.senderIdentity();
+  const source = (session ?? sent.claimedSource)?.trim();
+  if (!source) return undefined;
+  const parts = source.split("@");
+  const canonicalizes = session !== undefined && parts.length === 3 && parts.every(Boolean);
+  const stamps = sent.remoteHost !== undefined && !originUnknown;
+  if (!canonicalizes && !(stamps && parts.length === 2)) return source;
+  const selfId = await daemonSelfHostId(client);
+  if (selfId === undefined) return undefined;
+  const canonical = canonicalizes && parts[2] === selfId ? `${parts[0]}@${parts[1]}` : source;
+  // The daemon forwards only to another host (resolvesToLocalHost): a target naming its own id is a local create, unstamped.
+  const forwarded = stamps && sent.remoteHost !== selfId;
+  return forwarded && selfId && canonical.split("@").length === 2 ? `${canonical}@${selfId}` : canonical;
+}
+
+/** Which field shows a stored row isn't this create, by the rule the daemon applies to a create whose ID already exists
+ *  (the same destination and source, compared exactly), plus the body, which that rule reports as not saved. "unread" when
+ *  the source this create would have can't be established. Null when the row is this create. */
+function notThisCreate(row: Record<string, unknown>, sent: SentCreate, storedSource: string | undefined): "destination" | "unread" | "source" | "body" | null {
+  if (row.destinationSession !== sent.destinationSession) return "destination";
+  if (storedSource === undefined) return "unread";
+  if (row.sourceSession !== storedSource) return "source";
+  if (row.body !== sent.body) return "body";
+  return null;
+}
+
+/** Both reconciliation and --verify read the daemon that holds the row, with its own bearer. */
+async function queueReadTarget(deps: QueueDeps, client: DaemonClient, hostId: string | undefined) {
+  let remote = remoteHostOf(hostId);
+  const requestedRemote = remote;
+  const selfHostId = requestedRemote ? await daemonSelfHostId(client) : undefined;
+  if (remote && selfHostId === remote) remote = undefined;
+  const remoteConfirmed = requestedRemote !== undefined && typeof selfHostId === "string"
+    && selfHostId.trim().length > 0 && selfHostId !== requestedRemote;
+  let reader = client;
+  let options: { timeoutMs: number; headers?: Record<string, string> } = { timeoutMs: CREATE_READ_BACK_TIMEOUT_MS };
+  if (remote) {
+    const registry = loadHostRegistry();
+    const match = registry.ok ? resolveHost(registry.registry, remote, loadHostBindings().bindings) : undefined;
+    if (!match?.ok || match.host.transport !== "http") {
+      const why = match?.ok ? "its entry in this CLI's host registry is SSH, not a daemon URL" : "it isn't in this CLI's host registry";
+      return { error: `from host '${remote}' (${why})` };
+    }
+    const bearer = resolveRemoteBearer(match.host);
+    if (!bearer.ok) return { error: `from host '${remote}' (${bearer.error})` };
+    reader = deps.clientFactory(match.host.url);
+    if (bearer.token) options = { ...options, headers: { Authorization: `Bearer ${bearer.token}` } };
+  }
+  return { reader, options, remote, remoteConfirmed };
+}
+
+/** Where a verb that names an existing row (show, transitions, list, claim, update, block) sends its request with
+ *  `--host`: the remote daemon itself, called by this CLI with the host's bearer, as `send --host` does (#2637). The
+ *  selected daemon has no route that reads another host's queue, and a direct call lets the remote record the actor
+ *  as `<seat>@<rig>@<this host>`, the provenance `send --host` gives. Without `--host`, `local`, or a `--host` naming
+ *  the selected daemon's own host id, the selected daemon, unchanged. Explicit-only: never `rig host select`. */
+interface QueueHostTarget { client: DaemonClient; options: { headers?: Record<string, string>; timeoutMs?: number }; remote?: string }
+
+async function queueHostTarget(deps: QueueDeps, local: DaemonClient, hostId: string | undefined, write: boolean): Promise<QueueHostTarget | { error: string; message: string }> {
+  const remote = remoteHostOf(hostId);
+  if (!remote) return { client: local, options: {} };
+  // A --host naming the selected daemon's own id stays local, as create's does (the daemon's resolvesToLocalHost).
+  if (await daemonSelfHostId(local) === remote) return { client: local, options: {} };
+  const registry = (deps.hostRegistryLoader ?? loadHostRegistry)();
+  if (!registry.ok) return { error: "host_registry_unreadable", message: `--host ${remote}: this CLI's host registry can't be read (${registry.error}).` };
+  // The queue forwarder's rule for learned bindings (one policy): a self-id resolves only through a binding learned at
+  // its entry's current URL, with no recorded conflict, so a stale binding never sends a write to a replaced endpoint.
+  const learned = loadHostBindings();
+  const match = resolveHost(registry.registry, remote, eligibleQueueBindings(registry.registry, learned));
+  if (!match.ok) {
+    const unused = ineligibleBindingDetail(registry.registry, learned, remote);
+    return { error: "unknown_host", message: `--host ${remote}: no such host in this CLI's host registry (see rig host list).${unused ? ` ${unused}` : ""}` };
+  }
+  if (match.host.transport !== "http") return { error: "host_not_http", message: `--host ${remote}: its registry entry is SSH, not a daemon URL; queue verbs need an http host.` };
+  const bearer = resolveRemoteBearer(match.host);
+  if (!bearer.ok) return { error: "host_bearer_unavailable", message: `--host ${remote}: ${bearer.error}` };
+  const client = remoteDaemonClient(deps.clientFactory, match.host.url, await resolveOriginSelfHostId(deps.lifecycleDeps));
+  const headers = bearerAuthHeaders(bearer.token);
+  return {
+    client,
+    options: { ...(Object.keys(headers).length > 0 ? { headers } : {}), ...(write ? { timeoutMs: CROSS_HOST_QUEUE_WRITE_TIMEOUT_MS } : {}) },
+    remote,
+  };
+}
+
+/** The ` --host <id>` a printed follow-up command needs to reach the same row again. */
+function hostFlag(target: QueueHostTarget): string {
+  return target.remote ? ` --host ${shellQuote(target.remote)}` : "";
+}
+
+/** A successful forward isn't a delivery receipt. Never accept a different remote row as this create's receipt. */
+function createReceiptReader(deps: QueueDeps, client: DaemonClient, hostId: string | undefined, qitemId: string, sent: SentCreate): Pick<DaemonClient, "get"> {
+  if (!remoteHostOf(hostId)) return client;
+  let target: ReturnType<typeof queueReadTarget> | undefined;
+  let source: ReturnType<typeof storedSourceOf> | undefined;
+  return {
+    get: async <T>(path: string) => {
+      const selected = await (target ??= queueReadTarget(deps, client, hostId));
+      if ("error" in selected) throw new Error(`receipt could not be read ${selected.error}`);
+      const response = await selected.reader.get<T>(path, selected.options);
+      const row = response.data as Record<string, unknown> | undefined;
+      if (response.status === 200 && (!row || row.qitemId !== qitemId
+        || notThisCreate(row, sent, await (source ??= storedSourceOf(client, sent))) !== null)) {
+        throw new Error("receipt row does not match the created qitem");
+      }
+      return response;
+    },
+  };
+}
+
+/** A create whose answer didn't arrive, or arrived unreadable, may still have committed. Read the row back once by the ID it
+ *  was sent with, from the daemon that holds it. Only this create's row counts; it never sends the create again. */
+async function readBackCreate(deps: QueueDeps, client: DaemonClient, hostId: string | undefined, qitemId: string, sent: SentCreate): Promise<{ row: Record<string, unknown> | null; note: string; remoteConfirmed?: boolean }> {
+  const remote = remoteHostOf(hostId);
+  const where = remote ? ` on host '${remote}'` : "";
+  const target = await queueReadTarget(deps, client, hostId);
+  if ("error" in target) return { row: null, note: `This CLI couldn't read the row back ${target.error}.` };
+  try {
+    const res = await target.reader.get<Record<string, unknown>>(`/api/queue/${encodeURIComponent(qitemId)}`, target.options);
+    if (res.status === 200 && res.data?.qitemId === qitemId) {
+      const differs = notThisCreate(res.data, sent, await storedSourceOf(client, sent));
+      if (differs === "unread") {
+        return { row: null, note: `Row ${qitemId}${where} exists, but this CLI couldn't read this daemon's host id to tell whether its source is this create's, so the outcome is still unknown.` };
+      }
+      if (differs) {
+        return { row: null, note: `Row ${qitemId}${where} exists but isn't this create (its ${differs} differs), so the outcome is still unknown. Don't reuse this ID for other work.` };
+      }
+      return { row: res.data, note: `The create committed after all: row ${qitemId}${where} (read back by its ID).`,
+        remoteConfirmed: target.remoteConfirmed };
+    }
+    if (res.status === 404) return { row: null, note: `No row ${qitemId}${where} yet (read back once by its ID); it may still commit.` };
+    return { row: null, note: `Reading row ${qitemId}${where} back answered ${res.status}, so the outcome is still unknown.` };
+  } catch (err) {
+    return { row: null, note: `Reading row ${qitemId}${where} back didn't answer (${(err as Error).message}), so the outcome is still unknown.` };
+  }
+}
+
+async function printWriteResult(client: DaemonClient, json: boolean, body: unknown, status: number, receipt: ReceiptContext | null, hostUsed = false): Promise<void> {
+  // A direct --host write already settled its host when it chose the target: its receipt keeps the host it used.
+  // create and handoff, which the selected daemon forwards, are settled here as before.
+  const settled = receipt && status < 400 ? (hostUsed ? receipt : await settleReceiptHost(client, receipt)) : null;
+  const projected = settled ? buildWriteReceipt(body, settled) : null;
+  if (!projected) {
+    printResult(json, body, status);
+    return;
+  }
+  console.log(json ? JSON.stringify(projected.json) : projected.text);
+}
+
 // Recovery belongs to the selected daemon's reply; never infer a host from an ID.
 async function printQueueItemResult(
   client: DaemonClient,
@@ -170,6 +741,8 @@ async function printQueueItemResult(
   json: boolean,
   body: unknown,
   status: number,
+  receipt: ReceiptContext | null = null,
+  remoteHost?: string,
 ): Promise<void> {
   if (status >= 400 && body && typeof body === "object"
     && (body as { error?: unknown }).error === "qitem_not_found") {
@@ -184,10 +757,225 @@ async function printQueueItemResult(
     body = {
       ...body,
       hint: `Queue item ${JSON.stringify(qitemId)} was not found on ${daemon}.\n`
-        + `If it came from another host, run rig host list; replace <daemon-url> with its registered daemon URL and run: OPENRIG_URL='<daemon-url>' rig queue show ${shellQuote(qitemId)} --full --json`,
+        + `If it came from another host, run rig host list; replace <daemon-url> with its registered daemon URL and run: OPENRIG_URL='<daemon-url>' rig queue show ${shellQuote(qitemId)} --full --json`
+        + (remoteHost ? "" : `\nOr name that host: rig queue show ${shellQuote(qitemId)} --host <host-id> --full --json`),
     };
   }
-  printResult(json, body, status);
+  await printWriteResult(client, json, body, status, receipt && remoteHost ? { ...receipt, remoteHost } : receipt, remoteHost !== undefined);
+}
+
+const UPDATE_READ_BACK_FIELDS = [
+  "state", "closureReason", "closureTarget", "closureRequiredAt", "resolution", "blockedOn", "summary", "evidenceRef",
+] as const;
+
+interface QueueTransitionReadBack {
+  transitionId: number;
+  transitionNote: string | null;
+  actorSession: string;
+}
+
+function queueUpdateFieldMatches(field: (typeof UPDATE_READ_BACK_FIELDS)[number], requested: unknown, actual: unknown): boolean {
+  if (field === "closureRequiredAt" && typeof requested === "string" && typeof actual === "string") {
+    const requestedTime = Date.parse(requested);
+    const actualTime = Date.parse(actual);
+    return Number.isFinite(requestedTime) && Number.isFinite(actualTime) && requestedTime === actualTime;
+  }
+  if (field === "resolution" && typeof requested === "string" && typeof actual === "string") {
+    return actual === requested || actual.endsWith(`\n${requested}`);
+  }
+  return Object.is(actual, requested);
+}
+
+/** Whether a recorded note is this update's note as the daemon records it (QueueRepository.update): as written, or with
+ *  only what the daemon adds for this request, the reopen prefix, the summary suffix, or a revised deadline's receipt
+ *  naming the new time and the accepting actor. Another writer's note that merely starts the same way isn't. */
+function noteRecordedAs(actual: string, note: string, requested: Record<string, unknown>, actor: string, deadline: unknown): boolean {
+  const bases = [note];
+  if (requested.reopen === true) bases.push(`reopen acknowledged: ${note}`);
+  if (typeof requested.summary === "string" && requested.summary.trim() && !note.includes("(summary updated)")) {
+    bases.push(`${note} (summary updated)`);
+  }
+  if (requested.closureRequiredAt === undefined) return bases.includes(actual);
+  // The receipt's earlier time isn't known here: it's one line between the fixed parts.
+  const tail = ` -> ${String(deadline)}; accepted by ${actor}`;
+  return bases.some((base) => {
+    const head = `${base}\nclosure deadline re-estimated: `;
+    if (!actual.startsWith(head) || !actual.endsWith(tail) || actual.length <= head.length + tail.length) return false;
+    return !actual.slice(head.length, actual.length - tail.length).includes("\n");
+  });
+}
+
+/** Who the daemon records as this write's actor: the sender header as sent, else the actor the body declares. Empty when
+ *  neither is known. A daemon drops a sender's host suffix only when it's that daemon's own id, so the bare form is
+ *  this write's only where the selected daemon answers with that id; nothing else (an absent --host included) shows it. */
+async function updateActors(client: Pick<DaemonClient, "senderIdentity" | "get">, bodyActor: unknown): Promise<string[]> {
+  const { session } = await client.senderIdentity();
+  if (session) {
+    const parts = session.split("@");
+    if (parts.length !== 3) return [session];
+    let daemonId: unknown;
+    try {
+      daemonId = (await client.get<{ selfHostId?: unknown }>("/healthz", { timeoutMs: 1_000 })).data?.selfHostId;
+    } catch { /* Unanswered: the suffix stays unproven, so only the full actor counts. */ }
+    return daemonId === parts[2] ? [session, `${parts[0]}@${parts[1]}`] : [session];
+  }
+  return typeof bodyActor === "string" && bodyActor.trim() ? [bodyActor.trim()] : [];
+}
+
+async function readQueueTransitionCursor(
+  client: Pick<DaemonClient, "get">,
+  qitemId: string,
+  options: { headers?: Record<string, string>; timeoutMs?: number },
+): Promise<{ ok: true; latestTransitionId: number } | { ok: false; detail: string }> {
+  let response: DaemonResponse<unknown>;
+  try {
+    response = await client.get<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/transitions`, options);
+  } catch (error) {
+    return { ok: false, detail: `canonical transition preflight did not answer: ${(error as Error).message}` };
+  }
+  if (response.status !== 200 || !Array.isArray(response.data)) {
+    return { ok: false, detail: `canonical transition preflight returned HTTP ${response.status} without a transition list` };
+  }
+  const transitionIds = response.data.flatMap((entry) => {
+    if (!entry || typeof entry !== "object") return [];
+    const transitionId = (entry as { transitionId?: unknown }).transitionId;
+    return typeof transitionId === "number" && Number.isSafeInteger(transitionId) ? [transitionId] : [];
+  });
+  if (transitionIds.length !== response.data.length) {
+    return { ok: false, detail: "canonical transition preflight returned a malformed transition list" };
+  }
+  return { ok: true, latestTransitionId: Math.max(0, ...transitionIds) };
+}
+
+async function readBackQueueUpdate(
+  client: Pick<DaemonClient, "get">,
+  qitemId: string,
+  requested: Record<string, unknown>,
+  options: { headers?: Record<string, string>; timeoutMs?: number },
+  transitionFloor?: number,
+  /** Why the transition cursor wasn't taken before the write, when it wasn't. */
+  floorUnknown?: string,
+  /** Who the daemon records as this write's actor (updateActors). */
+  actors: string[] = [],
+): Promise<{ ok: true; row: Record<string, unknown> } | { ok: false; detail: string; noteUnproven?: true }> {
+  let response: DaemonResponse<Record<string, unknown>>;
+  try {
+    response = await client.get<Record<string, unknown>>(`/api/queue/${encodeURIComponent(qitemId)}`, options);
+  } catch (error) {
+    return { ok: false, detail: `canonical read-back did not answer: ${(error as Error).message}` };
+  }
+  if (response.status !== 200 || !response.data || response.data.qitemId !== qitemId) {
+    return { ok: false, detail: `canonical read-back returned HTTP ${response.status} without row ${qitemId}` };
+  }
+  const mismatches = UPDATE_READ_BACK_FIELDS.flatMap((field) => {
+    if (requested[field] === undefined) return [];
+    // A blank summary or evidence ref isn't stored (the daemon says so, summary_not_stored or evidence_ref_not_stored,
+    // and keeps the row's own), so there's nothing of it to read back.
+    if ((field === "summary" || field === "evidenceRef") && typeof requested[field] === "string" && !(requested[field] as string).trim()) return [];
+    return queueUpdateFieldMatches(field, requested[field], response.data[field])
+      ? []
+      : [`${field}: requested ${JSON.stringify(requested[field])}, read ${JSON.stringify(response.data[field])}`];
+  });
+  if (mismatches.length > 0) {
+    return { ok: false, detail: `canonical read-back mismatch (${mismatches.join("; ")})` };
+  }
+
+  const requestedNote = typeof requested.transitionNote === "string" && requested.transitionNote.trim().length > 0
+    ? requested.transitionNote
+    : null;
+  if (requestedNote !== null) {
+    // Without the cursor, a transition carrying the note can't be shown to be this write's: never accept an older one.
+    if (transitionFloor === undefined) {
+      return { ok: false, noteUnproven: true, detail: `the requested note can't be shown to be new, because the transition read before the write failed (${floorUnknown ?? "no cursor"})` };
+    }
+    if (actors.length === 0) {
+      return { ok: false, noteUnproven: true, detail: "the requested note can't be tied to this write, because the actor it was sent as isn't known" };
+    }
+    let transitions: DaemonResponse<unknown>;
+    try {
+      transitions = await client.get<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/transitions`, options);
+    } catch (error) {
+      return { ok: false, noteUnproven: true, detail: `canonical transition read-back did not answer: ${(error as Error).message}` };
+    }
+    if (transitions.status !== 200 || !Array.isArray(transitions.data)) {
+      return { ok: false, noteUnproven: true, detail: `canonical transition read-back returned HTTP ${transitions.status} without a transition list` };
+    }
+    const matching = transitions.data.some((entry) => {
+      if (!entry || typeof entry !== "object") return false;
+      const transition = entry as Partial<QueueTransitionReadBack>;
+      return typeof transition.transitionId === "number"
+        && transition.transitionId > transitionFloor
+        && typeof transition.transitionNote === "string"
+        && typeof transition.actorSession === "string"
+        && actors.includes(transition.actorSession)
+        && noteRecordedAs(transition.transitionNote, requestedNote, requested, transition.actorSession, response.data.closureRequiredAt);
+    });
+    if (!matching) {
+      return {
+        ok: false,
+        noteUnproven: true,
+        detail: `no newer canonical transition carried requested note ${JSON.stringify(requestedNote)} from ${actors.map((actor) => JSON.stringify(actor)).join(" or ")}`,
+      };
+    }
+  }
+  return { ok: true, row: response.data };
+}
+
+/** `noteUnproven`: the requested note wasn't shown to be recorded. A note is in the row's transition log, which `queue show`
+ *  doesn't print, so the action names that too. */
+function emitQueueUpdateReadBackFailure(qitemId: string, detail: string, json: boolean, noteUnproven = false): void {
+  const message = `Queue update response was not accepted as success: ${detail}. The write may have committed, but its requested state was not verified.`;
+  const action = `Run rig queue show ${shellQuote(qitemId)} --full --json against the same daemon before retrying`
+    + (noteUnproven ? `, and rig queue transitions ${shellQuote(qitemId)} --full --json to see whether the note was recorded.` : ".");
+  if (json) console.error(JSON.stringify({ error: "queue_update_readback_failed", message, action }));
+  else console.error(`${message}\n${action}`);
+  process.exitCode = 1;
+}
+
+const HANDOFF_SCOPE_ADVISORY_CODES = new Set([
+  "unresolved_scope",
+  "ambiguous_scope",
+  "empty_scope",
+  "conflicting_scope",
+  "scope_check_unavailable",
+  "scope_check_skipped",
+]);
+
+/** Handoff diagnostics and the opt-in acknowledgement stay out of stdout projections. */
+function emitHandoffScopeAdvisories(status: number, body: unknown): unknown {
+  if (status >= 400) return body;
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    console.error("Warning: this daemon didn't report a scope check; it may be older than this CLI");
+    return body;
+  }
+  const record = body as Record<string, unknown>;
+  const acknowledged = record.handoffScopeCheckAcknowledged === true;
+  const projected = { ...record };
+  delete projected.handoffScopeCheckAcknowledged;
+  if (!acknowledged) console.error("Warning: this daemon didn't report a scope check; it may be older than this CLI");
+  if (!Array.isArray(record.advisories)) return projected;
+
+  const retained: unknown[] = [];
+  let emitted = false;
+  for (const value of record.advisories) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      retained.push(value);
+      continue;
+    }
+    const advisory = value as { code?: unknown; message?: unknown };
+    if (!HANDOFF_SCOPE_ADVISORY_CODES.has(String(advisory.code)) || typeof advisory.message !== "string") {
+      retained.push(value);
+      continue;
+    }
+    emitted = true;
+    if (advisory.code === "scope_check_skipped") console.error(`Note: ${advisory.message}`);
+    else console.error(`Warning: ${advisory.message}`);
+  }
+  if (!emitted) return projected;
+
+  if (retained.length > 0) projected.advisories = retained;
+  else delete projected.advisories;
+  return projected;
 }
 
 // OPR.0.4.3.03 — `rig queue show` body preview.
@@ -197,6 +985,18 @@ async function printQueueItemResult(
 // body. The bound is a CODE-POINT count (delivery-set, adjustable) per
 // IMPL-SPEC §2.3-2.4.
 const SHOW_BODY_PREVIEW_MAX_CODEPOINTS = 512;
+
+// A misspelled state ("in_progress") would otherwise read as an empty queue, not as a mistake: the list route matches
+// names as given. Each name is checked and trimmed the way the route trims it. This warns rather than refuses, so the
+// CLI's copy of the list doesn't stop it working with a newer daemon that knows more states.
+const QUEUE_STATE_NAMES = ["pending", "in-progress", "done", "blocked", "failed", "denied", "canceled", "handed-off"];
+function warnIfUnknownStates(value?: string): void {
+  const names = (value ?? "").split(",").map((name) => name.trim()).filter(Boolean);
+  const unknown = names.filter((name) => !QUEUE_STATE_NAMES.includes(name));
+  if (unknown.length === 0) return;
+  const effect = unknown.length === names.length ? " Nothing is filed under these names, so an empty result doesn't mean an empty queue." : "";
+  console.error(`Warning: unrecognized --state '${unknown.join("', '")}'. Supported states: ${QUEUE_STATE_NAMES.join(", ")}.${effect}`);
+}
 
 // Commander option parser. InvalidArgumentError (like positiveIntArg/enumArg) is what Commander
 // renders as its usual "option ... argument ... is invalid" error; a plain Error would escape parse.
@@ -237,6 +1037,12 @@ export function previewBody(
     bodyBytes,
     bodyTruncated: true,
   };
+}
+
+// Mark the cut inside the body so readers that discard metadata or stderr can request the complete brief.
+// Counts use code points, like the preview.
+export function previewCutMarker(qitemId: string, shownCodePoints: number, totalCodePoints: number): string {
+  return `…[cut at ${shownCodePoints} of ${totalCodePoints} chars; rig queue show ${shellQuote(qitemId)} --full]`;
 }
 
 function isRecordWithStringBody(v: unknown): v is Record<string, unknown> & { body: string } {
@@ -338,6 +1144,10 @@ function requireNonEmptyResolvedBody(body: string, source: string): string {
   throw err;
 }
 
+/** The states that close a row; `rig queue update --resolution` needs one of them. */
+const CLOSING_STATES = ["done", "canceled", "denied", "failed", "handed-off"];
+const CLOSING_STATES_PHRASE = "done, canceled, denied, failed or handed-off";
+
 function emitBodyResolveError(err: Error & { fact?: string; consequence?: string; action?: string }, json: boolean): void {
   if (json) {
     console.log(JSON.stringify({ ok: false, error: { fact: err.fact ?? err.message, consequence: err.consequence ?? "", action: err.action ?? "" } }, null, 2));
@@ -348,12 +1158,73 @@ function emitBodyResolveError(err: Error & { fact?: string; consequence?: string
 }
 
 function resolveCurrentSession(explicit: string | undefined, optionName: string): string | undefined {
-  const session = explicit ?? readOpenRigEnv("OPENRIG_SESSION_NAME", "RIGGED_SESSION_NAME");
+  const session = explicit ?? resolveSenderSession();
   if (session) return session;
 
-  console.error(`--${optionName} is required when OPENRIG_SESSION_NAME is not set`);
+  console.error(`--${optionName} is required when OPENRIG_SESSION_NAME is not set and reconciled tmux pane metadata does not resolve a session`);
   process.exitCode = 1;
   return undefined;
+}
+
+/** For a verb whose actor is the seat's own identity (the X-OpenRig-Session header the CLI sets from managed identity),
+ *  where the named flag is deprecated and ignored: the error names what actually sets the actor, never the flag. */
+function requireSeatSession(ignoredFlag: string): string | undefined {
+  const session = resolveSenderSession();
+  if (session) return session;
+
+  console.error(`OPENRIG_SESSION_NAME is not set, so there's no seat to act as, and reconciled tmux pane metadata does not resolve one. Run this from a managed seat, or set ` +
+    `OPENRIG_SESSION_NAME to the seat's session name (for example dev-impl@my-rig). --${ignoredFlag} is ignored: the ` +
+    "actor is the seat's own identity.");
+  process.exitCode = 1;
+  return undefined;
+}
+
+/** The flags `rig queue update` takes that write more than a note. `--source` records a note only (#2866). */
+const UPDATE_STATE_WRITE_FLAGS = [
+  ["state", "--state"], ["reopen", "--reopen"], ["closureReason", "--closure-reason"], ["closureTarget", "--closure-target"],
+  ["closureRequiredAt", "--closure-required-at"], ["resolution", "--resolution"], ["blockedOn", "--blocked-on"],
+  ["wakeWatchdog", "--wake-watchdog"], ["wakeAfter", "--wake-after"], ["summary", "--summary"], ["evidenceRef", "--evidence-ref"],
+] as const;
+
+/**
+ * #2866: who appends a `rig queue update` note. Inside a managed seat it is the seat (the X-OpenRig-Session header the
+ * DaemonClient stamps), whatever --source says. Outside one, a routine can name itself with --source <name>@external:
+ * it rides the body as the declared actor, which the daemon records as claimed:v1 because no header names a seat, so
+ * the note is attributed to an external actor and never to a seat, and OPENRIG_SESSION_NAME is never forged. The
+ * external path records a note only, on the local daemon (the caller refuses a --host that resolves to another host).
+ * Returns the body actor to send (undefined = the header decides), or false after printing why nothing was sent.
+ */
+function resolveUpdateActor(source: string | undefined, opts: Record<string, unknown>): { actorSession?: string } | false {
+  const refuse = (message: string): false => { console.error(message); process.exitCode = 1; return false; };
+  // The same resolver the DaemonClient header uses, so the preflight and transport can never disagree.
+  const seat = resolveSenderSession();
+  if (source !== undefined) {
+    const trimmed = source.trim();
+    if (parseSessionName(trimmed).kind !== "external") {
+      return refuse(`--source must be <name>@external (got '${source}'): it names a routine outside any seat, never a seat. Nothing was sent.`);
+    }
+    const writes = UPDATE_STATE_WRITE_FLAGS.filter(([key]) => opts[key] !== undefined).map(([, flag]) => flag);
+    if (opts.note === undefined || writes.length > 0) {
+      return refuse(`--source records a note only: pass --note and nothing else that writes${writes.length > 0 ? ` (got ${writes.join(", ")})` : ""}. ` +
+        "Changing a row needs a seat. Nothing was sent.");
+    }
+    if (seat) {
+      process.stderr.write(`warning: --source ${trimmed} is ignored: this runs in the seat ${seat}, which is the note's actor.\n`);
+      return {};
+    }
+    return { actorSession: trimmed };
+  }
+  if (seat) return {};
+  const noteOnly = opts.note !== undefined && UPDATE_STATE_WRITE_FLAGS.every(([key]) => opts[key] === undefined);
+  return refuse(noteOnly
+    ? "notes need a seat; an external routine can pass --source <name>@external. OPENRIG_SESSION_NAME is not set and reconciled " +
+      "tmux pane metadata does not resolve a seat: run this from a managed seat, or add --source <name>@external to record the note as " +
+      "that external routine (claimed, never a seat). --actor is ignored: the actor is the seat's own identity."
+    : "OPENRIG_SESSION_NAME is not set, so there's no seat to act as, and reconciled tmux pane metadata does not resolve one. Run this from a managed seat, or set " +
+      "OPENRIG_SESSION_NAME to the seat's session name (for example dev-impl@my-rig). --actor is ignored: the actor is " +
+      "the seat's own identity. Changing a row needs a seat, and notes need a seat; an external routine can pass " +
+      "--source <name>@external for a note only. A person answering an ask addressed to them (a host pairing approval, " +
+      "say) does it in the TUI (rig tui, then attention) or in Steering, not with this command.");
 }
 
 function extractRigName(sessionName: string): string | undefined {
@@ -432,11 +1303,27 @@ function emitHostResolutionError(res: { error: string; message: string }, json: 
   process.exitCode = 1;
 }
 
+/** Emit a local queue-list filter error without printing rows returned by a daemon that ignored it. */
+function emitQueueListFilterError(res: { error: string; message: string }, json: boolean): void {
+  if (json) {
+    console.log(JSON.stringify(res));
+  } else {
+    console.error(res.message);
+  }
+  process.exitCode = 1;
+}
+
 const QUEUE_HOST_OPTION_HELP =
   "OPR.0.4.6.MH3: route this queue write to a REGISTERED remote host (see rig host ls). EXPLICIT-ONLY — queue verbs never follow the persisted 'rig host select' selection. Equivalent to the host-qualified destination form member@rig@<host>.";
 
+const QUEUE_HOST_ROW_OPTION_HELP =
+  "#2637: read or act on a row held by a REGISTERED remote host (see rig host ls). This CLI calls that host's daemon directly with its bearer, as send --host does; a write is recorded there as <seat>@<rig>@<this host>. EXPLICIT-ONLY — queue verbs never follow the persisted 'rig host select' selection. A blocker, watchdog or row id given with it must exist on that host.";
+
 export function queueCommand(depsOverride?: QueueDeps): Command {
   const cmd = new Command("queue").description("Coordination L3 — owned-work queue + inbox/outbox");
+  cmd.addCommand(queueExportCommand());
+  cmd.addCommand(queueImportCommand());
+  cmd.addCommand(queueStagingCommand());
   const getDeps = (): QueueDeps => depsOverride ?? {
     lifecycleDeps: realDeps(),
     clientFactory: (url: string) => new DaemonClient(url),
@@ -453,21 +1340,24 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
     .option("--mission <id>", "First-class mission scope; translated to a mission:<id> tag (composes with --tags)")
     .option("--slice <id>", "First-class slice scope; translated to a slice:<id> tag (composes with --tags)")
     .option("--gate <role>", "OPR.0.4.3.16: mark this as a gate qitem; translated to a gate:<role> tag (role e.g. guard | spec-review | pm-lead | qa | human). The idle-gate watchdog reads this predicate. Composes with --tags.")
-    .option("--priority <priority>", "Priority: routine | urgent | critical", "routine")
+    .option("--priority <priority>", "Priority: routine | urgent | critical", queuePriorityArg, "routine")
     .option("--tier <tier>", "Tier (e.g. fast, routine, deep, critical) — drives SLA")
     .option("--tags <tags>", "Comma-separated tags (composes with --mission and --slice)")
     .option("--expires-at <iso>", "ISO timestamp at which the qitem expires")
     .option("--id <qitemId>", "Retry identity: reuse for the same create after an unknown outcome; otherwise generated and printed before sending")
     .option("--target-repo <name>", "PL-007: typed repo scope (must match a repo in the source rig's RigSpec.workspace.repos[])")
-    .option("--summary <text>", "Short human-readable subject, shown in the needs-you view. For a human destination, --body-file is the complete decision brief or update; keep technical continuation in the owning agent row and evidence.")
+    .option("--summary <text>", "Short human-readable subject of the row, shown on every surface that lists it (RECENT, the story, the needs-you view). Say what the work is and why it needs this seat. For a human destination, --body-file is the complete decision brief or update; keep technical continuation in the owning agent row and evidence.")
     .option("--human-intent <intent>", "decision (default) or update: a quiet informational delivery, never an approval request")
+    .option("--alert", "For an ask to a person that's urgent: something only they can do, or an approval whose wait costs now. It stands out in Slack (an interrupt with a mention). Without it the ask still posts to Slack for a person on the default Slack subscription (every-ask), and waits on Steering and the TUI for one on urgent-only")
     .option("--human-detail-file <path>", "One explicitly authored supplemental thread reply; keep the complete action/options in --body-file")
     .option("--reply-to <qitemId>", "Post this update into an earlier qitem's Slack thread (requires --human-intent update; posts as a new top-level message instead if that thread can't be used, e.g. it is missing or still has an open human decision; --verify reports why)")
     .option("--human-questions-file <path>", "#193: JSON array of 1-4 questions for a decision, each {id, question, options: [{id, label, recommended?}]} with 2-4 options; Slack shows them as buttons")
     .option("--evidence-ref <path>", "OPR.0.4.4.19 FR-5: pointer to the durable artifact a human judges (e.g. a PROOF.md path). Required by the daemon when the item is human-routed; optional otherwise.")
     .option("--host <id>", QUEUE_HOST_OPTION_HELP)
+    .option("--return-route <route>", "For work a person answers from their own conversation: auto (OpenRig issues this conversation an address and prints it; use it from then on), self (this session's own address, for a session that joined), or an address you were given. The work carries it through handoffs, and a seat's prompt that isn't a choice dialog, and stuck steps, are sent to that address as tasks, ahead of the person's Slack connection, for this work only. Choice prompts and a route on another host keep their usual path; the conversation sees a task on its next turn. Without it, nothing changes")
     .option("--no-nudge", "Suppress the default destination nudge (cold-queue)")
-    .option("--verify", "Boundedly wait for the existing gateway delivery receipt after persistence; never retries the create and never claims human readership")
+    .option("--verify", "Boundedly wait after persistence for the existing receipts: the gateway receipt for a person, or the wake result and any claim already present for a seat, plus the gateway receipt when the gateway may also post to that seat (a registered person with a pane; eligible to post, not guaranteed). Never retries the create or the wake, and never claims the message was read")
+    .option("--full", "Print the whole response row(s) as today, even when output.compact is on (the receipt's waiting keeps only blocker and nextBackstop)")
     .option("--json", "JSON output for agents")
     .action(async (opts: {
       source?: string;
@@ -485,15 +1375,18 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
       id?: string;
       targetRepo?: string;
       humanIntent?: string;
+      alert?: boolean;
       humanDetailFile?: string;
       replyTo?: string;
       humanQuestionsFile?: string;
       summary?: string;
       evidenceRef?: string;
       host?: string;
+      returnRoute?: string;
       nudge?: boolean;
       verify?: boolean;
       json?: boolean;
+      full?: boolean;
     }) => {
       // OPR.0.4.6.MH3 D-3 (C3): resolve the host qualifier at the CLI edge —
       // the 3-part form never leaves the CLI; the request carries the 2-part
@@ -557,14 +1450,16 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
       // callers that omit it; hard-require is a future hardening.
       if (!opts.summary) {
         process.stderr.write(
-          "warning: rig queue create called without --summary. Pass --summary <text> to set the new qitem's short human-readable summary; without it, the Story node falls back to a bounded body preview. A good summary is 1-2 plain sentences a human skims in the needs-you view — what the work is and why it needs this seat, not the agent-speak --body. Proceeding (pre-18 callers exempt).\n"
+          "warning: rig queue create called without --summary. Pass --summary <text> to set the new qitem's short human-readable summary; without it, the Story node falls back to a bounded body preview. The summary is the row's subject in RECENT, the story and the needs-you view. A good summary is 1-2 plain sentences a human skims — what the work is and why it needs this seat, not the agent-speak --body. Proceeding (pre-18 callers exempt).\n"
         );
       }
       // A managed seat keeps transport-derived identity; an external caller can
       // name the existing claimed:v1 body actor without forging a transport header.
-      const managedSource = readOpenRigEnv("OPENRIG_SESSION_NAME", "RIGGED_SESSION_NAME");
-      const source = resolveCurrentSession(managedSource ?? opts.source, "source");
-      if (!source) return;
+      const managedSource = resolveSenderSession();
+      // With --return-route auto, a session with no address of its own needs none: OpenRig issues one, and it's this task's source.
+      const issuedActor = opts.returnRoute?.trim() === "auto" && managedSource === undefined && opts.source === undefined;
+      const source = issuedActor ? undefined : resolveCurrentSession(managedSource ?? opts.source, "source");
+      if (!source && !issuedActor) return;
       const deps = getDeps();
       // OPR.0.3.2.21.FR-4(b) — first-class --mission / --slice flags
       // translate to canonical mission:<id> / slice:<id> tags. Composes
@@ -582,7 +1477,12 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
       // Atom 6b snapshot provenance: record WHERE the body came from so the
       // handoff stays auditable even if the pack is edited later.
       if (opts.bodyContext) fromFlags.push(`body-context:${opts.bodyContext}`);
-      const merged = [...fromFlags, ...fromTagsArg];
+      // With --return-route auto on this host's daemon, the issued address is recorded with this conversation's key, so the
+      // openrig plugin's hooks find it in OpenRig's own record and wake the conversation when a task arrives there. No key
+      // (not run from Claude Code or Codex), no tag: nothing wakes, and no other conversation reads the address.
+      const local = hostResolved.hostId === undefined || hostResolved.hostId === "local";
+      const key = opts.returnRoute?.trim() === "auto" && local ? (deps.conversationKey ?? conversationKey)() : null;
+      const merged = [...withoutConversationKeys([...fromFlags, ...fromTagsArg]), ...(key ? [conversationKeyTag(key)] : [])];
       const seen = new Set<string>();
       const dedupedTags = merged.filter((t) => { if (seen.has(t)) return false; seen.add(t); return true; });
       const tags = dedupedTags.length > 0 ? dedupedTags : undefined;
@@ -614,12 +1514,16 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
         // stderr survives an interrupted wait without adding a second JSON
         // document to stdout. This is a request identity, NOT a commit receipt.
         console.error(`Queue create request ID: ${qitemId} (not proof of persistence). ${recovery}`);
-        const res = await client.post<Record<string, unknown>>("/api/queue/create", {
+        const receipt = writeReceipt(opts.full, {
+          verb: "create", nudgeSuppressed: opts.nudge === false, idGiven: opts.id !== undefined, remoteHost: remoteHostOf(hostResolved.hostId),
+        });
+        const res: DaemonResponse<Record<string, unknown>> | Error = await client.post<Record<string, unknown>>("/api/queue/create", {
           ...(managedSource === undefined ? { sourceSession: source } : {}),
           qitemId,
           destinationSession: hostResolved.destination,
           body: resolvedBody,
           humanIntent: opts.humanIntent,
+          ...(opts.alert ? { humanAlert: true } : {}),
           humanDetail: opts.humanDetailFile ? await resolveQueueBody({ bodyFile: opts.humanDetailFile }) : undefined,
           replyTo: opts.replyTo,
           humanQuestions,
@@ -631,46 +1535,145 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
           expiresAt: opts.expiresAt,
           targetRepo: opts.targetRepo,
           nudge: opts.nudge,
+          ...(opts.returnRoute !== undefined ? { returnRoute: opts.returnRoute } : {}),
           // OPR.0.4.6.MH3 FR-1: the out-of-band host envelope (omitted for
           // plain local writes — the local path stays byte-identical).
           ...(hostResolved.hostId !== undefined ? { hostId: hostResolved.hostId } : {}),
-        }).catch((error: unknown) => {
+        }, crossHostWriteOptions(hostResolved.hostId)).catch((error: unknown) => (error instanceof Error ? error : new Error(String(error))));
+        const sent: SentCreate = { destinationSession: hostResolved.destination, claimedSource: managedSource === undefined ? source : undefined, body: resolvedBody,
+          remoteHost: remoteHostOf(hostResolved.hostId) };
+        const emitScopeAdvisories = (created: Record<string, unknown>) => {
+          const advisories = Array.isArray(created?.advisories) ? created.advisories : [];
+          for (const value of advisories) {
+            if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+            const advisory = value as { code?: unknown; message?: unknown };
+            if (typeof advisory.message !== "string") continue;
+            switch (advisory.code) {
+              case "unmatched_destination_seat":
+              case "destination_status":
+                console.error(`Destination status: ${advisory.message}`);
+                break;
+              case "scope_check_skipped":
+                console.error(`Note: ${advisory.message}`);
+                break;
+              case "unresolved_scope":
+              case "ambiguous_scope":
+              case "empty_scope":
+              case "conflicting_scope":
+              case "scope_check_unavailable":
+              case "return_route_not_carried":
+                console.error(`Warning: ${advisory.message}`);
+                break;
+            }
+          }
+        };
+        const emitRecoveredScopeAdvisory = (recoveredRemote: boolean) => {
+          const recoveredTags: string[] = [];
+          for (const raw of tags ?? []) {
+            if (recoveredTags.length >= 8) break;
+            if (!raw.startsWith("mission:") && !raw.startsWith("slice:")) continue;
+            const prefix = raw.startsWith("mission:") ? "mission:" : "slice:";
+            const body = raw.slice(prefix.length).replace(/[\x00-\x1f\x7f]/g, "").trim().slice(0, 120);
+            const sanitized = body ? `${prefix}${body}` : prefix;
+            if (!recoveredTags.includes(sanitized)) recoveredTags.push(sanitized);
+          }
+          if (recoveredTags.length === 0) return;
+          // Only a confirmed different host ID justifies "forwarded";
+          // all other recovered outcomes remain neutral.
+          if (recoveredRemote) {
+            console.error(`Note: queue create scope check skipped for cross-host write (${recoveredTags.join(", ")}); row was forwarded.`);
+          } else {
+            console.error(`Warning: queue create scope check outcome unavailable after response recovery (${recoveredTags.join(", ")}): original scope check result was lost with the create response; row was created.`);
+          }
+        };
+        // Every create that's answered with a row ends here: its warning, --verify's delivery, and the output.
+        const finish = async (created: Record<string, unknown>, status: number, recovered?: "neutral" | "remote") => {
+          if (status < 400) {
+            if (recovered) emitRecoveredScopeAdvisory(recovered === "remote");
+            else emitScopeAdvisories(created);
+          }
+          const createWarning = created?.createWarning as { code?: unknown; message?: unknown } | undefined;
+          if (status < 400 && createWarning?.code === "qitem_body_not_saved" && typeof createWarning.message === "string") {
+            console.error(`Warning: ${createWarning.message}`);
+          }
+          // The address this work's questions come to, and the line to read them by.
+          if (status < 400 && typeof created?.returnRoute === "string") {
+            const route = created.returnRoute;
+            // A route kept as member@rig@host names a conversation on another host than the work's (a daemon drops its own
+            // host id from a route), and the work's host sends prompts only to a route on that same host.
+            if (route.split("@").length === 3) {
+              console.error(`Return route: ${route} is recorded with this work. It names a conversation on another host, and the work's ` +
+                `host sends prompts only to a route on its own host: this work's questions and its seats' prompts follow their usual path` +
+                (created.returnRouteBasis === "issued-actor" ? `. Put OPENRIG_SESSION_NAME=${shellQuote(route)} in front of your other queue commands for this work.` : "."));
+            } else if (created.returnRouteBasis === "inherited") {
+              console.error(`Return route: ${route}, carried from the routed work you hold. This work's questions and its seats' prompts ` +
+                `(not choice dialogs) go to that conversation as tasks.`);
+            } else {
+              // Slice 15: the wording proven in place on real runs: check the address at each wake, first, and start the wait
+              // where the app wakes on a background command's end. Not where the openrig plugin's hooks run: they're a wake
+              // already, and the wait would be a second one for the same task (#3964).
+              console.error(`Return route: ${route}. This work's questions and its seats' prompts (not choice dialogs) come there as tasks. ` +
+                `At each wake, before anything else, check that address first: OPENRIG_SESSION_NAME=${shellQuote(route)} rig queue list --owned --state pending,in-progress` +
+                (created.returnRouteBasis === "issued-actor" ? `, and put OPENRIG_SESSION_NAME=${shellQuote(route)} in front of your other queue commands for this work.` : ".") +
+                ` Where the openrig plugin's hooks run, they bring these tasks by themselves. Elsewhere, where your app wakes you when a background ` +
+                `command ends, start this wait in the background now, and again after you handle each task: ` +
+                `until OPENRIG_SESSION_NAME=${shellQuote(route)} rig queue list --owned --state pending --json 2>/dev/null | grep -q '"qitemId"'; do sleep 20; done`);
+            }
+          }
+          // An ask to a shared channel was accepted; nothing there will answer it (0.7.3).
+          const advisories = Array.isArray(created?.advisories) ? created.advisories as Array<{ code?: unknown; message?: unknown }> : [];
+          for (const advisory of advisories) {
+            if (status < 400 && advisory.code === "shared_channel_correspondence" && typeof advisory.message === "string") console.error(`Warning: ${advisory.message}`);
+          }
+          if (opts.verify && status < 400) {
+            const createdId = typeof created.qitemId === "string" ? created.qitemId : null;
+            const delivery = createdId
+              ? await waitForDeliveryOutcome(createReceiptReader(deps, client, hostResolved.hostId, qitemId, sent), createdId, deps.deliveryVerify, { destinationSession: hostResolved.destination, nudge: opts.nudge })
+              : unreadableDeliveryResult(null, hostResolved.destination, {}, "create response did not include a qitem id; delivery cannot be correlated");
+            await printWriteResult(client, opts.json ?? false, { ...created, qitemId: createdId, persisted: true, delivery }, status, receipt);
+            return;
+          }
+          await printWriteResult(client, opts.json ?? false, created, status, receipt);
+        };
+        if (res instanceof Error) {
           // A pre-header disconnect can follow a committed create. Preserve the
           // typed error, but do not let the shared renderer assert nondelivery.
-          if (error instanceof DaemonConnectionError) error.writeOutcome = "unknown";
-          if (error instanceof DaemonConnectionError || error instanceof DaemonResponseError) {
+          if (res instanceof DaemonConnectionError) res.writeOutcome = "unknown";
+          // No answer in time, a lost connection, or a response lost or unreadable after its headers: the create may have
+          // committed, so read it back once by its ID.
+          if (res instanceof DaemonTimeoutError || res instanceof DaemonConnectionError || res instanceof DaemonResponseError) {
+            const late = await readBackCreate(deps, client, hostResolved.hostId, qitemId, sent);
+            console.error(late.note);
+            if (late.row) {
+              await finish(late.row, 200, late.remoteConfirmed ? "remote" : "neutral");
+              return;
+            }
+          }
+          if (res instanceof DaemonConnectionError || res instanceof DaemonResponseError) {
             // Keep the shared typed error/exit path, including --json, while
             // supplying the identity missing from an unreadable/late response.
-            error.message += ` ${recovery}`;
+            res.message += ` ${recovery}`;
           }
-          throw error;
-        });
+          throw res;
+        }
         if (res.status >= 400 && res.data?.outcome === "indeterminate") {
           // Forwarded writes may return a structured unknown outcome rather
-          // than throw. Preserve that failure and expose the same recovery ID.
+          // than throw: read the row back once from the destination before reporting it.
+          const late = await readBackCreate(deps, client, hostResolved.hostId, qitemId, sent);
+          console.error(late.note);
+          if (late.row) {
+            await finish(late.row, 200, late.remoteConfirmed ? "remote" : "neutral");
+            return;
+          }
+          // Preserve that failure and expose the same recovery ID.
           printResult(opts.json ?? false, { ...res.data, qitemId, recovery }, res.status);
           return;
         }
-        const createWarning = res.data?.createWarning as { code?: unknown; message?: unknown } | undefined;
-        if (res.status < 400 && createWarning?.code === "qitem_body_not_saved" && typeof createWarning.message === "string") {
-          console.error(`Warning: ${createWarning.message}`);
-        }
-        if (opts.verify && res.status < 400) {
-          const created = res.data;
-          const qitemId = typeof created.qitemId === "string" ? created.qitemId : null;
-          const delivery = qitemId
-            ? await waitForDeliveryOutcome(client, qitemId, deps.deliveryVerify)
-            : {
-                outcome: "indeterminate" as const,
-                connectorAccepted: null,
-                humanReadership: "unknown" as const,
-                detail: "create response did not include a qitem id; delivery cannot be correlated",
-                nextAction: null,
-              };
-          printResult(opts.json ?? false, { ...created, qitemId, persisted: true, delivery }, res.status);
-          return;
-        }
-        printResult(opts.json ?? false, res.data, res.status);
+        const refusal = res.status >= 400 ? provenCreateRefusal(res.status, res.data) : null;
+        if (refusal) console.error(`No row was created: ${refusal}`);
+        const hint = hostSubstitutionHint(res.status, res.data, opts.destination, opts.host, hostResolved, `, keeping --id ${shellQuote(qitemId)}`);
+        if (hint) console.error(hint);
+        await finish(res.data, res.status);
       }, hostResolved.hostId !== undefined, hostResolved.hostId);
     });
 
@@ -678,15 +1681,17 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
     .command("claim <qitemId>")
     .description("Claim a qitem (pending → in-progress); computes closure_required_at from tier")
     .option("--destination <session>", "(deprecated, ignored) the claimant is derived from the seat env (X-OpenRig-Session); P21 I3 made the claim route derive it from the transport header")
+    .option("--full", "Print the whole response row(s) as today, even when output.compact is on (the receipt's waiting keeps only blocker and nextBackstop)")
     .option("--json", "JSON output for agents")
-    .action(async (qitemId: string, opts: { destination?: string; json?: boolean }) => {
+    .action(async (qitemId: string, opts: { destination?: string; json?: boolean; full?: boolean }) => {
       // P21 I3 reconcile: the claimant is DERIVED from the seat env — --destination deprecated + ignored,
       // no body claim. Verify the env (the header source) or the daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal).
-      if (!resolveCurrentSession(undefined, "destination")) return;
+      if (!requireSeatSession("destination")) return;
       const deps = getDeps();
+      // No --host here (#2678 review): a row is claimed by its destination seat, on the host that holds it.
       await withClient(deps, async (client) => {
         const res = await client.post<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/claim`, {});
-        await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status);
+        await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status, writeReceipt(opts.full, { verb: "claim" }));
       });
     });
 
@@ -695,68 +1700,183 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
     .description("Release a claimed qitem (in-progress → pending)")
     .option("--destination <session>", "(deprecated, ignored) the releaser is derived from the seat env (X-OpenRig-Session); the unclaim route derives it from the transport header")
     .option("--reason <text>", "Reason for unclaim", "manual")
+    .option("--full", "Print the whole response row(s) as today, even when output.compact is on (the receipt's waiting keeps only blocker and nextBackstop)")
     .option("--json", "JSON output for agents")
-    .action(async (qitemId: string, opts: { destination?: string; reason: string; json?: boolean }) => {
+    .action(async (qitemId: string, opts: { destination?: string; reason: string; json?: boolean; full?: boolean }) => {
       // P21 I3 reconcile: the releaser is DERIVED from the seat env — --destination deprecated + ignored,
       // no body claim. Verify the env or the daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal).
-      if (!resolveCurrentSession(undefined, "destination")) return;
+      if (!requireSeatSession("destination")) return;
       const deps = getDeps();
       await withClient(deps, async (client) => {
         const res = await client.post<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/unclaim`, {
           reason: opts.reason,
         });
-        await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status);
+        await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status, writeReceipt(opts.full, { verb: "unclaim" }));
       });
     });
 
   cmd
     .command("update <qitemId>")
-    .description("Append a note and/or mutate qitem state. A note without --state never changes row state. state=done REQUIRES --closure-reason (one of: handed_off_to, blocked_on, denied, canceled, no-follow-on, escalation). Closure ≠ acceptance: handed_off_to records delivery to the next stage; acceptance is the next stage's verdict on its own qitem, not this closure.")
+    .description("Append a note and/or mutate qitem state. A note without --state never changes row state. state=done REQUIRES --closure-reason (one of: handed_off_to, denied, canceled, no-follow-on, escalation, superseded). To cancel a row: --state done --closure-reason canceled. To wait for another qitem, use rig queue block <id> --on <child>. Closure ≠ acceptance: handed_off_to records delivery to the next stage; acceptance is the next stage's verdict on its own qitem, not this closure.")
     .option("--actor <session>", "(deprecated, ignored) the actor is derived from the seat env (X-OpenRig-Session); P21 I3 made the update route derive it from the transport header")
     .option("--state <state>", "New state: pending | in-progress | done | blocked | failed | denied | canceled | handed-off")
+    .option("--expect-state <state>", "Apply the update only if the row is still in this state (the one you last read), checked in the same transaction as the write; otherwise nothing is written or triggered (no note, event or wake) and the command fails with qitem_state_changed and the current state. An older daemon that doesn't know --expect-state ignores it and applies the update unchecked, so the check holds only against a daemon that has it. A closer that read pending: --expect-state pending --state done --closure-reason no-follow-on")
     .option("--reopen", "Explicitly acknowledge a deliberate terminal-to-active repair; requires --state and --note")
-    .option("--closure-reason <reason>", "Required for state=done; also 'superseded' on state=canceled (with --closure-target = the successor) records a supersession, distinct from an abandoned cancel")
-    .option("--closure-target <target>", "Required for handed_off_to, blocked_on, escalation, and superseded")
-    .option("--blocked-on <blocker>", "For state=blocked: the blocker — a qitem id (must exist and be live), a human seat (FR-6 park; requires summary + evidence_ref), or a typed non-qitem gate 'fold:<what>' / 'auth:<what>' / 'external:<what>'")
+    .option("--closure-reason <reason>", "Required for state=done. --state canceled takes no reason, except 'superseded' (with --closure-target = the successor), which records a supersession, distinct from an abandoned cancel")
+    .option("--closure-target <target>", "Required for handed_off_to, escalation, and superseded; blocked_on park records use state=blocked with --blocked-on")
+    .option("--closure-required-at <iso>", "Accept a revised closure deadline on an in-progress item; keeps the claim and records the old/new time and accepting actor")
+    .option("--resolution <text>", "The outcome, stored on the row and shown by rig queue show. Needs --state done, canceled, denied, failed or handed-off, and non-blank text. Stored when the update closes an open row, after anything the row already has (a fallback line, an earlier outcome); a row that is already closed keeps what it has")
+    .option("--blocked-on <blocker>", "For state=blocked: the blocker — a qitem id (must exist and be live), a human seat (FR-6 park; requires summary + evidence_ref), or a typed non-qitem gate 'fold:<what>' / 'auth:<what>' / 'external:<what>'. To wait on a person, ask them with a row to their registered address (rig gateway human list) and block on that row, which their answer resolves; an unregistered human seat such as human@host asks no one and doesn't close by itself")
     .option("--wake-watchdog <jobId>", "For state=blocked: attach an existing live watchdog id targeting the row owner")
     .option("--wake-after <duration>", "For state=blocked: atomically arm a timer (for example 90s, 15m, 2h)", wakeDurationSeconds)
-    .option("--summary <text>", "OPR.0.4.4.19 FR-6: park-time summary persisted onto the item (human-seat parks only)")
-    .option("--evidence-ref <path>", "OPR.0.4.4.19 FR-6: park-time durable-artifact pointer persisted onto the item (human-seat parks only)")
+    .option("--summary <text>", "Summary persisted onto the item, with or without a state change (a blank one isn't stored)")
+    .option("--evidence-ref <path>", "Pointer to the durable artifact, persisted onto the item with a state change (a park, a done close; a blank one isn't stored). For a code result, a JSON file of kind openrig.code-result/v1 (repo, base and revision as full commit ids, paths) lets a reader diff it exactly")
     .option("--note <text>", "Transition note for the audit log")
+    .addHelpText("after", `
+After reading an existing remote successor, record its exact closure target, including the host:
+  rig queue update <source-id> --note "custody-verified: receiver@team@remote-host. Registered-host read confirmed the successor"
+The note can accompany the closing update or be appended later; a separate note is not required.
+A trailing period, comma, semicolon, colon or closing parenthesis is accepted; a longer or different target is not.
+For a new cross-host transfer, prefer rig queue handoff --host <registered-host>.
+`)
+    .option("--source <name@external>", "Outside a managed seat: the external routine that appends the --note, recorded as an external actor (claimed:v1), never a seat; note only, on this host's daemon (a --host that resolves to another host is refused). A managed seat stays the actor. Like any note, it resets the item's stall and notification timing (and its recovery and operator episodes) and advances a claimed item's last activity, but never resets how long an unclaimed item has waited")
+    .option("--host <id>", QUEUE_HOST_ROW_OPTION_HELP)
+    .option("--full", "Print the whole response row(s) as today, even when output.compact is on (the receipt's waiting keeps only blocker and nextBackstop)")
     .option("--json", "JSON output for agents")
     .action(async (qitemId: string, opts: {
       actor?: string;
+      source?: string;
       state?: string;
+      expectState?: string;
       reopen?: boolean;
       closureReason?: string;
       closureTarget?: string;
+      closureRequiredAt?: string;
+      resolution?: string;
       blockedOn?: string;
       wakeWatchdog?: string;
       wakeAfter?: number;
       summary?: string;
       evidenceRef?: string;
       note?: string;
+      host?: string;
       json?: boolean;
+      full?: boolean;
     }) => {
+      // --resolution is checked here, before anything is sent: it names the outcome of a close, so it
+      // needs a closing --state and some text. The daemon ignores it anywhere else.
+      if (opts.resolution !== undefined) {
+        const problem = opts.state === undefined || !CLOSING_STATES.includes(opts.state)
+          ? { code: "resolution_needs_closing_state", message: `--resolution records the outcome of a close, so it needs --state ${CLOSING_STATES_PHRASE}${opts.state === undefined ? "" : ` (got '${opts.state}')`}. Nothing was sent.` }
+          : opts.resolution.trim().length === 0
+            ? { code: "resolution_needs_text", message: "--resolution needs text; it is blank. Nothing was sent." }
+            : null;
+        if (problem) {
+          if (opts.json) console.error(JSON.stringify({ error: problem.code, message: problem.message }));
+          else console.error(problem.message);
+          process.exitCode = 1;
+          return;
+        }
+      }
       // P21 I3 reconcile: the actor is DERIVED from the seat env (X-OpenRig-Session, stamped by
       // DaemonClient) — --actor is deprecated + ignored, no body actorSession. Verify the env (the
       // header source) or the daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal). Matches `resolve`.
-      if (!resolveCurrentSession(undefined, "actor")) return;
+      // #2866: outside a seat, --source <name>@external names the routine appending a note (the declared body actor).
+      const actor = resolveUpdateActor(opts.source, opts);
+      if (!actor) return;
       const deps = getDeps();
-      await withClient(deps, async (client) => {
-        const res = await client.post<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/update`, {
+      await withClient(deps, async (local) => {
+        const target = await queueHostTarget(deps, local, opts.host, true);
+        if ("error" in target) return emitHostResolutionError(target, opts.json ?? false);
+        if (actor.actorSession !== undefined && target.remote) {
+          // #2866: the other host would record the routine bare, indistinguishable from a routine of its own (a
+          // forwarded create stamps the origin; this path doesn't). A --host that resolves locally is fine.
+          console.error(`--source with --host ${target.remote} is not supported: that host would record ${actor.actorSession} ` +
+            "without the host it ran on. Run the routine on the host that holds the row. Nothing was sent.");
+          process.exitCode = 1;
+          return;
+        }
+        const requested = {
           state: opts.state,
+          ...(opts.expectState !== undefined ? { expectState: opts.expectState } : {}),
           reopen: opts.reopen,
           closureReason: opts.closureReason,
           closureTarget: opts.closureTarget,
+          ...(opts.closureRequiredAt !== undefined ? { closureRequiredAt: opts.closureRequiredAt } : {}),
+          resolution: opts.resolution,
           blockedOn: opts.blockedOn,
           wakeWatchdogId: opts.wakeWatchdog,
           wakeAfterSeconds: opts.wakeAfter,
           summary: opts.summary,
           evidenceRef: opts.evidenceRef,
           transitionNote: opts.note,
-        });
-        await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status);
+          ...actor,
+        };
+        let transitionFloor: number | undefined;
+        let floorUnknown: string | undefined;
+        if (typeof requested.transitionNote === "string" && requested.transitionNote.trim().length > 0) {
+          // The cursor proves the note is new afterwards. Without it the write still goes; the receipt says what's unproven.
+          const cursor = await readQueueTransitionCursor(target.client, qitemId, target.options);
+          if (cursor.ok) transitionFloor = cursor.latestTransitionId;
+          else floorUnknown = cursor.detail;
+        }
+        const res = await target.client.post<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/update`, requested, target.options);
+        if (res.status < 400) {
+          const actors = await updateActors(target.client, requested.actorSession);
+          const verified = await readBackQueueUpdate(target.client, qitemId, requested, target.options, transitionFloor, floorUnknown, actors);
+          if (!verified.ok) {
+            emitQueueUpdateReadBackFailure(qitemId, verified.detail, opts.json ?? false, verified.noteUnproven);
+            return;
+          }
+          // The canonical row's fields win; the write's own advisories (a park with no wake) come only with its response.
+          const advisories = (res.data as { advisories?: unknown } | null)?.advisories;
+          const row = Array.isArray(advisories) ? { ...verified.row, advisories } : verified.row;
+          await printQueueItemResult(target.client, qitemId, opts.json ?? false, row, res.status, writeReceipt(opts.full, { verb: "update" }), target.remote);
+          return;
+        }
+        await printQueueItemResult(target.client, qitemId, opts.json ?? false, res.data, res.status, writeReceipt(opts.full, { verb: "update" }), target.remote);
+      }, remoteHostOf(opts.host) !== undefined, remoteHostOf(opts.host));
+    });
+
+  cmd
+    .command("relay-answer <qitemId>")
+    .description("Record a person's verbatim answer given elsewhere and return it when the ask is fully answered")
+    .requiredOption("--attributed-to <person>", "The person who actually answered (a human seat or @external address), e.g. reader@external")
+    .requiredOption("--channel <channel>", "Where the person gave the answer")
+    .requiredOption("--text <text>", "The person's verbatim words")
+    .option("--question-id <id>", "Exact question ID (required for a structured ask)")
+    .option("--option-id <id>", "Exact option ID, when they chose an option")
+    .option("--answered-at <iso>", "When the person answered, only if known")
+    .option("--json", "JSON output for agents")
+    .action(async (qitemId: string, opts: { attributedTo: string; channel: string; text: string; questionId?: string; optionId?: string; answeredAt?: string; json?: boolean }) => {
+      if (!requireSeatSession("actor")) return;
+      const { json, ...submission } = opts;
+      await withClient(getDeps(), async (client) => {
+        const res = await client.post<{ replyQitemId: string | null; unanswered: string[] }>(`/api/queue/${encodeURIComponent(qitemId)}/relayed-answer`, submission);
+        if (res.status >= 400 || !res.data) return printQueueItemResult(client, qitemId, json ?? false, res.data, res.status);
+        if (json) console.log(JSON.stringify(res.data));
+        else if (res.data.replyQitemId) console.log(`RELAYED answer returned as ${res.data.replyQitemId}`);
+        else console.log(`RELAYED answer recorded; still open: ${res.data.unanswered.join(", ")}`);
+      });
+    });
+
+  cmd
+    .command("tag <qitemId>")
+    .description("Add tags to a qitem in any state, changing nothing else: its existing tags stay, a tag it already has adds nothing, and a closed row stays closed. The tags added are recorded on the row's history with who added them. Tags are never removed or rewritten.")
+    .requiredOption("--add <tag>", "A tag to add, exact and case-sensitive; repeat for several (commas are literal)", (value: string, previous: string[] = []) => [...previous, value], [] as string[])
+    .option("--json", "JSON output for agents")
+    .action(async (qitemId: string, opts: { add: string[]; json?: boolean }) => {
+      // The actor is the seat itself (X-OpenRig-Session, stamped by DaemonClient), as for update.
+      if (!requireSeatSession("actor")) return;
+      const deps = getDeps();
+      await withClient(deps, async (client) => {
+        const res = await client.post<{ added?: unknown }>(`/api/queue/${encodeURIComponent(qitemId)}/tags`, { add: opts.add });
+        const added = res.status < 400 && Array.isArray(res.data?.added) ? res.data.added as string[] : undefined;
+        if (!added) return printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status);
+        if (opts.json) console.log(JSON.stringify(res.data));
+        else console.log(added.length > 0
+          ? `Added to ${qitemId}: ${added.join(", ")}`
+          : `Nothing added: ${qitemId} already has ${[...new Set(opts.add)].join(", ")}`);
       });
     });
 
@@ -770,7 +1890,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
   cmd
     .command("block <qitemId>")
     .description("Park a qitem as HELD with a continuation and wake. Requires --on <blocker>. Choose --wake-watchdog, --wake-after, or a live blocker qitem for the wake.")
-    .requiredOption("--on <blocker>", "The blocker: a live blocker qitem, typed gate, or human-seat session")
+    .requiredOption("--on <blocker>", "The blocker: a live blocker qitem, typed gate, or human-seat session. To wait on a person, block on a row you sent to their registered address (rig gateway human list), which their answer resolves; an unregistered human seat such as human@host asks no one")
     .option("--actor <session>", "(deprecated, ignored) the actor is derived from the seat env (X-OpenRig-Session); the park writes via the same P21 I3 header-deriving update route")
     .option("--summary <text>", "Plain-language summary of the decision owed (required for human-seat parks unless already on the item)")
     .option("--evidence-ref <path>", "Durable artifact the human judges (required for human-seat parks unless already on the item)")
@@ -778,6 +1898,8 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
     .option("--continuation <text>", "What resumes. Workspace deferred/not-imminent work belongs in a mission/slice")
     .option("--wake-watchdog <jobId>", "Attach an existing live watchdog id targeting the parked owner")
     .option("--wake-after <duration>", "Atomically arm a timer with the park (for example 90s, 15m, 2h)", wakeDurationSeconds)
+    .option("--host <id>", QUEUE_HOST_ROW_OPTION_HELP)
+    .option("--full", "Print the whole response row(s) as today, even when output.compact is on (the receipt's waiting keeps only blocker and nextBackstop)")
     .option("--json", "JSON output for agents")
     .addHelpText("after", `
 --on <blocker> is always required; a wake option does not replace it.
@@ -786,6 +1908,9 @@ Every deliberate HELD row should name its continuation and one live wake:
   --wake-after <duration>  arm a timer atomically with the park
 
 A live blocker qitem supplied with --on also wakes the row when resolved.
+
+--on external:<name> with no wake is an event-only hold: it stays visible, no
+reminder fires, and rig queue resolve <qitemId> --decision "..." ends it.
 
 HELD is only for a row that must stay on the queue while waiting. Work with a
 workspace home that is deferred/not-imminent belongs in its mission/slice.`)
@@ -798,24 +1923,32 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       continuation?: string;
       wakeWatchdog?: string;
       wakeAfter?: number;
+      host?: string;
       json?: boolean;
+      full?: boolean;
     }) => {
       // P21 I3 reconcile: actor DERIVED from the seat env (X-OpenRig-Session) — --actor deprecated +
       // ignored, no body actorSession. Verify the env, else the daemon returns 400 actor_required (no seat identity to record). Matches `resolve`.
-      if (!resolveCurrentSession(undefined, "actor")) return;
+      if (!requireSeatSession("actor")) return;
       const deps = getDeps();
-      await withClient(deps, async (client) => {
-        const res = await client.post<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/update`, {
+      await withClient(deps, async (local) => {
+        const target = await queueHostTarget(deps, local, opts.host, true);
+        if ("error" in target) return emitHostResolutionError(target, opts.json ?? false);
+        // Wake/refocus readers require the continuation prefix at the start of the park note.
+        const transitionNote = opts.continuation?.trim()
+          ? [`continuation: ${opts.continuation}`, opts.note].filter(Boolean).join("\n\n")
+          : (opts.note ?? `parked on ${opts.on}`);
+        const res = await target.client.post<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/update`, {
           state: "blocked",
           blockedOn: opts.on,
           summary: opts.summary,
           evidenceRef: opts.evidenceRef,
           wakeWatchdogId: opts.wakeWatchdog,
           wakeAfterSeconds: opts.wakeAfter,
-          transitionNote: opts.continuation ? `continuation: ${opts.continuation}` : (opts.note ?? `parked on ${opts.on}`),
-        });
-        await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status);
-      });
+          transitionNote,
+        }, target.options);
+        await printQueueItemResult(target.client, qitemId, opts.json ?? false, res.data, res.status, writeReceipt(opts.full, { verb: "block" }), target.remote);
+      }, remoteHostOf(opts.host) !== undefined, remoteHostOf(opts.host));
     });
 
   // OPR.0.4.4.19 FR-7 — the resolve verb's CLI wrapper: a THIN client of the
@@ -826,8 +1959,8 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
   // in-progress on the SAME item) — never a closure, never a new owner.
   cmd
     .command("resolve <qitemId>")
-    .description("Resolve a leg-1 parked qitem (state=blocked on a human seat): records the decision text durably in queue_transitions, unparks blocked -> in-progress, and nudges the owner. Non-closure.")
-    .requiredOption("--decision <text>", "The human's decision text (non-empty; lands in transition_note + the audit row)")
+    .description("Resolve a qitem blocked on a human seat or a typed gate (external:, fold:, auth:): records the decision or satisfaction evidence durably, unparks blocked -> in-progress, and nudges the owner. Non-closure; qitem dependencies are not resolved by this command.")
+    .requiredOption("--decision <text>", "The human decision or typed-gate satisfaction evidence (non-empty; lands in transition_note + the audit row)")
     .option("--actor <session>", "(deprecated, ignored) resolver is derived from the seat env (X-OpenRig-Session)")
     .option("--bearer <token>", "Operator bearer token for the mission-control write gate (or set OPENRIG_AUTH_BEARER_TOKEN; loopback daemons without a configured bearer need none)")
     .option("--no-notify", "Skip the best-effort owner nudge (the unpark still commits)")
@@ -842,7 +1975,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       // P21: the resolver is DERIVED from the seat env (X-OpenRig-Session, stamped by DaemonClient) —
       // --actor is deprecated + ignored. The pre-check verifies the env (the header source); else the
       // daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal).
-      if (!resolveCurrentSession(undefined, "actor")) return;
+      if (!requireSeatSession("actor")) return;
       const deps = getDeps();
       const bearer = opts.bearer ?? process.env.OPENRIG_AUTH_BEARER_TOKEN;
       await withClient(deps, async (client) => {
@@ -869,15 +2002,17 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     .option("--body <text>", "New qitem body inline (use - to read from stdin; mutually exclusive with --body-file). Omit both to keep the source body.")
     .option("--body-file <path>", "Read the new qitem body from a file path (use - for stdin; mutually exclusive with --body). Kills the backtick-shell-corruption class.")
     .option("--note <text>", "Transition note")
-    .option("--priority <priority>", "Override priority for the new qitem")
+    .option("--priority <priority>", "Override priority for the new qitem: routine | urgent | critical", queuePriorityArg)
     .option("--tier <tier>", "Override tier for the new qitem")
     .option("--tags <tags>", "Comma-separated tags for the new qitem")
     .option("--gate <role>", "OPR.0.4.3.16: mark the new qitem as gate work; translated to a gate:<role> tag (e.g. guard | spec-review). The idle-gate watchdog reads this predicate. Composes with --tags.")
     .option("--target-repo <name>", "PL-007: typed repo scope for the new qitem")
-    .option("--summary <text>", "OPR.0.4.1.18: short human-readable 1-2 sentence summary for the new qitem — what it is and why this seat, skimmable in the needs-you view (--body stays source of truth). Warned-if-missing.")
+    .option("--summary <text>", "OPR.0.4.1.18: short human-readable 1-2 sentence subject of the new qitem — what it is and why this seat — shown on every surface that lists it (RECENT, the story, the needs-you view); --body stays source of truth. Not inherited from the source row. Warned-if-missing.")
     .option("--evidence-ref <path>", "OPR.0.4.4.19 FR-5: durable-artifact pointer for the new qitem. Required by the daemon when the new qitem is human-routed; optional otherwise.")
+    .option("--alert", "For a handoff to a person that's urgent: something only they can do, or an approval whose wait costs now. It stands out in Slack (an interrupt with a mention). Without it the item still posts to Slack for a person on the default Slack subscription (every-ask), and waits on Steering and the TUI for one on urgent-only")
     .option("--host <id>", QUEUE_HOST_OPTION_HELP)
     .option("--no-nudge", "Suppress the default nudge to the new destination")
+    .option("--full", "Print the whole response row(s) as today, even when output.compact is on (the receipt's waiting keeps only blocker and nextBackstop)")
     .option("--json", "JSON output for agents")
     .action(async (qitemId: string, opts: {
       from?: string;
@@ -892,13 +2027,15 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       targetRepo?: string;
       summary?: string;
       evidenceRef?: string;
+      alert?: boolean;
       host?: string;
       nudge?: boolean;
       json?: boolean;
+      full?: boolean;
     }) => {
       // P21 I3 reconcile: the handing-off seat is DERIVED from the seat env (X-OpenRig-Session) —
       // --from deprecated + ignored, no body fromSession. Verify the env or the daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal).
-      if (!resolveCurrentSession(undefined, "from")) return;
+      if (!requireSeatSession("from")) return;
       // slice-08 OPR.0.4.7.8 — body-input parity. Resolve through the shipped
       // resolveQueueBody ONLY when a body source is supplied; neither preserves
       // today's source-body default (POST body undefined). Both/invalid reject
@@ -923,7 +2060,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       // it should carry its own summary. Warn to stderr; do not hard-break.
       if (!opts.summary) {
         process.stderr.write(
-          "warning: rig queue handoff called without --summary. Pass --summary <text> to set the new qitem's short human-readable summary; without it, the Story node falls back to a bounded body preview. A good summary is 1-2 plain sentences a human skims in the needs-you view — what the work is and why it needs this seat, not the agent-speak --body. Proceeding.\n"
+          "warning: rig queue handoff called without --summary. Pass --summary <text> to set the new qitem's short human-readable summary; without it, the Story node falls back to a bounded body preview. The summary is the row's subject in RECENT, the story and the needs-you view. A good summary is 1-2 plain sentences a human skims — what the work is and why it needs this seat, not the agent-speak --body. Proceeding.\n"
         );
       }
       const deps = getDeps();
@@ -932,7 +2069,8 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       // this so the idle-gate watchdog's predicate has a producer.
       const explicitTags = opts.tags ? opts.tags.split(",").map((s) => s.trim()).filter(Boolean) : [];
       const gateTags = opts.gate ? [`gate:${opts.gate}`] : [];
-      const mergedTags = [...gateTags, ...explicitTags];
+      // The new item keeps the work's return route, so it takes no conversation's key from here (only OpenRig records one).
+      const mergedTags = withoutConversationKeys([...gateTags, ...explicitTags]);
       const seenTags = new Set<string>();
       const dedupedTags = mergedTags.filter((t) => { if (seenTags.has(t)) return false; seenTags.add(t); return true; });
       const tags = dedupedTags.length > 0 ? dedupedTags : undefined;
@@ -942,6 +2080,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           body: resolvedBody,
           summary: opts.summary,
           evidenceRef: opts.evidenceRef,
+          ...(opts.alert ? { humanAlert: true } : {}),
           transitionNote: opts.note,
           priority: opts.priority,
           tier: opts.tier,
@@ -949,8 +2088,15 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           targetRepo: opts.targetRepo,
           nudge: opts.nudge,
           ...(hostResolved.hostId !== undefined ? { hostId: hostResolved.hostId } : {}),
-        });
-        await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status);
+        }, handoffScopeDiagnosticOptions(hostResolved.hostId)).catch((error: unknown) => { throw withHandoffRecovery(error, qitemId, hostResolved.hostId); });
+        const hint = hostSubstitutionHint(res.status, res.data, opts.to, opts.host, hostResolved);
+        if (hint) console.error(hint);
+        warnRouteNotCarried(res.status, res.data);
+        const output = emitHandoffScopeAdvisories(res.status, res.data);
+        await printQueueItemResult(client, qitemId, opts.json ?? false, output, res.status, writeReceipt(opts.full, {
+          verb: "handoff", nudgeSuppressed: opts.nudge === false, remoteHost: remoteHostOf(hostResolved.hostId),
+        }));
+        if (isIndeterminateRemoteWrite(res.status, res.data)) console.error(handoffRecoveryHint(qitemId, hostResolved.hostId));
       });
     });
 
@@ -964,15 +2110,17 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     .option("--body <text>", "New qitem body inline (use - to read from stdin; mutually exclusive with --body-file). Omit both to keep the source body.")
     .option("--body-file <path>", "Read the new qitem body from a file path (use - for stdin; mutually exclusive with --body). Kills the backtick-shell-corruption class.")
     .option("--note <text>", "Transition note")
-    .option("--priority <priority>", "Override priority for the new qitem")
+    .option("--priority <priority>", "Override priority for the new qitem: routine | urgent | critical", queuePriorityArg)
     .option("--tier <tier>", "Override tier for the new qitem")
     .option("--tags <tags>", "Comma-separated tags for the new qitem")
     .option("--gate <role>", "OPR.0.4.3.16: mark the new qitem as gate work; translated to a gate:<role> tag (e.g. guard | spec-review). The idle-gate watchdog reads this predicate. Composes with --tags.")
     .option("--target-repo <name>", "PL-007: typed repo scope for the new qitem")
-    .option("--summary <text>", "OPR.0.4.1.18: short human-readable 1-2 sentence summary for the new qitem — what it is and why this seat, skimmable in the needs-you view (--body stays source of truth). Warned-if-missing.")
+    .option("--summary <text>", "OPR.0.4.1.18: short human-readable 1-2 sentence subject of the new qitem — what it is and why this seat — shown on every surface that lists it (RECENT, the story, the needs-you view); --body stays source of truth. Not inherited from the source row. Warned-if-missing.")
     .option("--evidence-ref <path>", "OPR.0.4.4.19 FR-5: durable-artifact pointer for the new qitem. Required by the daemon when the new qitem is human-routed; optional otherwise.")
+    .option("--alert", "For a handoff to a person that's urgent: something only they can do, or an approval whose wait costs now. It stands out in Slack (an interrupt with a mention). Without it the item still posts to Slack for a person on the default Slack subscription (every-ask), and waits on Steering and the TUI for one on urgent-only")
     .option("--host <id>", QUEUE_HOST_OPTION_HELP)
     .option("--no-nudge", "Suppress the default nudge to the new destination")
+    .option("--full", "Print the whole response row(s) as today, even when output.compact is on (the receipt's waiting keeps only blocker and nextBackstop)")
     .option("--json", "JSON output for agents")
     .action(async (qitemId: string, opts: {
       from?: string;
@@ -987,13 +2135,15 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       targetRepo?: string;
       summary?: string;
       evidenceRef?: string;
+      alert?: boolean;
       host?: string;
       nudge?: boolean;
       json?: boolean;
+      full?: boolean;
     }) => {
       // P21 I3 reconcile: the handing-off seat is DERIVED from the seat env (X-OpenRig-Session) —
       // --from deprecated + ignored, no body fromSession. Verify the env or the daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal).
-      if (!resolveCurrentSession(undefined, "from")) return;
+      if (!requireSeatSession("from")) return;
       // slice-08 OPR.0.4.7.8 — body-input parity (same contract as handoff):
       // resolve only when a body source is supplied; neither keeps the
       // source-body default; both/invalid reject before daemon contact.
@@ -1016,7 +2166,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       // it should carry its own summary. Warn to stderr; do not hard-break.
       if (!opts.summary) {
         process.stderr.write(
-          "warning: rig queue handoff called without --summary. Pass --summary <text> to set the new qitem's short human-readable summary; without it, the Story node falls back to a bounded body preview. A good summary is 1-2 plain sentences a human skims in the needs-you view — what the work is and why it needs this seat, not the agent-speak --body. Proceeding.\n"
+          "warning: rig queue handoff called without --summary. Pass --summary <text> to set the new qitem's short human-readable summary; without it, the Story node falls back to a bounded body preview. The summary is the row's subject in RECENT, the story and the needs-you view. A good summary is 1-2 plain sentences a human skims — what the work is and why it needs this seat, not the agent-speak --body. Proceeding.\n"
         );
       }
       const deps = getDeps();
@@ -1025,7 +2175,8 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       // this so the idle-gate watchdog's predicate has a producer.
       const explicitTags = opts.tags ? opts.tags.split(",").map((s) => s.trim()).filter(Boolean) : [];
       const gateTags = opts.gate ? [`gate:${opts.gate}`] : [];
-      const mergedTags = [...gateTags, ...explicitTags];
+      // The new item keeps the work's return route, so it takes no conversation's key from here (only OpenRig records one).
+      const mergedTags = withoutConversationKeys([...gateTags, ...explicitTags]);
       const seenTags = new Set<string>();
       const dedupedTags = mergedTags.filter((t) => { if (seenTags.has(t)) return false; seenTags.add(t); return true; });
       const tags = dedupedTags.length > 0 ? dedupedTags : undefined;
@@ -1035,6 +2186,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           body: resolvedBody,
           summary: opts.summary,
           evidenceRef: opts.evidenceRef,
+          ...(opts.alert ? { humanAlert: true } : {}),
           transitionNote: opts.note,
           priority: opts.priority,
           tier: opts.tier,
@@ -1042,8 +2194,15 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           targetRepo: opts.targetRepo,
           nudge: opts.nudge,
           ...(hostResolved.hostId !== undefined ? { hostId: hostResolved.hostId } : {}),
-        });
-        await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status);
+        }, handoffScopeDiagnosticOptions(hostResolved.hostId)).catch((error: unknown) => { throw withHandoffRecovery(error, qitemId, hostResolved.hostId); });
+        const hint = hostSubstitutionHint(res.status, res.data, opts.to, opts.host, hostResolved);
+        if (hint) console.error(hint);
+        warnRouteNotCarried(res.status, res.data);
+        const output = emitHandoffScopeAdvisories(res.status, res.data);
+        await printQueueItemResult(client, qitemId, opts.json ?? false, output, res.status, writeReceipt(opts.full, {
+          verb: "handoff-and-complete", nudgeSuppressed: opts.nudge === false, remoteHost: remoteHostOf(hostResolved.hostId),
+        }));
+        if (isIndeterminateRemoteWrite(res.status, res.data)) console.error(handoffRecoveryHint(qitemId, hostResolved.hostId));
       });
     });
 
@@ -1052,8 +2211,10 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     .description("Show the caller's queue position from the daemon's perspective")
     .option("--session <session>", "Caller's session name (defaults to OPENRIG_SESSION_NAME)")
     .option("--recent-limit <n>", "How many recent active qitems to include", "25")
+    .option("--work-candidates", "Also list labelled work candidates (tags, handoff ancestry, held and next work) for the refocus packet")
+    .option("--held-work", "With nothing in progress, also list held (blocked) and pending rows with their resolved mission and slice, as heldAndPendingWork, for refocus")
     .option("--json", "JSON output for agents")
-    .action(async (opts: { session?: string; recentLimit: string; json?: boolean }) => {
+    .action(async (opts: { session?: string; recentLimit: string; workCandidates?: boolean; heldWork?: boolean; json?: boolean }) => {
       const session = resolveCurrentSession(opts.session, "session");
       if (!session) return;
       const deps = getDeps();
@@ -1061,9 +2222,12 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
         session,
         recentLimit: opts.recentLimit,
       });
+      if (opts.workCandidates) params.set("candidates", "1");
+      if (opts.heldWork) params.set("held", "1");
       await withClient(deps, async (client) => {
         const res = await client.get<unknown>(`/api/queue/whoami?${params.toString()}`);
         printResult(opts.json ?? false, res.data, res.status);
+        if (!opts.json && res.status < 400) printCurrentWorkChoice(res.data);
       });
     });
 
@@ -1089,10 +2253,14 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     .description("Show one qitem and its derived waiting state (bounded preview; --full for complete body)")
     .option("--full", "Complete original record; may be large (use --full --json for lossless JSON)")
     .option("--json", "JSON preview with completeness, original byte size and exact full command")
-    .action(async (qitemId: string, opts: { full?: boolean; json?: boolean }) => {
+    .option("--host <id>", QUEUE_HOST_ROW_OPTION_HELP)
+    .action(async (qitemId: string, opts: { full?: boolean; json?: boolean; host?: string }) => {
       const deps = getDeps();
-      await withClient(deps, async (client) => {
-        const res = await client.get<unknown>(`/api/queue/${encodeURIComponent(qitemId)}`);
+      await withClient(deps, async (local) => {
+        const target = await queueHostTarget(deps, local, opts.host, false);
+        if ("error" in target) return emitHostResolutionError(target, opts.json ?? false);
+        const client = target.client;
+        const res = await client.get<unknown>(`/api/queue/${encodeURIComponent(qitemId)}`, target.options);
         const json = opts.json ?? false;
         const item = res.data;
         // --full is a pure passthrough of today's COMPLETE item shape (the
@@ -1100,19 +2268,74 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
         // passthrough on error responses / non-object payloads, where there is
         // no string body to preview.
         if (opts.full || res.status >= 400 || !isRecordWithStringBody(item)) {
-          await printQueueItemResult(client, qitemId, json, item, res.status);
+          await printQueueItemResult(client, qitemId, json, item, res.status, null, target.remote);
           return;
         }
+        // The closing transition is for --full; the bounded preview prints the record as it did before.
+        const { closingTransition, ...record } = item as typeof item & { closingTransition?: unknown };
         const { preview, bodyBytes, bodyTruncated } = previewBody(item.body);
         // Append-only additions: keep `body` in place (now the preview) and add
         // the honest size + truncation flag. Object otherwise unchanged.
-        const fullCommand = `rig queue show ${shellQuote(qitemId)} --full --json`;
-        const view = readView(item, fullCommand, bodyTruncated ? [omittedReadField("body (after preview)", item.body.slice(preview.length))] : []);
-        const transformed = { ...item, body: preview, bodyBytes, bodyTruncated, readView: view };
-        printResult(json, transformed, res.status);
+        const fullCommand = `rig queue show ${shellQuote(qitemId)}${hostFlag(target)} --full --json`;
+        // Everything held back from this preview is declared, so a reader that trusts readView runs --full.
+        const omitted = [
+          ...(bodyTruncated ? [omittedReadField("body (after preview)", item.body.slice(preview.length))] : []),
+          ...(closingTransition === undefined ? [] : [omittedReadField("closingTransition", closingTransition)]),
+        ];
+        const view = readView(item, fullCommand, omitted);
+        const shownBody = bodyTruncated
+          ? `${preview}${previewCutMarker(qitemId, Array.from(preview).length, Array.from(item.body).length)}`
+          : preview;
+        const transformed = { ...record, body: shownBody, bodyBytes, bodyTruncated, readView: view };
+        // Slice 15 P2: with output.compact on, the empty fields are left out and counted.
+        const compact = compactOutputEnabled() ? compactShow(transformed) : null;
+        printResult(json, compact ? compact.item : transformed, res.status);
+        // Notices go to stderr, as transitions' does, so stdout stays one JSON document an agent can parse.
         if (!json && bodyTruncated) {
-          console.log(`… (bounded preview — complete body is ${bodyBytes} bytes; full record ${view.fullJsonBytes} JSON bytes: ${fullCommand})`);
+          console.error(`… (bounded preview — complete body is ${bodyBytes} bytes; full record ${view.fullJsonBytes} JSON bytes: ${fullCommand})`);
         }
+        if (compact && compact.emptyOmitted.length > 0) console.error(showEmptyNotice(compact.emptyOmitted, fullCommand));
+      }, remoteHostOf(opts.host) !== undefined, remoteHostOf(opts.host));
+    });
+
+  cmd
+    .command("artifact <qitemId>")
+    .description("Read a qitem's evidenceRef through the daemon's shared roots; a code-result manifest also comes back parsed as codeResult")
+    .option("--root <name>", "The shared root a relative evidenceRef is under")
+    .option("--json", "JSON output for agents")
+    .action(async (qitemId: string, opts: { root?: string; json?: boolean }) => {
+      const deps = getDeps();
+      await withClient(deps, async (client) => {
+        const json = opts.json ?? false;
+        const item = await client.get<unknown>(`/api/queue/${encodeURIComponent(qitemId)}`);
+        if (item.status >= 400) { await printQueueItemResult(client, qitemId, json, item.data, item.status); return; }
+        const ref = ((item.data ?? {}) as { evidenceRef?: unknown }).evidenceRef;
+        const rootsRes = await client.get<{ roots?: SharedRoot[] }>("/api/files/roots");
+        if (rootsRes.status >= 400) { printResult(json, rootsRes.data, rootsRes.status); return; }
+        const roots = rootsRes.data?.roots ?? [];
+        // The same rule as rig_artifact_read: only a file in a shared root is read, through the daemon.
+        const plan = planItemArtifact(ref, roots, opts.root);
+        if ("unavailable" in plan) {
+          if (json) console.log(JSON.stringify({ available: false, qitemId, reason: plan.unavailable, evidenceRef: typeof ref === "string" ? ref : null, roots: roots.map((entry) => entry.name) }));
+          else console.error(`${qitemId}: ${plan.unavailable}`);
+          process.exitCode = 1;
+          return;
+        }
+        const res = await client.get<FileRead>(`/api/files/read?${new URLSearchParams({ root: plan.read.root, path: plan.read.path }).toString()}`);
+        if (res.status >= 400) { printResult(json, res.data, res.status); return; }
+        const read = res.data ?? {};
+        const parsed = codeResultOf(read);
+        if (json) {
+          console.log(JSON.stringify({ available: true, qitemId, root: read.root, path: read.path, size: read.size, mtime: read.mtime, binary: read.binary === true,
+            ...(read.binary ? {} : { text: read.content ?? "" }), truncated: read.truncated === true, ...parsed }));
+          return;
+        }
+        if (read.binary) console.log(`A binary file (${read.root}:${read.path}): not shown as text.`);
+        else process.stdout.write(read.content ?? "");
+        // Notices go to stderr, so stdout stays the file.
+        if (parsed && "codeResult" in parsed) console.error(`code result: ${parsed.codeResult.repo} ${parsed.codeResult.base}..${parsed.codeResult.revision}${parsed.codeResult.paths.length ? ` (${parsed.codeResult.paths.length} paths)` : ""}`);
+        else if (parsed) console.error(parsed.codeResultIssue);
+        if (read.truncated) console.error(`… cut at ${read.truncatedAtBytes} of ${read.totalBytes} bytes, as the daemon reads it`);
       });
     });
 
@@ -1120,13 +2343,44 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     .command("transitions <qitemId>")
     .description("Show the append-only transition log for a qitem")
     .option("--json", "JSON output for agents")
-    .action(async (qitemId: string, opts: { json?: boolean }) => {
+    .option("--full", `The whole log, as today, even when output.compact is on (compact shows the latest transitions, ${TRANSITIONS_SHOWN} in all, always including the current disposition)`)
+    .option("--host <id>", QUEUE_HOST_ROW_OPTION_HELP)
+    .action(async (qitemId: string, opts: { json?: boolean; full?: boolean; host?: string }) => {
       const deps = getDeps();
-      await withClient(deps, async (client) => {
-        const res = await client.get<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/transitions`);
-        await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status);
-      });
+      await withClient(deps, async (local) => {
+        const target = await queueHostTarget(deps, local, opts.host, false);
+        if ("error" in target) return emitHostResolutionError(target, opts.json ?? false);
+        const client = target.client;
+        const res = await client.get<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/transitions`, target.options);
+        // Slice 15 P3: with output.compact on, the recent story; the notice goes to stderr so it stays
+        // visible when the array is piped through jq.
+        if (!opts.full && res.status < 400 && Array.isArray(res.data) && compactOutputEnabled()) {
+          const { transitions, earlier } = compactTransitions(res.data as Record<string, unknown>[]);
+          printResult(opts.json ?? false, transitions, res.status);
+          if (earlier > 0) console.error(transitionsNotice(earlier, res.data.length, `rig queue transitions ${shellQuote(qitemId)}${hostFlag(target)} --full${opts.json ? " --json" : ""}`));
+          return;
+        }
+        await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status, null, target.remote);
+      }, remoteHostOf(opts.host) !== undefined, remoteHostOf(opts.host));
     });
+
+  const listTagFiltersInArgumentOrder: string[] = [];
+  const collectListTag = (value: string, previous: string[] = []): string[] => {
+    listTagFiltersInArgumentOrder.push(value);
+    return [...previous, value];
+  };
+  const collectMissionListTag = (value: string, previous: string[] = []): string[] => {
+    listTagFiltersInArgumentOrder.push(`mission:${value}`);
+    return [...previous, value];
+  };
+  const collectSliceListTag = (value: string, previous: string[] = []): string[] => {
+    listTagFiltersInArgumentOrder.push(`slice:${value}`);
+    return [...previous, value];
+  };
+
+  cmd.hook("preSubcommand", (_parent, subcommand) => {
+    if (subcommand.name() === "list") listTagFiltersInArgumentOrder.length = 0;
+  });
 
   cmd
     .command("list")
@@ -1141,8 +2395,12 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     .option("--source <session>", "Filter by source session")
     .option("--state <state>", "Filter by state (comma-separated for multiple)")
     .option("--target-repo <name>", "PL-007: filter qitems by target_repo (exact match)")
+    .option("--tag <tag>", "Exact, case-sensitive tag filter; repeat for AND (commas are literal)", collectListTag, [] as string[])
+    .option("--mission <id>", "Filter by the exact mission:<id> tag; repeatable", collectMissionListTag, [] as string[])
+    .option("--slice <id>", "Filter by the exact slice:<id> tag; repeatable", collectSliceListTag, [] as string[])
     .option("--limit <n>", "Result limit", positiveIntArg, 100)
     .option("--json", "JSON output (compact; use --full --json for complete fields)")
+    .option("--host <id>", `${QUEUE_HOST_ROW_OPTION_HELP} With --host, the rows of every rig on that host unless --destination or --source narrows them; --owned and --mine name this host's seat and are refused.`)
     .addHelpText("after", `
 Default: active items in your current rig, compact summary (like 'docker ps').
 Current rig is derived from OPENRIG_SESSION_NAME's @<rig> suffix.
@@ -1156,6 +2414,7 @@ Four orthogonal axes (docker/kubectl pattern):
 Active states: pending, in-progress, blocked.
 History (-a adds): done, canceled, handed-off, failed, denied.
 Use --state <states> to select specific states explicitly.
+Use repeated --tag <tag> values to require every exact, case-sensitive tag; commas are literal. --mission <id> and --slice <id> add mission:<id> and slice:<id> filters. Exact duplicates collapse and blank values are refused. A returned row that lacks a requested tag reveals an older daemon that ignored the filter; an empty list cannot prove it applied it.
 
 Depth: 'rig queue show <qitemId>' previews one body; add --full for the complete record.
 Frontier source: 'rig queue list' is the default status surface.
@@ -1183,46 +2442,93 @@ Examples:
       source?: string;
       state?: string;
       targetRepo?: string;
+      tag?: string[];
+      mission?: string[];
+      slice?: string[];
       limit: string;
       json?: boolean;
+      host?: string;
     }) => {
-      const deps = getDeps();
-      const params = new URLSearchParams();
-      const sessionName = readOpenRigEnv("OPENRIG_SESSION_NAME", "RIGGED_SESSION_NAME");
-      if (opts.owned && !sessionName) {
-        console.error("Cannot use --owned: checked OPENRIG_SESSION_NAME and RIGGED_SESSION_NAME, but neither caller seat identity is set. Set one to a canonical seat@rig address, or use --destination <session>.");
-        process.exitCode = 1;
+      const useJson = opts.json || opts.o === "json";
+      const orderedTags = listTagFiltersInArgumentOrder.splice(0);
+      const invalidTag = [...(opts.tag ?? []), ...(opts.mission ?? []), ...(opts.slice ?? [])]
+        .some((value) => value.trim().length === 0);
+      if (invalidTag) {
+        emitQueueListFilterError({ error: "tag_invalid", message: "tag filters cannot be blank" }, useJson);
         return;
       }
-      const hasExplicitScope = !!(opts.destination || opts.source || opts.owned);
-
-      if (opts.owned && sessionName) {
-        params.set("destinationSession", sessionName);
-      } else if (opts.mine && sessionName) {
-        params.set("as", sessionName);
-      } else if (!opts.allRigs && !hasExplicitScope) {
-        const rigName = sessionName ? extractRigName(sessionName) : undefined;
-        if (rigName) {
-          params.set("rig", rigName);
+      const tags = [...new Set(orderedTags)];
+      const deps = getDeps();
+      const remote = remoteHostOf(opts.host);
+      // The seat env names a seat of THIS host. On another host's daemon (a --host that resolves remote) it scopes
+      // nothing that daemon holds: no rig is derived from it, and --owned/--mine are refused.
+      const seatScope = (onRemote: boolean): URLSearchParams | null => {
+        const params = new URLSearchParams();
+        const sessionName = onRemote ? undefined : readOpenRigEnv("OPENRIG_SESSION_NAME", "RIGGED_SESSION_NAME");
+        if (onRemote && (opts.owned || opts.mine)) {
+          emitHostResolutionError({ error: "host_scope_unsupported", message: `--host ${remote} lists another host's rows: --${opts.owned ? "owned" : "mine"} names this host's seat. Use --destination or --source with the address as that host stores it.` }, useJson);
+          return null;
         }
-      }
+        if (opts.owned && !sessionName) {
+          console.error("Cannot use --owned: checked OPENRIG_SESSION_NAME and RIGGED_SESSION_NAME, but neither caller seat identity is set. Set one to a canonical seat@rig address, or use --destination <session>.");
+          process.exitCode = 1;
+          return null;
+        }
+        const hasExplicitScope = !!(opts.destination || opts.source || opts.owned);
 
-      if (!opts.all) {
-        params.set("activeOnly", "1");
-      }
-      if (!opts.full) {
-        params.set("compact", "1");
-      }
-      if (opts.destination) params.set("destinationSession", opts.destination);
-      if (opts.source) params.set("sourceSession", opts.source);
-      if (opts.state) params.set("state", opts.state);
-      if (opts.targetRepo) params.set("targetRepo", opts.targetRepo);
-      if (opts.limit) params.set("limit", String(opts.limit));
-      await withClient(deps, async (client) => {
-        const res = await client.get<unknown>(`/api/queue/list?${params.toString()}`);
-        const useJson = opts.json || opts.o === "json";
+        if (opts.owned && sessionName) {
+          params.set("destinationSession", sessionName);
+        } else if (opts.mine && sessionName) {
+          params.set("as", sessionName);
+        } else if (!opts.allRigs && !hasExplicitScope) {
+          const rigName = sessionName ? extractRigName(sessionName) : undefined;
+          if (rigName) {
+            params.set("rig", rigName);
+          }
+        }
+
+        if (!opts.all) {
+          params.set("activeOnly", "1");
+        }
+        if (!opts.full) {
+          params.set("compact", "1");
+        }
+        if (opts.destination) params.set("destinationSession", opts.destination);
+        if (opts.source) params.set("sourceSession", opts.source);
+        if (opts.state) params.set("state", opts.state);
+        if (opts.targetRepo) params.set("targetRepo", opts.targetRepo);
+        for (const tag of tags) params.append("tag", tag);
+        if (opts.limit) params.set("limit", String(opts.limit));
+        return params;
+      };
+      // Without --host, the scope is settled before the daemon is contacted, as before.
+      if (!remote && !seatScope(false)) return;
+      warnIfUnknownStates(opts.state);
+      await withClient(deps, async (local) => {
+        const target = await queueHostTarget(deps, local, opts.host, false);
+        if ("error" in target) return emitHostResolutionError(target, useJson);
+        const params = seatScope(target.remote !== undefined);
+        if (!params) return;
+        const res = await target.client.get<unknown>(`/api/queue/list?${params.toString()}`, target.options);
+        if (res.status < 400 && tags.length > 0 && Array.isArray(res.data)) {
+          const ignored = res.data.some((value) => {
+            if (!value || typeof value !== "object") return true;
+            const rowTags = (value as { tags?: unknown }).tags;
+            return !Array.isArray(rowTags) || tags.some((tag) => !rowTags.includes(tag));
+          });
+          if (ignored) {
+            emitQueueListFilterError({
+              error: "filter_unsupported",
+              message: "The daemon returned a queue row missing a requested exact tag; it may be too old to apply tag filters. Empty results cannot confirm tag filtering.",
+            }, useJson);
+            return;
+          }
+        }
         printResult(useJson, res.data, res.status);
-      });
+        // The rows stay on stdout as they were; only a page the daemon says it cut adds a line on stderr.
+        const page = res.status < 400 ? queueListPage(res.headers) : null;
+        if (page?.truncated) console.error(`this page stops at --limit ${page.limit} and more rows match; pass a larger --limit to see the rest`);
+      }, remote !== undefined, remote);
     });
 
   cmd
@@ -1276,6 +2582,103 @@ Examples:
       if (opts.limit) params.set("limit", String(opts.limit));
       await withClient(deps, async (client) => {
         const res = await client.get<unknown>(`/api/queue/undelivered?${params.toString()}`);
+        printResult(opts.json ?? false, res.data, res.status);
+      });
+    });
+
+  cmd
+    .command("erase")
+    .description("Erase queue rows in one exact scope: an account's rows, a list of ids, or the closed-work retention windows; a dry run unless --apply")
+    .option("--members <file>", "Account deletion: the account's recorded session names (exact, departed seats included), one per line or a JSON array. Empty, with --rig, for an account rig that never had a session")
+    .option("--rig <id>", "With --members: the account rig's id. Also erases the rig's own records that outlive it (events, snapshots, node and seat records); refused unless every member is a session of it")
+    .option("--ids <file>", "These qitem ids, one per line or a JSON array; a report's qitems entries, or an erasure ledger's JSON lines, keep each one's action")
+    .option("--action <action>", "With --ids: delete (default) removes each row and keeps only its id; scrub removes its content and keeps the row", enumArg(["delete", "scrub"]))
+    .option("--routine", "Run this daemon's closed-work windows now (retention.closed_content_days, retention.closed_metadata_days)")
+    .option("--apply", "Erase. Without it the command reports what would be erased and changes nothing")
+    .option("--actor <session>", "Who is erasing, when OPENRIG_SESSION_NAME isn't set (recorded as a claimed identity)")
+    .option("--json", "JSON output for agents")
+    .addHelpText("after", [
+      "",
+      "Name exactly one scope. What each one erases:",
+      "  --members  every row whose source and destination are both members, in any state, deleted with its transitions,",
+      "             outbox and inbox copies, stream actions, events and audit rows; then member-to-member outbox and inbox",
+      "             entries no row owns, and the members' stream items. OpenRig's own sessions (daemon@kernel, system:*)",
+      "             belong to no account, so its wakes and notices to a member are erased too. A row with one member",
+      "             endpoint and the other outside the account is reported under mixed and left untouched. With --rig,",
+      "             also the rig's own events, snapshots and node and seat records.",
+      "  --ids      the listed rows, deleted or scrubbed (a report's qitems entries keep their action); a deleted id",
+      "             that's already gone keeps (or regains) its id marker.",
+      "  --routine  closed rows (done, canceled, denied, handed-off) past the windows, aged from when they closed.",
+      "A deleted row keeps only its id, and a create that reuses that id is refused (qitem_erased). A row a workflow still",
+      "references is reported under gaps and left. Output is JSON: clean (true only when nothing was left), complete,",
+      "qitems, mixed, gaps, alreadyAbsent, linked, unlinked and rig. Refusals: erase_scope_required, erase_scope_conflict,",
+      "erase_members_invalid, erase_rig_invalid, erase_rig_mismatch, erase_rig_had_sessions, erase_rig_history_unknown,",
+      "erase_ids_invalid, erase_action_invalid, erase_routine_off. A run that stops on an error returns what it",
+      "committed, with error.stage, and exits 2.",
+      "Reference: docs/reference/queue-erasure.md",
+    ].join("\n"))
+    .action(async (opts: { members?: string; rig?: string; ids?: string; action?: string; routine?: boolean; apply?: boolean; actor?: string; json?: boolean }) => {
+      const list = (flag: string, path: string): unknown[] | undefined => {
+        let text: string;
+        try {
+          text = fs.readFileSync(path, "utf8");
+        } catch (err) {
+          console.error(`--${flag} ${path}: can't be read (${err instanceof Error ? err.message : String(err)}). Nothing was erased.`);
+          process.exitCode = 1;
+          return undefined;
+        }
+        if (text.trimStart().startsWith("[")) {
+          try {
+            const parsed: unknown = JSON.parse(text);
+            if (Array.isArray(parsed)) return parsed;
+          } catch { /* reported below */ }
+          console.error(`--${flag} ${path}: not a JSON array. Nothing was erased.`);
+          process.exitCode = 1;
+          return undefined;
+        }
+        // One entry per line: a plain id or session, or (an erasure ledger's line) a JSON object.
+        const entries: unknown[] = [];
+        for (const line of text.split(/\r?\n/).map((entry) => entry.trim()).filter((entry) => entry.length > 0 && !entry.startsWith("#"))) {
+          if (!line.startsWith("{")) {
+            entries.push(line);
+            continue;
+          }
+          try {
+            entries.push(JSON.parse(line));
+          } catch {
+            console.error(`--${flag} ${path}: a line isn't valid JSON (${line.slice(0, 60)}). Nothing was erased.`);
+            process.exitCode = 1;
+            return undefined;
+          }
+        }
+        return entries;
+      };
+      const body: Record<string, unknown> = { apply: opts.apply === true };
+      if (opts.members !== undefined) {
+        const members = list("members", opts.members);
+        if (!members) return;
+        body.members = members;
+      }
+      // Sent as given: the daemon refuses a rig without members (erase_rig_invalid), never drops it.
+      if (opts.rig !== undefined) body.rig = opts.rig;
+      if (opts.ids !== undefined) {
+        const ids = list("ids", opts.ids);
+        if (!ids) return;
+        body.ids = ids;
+        if (opts.action) body.action = opts.action;
+      }
+      if (opts.routine) body.routine = true;
+      if (!readOpenRigEnv("OPENRIG_SESSION_NAME", "RIGGED_SESSION_NAME")) {
+        if (!opts.actor) {
+          console.error("OPENRIG_SESSION_NAME is not set and --actor wasn't given, so there's no one to record as erasing. Nothing was erased.");
+          process.exitCode = 1;
+          return;
+        }
+        body.actorSession = opts.actor;
+      }
+      const deps = getDeps();
+      await withClient(deps, async (client) => {
+        const res = await client.post<unknown>("/api/queue/erase", body);
         printResult(opts.json ?? false, res.data, res.status);
       });
     });
@@ -1414,7 +2817,7 @@ Examples:
       }
       // P21 I3 reconcile: the sender is DERIVED from the seat env (X-OpenRig-Session) — --sender
       // deprecated + ignored, no body senderSession. Verify the env or the daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal).
-      if (!resolveCurrentSession(undefined, "sender")) return;
+      if (!requireSeatSession("sender")) return;
       const deps = getDeps();
       const tags = opts.tags ? opts.tags.split(",").map((s) => s.trim()).filter(Boolean) : undefined;
       await withClient(deps, async (client) => {

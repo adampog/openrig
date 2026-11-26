@@ -16,6 +16,38 @@ it is the mechanism that makes shipped chain files (see
 | Stop | ✓ | — | catch a long Claude turn crossing the growth threshold |
 | PostCompact | ✓ | ✓ | retain exact compaction due-state; deliver on the next actionable prompt |
 
+**How the hooks reach a seat.** A Claude seat whose resolved plugin selection includes the shipped `openrig-core` plugin
+(for example `plugins: [shared:openrig-core]`, or the same plugin under another name) starts with `CLAUDE_CODE_PLUGIN_DIRS`
+set to the vendored plugin (`$OPENRIG_HOME/plugins/openrig-core`), so Claude loads `hooks/claude.json` with no setup step, on a
+fresh launch, a restore, a handover successor and a launch with a permission mode. A seat that didn't select the plugin is
+launched as before and doesn't load these hooks. The folder a spec's plugin selection projects into the seat's workspace is
+not what Claude loads. A list the seat declares itself in `CLAUDE_CODE_PLUGIN_DIRS` keeps working, with the vendored plugin
+added after it.
+Claude Code reads this variable from v2.1.280. OpenRig doesn't check the Claude version at launch: an older Claude ignores the
+variable, starts normally, and doesn't load these hooks. The behaviour was checked on Claude Code 2.1.296 and not on
+earlier versions.
+A Claude started from inside a seat (its shell or Bash tool) inherits the seat's environment and so loads the plugin as well.
+A seat that loads the plugin is also given `OPENRIG_SEAT_PROJECT_DIR`, its launch project, and the plugin's seat effects (the
+activity and session-identity posts, the compaction hooks, refocus, and the first-launch marker) run only when that Claude's
+`CLAUDE_PROJECT_DIR` names the same folder (compared by real path, so a trailing slash or symlink doesn't matter). A nested
+Claude in another project, or in a subfolder of the seat's project, therefore changes nothing for the seat, and a `cd` inside
+the seat's own session keeps working because `CLAUDE_PROJECT_DIR` is fixed when Claude starts. A nested Claude in the seat's
+own project folder is the same project and still acts as the seat, as before this change. Without either variable (a seat
+launched before this change, a manual run) the hooks do what they always did. The plugin's activity relay stays quiet next to
+the seat's own `settings.local.json` copy only when that entry is exactly OpenRig's and the script it names is the same
+script; an entry from an older install doesn't match, so both report until the seat's next launch refreshes it.
+OpenRig automatically installs its Codex plugin for seats that select it. On its first installation, the six exact shipped
+hook definitions and bundle content are trusted before launch, after checking the entire installed plugin against this daemon's shipped copy.
+On upgrade, OpenRig renews content approval only for a previously approved OpenRig-owned bundle with unchanged approved hook definitions.
+It keeps explicit disables, refusals, unknown config layers and other plugins' state. An installation without a proven prior approval stays under native review.
+Codex's "continue without trusting" leaves no record: a skip of an otherwise eligible OpenRig-owned update may therefore be superseded on retry.
+OpenRig records its approved bundle in `CODEX_HOME/.openrig-core-hook-trust.json` and leaves Codex's immutable `.hook-trust` baseline untouched.
+Codex 0.164 checks bundle contents when hooks run; a later edit requires native approval again. Older Codex versions enforce their own trust rules.
+The Codex
+column above then applies only to a Codex seat whose plugin selection includes openrig-core: every Codex hook command
+exits 0 before running anything unless OpenRig gave that seat `OPENRIG_SEAT_PROJECT_DIR` and an explicit
+`OPENRIG_NODE`.
+
 Claude's additional firing signal is **transcript growth** — not turns (one turn
 can burn 200k tokens across fifty tool calls) and not wall-clock (the failure is
 sustained work, not elapsed time). Its default threshold is ~2.6MB of JSONL
@@ -33,11 +65,23 @@ that request asks the seat to read the refocusing skill and consume the delivere
 traces rather than rerun them, and the read-depth audit accounts for them. Otherwise the hook
 is a no-op (it writes a stderr advisory when the transcript shrinks or the
 session has no identity), and it degrades to silence on unrelated hook errors.
-Both runtimes stop the hook after 5 seconds, and the content REF lookup gets 2;
-a slow REF shows as `REFOCUS CONTENT REF FAILED`. A
-configured REF resolution failure instead degrades
-loudly in the delivered payload while still completing the hook — a refocus
-must never break a seat's turn.
+**Time budget.** By default each lookup (the trace, the content REF, `rig queue whoami`, `rig config`) gets 2 seconds,
+as before, and a slow one ends as a reported gap (`TRACE GAP`, `REFOCUS CONTENT REF FAILED`, or a role marked
+unknown). Set `OPENRIG_REFOCUS_BUDGET_MS` in a seat's environment to give a slow trace more time, up to 52000 (52 s).
+Each lookup's cap then grows in proportion (at 45000 the trace may take 20 seconds; at 52000, about 23), and every lookup
+is also cut to what is left of that budget, so the attempt delivers what it has and counts as failed. After a failed
+attempt, the issue report gets its own 1.5 seconds once the lookups are done. Both registrations allow `refocus.cjs` 60
+seconds, where they used to stop it at 5; the other OpenRig hooks keep theirs. So a default fire whose lookups together
+pass 5 seconds now completes instead of being stopped with nothing delivered, and a hook that hangs outside its lookups
+can hold a prompt for up to those 60 seconds.
+
+A configured REF resolution failure degrades loudly in the delivered payload while still completing the hook — a
+refocus must never break a seat's turn.
+
+**Overlapping events (unresolved).** Two hook runs for the same seat and occupant are not serialized. If they overlap,
+a `PostCompact` recorded while a prompt is delivering can be lost, and one refocus can be delivered twice. This is
+reproduced between hook processes; whether a harness overlaps these events for one session is not established, so it is
+an open gap, not one shown to be safe.
 
 Failed trace or configured-content resolution keeps refocus due. After three
 consecutive failed attempts for the same seat and occupant, the hook emits one
@@ -88,6 +132,106 @@ reports broken links as gaps rather than following pointers.
 
 This automatic hook path is additive to one-shot manual injection through
 `rig send --context`; neither mode substitutes for the other.
+
+## The work packet (off by default on every runtime, for now)
+
+Set `OPENRIG_REFOCUS_WORK_PACKET=1` in a seat's harness environment so its
+refocus carries the work it is actually doing as text rather than as pointers.
+`=0` (or `off`, `false`, `no`) turns it off. Unset, each runtime's default
+applies. A runtime's default becomes on only after a native run shows the
+packet reaching the agent and leading to the right next action. No runtime has
+been shown that yet, so today both Claude Code and Codex default to off.
+With the switch on:
+
+- The hook asks `rig queue whoami --work-candidates` for labelled evidence.
+  That is each in-progress row's own `mission:` tag (a slice tag is optional),
+  or for an untagged row the nearest local handoff ancestor's mission, plus
+  blocked rows as held work and pending rows as possible next work. The
+  strict `currentWork` derivation is unchanged.
+- One direct, resolved tag is shown as the work, labelled with its source so
+  the agent can correct a stale tag. Anything less certain lists every
+  candidate's one-line intent and asks the agent to name its mission (or to say
+  it has no current work), giving the `--work-start` route that then shows
+  that mission's intent as text. With nothing in progress and a project
+  selected for the seat, the missions it lists and that route are the
+  project's, under its own missions root, and the route names the project root
+  as `--work-root` so it runs on its own; otherwise they are workspace.root's.
+  The project-level chain appears only as labelled orientation.
+- A tag that does not resolve on this host is named, never replaced. A
+  retargeted handoff or a remote ancestor gives no assumed mission. A mission
+  named only in body text is not evidence.
+- The seat's `LEARNED.md` contributes its `MY JOB HERE` and `STANDING DUTIES`
+  sections, and notes and each node's `PROGRESS.md` contribute their
+  `Current state` section. When a file has
+  no such heading, the packet says so and shows a bounded excerpt. No heading
+  is required.
+- A notes or `LEARNED.md` file older than
+  `OPENRIG_REFOCUS_NOTES_MAX_AGE_DAYS` (default 14) is named with its age, the
+  age's source (`updated:` frontmatter, else mtime) and the threshold: a cue
+  for judgment, not a staleness verdict.
+- `rig scope slice progress <slice> --current-state "<text>"` and the
+  corresponding mission command replace the current-state section and stamp
+  `current_state_updated` in UTC. Repeating the same text leaves the stamp
+  unchanged. The packet reports that stamp, or an unknown write time when it
+  is absent; unrelated edits to the file do not refresh it. For a readme-only
+  rail, the section and stamp live in the node's spec instead of PROGRESS.md.
+- Each field is bounded on its own, with no total cap. A held or next row's
+  summary and continuation are one line each (about 160 characters), with
+  `rig queue show <id>` named when one was shortened. At most 20 held and 10
+  next rows are shown, with how many there are and the `rig queue list` command
+  for the rest. A matched section's body is cut at about 1,500 characters,
+  pointing to `--depth full`.
+
+`trace-to-root.py --packet --work-candidates <path|->` renders the same packet
+by hand.
+
+## With nothing in progress: held and pending work as context
+
+When a seat holds no in-progress row, `rig queue whoami --json --held-work` also
+carries its held (blocked) and pending rows as `heldAndPendingWork`: up to 50 of
+each, with which list was cut. Without `--held-work` the answer is unchanged.
+Each row has its summary (or, when it has none, its body's first line with words in it), its `mission:` and `slice:` tags, and
+the mission and slice folders they resolve to through the row's project, or why
+they don't. When a row's project can't be used, its tags are resolved under the
+configured missions root instead. If another root could hold a mission of the
+same name (the catalogue lists other projects, or it or the row's project in it
+can't be read), `missionsRootFallback` says why, even when the mission is found
+there. With no catalogue configured the configured root is the only root, and
+the field stays empty. Completed rows are never read, and none of this changes what counts
+as current work. With the work packet off, the hook asks for these rows on its
+one lookup and passes them to the trace; with it on, the work packet's
+`workCandidates` carries the same rows and fields. The trace shows them as
+context, never as current work, each tag and reason as one line of at most 160
+characters, with the row's `rig queue show` pointer when one was shortened:
+
+- When every held and pending row resolves to one mission folder through its
+  own project and neither list was cut, the trace shows that mission's chain under
+  `CONTEXT FROM HELD AND PENDING WORK`, down to the slice when every row
+  resolves to the same slice. Missions are compared by folder, so one mission
+  name in two projects is two missions. Using this context does not resume a
+  task.
+- Otherwise (rows naming different missions, a row with no mission tag, a tag
+  that doesn't resolve here, a mission found only through the fallback missions
+  root, which may be another project's mission of the same name, or a cut list)
+  it lists each mission the rows name with its folder and the command that
+  reads it, and keeps the broad orientation. A folder outside `workspace.root`
+  gets a command that names the known root holding it as `--work-root`, so the
+  command works as the agent's own call. Only when a mission has no folder does
+  the generic `--work-start <missions root>/<mission>` route appear, with the
+  root quoted for the shell. Held rows are listed first; that is only the order
+  shown.
+- When no held or pending row names a mission, the orientation is as before.
+- The roster-ready notice a freshly built rig gives each started agent, when it
+  names no mission, isn't the seat's work toward any mission. Other rows OpenRig
+  sends can carry real work, such as a relayed network request; they still count
+  toward the mission choice. The daemon marks the roster notice `openrigNotice`, and the trace sets it
+  aside when deciding whether the other rows settle one mission, counting it in
+  the context line ("1 OpenRig notice set aside"). It stays listed with the
+  pending or held rows.
+
+In every case the held and pending rows follow the work section, labelled as in
+the work packet. `trace-to-root.py --work-basis <basis> --held-work <path|->`
+renders this by hand.
 
 ## Relation to chain files
 

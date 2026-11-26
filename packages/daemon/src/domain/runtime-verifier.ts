@@ -1,11 +1,26 @@
 import type Database from "better-sqlite3";
 import { ulid } from "ulid";
 import type { ExecFn } from "../adapters/tmux.js";
+import { ProbeStoppedError, ProbeTimeoutError } from "../adapters/bounded-probe-exec.js";
 import type { RuntimeVerification, RuntimeStatus } from "./bootstrap-types.js";
 
 interface RuntimeVerifierDeps {
   exec: ExecFn;
   db: Database.Database;
+  /** Runs the `--version` / `--help` probes (default: exec). The daemon passes boundedProbeExec, so a hung
+   *  runtime binary is ended after a bound instead of holding up startup or bootstrap. */
+  probeExec?: ExecFn;
+}
+
+/** What a probe that didn't answer within its bound records: status "error" with what happened. The binary
+ *  exists but hangs, so it isn't "not found", and after a `--version` timeout `--help` isn't tried (it would
+ *  usually hang too, doubling the wait). */
+export function probeTimeoutOutcome(
+  _binary: string,
+  _probe: "version" | "help",
+  timeout: ProbeTimeoutError,
+): { fallBackToHelp: true } | { status: RuntimeStatus; error: string } {
+  return { status: "error", error: timeout.message };
 }
 
 // OPR.0.4.6.PI1 — Pi's documented Node engine floor (package.json engines).
@@ -30,10 +45,12 @@ export function meetsPiNodeEngineFloor(version: string): boolean {
 export class RuntimeVerifier {
   readonly db: Database.Database;
   private exec: ExecFn;
+  private probeExec: ExecFn;
 
   constructor(deps: RuntimeVerifierDeps) {
     this.db = deps.db;
     this.exec = deps.exec;
+    this.probeExec = deps.probeExec ?? deps.exec;
   }
 
   /** Verify tmux: `tmux -V`, parse version from output. */
@@ -88,7 +105,7 @@ export class RuntimeVerifier {
     let result = await this.verifyVersionOrHelp("pi", "pi");
     if (result.status === "verified") {
       try {
-        const nodeVersion = this.parseVersion(await this.exec("node --version"));
+        const nodeVersion = this.parseVersion(await this.probeExec("node --version"));
         if (nodeVersion && !meetsPiNodeEngineFloor(nodeVersion)) {
           result = this.buildVerification(
             "pi",
@@ -98,9 +115,13 @@ export class RuntimeVerifier {
             `Pi requires Node >= ${PI_NODE_ENGINE_FLOOR}; found ${nodeVersion}. Upgrade Node to run pi seats.`,
           );
         }
-      } catch {
-        // `node` unresolvable from the daemon's exec context — leave the
-        // binary verification standing; the engine floor re-checks at launch.
+      } catch (err) {
+        if (err instanceof ProbeStoppedError) throw err;
+        if (err instanceof ProbeTimeoutError) {
+          result = this.buildVerification("pi", "error", result.version, null, err.message);
+        }
+        // Other failures (such as `node` not on PATH) leave the binary verification
+        // standing; the engine floor re-checks at launch.
       }
     }
     this.persist(result);
@@ -145,15 +166,26 @@ export class RuntimeVerifier {
   private async verifyVersionOrHelp(binary: string, canonicalName: string): Promise<RuntimeVerification> {
     // Try --version first
     try {
-      const output = await this.exec(`${binary} --version`);
+      const output = await this.probeExec(`${binary} --version`);
       const version = this.parseVersion(output);
       return this.buildVerification(canonicalName, "verified", version ?? null, null, null);
-    } catch {
+    } catch (err) {
+      // The daemon is stopping: this probe says nothing about the runtime, so no --help and no row.
+      if (err instanceof ProbeStoppedError) throw err;
+      if (err instanceof ProbeTimeoutError) {
+        const outcome = probeTimeoutOutcome(binary, "version", err);
+        if (!("fallBackToHelp" in outcome)) return this.buildVerification(canonicalName, outcome.status, null, null, outcome.error);
+      }
       // Fall back to --help
       try {
-        await this.exec(`${binary} --help`);
+        await this.probeExec(`${binary} --help`);
         return this.buildVerification(canonicalName, "verified", null, null, null);
-      } catch {
+      } catch (helpErr) {
+        if (helpErr instanceof ProbeStoppedError) throw helpErr;
+        if (helpErr instanceof ProbeTimeoutError) {
+          const outcome = probeTimeoutOutcome(binary, "help", helpErr);
+          if (!("fallBackToHelp" in outcome)) return this.buildVerification(canonicalName, outcome.status, null, null, outcome.error);
+        }
         return this.buildVerification(canonicalName, "not_found", null, null, `${binary} not found`);
       }
     }

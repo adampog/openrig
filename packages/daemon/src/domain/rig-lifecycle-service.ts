@@ -6,6 +6,10 @@ import type { EventBus } from "./event-bus.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
 import type { QueueRepository } from "./queue-repository.js";
 import { findOtherSessionOwner } from "./session-owner.js";
+import { DeliveryGuardError } from "./seat-delivery-guard.js";
+import { resolveSeatKind, seatProcessOwner } from "./seat-kinds.js";
+import { isRosterReadyNotice, rosterReadyNoticeId } from "./roster-ready-notice.js";
+import { OPENRIG_SENDER } from "../lib/pane-envelope.js";
 
 type ClaimedSessionRow = {
   session_id: string;
@@ -34,6 +38,8 @@ type RigReleaseRow = {
   session_id: string | null;
   session_name: string | null;
   session_origin: string | null;
+  session_status: string | null;
+  tmux_session: string | null;
 };
 
 type FallbackValidationFailure = {
@@ -53,7 +59,7 @@ export type UnclaimSessionResult =
     }
   | {
       ok: false;
-      code: "session_not_found" | "session_ambiguous";
+      code: "session_not_found" | "session_ambiguous" | "session_not_current";
       error: string;
     };
 
@@ -76,7 +82,24 @@ export type RemoveNodeResult =
       activeQitemIds?: string[];
       fallbackDestination?: string;
       reroutedQitemIds?: string[];
+      sessionsKilled?: number;
+      /** Set when the node was kept for late queue work after its session had already stopped. */
+      retained?: true;
+      sessionStopped?: boolean;
     };
+
+type ShrinkNodeOutcome = {
+  nodeId: string;
+  logicalId: string;
+  status: "removed" | "failed";
+  sessionsKilled: number;
+  sessionKeptFor?: string;
+  code?: Exclude<RemoveNodeResult, { ok: true }>["code"];
+  retained?: true;
+  sessionStopped?: boolean;
+  activeQitemIds?: string[];
+  error?: string;
+};
 
 export type ReleaseRigResult =
   | {
@@ -116,13 +139,7 @@ export type ShrinkPodResult =
       sessionsKilled: number;
       fallbackDestination?: string;
       reroutedQitemIds: string[];
-      nodes: Array<{
-        nodeId: string;
-        logicalId: string;
-        status: "removed" | "failed";
-        sessionsKilled: number;
-        error?: string;
-      }>;
+      nodes: ShrinkNodeOutcome[];
     }
   | {
       ok: false;
@@ -131,6 +148,8 @@ export type ShrinkPodResult =
       activeQitemIds?: string[];
       fallbackDestination?: string;
       reroutedQitemIds?: string[];
+      sessionsKilled?: number;
+      nodes?: ShrinkNodeOutcome[];
     };
 
 interface RigLifecycleDeps {
@@ -167,6 +186,7 @@ export class RigLifecycleService {
     this.tmuxAdapter = deps.tmuxAdapter ?? null;
   }
 
+  /** Release a current claimed session without killing its external process. */
   async unclaimSession(sessionRef: string): Promise<UnclaimSessionResult> {
     const exactId = this.db.prepare(`
       SELECT s.id AS session_id, s.session_name, n.id AS node_id, n.rig_id, n.logical_id, b.tmux_session
@@ -203,8 +223,40 @@ export class RigLifecycleService {
 
     const session = matches[0]!;
 
+    const guard = this.tmuxAdapter?.deliveryGuard;
+    const success: UnclaimSessionResult = {
+      ok: true, rigId: session.rig_id, nodeId: session.node_id, logicalId: session.logical_id,
+      sessionId: session.session_id, sessionName: session.session_name,
+    };
+    const isReleased = () => {
+      const latest = this.db.prepare(
+        "SELECT status FROM sessions WHERE node_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+      ).get(session.node_id) as { status: string } | undefined;
+      return !this.sessionRegistry.getBindingForNode(session.node_id) && latest?.status === "detached";
+    };
+    const releasedRetry = isReleased();
+    if (!releasedRetry && guard && !guard.ownsCustody(session.node_id)) {
+      return guard.custody([session.node_id], () => this.unclaimSession(session.session_id));
+    }
+    /** Read fresh custody both before metadata cleanup and at the detach commit. */
+    const isCurrent = () => {
+      const latest = this.db.prepare(
+        "SELECT id FROM sessions WHERE node_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+      ).get(session.node_id) as { id: string } | undefined;
+      const binding = this.sessionRegistry.getBindingForNode(session.node_id);
+      return latest?.id === session.session_id
+        && (!binding?.tmuxSession || binding.tmuxSession === session.session_name);
+    };
+    if (!releasedRetry && !isCurrent()) {
+      return {
+        ok: false,
+        code: "session_not_current",
+        error: `Claimed session '${session.session_id}' no longer owns this seat. No metadata or custody was changed.`,
+      };
+    }
+
     // Best-effort: clear OpenRig-owned tmux metadata from the adopted session.
-    if (this.tmuxAdapter && session.tmux_session) {
+    if (!releasedRetry && this.tmuxAdapter && session.tmux_session) {
       const keys = [
         "@rigged_node_id",
         "@rigged_session_name",
@@ -224,9 +276,12 @@ export class RigLifecycleService {
     let persistedSeq = 0;
     let persistedAt = "";
     const tx = this.db.transaction(() => {
+      if (releasedRetry ? !isReleased() : !isCurrent()) return false;
       this.sessionRegistry.markDetached(session.session_id);
-      this.sessionRegistry.clearBinding(session.node_id);
-      this.discoveryRepo.releaseClaimByNodeId(session.node_id);
+      if (!releasedRetry) {
+        this.sessionRegistry.clearBinding(session.node_id);
+        this.discoveryRepo.releaseClaimByNodeId(session.node_id);
+      }
       const event = this.eventBus.persistWithinTransaction({
         type: "session.detached",
         rigId: session.rig_id,
@@ -235,8 +290,15 @@ export class RigLifecycleService {
       });
       persistedSeq = event.seq;
       persistedAt = event.createdAt;
+      return true;
     });
-    tx();
+    if (!tx()) {
+      return {
+        ok: false,
+        code: "session_not_current",
+        error: `Claimed session '${session.session_id}' no longer owns this seat. Database custody was not changed. OpenRig tmux metadata on '${session.tmux_session ?? session.session_name}' may already have been cleared.`,
+      };
+    }
 
     this.eventBus.notifySubscribers({
       type: "session.detached",
@@ -247,30 +309,27 @@ export class RigLifecycleService {
       createdAt: persistedAt,
     });
 
-    return {
-      ok: true,
-      rigId: session.rig_id,
-      nodeId: session.node_id,
-      logicalId: session.logical_id,
-      sessionId: session.session_id,
-      sessionName: session.session_name,
-    };
+    return success;
   }
 
+  /** Release adopted seats under their lifecycle leases, optionally deleting the rig. */
   async releaseRig(rigId: string, opts?: { delete?: boolean }): Promise<ReleaseRigResult> {
     const rig = this.rigRepo.getRig(rigId);
     if (!rig) {
       return { ok: false, code: "rig_not_found", error: `Rig '${rigId}' not found.` };
     }
 
-    const rows = this.db.prepare(`
+    const readRows = () => this.db.prepare(`
       SELECT
         n.id AS node_id,
         n.logical_id,
         s.id AS session_id,
         s.session_name,
-        s.origin AS session_origin
+        s.origin AS session_origin,
+        s.status AS session_status,
+        b.tmux_session
       FROM nodes n
+      LEFT JOIN bindings b ON b.node_id = n.id
       LEFT JOIN sessions s ON s.id = (
         SELECT s2.id
         FROM sessions s2
@@ -281,6 +340,7 @@ export class RigLifecycleService {
       WHERE n.rig_id = ?
       ORDER BY n.logical_id
     `).all(rigId) as RigReleaseRow[];
+    const rows = readRows();
 
     const launchedLogicalIds = rows
       .filter((row) => row.session_id && row.session_origin === "launched")
@@ -294,79 +354,138 @@ export class RigLifecycleService {
       };
     }
 
-    const released: Array<{
-      nodeId: string;
-      logicalId: string;
-      sessionId: string;
-      sessionName: string;
-    }> = [];
-    const failed: Array<{
-      nodeId: string;
-      logicalId: string;
-      sessionId: string | null;
-      sessionName: string | null;
-      error: string;
-    }> = [];
-
-    for (const row of rows) {
-      if (!row.session_id || row.session_origin !== "claimed") continue;
-      const result = await this.unclaimSession(row.session_id);
-      if (result.ok) {
-        released.push({
-          nodeId: result.nodeId,
-          logicalId: result.logicalId,
-          sessionId: result.sessionId,
-          sessionName: result.sessionName,
-        });
-      } else {
-        failed.push({
-          nodeId: row.node_id,
-          logicalId: row.logical_id,
-          sessionId: row.session_id,
-          sessionName: row.session_name,
-          error: result.error,
-        });
+    const targets = opts?.delete ? rows : rows.filter(row => row.session_origin === "claimed");
+    const leaseTargets = opts?.delete ? targets : targets.filter(row => row.session_status !== "detached" || row.tmux_session !== null);
+    const changed = new Map<string, string>();
+    const matches = (target: RigReleaseRow, row?: RigReleaseRow) => !!row
+      && row.session_id === target.session_id && row.session_name === target.session_name
+      && row.session_origin === target.session_origin && row.logical_id === target.logical_id
+      && row.session_status === target.session_status && row.tmux_session === target.tmux_session;
+    const release = async (): Promise<ReleaseRigResult> => {
+      const current = new Map(readRows().map(row => [row.node_id, row]));
+      for (const target of targets) {
+        if (!matches(target, current.get(target.node_id))) changed.set(target.node_id, "Release target changed while waiting; no cleanup performed for this seat.");
       }
-    }
+      if (opts?.delete && (current.size !== rows.length || changed.size > 0)) {
+        throw new DeliveryGuardError("guard_target_changed", "Release target changed while waiting; no cleanup performed.");
+      }
 
-    let deleted = false;
-    if (failed.length === 0 && opts?.delete) {
-      let persistedSeq = 0;
-      let persistedAt = "";
-      const tx = this.db.transaction(() => {
-        const event = this.eventBus.persistWithinTransaction({
-          type: "rig.deleted",
-          rigId,
+      const released: Array<{
+        nodeId: string;
+        logicalId: string;
+        sessionId: string;
+        sessionName: string;
+      }> = [];
+      const failed: Array<{
+        nodeId: string;
+        logicalId: string;
+        sessionId: string | null;
+        sessionName: string | null;
+        error: string;
+      }> = [];
+
+      for (const row of targets) {
+        if (!row.session_id || row.session_origin !== "claimed") continue;
+        // Unleased detached seats may be reclaimed while another seat is cleaned.
+        if (!matches(row, readRows().find(current => current.node_id === row.node_id))) {
+          changed.set(row.node_id, "Release target changed; no cleanup performed for this seat.");
+        }
+        const error = changed.get(row.node_id);
+        if (error) {
+          failed.push({ nodeId: row.node_id, logicalId: row.logical_id, sessionId: row.session_id, sessionName: row.session_name, error });
+          continue;
+        }
+        const result = await this.unclaimSession(row.session_id).catch((error: unknown) => {
+          if (!(error instanceof DeliveryGuardError)) throw error;
+          return { ok: false as const, error: error.message };
         });
-        persistedSeq = event.seq;
-        persistedAt = event.createdAt;
-        this.rigRepo.deleteRig(rigId);
-      });
-      tx();
+        if (result.ok) {
+          released.push({
+            nodeId: result.nodeId,
+            logicalId: result.logicalId,
+            sessionId: result.sessionId,
+            sessionName: result.sessionName,
+          });
+        } else {
+          failed.push({
+            nodeId: row.node_id,
+            logicalId: row.logical_id,
+            sessionId: row.session_id,
+            sessionName: row.session_name,
+            error: result.error,
+          });
+        }
+      }
 
-      this.eventBus.notifySubscribers({
-        type: "rig.deleted",
+      let deleted = false;
+      if (failed.length === 0 && opts?.delete) {
+        let persistedSeq = 0;
+        let persistedAt = "";
+        const tx = this.db.transaction(() => {
+          const current = readRows();
+          const conflicts = current.filter(row => !rows.some(captured => captured.node_id === row.node_id && captured.session_id === row.session_id));
+          const missing = rows.filter(captured => !current.some(row => row.node_id === captured.node_id));
+          if (conflicts.length > 0 || missing.length > 0) {
+            for (const row of [...conflicts, ...missing]) {
+              const captured = rows.find(target => target.node_id === row.node_id);
+              failed.push({ nodeId: row.node_id, logicalId: row.logical_id,
+                sessionId: captured?.session_id ?? null, sessionName: captured?.session_name ?? null,
+                error: "Rig membership or session changed during cleanup; rig was not deleted.",
+              });
+            }
+            return false;
+          }
+          const event = this.eventBus.persistWithinTransaction({
+            type: "rig.deleted",
+            rigId,
+          });
+          persistedSeq = event.seq;
+          persistedAt = event.createdAt;
+          this.rigRepo.deleteRig(rigId);
+          return true;
+        });
+        if (tx()) {
+          this.eventBus.notifySubscribers({
+            type: "rig.deleted",
+            rigId,
+            seq: persistedSeq,
+            createdAt: persistedAt,
+          });
+          deleted = true;
+        }
+      }
+
+      return {
+        ok: true,
+        status: failed.length > 0 ? "partial" : "ok",
         rigId,
-        seq: persistedSeq,
-        createdAt: persistedAt,
-      });
-      deleted = true;
-    }
-
-    return {
-      ok: true,
-      status: failed.length > 0 ? "partial" : "ok",
-      rigId,
-      deleted,
-      released,
-      failed,
+        deleted,
+        released,
+        failed,
+      };
     };
+    const guard = this.tmuxAdapter?.deliveryGuard;
+    return guard ? guard.custody(leaseTargets.map(row => row.node_id), release,
+      opts?.delete ? undefined : (nodeId, error) => { changed.set(nodeId, error.message); }) : release();
   }
 
   async removeNode(
     rigId: string,
     nodeRef: string,
     opts?: { fallbackDestination?: string },
+  ): Promise<RemoveNodeResult> {
+    return this.removeNodeWithin(rigId, nodeRef, opts?.fallbackDestination, null);
+  }
+
+  /**
+   * `shrinkTarget` is set when a pod shrink removes its members: the shrink has already validated the
+   * fallback once for the whole pod, so a member revalidates it only when its own work needs rerouting.
+   */
+  private async removeNodeWithin(
+    rigId: string,
+    nodeRef: string,
+    fallbackDestination: string | undefined,
+    shrinkTarget: Set<string> | null,
   ): Promise<RemoveNodeResult> {
     const rig = this.rigRepo.getRig(rigId);
     if (!rig) {
@@ -379,11 +498,13 @@ export class RigLifecycleService {
     }
 
     const guard = this.tmuxAdapter?.deliveryGuard;
-    if (guard && !guard.ownsLifecycle(node.node_id)) return guard.lifecycle([node.node_id], () => this.removeNode(rigId, nodeRef, opts));
+    if (guard && !guard.ownsLifecycle(node.node_id)) {
+      return guard.lifecycle([node.node_id], () => this.removeNodeWithin(rigId, nodeRef, fallbackDestination, shrinkTarget));
+    }
 
-    const fallbackDestination = opts?.fallbackDestination;
-    if (fallbackDestination !== undefined) {
-      const invalidFallback = await this.validateFallbackDestination(fallbackDestination, new Set([node.node_id]));
+    const targetNodeIds = shrinkTarget ?? new Set([node.node_id]);
+    if (fallbackDestination !== undefined && !shrinkTarget) {
+      const invalidFallback = await this.validateFallbackDestination(fallbackDestination, targetNodeIds);
       if (invalidFallback) return invalidFallback;
     }
 
@@ -394,9 +515,8 @@ export class RigLifecycleService {
     const sessionOwner = node.latest_session_name
       ? findOtherSessionOwner(this.db, node.latest_session_name, node.node_id, { ignoreArchived: true })
       : null;
-    const activeQitemIds = this.activeQitemIdsForSessionNames(
-      node.latest_session_name && !sessionOwner ? [node.latest_session_name] : [],
-    );
+    const addressedSessions = node.latest_session_name && !sessionOwner ? [node.latest_session_name] : [];
+    const activeQitemIds = this.activeQitemIdsForSessionNames(addressedSessions);
     if (activeQitemIds.length > 0 && fallbackDestination === undefined) {
       return {
         ok: false,
@@ -410,14 +530,20 @@ export class RigLifecycleService {
       };
     }
 
-    if (fallbackDestination !== undefined) {
+    if (fallbackDestination !== undefined && activeQitemIds.length > 0) {
+      // A pod member's work arrived after the pod-level check, so its fallback is checked again before use.
+      const invalidFallback = shrinkTarget ? await this.validateFallbackDestination(fallbackDestination, targetNodeIds) : null;
+      if (invalidFallback) return { ...invalidFallback, activeQitemIds };
       for (const qitemId of activeQitemIds) {
         this.queueRepo.routeToFallback(qitemId, fallbackDestination, `explicit fallback while removing node ${node.logical_id}`);
       }
     }
 
     const preserveDetachedClaimedSession = node.latest_session_origin === "claimed" && node.latest_session_status === "detached";
-    const keepSession = preserveDetachedClaimedSession || sessionOwner !== null;
+    // Removing membership does not stop an external CLI's caller-owned process or require a tmux server.
+    const externallyOwned = seatProcessOwner(resolveSeatKind(this.sessionRegistry.getBindingForNode(node.node_id)?.attachmentType)) === "external";
+    const keepSession = externallyOwned || preserveDetachedClaimedSession || sessionOwner !== null;
+    const sessionStopped = !keepSession && Boolean(node.latest_session_name);
 
     let sessionsKilled = 0;
     if (node.latest_session_name && !keepSession) {
@@ -434,9 +560,33 @@ export class RigLifecycleService {
       sessionsKilled = !kill || kill.ok ? 1 : 0;
     }
 
+    // Queue writes can be accepted while tmux termination awaits, even while this operation owns the
+    // seat's lifecycle lease. Late work goes to the same fallback once it is confirmed still running;
+    // the topology transaction then checks again and keeps the node if any work remains.
+    let lateFallbackFailure: FallbackValidationFailure | null = null;
+    const lateQitemIds = this.activeQitemIdsForSessionNames(addressedSessions);
+    if (fallbackDestination !== undefined && lateQitemIds.length > 0) {
+      lateFallbackFailure = await this.validateFallbackDestination(fallbackDestination, targetNodeIds);
+      if (!lateFallbackFailure) {
+        for (const qitemId of lateQitemIds) {
+          this.queueRepo.routeToFallback(qitemId, fallbackDestination, `explicit fallback while removing node ${node.logical_id}`);
+          if (!activeQitemIds.includes(qitemId)) activeQitemIds.push(qitemId);
+        }
+      }
+    }
+
+    const queueEvents: ReturnType<QueueRepository["updateWithinTransaction"]>["persistedEvents"] = [];
     const persisted: Array<{ type: "session.detached" | "node.removed"; seq: number; createdAt: string }> = [];
     let rosterEvent: ReturnType<EventBus["persistWithinTransaction"]> | null = null;
     const tx = this.db.transaction(() => {
+      const remaining = this.activeQitemIdsForSessionNames(addressedSessions);
+      if (sessionStopped && node.latest_session_id && node.latest_session_name) {
+        this.sessionRegistry.markIntentionallyStopped(node.latest_session_id);
+        this.eventBus.persistWithinTransaction({ type: "session.stopped", rigId, nodeId: node.node_id,
+          sessionId: node.latest_session_id, sessionName: node.latest_session_name,
+          operator: "rig remove", reason: "node_removal" });
+        this.sessionRegistry.clearBinding(node.node_id);
+      }
       if (node.latest_session_name && !keepSession) {
         const detached = this.eventBus.persistWithinTransaction({
           type: "session.detached",
@@ -446,12 +596,23 @@ export class RigLifecycleService {
         });
         persisted.push({ type: "session.detached", seq: detached.seq, createdAt: detached.createdAt });
       }
+      if (remaining.length > 0) return remaining;
       const removed = this.eventBus.persistWithinTransaction({
         type: "node.removed",
         rigId,
         nodeId: node.node_id,
       });
       persisted.push({ type: "node.removed", seq: removed.seq, createdAt: removed.createdAt });
+      const noticeSessions = node.latest_session_name ? [node.latest_session_name] : [];
+      for (const notice of this.activeQitemsForSessionNames(noticeSessions).filter(isRosterReadyNotice)) {
+        // A live replacement owns this shared name; close only the removed generation's notice.
+        if (sessionOwner && notice.qitem_id !== rosterReadyNoticeId(rigId, node.latest_session_name!)) continue;
+        const updated = this.queueRepo.updateWithinTransaction({
+          qitemId: notice.qitem_id, actorSession: OPENRIG_SENDER, state: "done",
+          closureReason: "no-follow-on", resolution: "seat removed", transitionNote: "seat removed",
+        });
+        queueEvents.push(...updated.persistedEvents);
+      }
       this.rigRepo.deleteNode(node.node_id);
       rosterEvent = this.eventBus.persistWithinTransaction({
         type: "topology.roster_recorded",
@@ -459,8 +620,9 @@ export class RigLifecycleService {
         intendedNodeIds: this.rigRepo.getRig(rigId)?.nodes.map((candidate) => candidate.id) ?? [],
         source: "materialized_topology",
       });
+      return [];
     });
-    tx();
+    const remaining = tx();
 
     for (const event of persisted) {
       if (event.type === "session.detached" && node.latest_session_name) {
@@ -483,7 +645,29 @@ export class RigLifecycleService {
         });
       }
     }
+    for (const event of queueEvents) this.eventBus.notifySubscribers(event);
     if (rosterEvent) this.eventBus.notifySubscribers(rosterEvent);
+
+    if (remaining.length > 0) {
+      const subject = lateFallbackFailure
+        ? `Fallback destination '${fallbackDestination}' is no longer a running seat, so queue work that arrived while removing node '${node.logical_id}' was not rerouted and the node was kept.`
+        : `Node '${node.logical_id}' received active queue work during removal and was kept.`;
+      const stopped = sessionStopped ? ` Its session '${node.latest_session_name}' was stopped and stays stopped.` : "";
+      const rerouted = activeQitemIds.length > 0
+        ? ` Already rerouted to '${fallbackDestination}': ${activeQitemIds.join(", ")}.`
+        : "";
+      return {
+        ok: false,
+        code: lateFallbackFailure?.code ?? "active_qitems",
+        activeQitemIds: remaining,
+        fallbackDestination,
+        reroutedQitemIds: activeQitemIds,
+        sessionsKilled,
+        retained: true,
+        sessionStopped,
+        error: this.activeQitemsError(`${subject}${stopped}${rerouted}`, remaining),
+      };
+    }
 
     return {
       ok: true,
@@ -562,29 +746,33 @@ export class RigLifecycleService {
 
     let sessionsKilled = 0;
     const removedLogicalIds: string[] = [];
-    const nodeOutcomes: Array<{
-      nodeId: string;
-      logicalId: string;
-      status: "removed" | "failed";
-      sessionsKilled: number;
-      sessionKeptFor?: string;
-      error?: string;
-    }> = [];
+    const nodeOutcomes: ShrinkNodeOutcome[] = [];
     for (const node of nodes) {
-      const removed = await this.removeNode(rigId, node.id);
+      const removed = await this.removeNodeWithin(rigId, node.id, fallbackDestination, new Set(ids));
+      for (const qitemId of removed.reroutedQitemIds ?? []) {
+        if (!activeQitemIds.includes(qitemId)) activeQitemIds.push(qitemId);
+      }
       if (!removed.ok) {
-        const error = removed.code === "node_not_found"
+        sessionsKilled += removed.sessionsKilled ?? 0;
+        const code = removed.code === "node_not_found" ? "kill_failed" : removed.code;
+        const memberError = removed.code === "node_not_found"
           ? `Node '${node.logical_id}' disappeared while shrinking pod '${pod.namespace}'.`
           : removed.error;
+        const error = this.withShrinkEffects(memberError, pod.namespace, {
+          fallbackDestination, reroutedQitemIds: activeQitemIds, removedLogicalIds, sessionsKilled,
+        });
+        nodeOutcomes.push({
+          nodeId: node.id,
+          logicalId: node.logical_id,
+          status: "failed",
+          sessionsKilled: removed.sessionsKilled ?? 0,
+          code: removed.code,
+          ...(removed.retained ? { retained: true as const, sessionStopped: removed.sessionStopped ?? false } : {}),
+          ...(removed.activeQitemIds ? { activeQitemIds: removed.activeQitemIds } : {}),
+          error,
+        });
 
         if (removedLogicalIds.length > 0) {
-          nodeOutcomes.push({
-            nodeId: node.id,
-            logicalId: node.logical_id,
-            status: "failed",
-            sessionsKilled: 0,
-            error,
-          });
           return {
             ok: true,
             status: "partial",
@@ -599,30 +787,15 @@ export class RigLifecycleService {
           };
         }
 
-        if (removed.code === "rig_not_found") {
-          return {
-            ok: false,
-            code: "rig_not_found",
-            error: removed.error,
-            fallbackDestination,
-            reroutedQitemIds: activeQitemIds,
-          };
-        }
-        if (removed.code === "node_not_found") {
-          return {
-            ok: false,
-            code: "kill_failed",
-            error,
-            fallbackDestination,
-            reroutedQitemIds: activeQitemIds,
-          };
-        }
         return {
           ok: false,
-          code: "kill_failed",
+          code,
           error,
+          ...(removed.activeQitemIds ? { activeQitemIds: removed.activeQitemIds } : {}),
           fallbackDestination,
           reroutedQitemIds: activeQitemIds,
+          sessionsKilled,
+          nodes: nodeOutcomes,
         };
       }
       sessionsKilled += removed.sessionsKilled;
@@ -672,17 +845,41 @@ export class RigLifecycleService {
     };
   }
 
+  /** A member failure during a shrink, restated so it doesn't deny effects the shrink already applied. */
+  private withShrinkEffects(
+    memberError: string,
+    namespace: string,
+    effects: { fallbackDestination?: string; reroutedQitemIds: string[]; removedLogicalIds: string[]; sessionsKilled: number },
+  ): string {
+    const applied: string[] = [];
+    if (effects.reroutedQitemIds.length > 0) {
+      applied.push(`rerouted ${effects.reroutedQitemIds.join(", ")} to '${effects.fallbackDestination}'`);
+    }
+    if (effects.removedLogicalIds.length > 0) applied.push(`removed ${effects.removedLogicalIds.join(", ")}`);
+    if (effects.sessionsKilled > 0) applied.push(`stopped ${effects.sessionsKilled} session(s)`);
+    if (applied.length === 0) return memberError;
+    const error = memberError.replace(" No queue or topology changes were made.", "");
+    return `${error}
+Shrinking pod '${namespace}' already ${applied.join("; ")}; those changes were not undone.`;
+  }
+
   private activeQitemIdsForSessionNames(sessionNames: string[]): string[] {
+    return this.activeQitemsForSessionNames(sessionNames)
+      .filter(row => !isRosterReadyNotice(row))
+      .map(row => row.qitem_id);
+  }
+
+  private activeQitemsForSessionNames(sessionNames: string[]): Array<{ qitem_id: string; source_session: string }> {
     const uniqueSessionNames = [...new Set(sessionNames)];
     if (uniqueSessionNames.length === 0) return [];
     const placeholders = uniqueSessionNames.map(() => "?").join(", ");
-    return (this.db.prepare(`
-      SELECT qitem_id
+    return this.db.prepare(`
+      SELECT qitem_id, source_session
       FROM queue_items
       WHERE destination_session IN (${placeholders})
         AND state IN ('pending', 'in-progress', 'blocked')
       ORDER BY qitem_id
-    `).all(...uniqueSessionNames) as Array<{ qitem_id: string }>).map((row) => row.qitem_id);
+    `).all(...uniqueSessionNames) as Array<{ qitem_id: string; source_session: string }>;
   }
 
   private activeQitemsError(subject: string, activeQitemIds: string[], before = "removal"): string {

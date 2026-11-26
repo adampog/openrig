@@ -7,16 +7,69 @@ Canonical OpenRig skills and hooks for cross-runtime agent topology coordination
 **Skills (19):** canonical OpenRig operating knowledge, including the public `refocusing` skill and
 its path-only topology/work trace.
 
-**Hooks:** activity tracking, compaction continuity, and the default-on refocus channel. Refocus is
-post-compaction on both runtimes, threshold-triggered on Claude, on-demand on both, configurable
+**Hooks:** activity tracking, compaction continuity, the default-on refocus channel, and on Claude the permission
+answer. Refocus is post-compaction on both runtimes, threshold-triggered on Claude, on-demand on both, configurable
 off, and never runs at fresh session start.
+
+**The permission answer (Claude Code):** when a seat's Claude asks permission for a tool call, `permission-answer.cjs`
+(its own synchronous `PermissionRequest` hook, beside the passive relay) asks the seat's person through OpenRig, with the
+exact action, and waits as long as the prompt is open, up to 24 hours. Claude Code's own prompt stays open in the terminal
+meanwhile, and whichever answer comes first counts. The hook returns only Allow once, or Deny with the person's words.
+With no one to ask, no answer in time, or any failure, it returns no decision and the prompt carries on as before. It never remembers a rule, never
+changes the request, and never blocks a tool call on its own failure. Who's asked, and what an answer means, is in
+`docs/reference/harness-runner-contract.md` ("A seat's own Claude Code prompt").
 
 ## Runtimes
 
-This plugin ships dual-manifest packaging — both `.claude-plugin/` and `.codex-plugin/`. Use it with:
+This plugin ships dual-manifest packaging — both `.claude-plugin/` and `.codex-plugin/`.
 
-- **Claude Code** — install via `/plugin` after the OpenRig daemon vendors `openrig-core/` to `~/.openrig/plugins/openrig-core/` on first run, or install the plugin directly through Claude Code's own plugin commands when remote distribution is available
-- **Codex CLI** — install via `/plugins` after the same vendoring step, or directly through Codex's own plugin commands
+- **Claude Code** — the OpenRig daemon vendors `openrig-core/` to `$OPENRIG_HOME/plugins/openrig-core/` at startup and starts
+  each Claude seat whose resolved plugin selection includes it (for example `plugins: [shared:openrig-core]`) with
+  `CLAUDE_CODE_PLUGIN_DIRS` pointing at that copy, so the plugin's hooks (refocus, compaction restore) load with no setup
+  step. A seat that didn't select the plugin is launched as before. This applies to fresh launches, restores, handover
+  successors and launches with a permission mode; a seat that was already running picks it up at its next launch. A
+  `CLAUDE_CODE_PLUGIN_DIRS` list a seat declares itself (its spec's `env:` or a one-off `rig up --env`) keeps working: the
+  vendored plugin is added after it. Claude Code reads the variable from v2.1.280; an older Claude ignores it, starts
+  normally, and doesn't load the hooks (OpenRig doesn't check the version or refuse the launch).
+  A seat that has OpenRig's activity relay in its own `settings.local.json` (the `claude-activity-hooks` runtime resource)
+  already reports activity from there, so the plugin's `activity-relay.cjs` (which the manifest starts with `--from-plugin`)
+  exits for an event the seat's settings register it for. It does so only when the entry is exactly the one OpenRig writes
+  (legacy `node` or a quoted absolute Node executable, optionally after one plain leading `exec`, then one quoted path to
+  `state/claude-activity-hooks/activity-relay.cjs`), the interpreter is executable, and the script at that path is this same
+  script. A missing interpreter/script, a different script, or a wrapper around it never silences the plugin. A seat without
+  that resource, and a plugin installed outside OpenRig, report through the plugin's relay, so each event is reported once.
+  A relay entry written by an older install (a different path or quoting) doesn't match, so until the seat is relaunched and
+  its entry refreshed, both relays report and its events come twice. The plugin is not a Claude marketplace entry, so
+  `/plugin` has nothing to install.
+  **A Claude started inside a seat** (from its shell or its Bash tool) inherits the seat's environment, so it loads the
+  plugin too. OpenRig gives such a seat `OPENRIG_SEAT_PROJECT_DIR`, its launch project, and the plugin's seat effects (the
+  activity and session-identity posts, the compaction hooks, refocus, and the first-launch marker) run only when the Claude's
+  own `CLAUDE_PROJECT_DIR` is that folder (compared by real path). So a Claude in another project, or in a subfolder of the
+  seat's project, doesn't act as the seat, and a `cd` inside the seat's own session doesn't switch it off, because
+  `CLAUDE_PROJECT_DIR` doesn't follow a `cd`. A Claude started in the seat's own project folder is the same project and
+  still acts as the seat. A seat launched before this change has no `OPENRIG_SEAT_PROJECT_DIR` until its next launch, restore
+  or handover, and behaves as before until then.
+- **Codex CLI** — OpenRig installs the plugin automatically when a Codex seat selects it and hooks are enabled.
+  On the first installation, it trusts only the six exact shipped hook definitions, after checking installed hook files
+  and scripts against the daemon's packaged copy. Existing plugin disables and hook choices remain in place across
+  restart and upgrade. An existing untrusted plugin stays under native review: Codex does not persist "continue without
+  trusting", so an absent trust record on an existing installation is not treated as permission.
+  - **One activity producer:** the four managed inline hooks report Codex activity; the plugin's activity entries are
+    no-ops. The plugin supplies refocus and skills. Disabling an inline activity hook is not bypassed by the plugin.
+  - **Seat scope:** the commands require both `OPENRIG_SEAT_PROJECT_DIR` and the executable `OPENRIG_NODE`. Personal and
+    unselected sessions are no-ops. A nested Codex inheriting those seat variables still acts as that seat.
+  - **Refocus output:** the Codex prompt handler keeps its unchanged declaration and default 2,500-token budget
+    (10,000 UTF-8 bytes), preserving its native trust identity. Larger packets
+    send a prefix and an explicit shortening notice for the current attempt. After a claimed, successful render/write
+    and state save, the refocus record lists that attempt's omitted tail byte count and full packet's `.context.txt`
+    path, or says the full text could not be saved. A trace/content failure or unavailable final state guard/write can
+    leave older metadata or no record. The metadata describes the last successfully recorded attempt, not model receipt.
+
+Generated Claude settings commands for the activity relay and context collector use the daemon's absolute Node
+executable when its name is recognized (`node` or `node.exe`); other names keep the legacy bare `node` command and
+its PATH requirement. Pinned commands do not require Node on the Claude process's inherited PATH. The executable must
+remain installed; removing or moving it requires normal command refresh from a healthy runtime. This does not change the Claude plugin
+manifest's commands, which still use `node` (the Codex manifest's run `$OPENRIG_NODE`, above), or prove that an already-running Claude reloaded changed settings.
 
 One skill targets Claude Code's compaction behavior specifically:
 - `claude-compaction-restore` — used to rebuild a Claude Code agent's working mental model after `/compact`, from JSONL transcripts and touched files
@@ -30,7 +83,7 @@ All other skills are cross-runtime by design.
 The npm package includes an offline baseline under the daemon's
 `assets/plugins/openrig-core/`. The daemon resolves local plugin authority before
 attempting a network fetch, using the configured OpenRig home (normally
-`~/.openrig/plugins/openrig-core/` for the installed copy):
+`$OPENRIG_HOME/plugins/openrig-core/` for the installed copy):
 
 | Installed state | Local vendoring behavior |
 | --- | --- |
@@ -51,8 +104,6 @@ install its content. Fetch failures, including 404 and network errors, leave the
 resolved local copy in place. A successful fetch also leaves it unchanged.
 This describes the fetch implementation, not a claim that a release artifact is
 currently available at the external repository.
-
-You can also install directly via Claude Code or Codex's own plugin commands if you prefer to manage plugins outside OpenRig.
 
 ## License
 

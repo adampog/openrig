@@ -16,6 +16,8 @@
 import type { AgentRow, ExplorerRow, FleetSnapshot } from "./types.js";
 import type { MarkSeg } from "./topology/runtime-marks.js";
 import { rowStatusGlyph } from "./topology/glyphs.js";
+import { hostExplorerLabel } from "./topology/host-label.js";
+import { columns } from "./visual-layout.js";
 
 interface KeyParts {
   kind: string;
@@ -60,9 +62,12 @@ function keyDepth(row: ExplorerRow): number {
 
 /** the label with its legacy indent + list glyph stripped; pod/folder rows
  * keep their GENUINE ▾/▸ (they really collapse), hosts/rigs lose theirs */
-function contentOf(row: ExplorerRow, parsed: KeyParts, snap: FleetSnapshot): string {
+function contentOf(row: ExplorerRow, parsed: KeyParts, snap: FleetSnapshot, width: number): string {
   const stripped = row.label.replace(/^\s+/, "");
-  if (parsed.kind === "host") return `⊕ ${stripped.replace(/^[▾⌄] /, "")}`;
+  if (parsed.kind === "host") {
+    const host = snap.hosts.find(host => row.key === `host:${host.name}`);
+    return `⊕ ${host ? hostExplorerLabel(host, width - 2) : stripped.replace(/^[▾⌄] /, "")}`;
+  }
   if (parsed.kind === "rig") return `${rigPresence(parsed, snap) === null ? "?" : "▦"} ${stripped.replace(/^[▾⌄] /, "")}`;
   if (parsed.kind === "pod") return stripped.replace(/^[▾▸] /, (m) => m.startsWith("▾") ? "⌄ " : "› ").replace(/ \(\d+\)$/, ""); // count moves to meta
   if (parsed.kind === "scopes-mission") return stripped.replace(/^[▾▸] /, (m) => m.startsWith("▾") ? "⌄ " : "› ");
@@ -81,7 +86,7 @@ function contentOf(row: ExplorerRow, parsed: KeyParts, snap: FleetSnapshot): str
 }
 
 export interface NavigatorMeta {
-  /** column (within the DISPLAY label) where this run begins */
+  /** String index within the display label where this run begins. */
   start: number;
   /** token segments — a run's own colors (status role; formerly the mark's
    * bg channel) survive the paint layer through this channel (guard finding 2;
@@ -99,7 +104,7 @@ function agentOf(parsed: KeyParts, snap: FleetSnapshot): AgentRow | null {
 /** Use structured identity/presence, never the possibly clipped status suffix. */
 function rigPresence(parsed: KeyParts, snap: FleetSnapshot): boolean | null {
   const host = snap.hosts.find(h => h.name === parsed.parts[0]);
-  if (!host?.reachable) return null;
+  if (host?.reachable !== true) return null;
   return host.rigs.find(r => r.name === parsed.parts[1])?.hasLiveAgents ?? null;
 }
 
@@ -172,9 +177,9 @@ function navigatorLabelsInner(rows: ExplorerRow[], snap: FleetSnapshot, width: n
     const guides = Array.from({ length: depth - 1 }, (_, level) => (railOpen[level + 1] ? "┃ " : "  ")).join("");
     const branch = isLast[i] ? "┗━ " : "┣━ ";
     const parsed = parseKey(row.key)!;
-    const content = contentOf(row, parsed, snap);
-    const meta = metaOf(row, snap);
     const prefix = ` ${guides}${branch}`;
+    const content = contentOf(row, parsed, snap, width - prefix.length);
+    const meta = metaOf(row, snap);
     // S19 round-4 (guard finding 4): agent rows carry a STATUS BADGE run so
     // the served-truth glyph paints its activity ROLE (color is for status —
     // the one colored thing on the row; non-status icons stay monochrome)
@@ -194,9 +199,10 @@ function navigatorLabelsInner(rows: ExplorerRow[], snap: FleetSnapshot, width: n
     // S19 re-sealed width policy (guard NOT-CLEAR finding 1): the NAME renders
     // FIRST and UNTRUNCATED — when the full name leaves no room, the META
     // yields entirely (never an ellipsised identity).
-    const room = width - prefix.length - content.length - 1;
+    const available = width - prefix.length - columns(content);
+    const room = available - 1;
     if (room < meta.text.length) { metasOut.push(runs.length ? runs : null); return `${prefix}${content}`; }
-    const gap = Math.max(width - prefix.length - content.length - meta.text.length, 1);
+    const gap = available - meta.text.length;
     runs.push({ start: prefix.length + content.length + gap, segs: meta.segs });
     metasOut.push(runs);
     return `${prefix}${content}${" ".repeat(gap)}${meta.text}`;

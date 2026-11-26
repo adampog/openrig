@@ -1,3 +1,6 @@
+import type { ViewerKey, ViewerResult } from "./herdr-viewer.js";
+import type { TaskMembership } from "./task-terminal-view.js";
+import type { FollowControls, FollowingStatus } from "./terminal-follow-policy.js";
 // OPR.0.4.6.02 C2 — the TerminalProvider abstraction (the CORE seam of the
 // terminal-provider ride).
 //
@@ -29,8 +32,14 @@ export interface ComposedPane {
   label: string;
   /** Provider-neutral shell command; a provider may wrap it using runtime metadata. */
   paneCommand: string;
+  /** Short, one-shot attach for a person's manual recovery instructions. */
+  recoveryCommand?: string;
+  /** The same local attach as an argv, for a provider that reruns it without a shell (a Herdr restart). Absent for an ssh tile. */
+  attachArgv?: string[];
   /** True when the attach is view-only (`tmux attach -r`) — cross-rig / saved read-only. */
   readOnly: boolean;
+  /** Structured host id of a remote (ssh) tile; absent for a local seat. The seat name alone doesn't say which host. */
+  host?: string;
 }
 
 /** A seat that could not be tiled because it has no live/attachable session. Named, never dropped. */
@@ -44,6 +53,8 @@ export interface AbsentSeat {
 /** A seat that is honestly degraded (e.g. an http-registered host that tiles cannot reach over ssh). */
 export interface DegradedSeat {
   seat: string;
+  /** The provider accepted the layout but could not confirm this seat's pane. */
+  code?: "pane_unconfirmed";
   /** Structured host id (degrade is always host-driven). */
   host: string;
   reason: string;
@@ -54,10 +65,16 @@ export interface DegradedSeat {
  * `opened` is the flat tiled set; `pages` is that same set chunked into
  * fixed-size grids (one provider tab/workspace per page).
  */
+export interface ViewDescriptor { kind: "following" | "fixed"; name: string }
+
 export interface ComposedView {
   id: string;
-  /** Canonical inventory name for a pod's owning rig (view arguments may contain rig IDs). */
+  /** Human rig name for display; identity and reuse remain bound to id. */
   rigName?: string;
+  /** Explicit daemon server for local viewer creation as well as its attached seats. */
+  localTmuxServer?: readonly string[];
+  task?: TaskMembership;
+  viewDescriptor?: ViewDescriptor;
   /** Service-provided preview fingerprint, attached after composition for provider labels. */
   planId?: string;
   opened: ComposedPane[];
@@ -80,6 +97,15 @@ export interface ProviderStatus {
   capabilities: Record<string, boolean>;
   /** Herdr endpoint the local desktop client must attach to. */
   launch?: { socketPath: string; session?: string };
+  /** herdr-app: the herdr-core this daemon starts and ends viewers in. The app at that home must run on the same core:
+   *  terminal addresses are per core. */
+  core?: { session: string; socket?: string };
+  /** herdr-app: explicit statement of the shared herdr-core assumption between daemon and app window. */
+  assumption?: string;
+  /** herdr-app: count of viewer starts whose hc run outcome was unknown and are still being tracked for cleanup, or "unknown" when the journal could not be read. */
+  pendingStarts?: number | "unknown";
+  /** The provider server's identity, so a caller can tell whether it talks to the same server (Rex). */
+  server?: { instanceId: string };
 }
 
 /** Liveness of the provider surface itself (herdr: `herdr status`; NOT a daemon ping). */
@@ -96,9 +122,19 @@ export interface ProviderLiveness {
  * pane that failed to render). `pages` is the number of grid pages painted.
  */
 export interface OpenViewResult {
+  /** Stable provider workspace of an explicitly following task. */
+  workspaceId?: string;
+  following?: FollowingStatus;
   provider: string;
+  task?: TaskMembership;
+  viewDescriptor?: ViewDescriptor;
+  /** Explicitly selected provider session, when the request names one. */
+  session?: string;
   ok: boolean;
   opened: string[];
+  /** Opened seats on another host, with that host: `opened` names them by seat alone. Always the complete list when
+   *  this service sends it (empty when every opened seat is local), so its absence means provenance is unknown. */
+  remote?: Array<{ seat: string; host: string }>;
   absent: AbsentSeat[];
   degraded: DegradedSeat[];
   pages: number;
@@ -108,10 +144,20 @@ export interface OpenViewResult {
   /** Plain-language facts about how the open was done that the user should know
    *  (e.g. a suffixed workspace name, or a focus step the provider refused). */
   notes?: string[];
+  /** The provider space the view opened in (a Rex session), for a caller that shows it. */
+  space?: { id: string; label: string };
+  /** An existing workspace that still showed this view live was focused instead of opening tiles (`opened` is empty). */
+  reusedWorkspace?: { id: string; tabId: string; view: string };
+}
+
+/** How an open may treat a view that is already on screen. */
+export interface OpenViewOptions {
+  /** Reuse a workspace that still shows every tile of this view, attached, instead of opening a copy. */
+  reuseLive?: boolean;
 }
 
 /**
- * The provider contract:
+ * The provider contract. Three methods only:
  *  - `status()`   — availability + version + capabilities (version-adaptive probe).
  *  - `liveness()` — is the provider surface itself up right now.
  *  - `openView()` — render an already-composed view into the provider surface.
@@ -122,9 +168,12 @@ export interface TerminalProvider {
   readonly name: string;
   /** Panes per page this provider lays out; the composer uses PANES_PER_PAGE when absent. */
   readonly panesPerPage?: number;
+  /** Its local writable tiles pin their seat at the seat's own size instead of sizing it (`pinnedTileAttachArgv`). */
+  readonly pinsWritableSeats?: boolean;
   status(): Promise<ProviderStatus>;
   liveness(): Promise<ProviderLiveness>;
-  openView(view: ComposedView): Promise<OpenViewResult>;
-  /** Add panes to an existing exact-label workspace; never create a workspace or replace its tabs. */
-  joinExistingWorkspace?(label: string, view: ComposedView): Promise<OpenViewResult>;
+  openView(view: ComposedView, options?: OpenViewOptions): Promise<OpenViewResult>;
+  ensureViewer?(key: ViewerKey, pane: ComposedPane, stillCurrent?: () => Promise<boolean>): Promise<ViewerResult>;
+  lookupViewer?(key: ViewerKey, pane: ComposedPane): Promise<ViewerResult>;
+  followView?(viewId: string, view: ComposedView | null, controls: FollowControls, stillCurrent: () => Promise<boolean>, membershipError?: string): Promise<OpenViewResult>;
 }

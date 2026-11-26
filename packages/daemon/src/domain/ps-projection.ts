@@ -1,19 +1,24 @@
 import type Database from "better-sqlite3";
-import type { AgentActivity, NodeInventoryEntry, NodeLifecycleState, RigLifecycleState } from "./types.js";
+import type { NodeInventoryEntry, NodeLifecycleState, RigLifecycleState } from "./types.js";
+import { identityVerdictConfirmsExecutorStopped } from "./types.js";
 import {
   countAssignedWorkForEntry,
+  isUnlaunchedHeldWithoutWork,
+  seatNeedsAttention,
+  arbitratedNeedsInputSignal,
+  hookOrPaneActivity,
+  providerFailureActivity,
+  retainedProviderFailure,
   getNodeInventoryForAllRigs,
+  getNodeInventoryForRigs,
   readAssignedWorkBySession,
   type AssignedWorkCounts,
 } from "./node-inventory.js";
 import { archiveWhereClause, type RigArchiveFilter } from "./rig-repository.js";
+import { runningNonArchivedRigIds } from "./periodic-snapshot-scheduler.js";
 import type { SeatActivityService } from "./seat-activity-service.js";
+import type { SeatStructuralActivityService } from "./seat-structural-activity-service.js";
 import type { AgentActivityStore } from "./agent-activity-store.js";
-import type { ArbitratedSeatState, EvidenceRungId } from "./activity-taxonomy.js";
-
-/** The rungs that can answer the needs-input signal (the ones `arbitrate` consults,
- *  chrome > hooks > self-report). Sampling carries no needs-input evidence. */
-const NEEDS_INPUT_RUNGS: readonly EvidenceRungId[] = ["needs-input-chrome", "lifecycle-hooks", "self-report"];
 
 export interface PsEntry {
   rigId: string;
@@ -45,8 +50,8 @@ export interface PsEntry {
    */
   hasWorkCount: number;
   status: "running" | "partial" | "stopped";
-  /** Always populated. Folded from per-node `lifecycleState` (post-L2);
-   * empty rigs derive `stopped`. Never undefined or null. */
+  /** Folded from members not explicitly stopped. Empty rigs and rigs whose
+   * members are all intentionally stopped derive `stopped`. */
   lifecycleState: RigLifecycleState;
   uptime: string | null;
   latestSnapshot: string | null;
@@ -54,7 +59,8 @@ export interface PsEntry {
   archivedAt: string | null;
   /** OPR.0.3.3.19 - convenience flag; true iff `archivedAt !== null`. */
   isArchived: boolean;
-  /** OPR.0.3.4.9 — periodic snapshot floor: whether the scheduler is active. */
+  /** OPR.0.3.4.9 — periodic snapshot floor: whether the scheduler is active and snapshots this rig (running, not
+   *  archived). */
   periodicSnapshotActive: boolean;
   /** OPR.0.3.4.9 — periodic snapshot interval in seconds (0 if inactive). */
   periodicSnapshotIntervalSeconds: number;
@@ -68,61 +74,11 @@ export interface PsEntry {
    * pass as `lifecycleState` — no extra probes.
    */
   attentionCount: number;
+  /** With `seats: true` only: the rig's seat session names, from the same inventory pass (no extra reads). */
+  seats?: string[];
 }
 
-/**
- * OPR.0.4.4.21 — THE rig-rollup attention predicate (one predicate, one
- * count; mirrors + extends the CLI's per-node `needsAttention`). A seat
- * needs attention iff ANY of:
- *   - lifecycle `attention_required`
- *   - startup `attention_required`/`failed` — counted DIRECTLY from
- *     startupStatus; `latestError` may legitimately be null here
- *   - `needs_input`: the ARBITRATED seat state is the first answer when it has one
- *     (`arbitratedNeedsInput` — the same oracle the per-seat row renders, pane chrome
- *     included), and the hook store's live `needs_input` is the fallback when the
- *     arbitrated signal is `null` (stale hooks arrive as `unknown` and contribute
- *     nothing — never guessed). The rig total and the seat row must not disagree
- *     about the same seat.
- *   - a held seat (`heldReason` present)
- *   - a recorded startup error (`latestError` present)
- */
-export function seatNeedsAttention(
-  entry: NodeInventoryEntry,
-  activity: AgentActivity | null,
-  arbitratedNeedsInput: boolean | null = null,
-): boolean {
-  return entry.lifecycleState === "attention_required"
-    || entry.startupStatus === "attention_required"
-    || entry.startupStatus === "failed"
-    || (arbitratedNeedsInput ?? activity?.state === "needs_input")
-    || entry.heldReason != null
-    || entry.latestError != null;
-}
-
-/**
- * #180 review — the arbitrated needs-input answer is TRI-STATE; collapsing it to
- * `needsInput.count > 0` treats `count: 0` as a definite "no" even when no source said
- * "no". `count: 0` is also the default when no authoritative rung reported needs-input:
- * a Codex seat (hooks at `trial`), a generic/Pi/OMP seat (sampling floor only), a seat
- * with no declaration, or a Claude seat whose declared rungs have not reported (after a
- * daemon restart, or once its hook rung is downgraded). A live `PermissionRequest` in
- * the hook store must still count there. Rules:
- *   - count > 0                                    → true  (the service only reports a
- *     positive count from an authoritative source)
- *   - count is 0 AND needs-input evidence from an authoritative rung supplied it → false
- *     (an observed clear legitimately supersedes a stale hook)
- *   - otherwise                                    → null (let the hook store decide).
- *     A declared rung is a capability, not an observation that the seat is clear.
- */
-export function arbitratedNeedsInputSignal(
-  state: Pick<ArbitratedSeatState, "needsInput" | "needsInputEvidence"> | null,
-): boolean | null {
-  if (!state) return null;
-  if (state.needsInput.count > 0) return true;
-  const observedClear = state.needsInputEvidence != null
-    && NEEDS_INPUT_RUNGS.includes(state.needsInputEvidence.rung);
-  return observedClear ? false : null;
-}
+export { seatNeedsAttention, arbitratedNeedsInputSignal } from "./node-inventory.js";
 
 /**
  * Folds per-node lifecycle states into a rig-level lifecycle state.
@@ -155,6 +111,21 @@ export function deriveRigLifecycleState(nodeStates: NodeLifecycleState[]): RigLi
   return "degraded";
 }
 
+/** Shared display rollup for ps and the rig summaries consumed by the TUI.
+ * Intentionally stopped seats remain in process counts and node diagnostics. */
+export function deriveRigLifecycleFromInventory(
+  inventory: readonly NodeInventoryEntry[],
+  assignedWorkCount: (entry: NodeInventoryEntry) => number,
+): RigLifecycleState {
+  return deriveRigLifecycleState(
+    inventory.filter((entry) => {
+      if (entry.intentionallyStopped) return false;
+      const work = assignedWorkCount(entry);
+      return !(isUnlaunchedHeldWithoutWork(entry, work) && !seatNeedsAttention(entry, null, null, work));
+    }).map((entry) => entry.lifecycleState),
+  );
+}
+
 /**
  * Slice-05 item-5 (D5) — the SINGLE effective-running predicate for the ps
  * running rollup. `sessions.status='running'` alone is verdict-blind: a seat
@@ -165,8 +136,9 @@ export function deriveRigLifecycleState(nodeStates: NodeLifecycleState[]): RigLi
  * verdict for exactly that case; node-inventory already surfaces it here,
  * applicability-gated (a stale verdict is null → fail-open).
  *
- * ONLY `reason === "session_missing"` — a genuinely-gone tmux session — is
- * excluded. `pane_pid_gone` / `mismatch` / `tmux_unavailable` and an absent or
+ * Only positive `session_missing` or `pane_exited` evidence excludes an executor, and restore's own marker for a pane
+ * it left as a bare shell (startup `attention_required` with the current session's `harness_not_started` failure).
+ * `pane_pid_gone` / `mismatch` / `tmux_unavailable` and an absent or
  * inapplicable (null) verdict all stay running: an ambiguous or non-fatal
  * identity signal must never fabricate `stopped` (it down-ranks lifecycle to
  * attention, a separate axis). runningCount, status, and activeCount all flow
@@ -175,7 +147,10 @@ export function deriveRigLifecycleState(nodeStates: NodeLifecycleState[]): RigLi
  */
 export function isEffectivelyRunning(node: NodeInventoryEntry): boolean {
   if (node.sessionStatus !== "running") return false;
-  if (node.identityVerdict?.reason === "session_missing") return false;
+  // Positive evidence that no harness started: restore left the pane as a bare shell (its own marker). Other attention
+  // keeps the existing running count; that count alone doesn't establish a useful harness when runtime evidence is unknown.
+  if (node.startupStatus === "attention_required" && node.latestErrorStage === "harness_not_started") return false;
+  if (identityVerdictConfirmsExecutorStopped(node.identityVerdict)) return false;
   return true;
 }
 
@@ -190,13 +165,19 @@ export class PsProjectionService {
    *  predicate's `needs_input` signal. Optional: absent → the signal
    *  contributes false (honest degrade), never a guess. */
   private readonly agentActivity: AgentActivityStore | null;
+  /** The cached pane reading, so the count sees a prompt only the pane shows, as the seat row does. */
+  private readonly structuralActivity: Pick<SeatStructuralActivityService, "getStructuralActivity"> | null;
   private periodicSnapshotActive = false;
   private periodicSnapshotIntervalSeconds = 0;
 
-  constructor(deps: { db: Database.Database; seatActivity?: SeatActivityService; agentActivity?: AgentActivityStore }) {
+  constructor(deps: {
+    db: Database.Database; seatActivity?: SeatActivityService; agentActivity?: AgentActivityStore;
+    structuralActivity?: Pick<SeatStructuralActivityService, "getStructuralActivity">;
+  }) {
     this.db = deps.db;
     this.seatActivity = deps.seatActivity ?? null;
     this.agentActivity = deps.agentActivity ?? null;
+    this.structuralActivity = deps.structuralActivity ?? null;
   }
 
   setPeriodicSnapshotState(active: boolean, intervalSeconds: number): void {
@@ -204,7 +185,7 @@ export class PsProjectionService {
     this.periodicSnapshotIntervalSeconds = intervalSeconds;
   }
 
-  getEntries(filter?: RigArchiveFilter): PsEntry[] {
+  getEntries(filter?: RigArchiveFilter, opts?: { seats?: boolean }): PsEntry[] {
     // OPR.0.3.3.19 - default excludes archived rigs at the projection layer
     // (NOT client-side). Explicit includeArchived/archivedOnly opt in.
     const cond = archiveWhereClause("r.archived_at", filter);
@@ -215,14 +196,6 @@ export class PsProjectionService {
         r.name,
         r.archived_at as archived_at,
         (SELECT COUNT(*) FROM nodes n WHERE n.rig_id = r.id) as node_count,
-        (SELECT COUNT(*) FROM nodes n WHERE n.rig_id = r.id AND
-          (SELECT status FROM sessions s WHERE s.node_id = n.id ORDER BY s.created_at DESC, s.id DESC LIMIT 1) = 'running'
-        ) as running_count,
-        (SELECT MIN(s.created_at) FROM sessions s
-          JOIN nodes n ON n.id = s.node_id
-          WHERE n.rig_id = r.id AND s.status = 'running'
-          AND s.id = (SELECT s2.id FROM sessions s2 WHERE s2.node_id = s.node_id ORDER BY s2.created_at DESC, s2.id DESC LIMIT 1)
-        ) as earliest_running_at,
         (SELECT snap.created_at FROM snapshots snap WHERE snap.rig_id = r.id ORDER BY snap.created_at DESC, snap.id DESC LIMIT 1) as latest_snapshot_at,
         (SELECT COUNT(*) FROM snapshots snap WHERE snap.rig_id = r.id AND snap.kind = 'auto-periodic') as auto_periodic_count
       FROM rigs r
@@ -233,8 +206,6 @@ export class PsProjectionService {
       name: string;
       archived_at: string | null;
       node_count: number;
-      running_count: number;
-      earliest_running_at: string | null;
       latest_snapshot_at: string | null;
       auto_periodic_count: number;
     }>;
@@ -246,9 +217,27 @@ export class PsProjectionService {
     // instead of one countNodesWithPendingWork query per rig. Per-rig hasWorkCount
     // is then a pure JS derivation over the already-fetched inventory below.
     const assignedByDest = readAssignedWorkBySession(this.db);
-    // FS-1 W1.2: node inventory for ALL rigs built in ONE batched pass (was one
-    // getNodeInventory query-set PER RIG — the rig-level N+1); indexed per rig below.
-    const inventoryByRig = getNodeInventoryForAllRigs(this.db);
+    // FS-1 W1.2: node inventory built in ONE batched pass (was one getNodeInventory
+    // query-set PER RIG — the rig-level N+1); indexed per rig below. Scoped to the
+    // rigs this projection returns, as /api/rigs/summary does, so the default
+    // projection never folds the nodes of archived rigs it then discards (#3636).
+    // With no archive filter every rig is returned: the all-rigs pass avoids an
+    // IN list of every rig id.
+    const inventoryByRig = cond === null
+      ? getNodeInventoryForAllRigs(this.db)
+      : getNodeInventoryForRigs(this.db, new Set(rows.map((r) => r.rig_id)));
+
+    // Read the current registration's timestamp once per node, in one batch.
+    // Uptime membership comes from the same effective-running inventory below.
+    const sessionTimes = this.db.prepare(`
+      SELECT n.id as node_id,
+        (SELECT s.created_at FROM sessions s WHERE s.node_id = n.id ORDER BY s.id DESC LIMIT 1) as created_at
+      FROM nodes n JOIN rigs r ON r.id = n.rig_id
+      ${where}
+    `).all() as Array<{ node_id: string; created_at: string | null }>;
+    const sessionCreatedAt = new Map(sessionTimes.map((row) => [row.node_id, row.created_at]));
+    // The scheduler snapshots only running, non-archived rigs; ask it which, so a stopped rig doesn't read as saved.
+    const snapshotted = this.periodicSnapshotActive ? new Set(runningNonArchivedRigIds(this.db)) : null;
 
     return rows.map((r) => {
       // Derive rig-level lifecycleState by folding per-node states. FS-1 W1.2:
@@ -256,23 +245,16 @@ export class PsProjectionService {
       // getNodeInventory query-set per rig — the rig-level N+1); index it here.
       const inventory = inventoryByRig.get(r.rig_id) ?? [];
 
-      // Slice-05 item-5 (D5) — running honesty. The raw SQL `running_count` is
-      // the running BASE: it selects each node's latest session by
-      // `created_at DESC, id DESC` (the "newest session counts" contract). We
-      // must NOT re-derive that base from `inventory` — node-inventory picks the
-      // latest session by `id DESC` alone, a DIFFERENT ordering that diverges
-      // whenever session ids are not monotonic with created_at (pre-existing
-      // latent inconsistency, orthogonal to D5). Instead, subtract ONLY the
-      // status-running seats that are not EFFECTIVELY running — i.e. those
-      // carrying an applicable `session_missing` verdict — so a torn-down tmux
-      // session is never fabricated as running. The subtraction routes through
-      // the SAME isEffectivelyRunning predicate the activeCount gate uses below,
-      // so the two counts never disagree on liveness. NEVER mutates
-      // `sessions.status`.
-      const sessionMissingRunning = inventory.filter(
-        (n) => n.sessionStatus === "running" && !isEffectivelyRunning(n),
-      ).length;
-      const effectiveRunningCount = Math.max(0, r.running_count - sessionMissingRunning);
+      // Count the same current registrations used for lifecycle and activity.
+      // Registry IDs stay monotonic through clock rollback within one daemon;
+      // created_at does not. Reusing inventory also avoids another per-node sort.
+      const running = inventory.filter(isEffectivelyRunning);
+      const effectiveRunningCount = running.length;
+      let earliestRunningAt: string | null = null;
+      for (const node of running) {
+        const createdAt = sessionCreatedAt.get(node.nodeId);
+        if (createdAt != null && (earliestRunningAt === null || createdAt < earliestRunningAt)) earliestRunningAt = createdAt;
+      }
 
       const status: PsEntry["status"] =
         r.node_count === 0 ? "stopped"
@@ -280,7 +262,7 @@ export class PsProjectionService {
         : effectiveRunningCount > 0 ? "partial"
         : "stopped";
 
-      const lifecycleState = deriveRigLifecycleState(inventory.map((e) => e.lifecycleState));
+      const lifecycleState = deriveRigLifecycleFromInventory(inventory, (node) => countAssignedWorkForEntry(node, assignedByDest).assignedWorkCount);
 
       // Slice 15 — `terminal-active` count. Subset of running tmux-bound
       // seats whose latest SeatActivity observation says
@@ -310,8 +292,9 @@ export class PsProjectionService {
       // OPR.0.4.4.21 — attention fold, same inventory pass. `needs_input` is
       // read from the ARBITRATED seat state first — the same oracle the
       // per-seat row renders (`activityState` on node-inventory), which also
-      // sees pane chrome a hook-silent gated seat never reports. The hook
-      // store is the fallback when the arbitrated signal is `null` — service
+      // sees pane chrome a hook-silent gated seat never reports. The served
+      // activity (the hook store, else the cached pane reading, as the seat row
+      // reads it) is the fallback when the arbitrated signal is `null` — service
       // unwired, session not in the ladder, or a `count: 0` that no authoritative
       // needs-input evidence supplied (#180 review; discussion #879); `now` keeps its
       // staleness honest (stale hooks come back `unknown` and contribute
@@ -325,10 +308,18 @@ export class PsProjectionService {
           && typeof this.seatActivity.getSeatStateBySession === "function"
           ? this.seatActivity.getSeatStateBySession(session)
           : null;
-        const activity = this.agentActivity && session
-          ? this.agentActivity.getLatestForNode({ sessionName: session, now: nowDate })
+        const hook = this.agentActivity && session
+          ? this.agentActivity.getLatestForNode({ nodeId: node.nodeId, sessionName: session, now: nowDate,
+            order: node.runtime === "claude-code" ? "source" : "arrival" })
           : null;
-        if (seatNeedsAttention(node, activity, arbitratedNeedsInputSignal(arbitrated))) attentionCount++;
+        // The row's served activity: a live hook, else the cached pane reading. A confirmed-missing session serves
+        // neither, as on the row.
+        const structural = this.structuralActivity && session ? this.structuralActivity.getStructuralActivity(session) : null;
+        const activity = identityVerdictConfirmsExecutorStopped(node.identityVerdict) ? null
+          : providerFailureActivity(retainedProviderFailure(this.agentActivity, { nodeId: node.nodeId, sessionName: session,
+            runtime: node.runtime, now: nowDate }, hook), structural, node.runtime)
+            ?? hookOrPaneActivity(hook, structural, false, node.runtime)?.activity ?? hook;
+        if (seatNeedsAttention(node, activity, arbitratedNeedsInputSignal(arbitrated), countAssignedWorkForEntry(node, assignedByDest).assignedWorkCount)) attentionCount++;
       }
 
       return {
@@ -341,16 +332,45 @@ export class PsProjectionService {
         hasWorkCount,
         status,
         lifecycleState,
-        uptime: r.earliest_running_at ? formatDuration(now - new Date(r.earliest_running_at + "Z").getTime()) : null,
+        uptime: earliestRunningAt ? formatDuration(now - new Date(earliestRunningAt + "Z").getTime()) : null,
         latestSnapshot: r.latest_snapshot_at ? formatAge(now - new Date(r.latest_snapshot_at + "Z").getTime()) : null,
         archivedAt: r.archived_at,
         isArchived: r.archived_at !== null,
-        periodicSnapshotActive: this.periodicSnapshotActive,
+        periodicSnapshotActive: snapshotted?.has(r.rig_id) ?? false,
         periodicSnapshotIntervalSeconds: this.periodicSnapshotIntervalSeconds,
         autoPeriodicSnapshotCount: r.auto_periodic_count,
         attentionCount,
+        ...(opts?.seats ? { seats: inventory.flatMap((node) => node.canonicalSessionName ? [node.canonicalSessionName] : []) } : {}),
       };
     });
+  }
+
+  /**
+   * Host-wide count of effectively running seats, archived rigs included: forced
+   * archival can hide a rig without stopping its seats. Equal to the sum of
+   * `runningCount` over `getEntries({ includeArchived: true })`, through the same
+   * `isEffectivelyRunning` predicate, but the inventory is built only for rigs
+   * with a node whose latest registration is `running`. The fold never turns any
+   * other node into a running one, so the other rigs can't add to the sum (#3636).
+   */
+  /** How many rigs are archived, read from the archived_at index (`idx_rigs_archived`) without folding them, so the count
+   *  line `rig ps` prints doesn't cost an archived listing (#3636). */
+  countArchivedRigs(): number {
+    return (this.db.prepare("SELECT COUNT(*) AS n FROM rigs WHERE archived_at IS NOT NULL").get() as { n: number }).n;
+  }
+
+  countRunningSeats(): number {
+    const rigIds = this.db.prepare(`
+      SELECT DISTINCT n.rig_id FROM nodes n
+      JOIN sessions s ON s.node_id = n.id
+        AND s.id = (SELECT s2.id FROM sessions s2 WHERE s2.node_id = n.id ORDER BY s2.id DESC LIMIT 1)
+      WHERE s.status = 'running'
+    `).all() as Array<{ rig_id: string }>;
+    let running = 0;
+    for (const inventory of getNodeInventoryForRigs(this.db, new Set(rigIds.map((r) => r.rig_id))).values()) {
+      running += inventory.filter(isEffectivelyRunning).length;
+    }
+    return running;
   }
 }
 

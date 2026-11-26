@@ -51,7 +51,12 @@ another preference store or infer delegation from workflow existence or activity
 The existing SQLite mode-binding table remains the only preference store. Matching
 posture bindings resolve in this order: qitem, workstream, mission, project, rig,
 global host. The qualifiers are respectively a qitem ID, `project/mission/slice-id`,
-`project/mission`, project ID, canonical rig ID, and null. Rig names resolve to IDs.
+`project/mission`, project ID, canonical rig ID, and null. Rig names resolve to IDs: an ID
+resolves exactly, and a name to the one live rig with it. Archived rigs of that name count only
+when no live one has it, and a name that still matches several rigs reports `unknown` with their
+IDs in the reason, so one can be named by ID. A qitem addressed to a seat takes that seat's rig;
+one addressed to a person (`<person>@external`) names no rig, and its posture comes from its work
+scope.
 The workstream is an existing authored slice, found by its directory or SPEC ID;
 the returned identity uses its SPEC ID and project/mission qualification.
 
@@ -81,8 +86,18 @@ their bindings and ten-field records. They do not imply either operating posture
 Only human-led/delegated bindings participate in posture precedence. The legacy
 `effective` and `posture: known|unknown_posture` fields remain for compatibility;
 `unknown_posture` there means no legacy mode binding and does not override the
-new `operatingPosture.source: product-default` result. Setting another mode at the
-same scope replaces that row; inspect effective posture after any mode change.
+new `operatingPosture.source: product-default` result. A saved legacy mode and a
+posture are kept side by side at the same target: a write replaces only the
+binding of its own kind. Inspect effective posture after any mode change.
+
+Eight of the record's fields are stored, validated and shown, but nothing in
+OpenRig acts on them yet: `autonomy_scope`, `heartbeat_cadence`,
+`inspection_depth`, `update_detail`, `escalation_threshold`, `concurrency_limit`,
+`permission_prompt_posture` and `expiry_or_stale_rule`. `rig mode effective`,
+`rig mode defaults` and the `rig mode set` preview mark them `(stored; not applied)`.
+`scope` is the binding's key, and the posture reads `evidence_citation` into its
+`binding.evidence`. `permission_prompt_posture` never changes a native permission
+prompt.
 
 ## Diagnosis effects
 

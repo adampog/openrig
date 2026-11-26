@@ -13,8 +13,10 @@
  */
 
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import net from "node:net";
 import { join } from "node:path";
+import { DAEMON_START_COMMAND_TIMEOUT_MS } from "../../src/daemon-shutdown.js";
 import { assertNoForeignDaemon, type HermeticScaffold } from "./hermetic-env.js";
 
 export interface RigResult {
@@ -64,7 +66,7 @@ export interface SpawnScenarioDaemonOptions {
   rigBin: string;
   /** Override the port (default: an ephemeral free port). */
   port?: number;
-  /** Per-invocation timeout for `rig` subprocesses (ms). */
+  /** Per-invocation timeout for `rig` subprocesses (ms). The start itself gets the product's own start budget. */
   timeoutMs?: number;
 }
 
@@ -125,17 +127,28 @@ export async function spawnScenarioDaemon(
   assertNoForeignDaemon(scaffold.env);
 
   const { rigBin, timeoutMs } = opts;
+  // The default seam is this checkout's built CLI. `npm test` and `npm run build -w packages/daemon`
+  // build only the daemon, so name the missing build instead of surfacing a Node MODULE_NOT_FOUND.
+  if (!existsSync(rigBin)) {
+    throw new Error(
+      `scenario-local daemon cannot start: the rig CLI is not built at ${rigBin}. ` +
+        "Run `npm run build` at the repository root first (it builds every workspace).",
+    );
+  }
   const port = opts.port ?? (await findFreePort());
   const db = join(scaffold.stateDir, "scenario.db");
 
   // The single start path — reused by initial spawn AND by restart, so a restart
   // re-spawns through EXACTLY the same forced-local/scratch/fail-closed guarantees.
+  // `rig daemon start` waits for its daemon's readiness for up to its own budget (DAEMON_START_COMMAND_TIMEOUT_MS, as the
+  // TUI's start uses). Cutting it off at the per-invocation timeout reported a slow but healthy start as a failure, and
+  // left its daemon child running.
   const startProc = async () => {
     const start = await runRig(
       ["daemon", "start", "--port", String(port), "--db", db, "--no-kernel"],
       scaffold.env,
       rigBin,
-      timeoutMs,
+      DAEMON_START_COMMAND_TIMEOUT_MS,
     );
     if (start.code !== 0) {
       throw new Error(
@@ -143,15 +156,18 @@ export async function spawnScenarioDaemon(
       );
     }
   };
+  const baseUrl = `http://127.0.0.1:${port}`;
   const killProc = async () => {
     // `rig daemon stop` reads daemon.json under the scratch OPENRIG_HOME and
-    // SIGTERMs the daemon. Best-effort (already-down is fine).
-    await runRig(["daemon", "stop"], scaffold.env, rigBin, timeoutMs).catch(() => {});
+    // SIGTERMs the daemon. Best-effort (already-down is fine). Addressed to this
+    // daemon's own URL: once a stop has removed daemon.json, the scrubbed env
+    // would otherwise check the configured default, 127.0.0.1:7433, which can be
+    // the machine's own daemon (#3631).
+    await runRig(["daemon", "stop"], { ...scaffold.env, OPENRIG_URL: baseUrl }, rigBin, timeoutMs).catch(() => {});
   };
 
   await startProc();
 
-  const baseUrl = `http://127.0.0.1:${port}`;
   const readEnv: Record<string, string | undefined> = { ...scaffold.env, OPENRIG_URL: baseUrl };
 
   return {

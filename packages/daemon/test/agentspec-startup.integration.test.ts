@@ -22,7 +22,9 @@ function mockTmux(): TmuxAdapter {
     killSession: vi.fn(async () => ({ ok: true as const })),
     listSessions: vi.fn(async () => []),
     listWindows: vi.fn(async () => []),
-    listPanes: vi.fn(async () => []),
+    listPanes: vi.fn(async () => [{ id: "%1", index: 0, cwd: "/project", width: 80, height: 24, active: true }]),
+    getPanePid: vi.fn(async () => 4242),
+    getPaneCommand: vi.fn(async () => "claude"),
     sendKeys: vi.fn(async () => ({ ok: true as const })),
     capturePaneContent: vi.fn(async () => "❯ \n────────────────────\n"),
   } as unknown as TmuxAdapter;
@@ -157,7 +159,7 @@ describe("AgentSpec startup integration", () => {
     });
 
     // 8. Run startup orchestrator
-    const orchestrator = new StartupOrchestrator({ db, sessionRegistry, eventBus, tmuxAdapter: tmux });
+    const orchestrator = new StartupOrchestrator({ db, sessionRegistry, eventBus, tmuxAdapter: tmux, sleep: async () => {} });
     const startupResult = await orchestrator.startNode({
       rigId: rig.id,
       nodeId: node.id,

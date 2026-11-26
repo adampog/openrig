@@ -1,3 +1,4 @@
+import { savedSessionName } from "../domain/session-registry.js";
 import { Hono } from "hono";
 import type Database from "better-sqlite3";
 import type { RigRepository } from "../domain/rig-repository.js";
@@ -5,9 +6,11 @@ import type { TranscriptIngestHealth, TranscriptStore } from "../domain/transcri
 import type { TmuxAdapter } from "../adapters/tmux.js";
 import { startTmuxTranscriptCapture } from "../domain/transcript-capture.js";
 import { redactTranscriptContent } from "../domain/transcript-redaction.js";
+import { TranscriptGrepTimeoutError } from "../domain/transcript-grep.js";
 
 interface SessionRow {
   node_id: string;
+  status: string;
 }
 
 interface NodeRow {
@@ -22,14 +25,22 @@ interface BindingRow {
 
 const CAPTURE_WARMUP_MS = 150;
 
+/** `ended`: the session was stopped or cleaned, so no capture runs for it any more. */
+interface SessionResolution {
+  rigName: string;
+  nodeId: string;
+  runtime: string | null;
+  ended: boolean;
+}
+
 function resolveSessionToRig(
   db: Database.Database,
   rigRepo: RigRepository,
   sessionName: string,
-): { rigName: string; nodeId: string; runtime: string | null } | { error: string; status: number } {
+): SessionResolution | { error: string; status: number } {
   // Find ALL sessions with this name to detect ambiguity
   const sessionRows = db
-    .prepare("SELECT node_id FROM sessions WHERE session_name = ? ORDER BY id DESC")
+    .prepare("SELECT node_id, status FROM sessions WHERE session_name = ? ORDER BY id DESC")
     .all(sessionName) as SessionRow[];
 
   if (sessionRows.length === 0) {
@@ -73,6 +84,7 @@ function resolveSessionToRig(
     rigName: rigNames.values().next().value!,
     nodeId: sessionRows[0]!.node_id,
     runtime: selectedNode.runtime,
+    ended: sessionRows[0]!.status === "exited",
   };
 }
 
@@ -100,12 +112,14 @@ async function ensureTranscriptIngest(
   db: Database.Database,
   transcriptStore: TranscriptStore,
   tmuxAdapter: TmuxAdapter | undefined,
-  resolution: { rigName: string; nodeId: string; runtime: string | null },
+  resolution: SessionResolution,
   sessionName: string,
 ): Promise<{ health: RouteIngestHealth; started: boolean }> {
   let health = transcriptStore.getIngestHealth(resolution.rigName, sessionName);
+  // An ended session's capture stopped with it, however recent its saved file.
+  if (resolution.ended && health.state === "live") health = { ...health, state: "degraded", reason: "capture_stale" };
   let started = false;
-  if (health.state !== "live") {
+  if (health.state !== "live" && !resolution.ended) {
     started = await tryStartCaptureForSession(
       db,
       transcriptStore,
@@ -120,6 +134,12 @@ async function ensureTranscriptIngest(
     }
   }
   return { health: { ...health, runtime: resolution.runtime }, started };
+}
+
+/** A stopped or cleaned session's capture has ended, so its saved text is served as it stands, its ingest health
+ *  still saying capture is stale. */
+function servesTranscript(resolution: SessionResolution, health: RouteIngestHealth): boolean {
+  return health.state === "live" || (resolution.ended && health.reason === "capture_stale");
 }
 
 function transcriptIngestError(sessionName: string, health: RouteIngestHealth, started = false): string {
@@ -141,7 +161,7 @@ export function transcriptRoutes(): Hono {
     const db = c.get("db" as never) as Database.Database;
     const rigRepo = c.get("rigRepo" as never) as RigRepository;
     const tmuxAdapter = c.get("tmuxAdapter" as never) as TmuxAdapter | undefined;
-    const sessionName = c.req.param("session");
+    let sessionName = c.req.param("session");
     const rawLines = parseInt(c.req.query("lines") ?? "50", 10);
     const lines = isNaN(rawLines) || rawLines < 1 ? 50 : rawLines;
 
@@ -152,6 +172,7 @@ export function transcriptRoutes(): Hono {
       );
     }
 
+    sessionName = savedSessionName(db, sessionName);
     const resolution = resolveSessionToRig(db, rigRepo, sessionName);
     if ("error" in resolution) {
       return c.json({ error: resolution.error }, resolution.status as 404);
@@ -161,7 +182,7 @@ export function transcriptRoutes(): Hono {
       db, transcriptStore, tmuxAdapter, resolution, sessionName,
     );
     const ingestHealth = ingest.health;
-    if (ingestHealth.state !== "live") {
+    if (!servesTranscript(resolution, ingestHealth)) {
       return c.json(
         { error: transcriptIngestError(sessionName, ingestHealth, ingest.started), ingestHealth },
         ingestHealth.state === "unavailable" ? 404 : 503,
@@ -189,12 +210,17 @@ export function transcriptRoutes(): Hono {
     const db = c.get("db" as never) as Database.Database;
     const rigRepo = c.get("rigRepo" as never) as RigRepository;
     const tmuxAdapter = c.get("tmuxAdapter" as never) as TmuxAdapter | undefined;
-    const sessionName = c.req.param("session");
+    let sessionName = c.req.param("session");
     const pattern = c.req.query("pattern");
 
     if (!pattern) {
       return c.json({ error: "Missing required query parameter: pattern" }, 400);
     }
+
+    // The scan runs the caller's regular expression over every line, so it happens on its own thread with
+    // a deadline: on the daemon's thread a catastrophic pattern would stop every other request and every
+    // sweep (domain/transcript-grep.ts). The pattern itself is not bounded here; a long regex is the
+    // caller's to write, and the deadline is what keeps it from costing the daemon.
 
     // Pre-validate regex
     try {
@@ -213,6 +239,7 @@ export function transcriptRoutes(): Hono {
       );
     }
 
+    sessionName = savedSessionName(db, sessionName);
     const resolution = resolveSessionToRig(db, rigRepo, sessionName);
     if ("error" in resolution) {
       return c.json({ error: resolution.error }, resolution.status as 404);
@@ -222,14 +249,23 @@ export function transcriptRoutes(): Hono {
       db, transcriptStore, tmuxAdapter, resolution, sessionName,
     );
     const ingestHealth = ingest.health;
-    if (ingestHealth.state !== "live") {
+    if (!servesTranscript(resolution, ingestHealth)) {
       return c.json(
         { error: transcriptIngestError(sessionName, ingestHealth, ingest.started), ingestHealth },
         ingestHealth.state === "unavailable" ? 404 : 503,
       );
     }
 
-    const matches = transcriptStore.grep(resolution.rigName, sessionName, pattern);
+    let matches: string[] | null;
+    try {
+      matches = await transcriptStore.grep(resolution.rigName, sessionName, pattern);
+    } catch (err) {
+      // A scan that outlived its bound was ended; the request answers honestly instead of holding.
+      if (err instanceof TranscriptGrepTimeoutError) {
+        return c.json({ error: `Grep scan ended: ${err.message}. Try a narrower pattern.` }, 504);
+      }
+      throw err;
+    }
     if (matches === null) {
       return c.json({ error: transcriptIngestError(sessionName, ingestHealth), ingestHealth }, 503);
     }
@@ -239,8 +275,8 @@ export function transcriptRoutes(): Hono {
 
   // GET /:session/full — return the full transcript content for a session.
   //
-  // Per orch decision approved-option-a (escalation
-  // qitem-20260502020833-68e4eca3): this route adopts the existing
+  // Per orch decision approved-option-a (escalation):
+  // this route adopts the existing
   // tail/grep posture (open route, daemon-local trust boundary). No
   // session-scoped auth is enforced because no caller-identity primitive
   // exists in the daemon today. Route-level redaction (M1 contract § 4 /
@@ -255,7 +291,7 @@ export function transcriptRoutes(): Hono {
     const db = c.get("db" as never) as Database.Database;
     const rigRepo = c.get("rigRepo" as never) as RigRepository;
     const tmuxAdapter = c.get("tmuxAdapter" as never) as TmuxAdapter | undefined;
-    const sessionName = c.req.param("session");
+    let sessionName = c.req.param("session");
 
     if (!transcriptStore?.enabled) {
       return c.json(
@@ -264,6 +300,7 @@ export function transcriptRoutes(): Hono {
       );
     }
 
+    sessionName = savedSessionName(db, sessionName);
     const resolution = resolveSessionToRig(db, rigRepo, sessionName);
     if ("error" in resolution) {
       return c.json({ error: resolution.error }, resolution.status as 404);
@@ -273,7 +310,7 @@ export function transcriptRoutes(): Hono {
       db, transcriptStore, tmuxAdapter, resolution, sessionName,
     );
     const ingestHealth = ingest.health;
-    if (ingestHealth.state !== "live") {
+    if (!servesTranscript(resolution, ingestHealth)) {
       return c.json(
         { error: transcriptIngestError(sessionName, ingestHealth, ingest.started), ingestHealth },
         ingestHealth.state === "unavailable" ? 404 : 503,

@@ -88,6 +88,16 @@ describe("RigSpec codec (pod-aware)", () => {
     expect(normalized.pods[0]!.members[0]!.effort).toBe("high");
   });
 
+  it("member mechanic round-trips through serialize/parse/normalize", () => {
+    const yaml = RigSpecCodec.serialize({
+      ...VALID_RIG,
+      pods: [{ ...VALID_RIG.pods[0]!, members: [{ ...VALID_RIG.pods[0]!.members[0]!, mechanic: "mech@dev-rig" }] }],
+    });
+    expect(yaml).toContain("mechanic: mech@dev-rig");
+    const normalized = RigSpecSchema.normalize(RigSpecCodec.parse(yaml) as Record<string, unknown>);
+    expect(normalized.pods[0]!.members[0]!.mechanic).toBe("mech@dev-rig");
+  });
+
   it("loads YAML with member effort through validation, normalization, and serializes back", () => {
     const rawYaml = `
 version: "0.2"
@@ -269,6 +279,112 @@ edges: []
     const yaml = RigSpecCodec.serialize(VALID_RIG);
     expect(yaml).not.toContain("starter_ref:");
   });
+
+  it("member launch_wrapper round-trips non-empty argv, retains explicit [], and omits absent", () => {
+    const argv = ["mtn", "sandbox", "exec", "", "--flag='quoted $VAR ;'", "--"];
+    const withWrapper: RigSpec = {
+      ...VALID_RIG,
+      pods: [
+        {
+          id: "dev",
+          label: "Development",
+          members: [
+            { id: "impl", agentRef: "local:agents/impl", profile: "tdd", runtime: "claude-code", cwd: "." },
+            { id: "qa", agentRef: "local:agents/qa", profile: "reviewer", runtime: "codex", cwd: ".", launchWrapper: argv },
+          ],
+          edges: [],
+        },
+      ],
+    };
+
+    const yaml = RigSpecCodec.serialize(withWrapper);
+    expect(yaml).toContain("launch_wrapper:");
+    const parsed = RigSpecCodec.parse(yaml);
+    expect(RigSpecSchema.validate(parsed)).toEqual({ valid: true, errors: [] });
+    const normalized = RigSpecSchema.normalize(parsed as Record<string, unknown>);
+    expect(normalized.pods[0]!.members[0]!.launchWrapper).toBeUndefined();
+    expect(normalized.pods[0]!.members[1]!.launchWrapper).toEqual(argv);
+
+    const withClear: RigSpec = {
+      ...VALID_RIG,
+      pods: [
+        {
+          id: "dev",
+          label: "Development",
+          members: [
+            { id: "qa", agentRef: "local:agents/qa", profile: "reviewer", runtime: "pi", cwd: ".", launchWrapper: [] },
+          ],
+          edges: [],
+        },
+      ],
+    };
+    const clearYaml = RigSpecCodec.serialize(withClear);
+    expect(clearYaml).toContain("launch_wrapper: []");
+    const clearParsed = RigSpecCodec.parse(clearYaml);
+    expect(RigSpecSchema.validate(clearParsed)).toEqual({ valid: true, errors: [] });
+    expect(RigSpecSchema.normalize(clearParsed as Record<string, unknown>).pods[0]!.members[0]!.launchWrapper).toEqual([]);
+
+    const defaultYaml = RigSpecCodec.serialize(VALID_RIG);
+    expect(defaultYaml).not.toContain("launch_wrapper");
+  });
+
+  it("A codec round trip keeps a valid block, and `normalize` drops a malformed one without throwing.", () => {
+    const yamlWith = (pool: string) => [
+      "version: \"0.2\"", "name: pool-rig", "pods:", "  - id: dev", "    label: Dev", "    members:",
+      "      - id: impl", "        agent_ref: local:agents/impl", "        profile: default", "        runtime: claude-code",
+      "        cwd: .", `        pool: ${pool}`, "    edges: []", "edges: []", "",
+    ].join("\n");
+
+    const valid = RigSpecSchema.normalize(RigSpecCodec.parse(yamlWith("{ max: 3, dispatch_tag: \"role:impl\", cwd_template: \"/work/{rig}/{slot}\" }")) as Record<string, unknown>);
+    const pool = valid.pods[0]!.members[0]!.pool;
+    expect(pool).toEqual({ max: 3, min: 0, dispatchAfterSeconds: 60, idleGraceSeconds: 300, cooldownSeconds: 60,
+      dispatchTag: "role:impl", cwdTemplate: "/work/{rig}/{slot}", drain: false });
+    const again = RigSpecCodec.parse(RigSpecCodec.serialize(valid));
+    expect(RigSpecSchema.validate(again)).toEqual({ valid: true, errors: [] });
+    expect(RigSpecSchema.normalize(again as Record<string, unknown>).pods[0]!.members[0]!.pool).toEqual(pool);
+
+    // every field away from its default, and dispatch_after_s != cooldown_s, so a swapped or fixed field shows
+    const full = RigSpecSchema.normalize(RigSpecCodec.parse(yamlWith(
+      "{ max: 5, min: 2, dispatch_after_s: 45, idle_grace_s: 120, cooldown_s: 90, dispatch_tag: \"role:qa\", cwd_template: \"/work/{slot}\", drain: true }",
+    )) as Record<string, unknown>);
+    const fullPool = full.pods[0]!.members[0]!.pool;
+    expect(fullPool).toEqual({ max: 5, min: 2, dispatchAfterSeconds: 45, idleGraceSeconds: 120, cooldownSeconds: 90,
+      dispatchTag: "role:qa", cwdTemplate: "/work/{slot}", drain: true });
+    const fullAgain = RigSpecCodec.parse(RigSpecCodec.serialize(full));
+    expect(RigSpecSchema.normalize(fullAgain as Record<string, unknown>).pods[0]!.members[0]!.pool).toEqual(fullPool);
+
+    const malformed = RigSpecCodec.parse(yamlWith("{ max: 3, min: 5 }")) as Record<string, unknown>;
+    let normalized!: RigSpec;
+    expect(() => { normalized = RigSpecSchema.normalize(malformed); }).not.toThrow();
+    expect(normalized.pods[0]!.members[0]!.pool).toBeUndefined();
+    const written = RigSpecCodec.serialize(normalized);
+    expect(written).not.toMatch(/^\s*pool:/m);
+    expect(RigSpecSchema.validate(RigSpecCodec.parse(written))).toEqual({ valid: true, errors: [] });
+  });
+
+  it("A malformed block that refers to itself through a YAML alias is dropped without throwing, and what is kept for its node can be stored.", () => {
+    const yaml = [
+      "version: \"0.2\"", "name: alias-rig", "pods:", "  - id: dev", "    label: Dev", "    members:",
+      "      - id: impl", "        agent_ref: local:agents/impl", "        profile: default", "        runtime: claude-code",
+      "        cwd: .", "        pool: &loop", "          max: 1", "          again: *loop", "    edges: []", "edges: []", "",
+    ].join("\n");
+    const parsed = RigSpecCodec.parse(yaml) as Record<string, unknown>;
+    expect(() => JSON.stringify(parsed)).toThrow(/circular/i);
+    expect(RigSpecSchema.validate(parsed).valid).toBe(true);
+    const member = RigSpecSchema.normalize(parsed).pods[0]!.members[0]!;
+    expect(member.pool).toBeUndefined();
+    expect(() => JSON.stringify(member)).not.toThrow();
+  });
+
+  it("`pool: {}` round-trips as the explicit clear, and a member without the key writes none.", () => {
+    const withClear: RigSpec = { ...VALID_RIG, pods: [{ ...VALID_RIG.pods[0]!, members: [
+      { id: "impl", agentRef: "local:agents/impl", profile: "tdd", runtime: "claude-code", cwd: ".", pool: null },
+    ], edges: [] }] };
+    const yaml = RigSpecCodec.serialize(withClear);
+    expect(yaml).toContain("pool: {}");
+    expect(RigSpecSchema.normalize(RigSpecCodec.parse(yaml) as Record<string, unknown>).pods[0]!.members[0]!.pool).toBeNull();
+    expect(RigSpecCodec.serialize(VALID_RIG)).not.toMatch(/^\s*pool:/m);
+  });
 });
 
 describe("LegacyRigSpecCodec", () => {
@@ -298,5 +414,65 @@ describe("LegacyRigSpecCodec", () => {
 
     const normalized = LegacyRigSpecSchema.normalize(parsed);
     expect(normalized.nodes[0]!.effort).toBe("high");
+  });
+
+  it("legacy node launch_wrapper round-trips non-empty argv on Pi, Codex and Claude, retains explicit [], and omits absent", () => {
+    const piArgv = ["mtn", "sandbox", "exec", "", "--flag='quoted $VAR ;'", "--"];
+    const codexArgv = ["/usr/local/bin/codex-wrap", "--seat", "qa", "--"];
+    const legacyWithWrapper: LegacyRigSpec = {
+      schemaVersion: 1,
+      name: "legacy-wrapper-rig",
+      version: "1.0.0",
+      nodes: [
+        { id: "orch", runtime: "claude-code", cwd: "/workspace" },
+        { id: "pi-worker", runtime: "pi", cwd: "/workspace", launchWrapper: piArgv },
+        { id: "codex-worker", runtime: "codex", cwd: "/workspace", launchWrapper: codexArgv },
+      ],
+      edges: [],
+    };
+
+    const yaml = LegacyRigSpecCodec.serialize(legacyWithWrapper);
+    expect(yaml).toContain("launch_wrapper:");
+    const parsed = LegacyRigSpecCodec.parse(yaml);
+    expect(LegacyRigSpecSchema.validate(parsed)).toEqual({ valid: true, errors: [] });
+    const normalized = LegacyRigSpecSchema.normalize(parsed);
+    expect(normalized.nodes[0]!.launchWrapper).toBeUndefined();
+    expect("launchWrapper" in normalized.nodes[0]!).toBe(false);
+    expect(normalized.nodes[1]!.launchWrapper).toEqual(piArgv);
+    expect(normalized.nodes[2]!.launchWrapper).toEqual(codexArgv);
+
+    const legacyWithClear: LegacyRigSpec = {
+      schemaVersion: 1,
+      name: "legacy-wrapper-clear-rig",
+      version: "1.0.0",
+      nodes: [
+        { id: "pi-clear", runtime: "pi", cwd: "/workspace", launchWrapper: [] },
+        { id: "codex-clear", runtime: "codex", cwd: "/workspace", launchWrapper: [] },
+      ],
+      edges: [],
+    };
+    const clearYaml = LegacyRigSpecCodec.serialize(legacyWithClear);
+    expect(clearYaml).toContain("launch_wrapper: []");
+    const clearParsed = LegacyRigSpecCodec.parse(clearYaml);
+    expect(LegacyRigSpecSchema.validate(clearParsed)).toEqual({ valid: true, errors: [] });
+    const clearNormalized = LegacyRigSpecSchema.normalize(clearParsed);
+    expect(clearNormalized.nodes[0]!.launchWrapper).toEqual([]);
+    expect(clearNormalized.nodes[1]!.launchWrapper).toEqual([]);
+
+    const claudeArgv = ["/usr/local/bin/claude-wrap", "--seat", "claude", "--"];
+    const claudeYaml = LegacyRigSpecCodec.serialize({ schemaVersion: 1, name: "legacy-claude-wrapper", version: "1.0.0",
+      nodes: [{ id: "claude-worker", runtime: "claude-code", cwd: "/workspace", launchWrapper: claudeArgv }], edges: [] });
+    const claudeParsed = LegacyRigSpecCodec.parse(claudeYaml);
+    expect(LegacyRigSpecSchema.validate(claudeParsed)).toEqual({ valid: true, errors: [] });
+    expect(LegacyRigSpecSchema.normalize(claudeParsed).nodes[0]!.launchWrapper).toEqual(claudeArgv);
+
+    const defaultYaml = LegacyRigSpecCodec.serialize({
+      schemaVersion: 1,
+      name: "legacy-no-wrapper",
+      version: "1.0.0",
+      nodes: [{ id: "worker", runtime: "codex", cwd: "/workspace" }],
+      edges: [],
+    });
+    expect(defaultYaml).not.toContain("launch_wrapper");
   });
 });

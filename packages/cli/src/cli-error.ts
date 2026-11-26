@@ -14,6 +14,7 @@ import type { Command } from "commander";
 import { InvalidArgumentError } from "commander";
 import { DaemonConnectionError, DaemonResponseError, DaemonTimeoutError } from "./client.js";
 import { blockedConnectionGuidance, isBlockedConnectionCode } from "./daemon-reachability.js";
+import { resetSenderSession } from "./sender-identity.js";
 
 /**
  * Commander option parser — a positive integer (>= 1). Rejects negative, zero,
@@ -42,6 +43,7 @@ export function enumArg(allowed: readonly string[]): (value: string) => string {
 export function wantsJsonOutput(argv: readonly string[]): boolean {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
+    if (a === "--") break;
     if (a === "--json") return true;
     if ((a === "-o" || a === "--output" || a === "--format") && argv[i + 1] === "json") return true;
     if (/^(?:-o|--output|--format)=json$/.test(a)) return true;
@@ -145,6 +147,13 @@ export function renderDaemonTransportError(
   return true;
 }
 
+/** For a command's own catch around a daemon request: renders a daemon transport error as the shared
+ *  path does (a timeout says the outcome is unknown and to check its effect before any retry) and returns
+ *  true; returns false for any other error, which the caller reports as before. */
+export function renderCaughtTransportError(e: unknown, json = false): boolean {
+  return renderDaemonTransportError(e, { out: (l) => console.log(l), err: (l) => console.error(l), json });
+}
+
 /**
  * Parse+run the program through the shared error path. Injectable IO for tests.
  * Returns the process exit code (0 on success / clean help/version).
@@ -167,9 +176,14 @@ export async function runProgram(program: Command, argv: string[], io: RunProgra
   };
   suppressErr(program);
 
+  // Each run starts clean: an earlier in-process run's failure isn't this run's status, and its sender isn't this run's.
+  process.exitCode = undefined;
+  resetSenderSession();
   try {
     await program.parseAsync(argv);
-    return 0;
+    // An action's own failure sets process.exitCode. It's returned, not passed to process.exit(), which can drop output
+    // still being written to a pipe; the process ends with process.exitCode.
+    return typeof process.exitCode === "number" ? process.exitCode : 0;
   } catch (e) {
     if (isCleanCommanderExit(e)) return 0;
     // Response-integrity: render daemon transport failures honestly (3-part, both

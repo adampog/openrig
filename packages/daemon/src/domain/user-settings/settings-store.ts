@@ -66,6 +66,14 @@ export function resolveLegacyTopologyRigsRoot(): string {
 export const SETTINGS_VALID_KEYS = [
   "daemon.port",
   "daemon.host",
+  "daemon.db_conflict",
+  // #2687: the cadence of the seat-activity and structural-activity pollers; startup-only, read once at daemon start.
+  "daemon.seat_poll_interval_ms",
+  // #3146: the cadence of the seat identity reconciler; startup-only, read once at daemon start.
+  "daemon.identity_poll_interval_ms",
+  // #3637: how long a start waits for its child's readiness (rig daemon start, rig start, rig up, the TUI); read by
+  // each start, not by the running daemon. Twin of the CLI key.
+  "daemon.start_readiness_wait_seconds",
   // OPR.0.4.6.MH1 FR-1 — the persisted host-selection pointer, ONE
   // static key, lockstep with cli/src/config-store.ts VALID_KEYS (the
   // twins parity test pins both). Default "local" (unset ≡ local host).
@@ -105,9 +113,13 @@ export const SETTINGS_VALID_KEYS = [
   // OPR.0.5.9.5 Wave B — canonical context library; old key is refused.
   "context.root",
   "context.system_world",
+  "specs.builtins_visible",
   "skills.root",
+  // OPR.0.7.0.13 (router): the person's recorded yes to OpenRig's one-line seat-skills bootstrap in AGENTS.md / CLAUDE.md.
+  "skills.router_line.enabled",
   "onboarding.default_pack.enabled",
   "launch.non_interruptive",
+  "launch.codex_login_shell",
   "health.context_pressure.warning_percent",
   "health.context_pressure.critical_percent",
   "files.allowlist",
@@ -117,7 +129,10 @@ export const SETTINGS_VALID_KEYS = [
   "ui.preview.default_lines",
   "ui.timezone",
   // The web UI and its terminal WebSocket are off unless this is true (read at daemon start).
+  // The web UI and its terminal WebSocket are off unless this is true (read at daemon start).
   "ui.enabled",
+  // TUI topology: whether a remote rig's seats may be read through this daemon (off by default).
+  "ui.topology_remote_seats",
   // OPR.0.4.0.1 — global cap on simultaneously-live terminals (default 2).
   "ui.terminal.max_live_terminals",
   "recovery.auto_drive_provider_prompts",
@@ -127,6 +142,8 @@ export const SETTINGS_VALID_KEYS = [
   // dispatch ACK §4: allowlist-only edit; no migrations / new
   // endpoints / event types.
   "agents.advisor_session",
+  // The default receiving agent: reads what a person answers when nothing else reads it (resolveDefaultReceiver), and the
+  // agent a dead seat's recovery reaches. Unset means the kernel operator, when this host has that seat.
   "agents.operator_session",
   // Explicit operator override; unset means discover the registered human.
   "workspace.operator_seat_name",
@@ -149,7 +166,7 @@ export const SETTINGS_VALID_KEYS = [
   "runtime.codex.hooks_enabled",
   "runtime.readiness_timeout_seconds",
   // Slice 27 — Claude auto-compaction policy. SC-29 EXCEPTION #10:
-  // 7 keys (lockstep with cli/src/config-store.ts VALID_KEYS).
+  // 8 keys (lockstep with cli/src/config-store.ts VALID_KEYS).
   // Opt-in default-off; daemon ContextMonitor reads `enabled` +
   // `threshold_percent` to decide when to send pre-compact prep +
   // /compact. The daemon wraps `pre_compact_instruction` with usage
@@ -157,6 +174,7 @@ export const SETTINGS_VALID_KEYS = [
   // the actual compaction phase, uses `message_inline` +
   // `message_file_path` for post-compaction restore guidance, then
   // wraps `post_restore_audit_instruction` as the read-depth nudge.
+  "policies.claude_compaction.preparation_root",
   "policies.claude_compaction.enabled",
   "policies.claude_compaction.threshold_percent",
   "policies.claude_compaction.pre_compact_instruction",
@@ -182,6 +200,35 @@ export const SETTINGS_VALID_KEYS = [
   // twins). Consumed by NodeLauncher at session-create only; a flip is
   // future-launches-only and never retroactive (BR-1 never-retro).
   "terminal.status_bar",
+  "terminal.tmux_server",
+  // The managed ~/.tmux.conf block's history-limit; written by `rig setup` (CLI), twin of the CLI key.
+  "terminal.history_limit",
+  "terminal.fixed_geometry",
+  "terminal.inherit_tmux_environment",
+  // Slice 15 (OPR.0.7.0.15) — compact command-output defaults; CLI-read, twin of the CLI key.
+  "output.compact",
+  "output.whoami_peers",
+  "output.rebuild_recaps",
+  // Slice 01 (OPR.0.7.0.1) — Codex and Claude usage windows in the provider view; daemon-read, twin of the CLI key.
+  "provider.usage_windows",
+  // The providers chosen at rig setup --providers; kernel boot counts only these. Twin of the CLI key.
+  "provider.selected",
+  // Service-backed archives, including packing, preview and durable-target admission; default off.
+  "bundle.services_enabled",
+  "usage.pi_cost_facts",
+  "usage.pi_openrouter_charge",
+  // A verified Claude Code or Codex send reports on input-box evidence; daemon-read, twin of the CLI key.
+  "transport.verify_input_box",
+  "transport.local_user_guard",
+  // Whether an ordinary send or work notice reaches a seat whose prompt holds a person's draft; daemon-read, twin of the CLI key.
+  "transport.draft_delivery",
+  // Slice 22 (OPR.0.7.2.22) — typed decisions (OpenRouter + Jev), off by default; read by the invoking
+  // rig process, never by the daemon. Twin of the CLI keys.
+  "decisions.enabled",
+  "decisions.consumers",
+  "decisions.template_dir",
+  // rig acp serve's receiver when --to isn't given; read by the invoking rig process, never by the daemon. Twin of the CLI key.
+  "acp.to",
   // OPR.0.4.6.FS-1 W2 — queue-retention maintenance knobs (arch D3; closed-set,
   // arch-safe defaults BAKED in getDefaultValue, bounded validation in
   // KEY_CONSTRAINTS). CLI-settable twin: lockstep with cli/src/config-store.ts
@@ -192,7 +239,19 @@ export const SETTINGS_VALID_KEYS = [
   "retention.transitions_days",
   "retention.watchdog_days",
   "retention.usage_samples_days",
+  // The history-only event types of `events` (queue-retention PRUNABLE_EVENT_TYPES) older than N days; 0 (default) keeps them.
+  "retention.events_days",
+  // Closed queue work (done, canceled, denied, handed-off): its content goes N days after it closed, then the row, keeping
+  // only its id (queue-erasure). 0 (default) keeps them.
+  "retention.closed_content_days",
+  "retention.closed_metadata_days",
+  // Where queue erasure appends each erased id and action (JSON lines), for replaying after a restore; empty keeps none.
+  "retention.erasure_ledger",
   "retention.watchdog_keep_per_job",
+  // Slice 22 outcome 9 — stream retention: unreferenced items older than N days or beyond the newest N.
+  "retention.stream_days",
+  "retention.stream_max_items",
+  "stream.intake",
   "retention.batch_size",
   // S04 (OPR.0.5.5.4) — pickup-receipt stall threshold; net-new key, OPENRIG_* only,
   // CLI-settable twin lockstep with cli/src/config-store.ts VALID_KEYS. Fresh-read per
@@ -208,6 +267,10 @@ export const SETTINGS_VALID_KEYS = [
   "queue.wake_retry_cap",
   "queue.wake_unconfirmed_window_minutes",
   "queue.wake_swap_grace_seconds",
+  // #811 — whether the operator rung posts agent-to-agent escalations to a person.
+  // Under explicit-only, an ask that needs a person must be addressed to the person;
+  // without a human registry, explicit-only posts everything, as always does.
+  "queue.wake_human_rung",
 ] as const;
 
 export type SettingsValidKey = typeof SETTINGS_VALID_KEYS[number];
@@ -217,6 +280,10 @@ const ENV_MAP: Record<SettingsValidKey, { primary: string; legacy?: string }> = 
   // compatibility. New typed keys use OPENRIG_* only.
   "daemon.port": { primary: "OPENRIG_PORT", legacy: "RIGGED_PORT" },
   "daemon.host": { primary: "OPENRIG_HOST", legacy: "RIGGED_HOST" },
+  "daemon.db_conflict": { primary: "OPENRIG_DAEMON_DB_CONFLICT" },
+  "daemon.seat_poll_interval_ms": { primary: "OPENRIG_SEAT_POLL_INTERVAL_MS" },
+  "daemon.identity_poll_interval_ms": { primary: "OPENRIG_IDENTITY_POLL_INTERVAL_MS" },
+  "daemon.start_readiness_wait_seconds": { primary: "OPENRIG_DAEMON_START_READINESS_WAIT_SECONDS" },
   "db.path": { primary: "OPENRIG_DB", legacy: "RIGGED_DB" },
   "transcripts.enabled": { primary: "OPENRIG_TRANSCRIPTS_ENABLED", legacy: "RIGGED_TRANSCRIPTS_ENABLED" },
   "transcripts.path": { primary: "OPENRIG_TRANSCRIPTS_PATH", legacy: "RIGGED_TRANSCRIPTS_PATH" },
@@ -231,9 +298,12 @@ const ENV_MAP: Record<SettingsValidKey, { primary: string; legacy?: string }> = 
   "topology.root": { primary: "OPENRIG_TOPOLOGY_ROOT" },
   "context.root": { primary: "OPENRIG_CONTEXT_ROOT" },
   "context.system_world": { primary: "OPENRIG_CONTEXT_SYSTEM_WORLD" },
+  "specs.builtins_visible": { primary: "OPENRIG_SPECS_BUILTINS_VISIBLE" },
   "skills.root": { primary: "OPENRIG_SKILLS_ROOT" },
+  "skills.router_line.enabled": { primary: "OPENRIG_SKILLS_ROUTER_LINE_ENABLED" },
   "onboarding.default_pack.enabled": { primary: "OPENRIG_ONBOARDING_DEFAULT_PACK_ENABLED" },
   "launch.non_interruptive": { primary: "OPENRIG_LAUNCH_NON_INTERRUPTIVE" },
+  "launch.codex_login_shell": { primary: "OPENRIG_LAUNCH_CODEX_LOGIN_SHELL" },
   "health.context_pressure.warning_percent": { primary: "OPENRIG_HEALTH_CONTEXT_PRESSURE_WARNING_PERCENT" },
   "health.context_pressure.critical_percent": { primary: "OPENRIG_HEALTH_CONTEXT_PRESSURE_CRITICAL_PERCENT" },
   "files.allowlist": { primary: "OPENRIG_FILES_ALLOWLIST" },
@@ -242,6 +312,7 @@ const ENV_MAP: Record<SettingsValidKey, { primary: string; legacy?: string }> = 
   "ui.preview.max_pins": { primary: "OPENRIG_UI_PREVIEW_MAX_PINS" },
   "ui.timezone": { primary: "OPENRIG_UI_TIMEZONE" },
   "ui.enabled": { primary: "OPENRIG_UI_ENABLED" },
+  "ui.topology_remote_seats": { primary: "OPENRIG_UI_TOPOLOGY_REMOTE_SEATS" },
   "ui.preview.default_lines": { primary: "OPENRIG_UI_PREVIEW_DEFAULT_LINES" },
   "ui.terminal.max_live_terminals": { primary: "OPENRIG_UI_TERMINAL_MAX_LIVE_TERMINALS" },
   "recovery.auto_drive_provider_prompts": { primary: "OPENRIG_RECOVERY_AUTO_DRIVE_PROVIDER_PROMPTS" },
@@ -265,6 +336,7 @@ const ENV_MAP: Record<SettingsValidKey, { primary: string; legacy?: string }> = 
   "runtime.readiness_timeout_seconds": { primary: "OPENRIG_RUNTIME_READINESS_TIMEOUT_SECONDS" },
   // Slice 27 — Claude auto-compaction policy. Net-new keys; OPENRIG_X
   // primary only.
+  "policies.claude_compaction.preparation_root": { primary: "OPENRIG_POLICIES_CLAUDE_COMPACTION_PREPARATION_ROOT" },
   "policies.claude_compaction.enabled": { primary: "OPENRIG_POLICIES_CLAUDE_COMPACTION_ENABLED" },
   "policies.claude_compaction.threshold_percent": { primary: "OPENRIG_POLICIES_CLAUDE_COMPACTION_THRESHOLD_PERCENT" },
   "policies.claude_compaction.pre_compact_instruction": { primary: "OPENRIG_POLICIES_CLAUDE_COMPACTION_PRE_COMPACT_INSTRUCTION" },
@@ -281,12 +353,38 @@ const ENV_MAP: Record<SettingsValidKey, { primary: string; legacy?: string }> = 
   "snapshots.periodic.retention_keep": { primary: "OPENRIG_SNAPSHOTS_PERIODIC_RETENTION_KEEP" },
   // OPR.0.4.6.02 S1 — net-new key; OPENRIG_* primary only (no RIGGED_* legacy).
   "terminal.status_bar": { primary: "OPENRIG_TERMINAL_STATUS_BAR" },
+  "terminal.tmux_server": { primary: "OPENRIG_TMUX_SERVER" },
+  "terminal.history_limit": { primary: "OPENRIG_TERMINAL_HISTORY_LIMIT" },
+  "terminal.fixed_geometry": { primary: "OPENRIG_TERMINAL_FIXED_GEOMETRY" },
+  "terminal.inherit_tmux_environment": { primary: "OPENRIG_TERMINAL_INHERIT_TMUX_ENVIRONMENT" },
+  "output.compact": { primary: "OPENRIG_OUTPUT_COMPACT" },
+  "output.whoami_peers": { primary: "OPENRIG_OUTPUT_WHOAMI_PEERS" },
+  "output.rebuild_recaps": { primary: "OPENRIG_OUTPUT_REBUILD_RECAPS" },
+  "provider.usage_windows": { primary: "OPENRIG_PROVIDER_USAGE_WINDOWS" },
+  "provider.selected": { primary: "OPENRIG_PROVIDER_SELECTED" },
+  "bundle.services_enabled": { primary: "OPENRIG_BUNDLE_SERVICES_ENABLED" },
+  "usage.pi_cost_facts": { primary: "OPENRIG_USAGE_PI_COST_FACTS" },
+  "usage.pi_openrouter_charge": { primary: "OPENRIG_USAGE_PI_OPENROUTER_CHARGE" },
+  "transport.local_user_guard": { primary: "OPENRIG_TRANSPORT_LOCAL_USER_GUARD" },
+  "transport.verify_input_box": { primary: "OPENRIG_TRANSPORT_VERIFY_INPUT_BOX" },
+  "transport.draft_delivery": { primary: "OPENRIG_TRANSPORT_DRAFT_DELIVERY" },
+  "decisions.enabled": { primary: "OPENRIG_DECISIONS_ENABLED" },
+  "decisions.consumers": { primary: "OPENRIG_DECISIONS_CONSUMERS" },
+  "decisions.template_dir": { primary: "OPENRIG_DECISIONS_TEMPLATE_DIR" },
+  "acp.to": { primary: "OPENRIG_ACP_TO" },
   // OPR.0.4.6.FS-1 W2 — retention knobs; net-new keys, OPENRIG_* primary only.
   "retention.enabled": { primary: "OPENRIG_RETENTION_ENABLED" },
   "retention.transitions_days": { primary: "OPENRIG_RETENTION_TRANSITIONS_DAYS" },
   "retention.watchdog_days": { primary: "OPENRIG_RETENTION_WATCHDOG_DAYS" },
   "retention.usage_samples_days": { primary: "OPENRIG_RETENTION_USAGE_SAMPLES_DAYS" },
+  "retention.events_days": { primary: "OPENRIG_RETENTION_EVENTS_DAYS" },
+  "retention.closed_content_days": { primary: "OPENRIG_RETENTION_CLOSED_CONTENT_DAYS" },
+  "retention.closed_metadata_days": { primary: "OPENRIG_RETENTION_CLOSED_METADATA_DAYS" },
+  "retention.erasure_ledger": { primary: "OPENRIG_RETENTION_ERASURE_LEDGER" },
   "retention.watchdog_keep_per_job": { primary: "OPENRIG_RETENTION_WATCHDOG_KEEP_PER_JOB" },
+  "retention.stream_days": { primary: "OPENRIG_RETENTION_STREAM_DAYS" },
+  "retention.stream_max_items": { primary: "OPENRIG_RETENTION_STREAM_MAX_ITEMS" },
+  "stream.intake": { primary: "OPENRIG_STREAM_INTAKE" },
   "retention.batch_size": { primary: "OPENRIG_RETENTION_BATCH_SIZE" },
   // S04 — net-new key; OPENRIG_* primary only.
   "queue.pickup_stall_threshold_minutes": { primary: "OPENRIG_QUEUE_PICKUP_STALL_THRESHOLD_MINUTES" },
@@ -295,12 +393,17 @@ const ENV_MAP: Record<SettingsValidKey, { primary: string; legacy?: string }> = 
   "queue.wake_retry_interval_seconds": { primary: "OPENRIG_QUEUE_WAKE_RETRY_INTERVAL_SECONDS" },
   "queue.wake_retry_cap": { primary: "OPENRIG_QUEUE_WAKE_RETRY_CAP" },
   "queue.wake_unconfirmed_window_minutes": { primary: "OPENRIG_QUEUE_WAKE_UNCONFIRMED_WINDOW_MINUTES" },
+  "queue.wake_human_rung": { primary: "OPENRIG_QUEUE_WAKE_HUMAN_RUNG" },
   "queue.wake_swap_grace_seconds": { primary: "OPENRIG_QUEUE_WAKE_SWAP_GRACE_SECONDS" },
 };
 
 const KEY_TO_PATH: Record<SettingsValidKey, string[]> = {
   "daemon.port": ["daemon", "port"],
   "daemon.host": ["daemon", "host"],
+  "daemon.db_conflict": ["daemon", "dbConflict"],
+  "daemon.seat_poll_interval_ms": ["daemon", "seatPollIntervalMs"],
+  "daemon.identity_poll_interval_ms": ["daemon", "identityPollIntervalMs"],
+  "daemon.start_readiness_wait_seconds": ["daemon", "startReadinessWaitSeconds"],
   "db.path": ["db", "path"],
   "transcripts.enabled": ["transcripts", "enabled"],
   "transcripts.path": ["transcripts", "path"],
@@ -315,9 +418,12 @@ const KEY_TO_PATH: Record<SettingsValidKey, string[]> = {
   "topology.root": ["topology", "root"],
   "context.root": ["context", "root"],
   "context.system_world": ["context", "systemWorld"],
+  "specs.builtins_visible": ["specs", "builtinsVisible"],
   "skills.root": ["skills", "root"],
+  "skills.router_line.enabled": ["skills", "routerLine", "enabled"],
   "onboarding.default_pack.enabled": ["onboarding", "defaultPack", "enabled"],
   "launch.non_interruptive": ["launch", "nonInterruptive"],
+  "launch.codex_login_shell": ["launch", "codexLoginShell"],
   "health.context_pressure.warning_percent": ["health", "contextPressure", "warningPercent"],
   "health.context_pressure.critical_percent": ["health", "contextPressure", "criticalPercent"],
   "files.allowlist": ["files", "allowlist"],
@@ -326,6 +432,7 @@ const KEY_TO_PATH: Record<SettingsValidKey, string[]> = {
   "ui.preview.max_pins": ["ui", "preview", "maxPins"],
   "ui.timezone": ["ui", "timezone"],
   "ui.enabled": ["ui", "enabled"],
+  "ui.topology_remote_seats": ["ui", "topologyRemoteSeats"],
   "ui.preview.default_lines": ["ui", "preview", "defaultLines"],
   "ui.terminal.max_live_terminals": ["ui", "terminal", "maxLiveTerminals"],
   "recovery.auto_drive_provider_prompts": ["recovery", "autoDriveProviderPrompts"],
@@ -343,6 +450,7 @@ const KEY_TO_PATH: Record<SettingsValidKey, string[]> = {
   "feed.subscriptions.audit_log": ["feed", "subscriptions", "auditLog"],
   "runtime.codex.hooks_enabled": ["runtime", "codex", "hooksEnabled"],
   "runtime.readiness_timeout_seconds": ["runtime", "readinessTimeoutSeconds"],
+  "policies.claude_compaction.preparation_root": ["policies", "claudeCompaction", "preparationRoot"],
   "policies.claude_compaction.enabled": ["policies", "claudeCompaction", "enabled"],
   "policies.claude_compaction.threshold_percent": ["policies", "claudeCompaction", "thresholdPercent"],
   "policies.claude_compaction.pre_compact_instruction": ["policies", "claudeCompaction", "preCompactInstruction"],
@@ -358,11 +466,37 @@ const KEY_TO_PATH: Record<SettingsValidKey, string[]> = {
   "snapshots.periodic.interval_seconds": ["snapshots", "periodic", "intervalSeconds"],
   "snapshots.periodic.retention_keep": ["snapshots", "periodic", "retentionKeep"],
   "terminal.status_bar": ["terminal", "statusBar"],
+  "terminal.tmux_server": ["terminal", "tmuxServer"],
+  "terminal.history_limit": ["terminal", "historyLimit"],
+  "terminal.fixed_geometry": ["terminal", "fixedGeometry"],
+  "terminal.inherit_tmux_environment": ["terminal", "inheritTmuxEnvironment"],
+  "output.compact": ["output", "compact"],
+  "output.whoami_peers": ["output", "whoamiPeers"],
+  "output.rebuild_recaps": ["output", "rebuildRecaps"],
+  "provider.usage_windows": ["provider", "usageWindows"],
+  "provider.selected": ["provider", "selected"],
+  "bundle.services_enabled": ["bundle", "servicesEnabled"],
+  "usage.pi_cost_facts": ["usage", "piCostFacts"],
+  "usage.pi_openrouter_charge": ["usage", "piOpenRouterCharge"],
+  "transport.local_user_guard": ["transport", "localUserGuard"],
+  "transport.verify_input_box": ["transport", "verifyInputBox"],
+  "transport.draft_delivery": ["transport", "draftDelivery"],
+  "decisions.enabled": ["decisions", "enabled"],
+  "decisions.consumers": ["decisions", "consumers"],
+  "decisions.template_dir": ["decisions", "templateDir"],
+  "acp.to": ["acp", "to"],
   "retention.enabled": ["retention", "enabled"],
   "retention.transitions_days": ["retention", "transitionsDays"],
   "retention.watchdog_days": ["retention", "watchdogDays"],
   "retention.usage_samples_days": ["retention", "usageSamplesDays"],
+  "retention.events_days": ["retention", "eventsDays"],
+  "retention.closed_content_days": ["retention", "closedContentDays"],
+  "retention.closed_metadata_days": ["retention", "closedMetadataDays"],
+  "retention.erasure_ledger": ["retention", "erasureLedger"],
   "retention.watchdog_keep_per_job": ["retention", "watchdogKeepPerJob"],
+  "retention.stream_days": ["retention", "streamDays"],
+  "retention.stream_max_items": ["retention", "streamMaxItems"],
+  "stream.intake": ["stream", "intake"],
   "retention.batch_size": ["retention", "batchSize"],
   "queue.pickup_stall_threshold_minutes": ["queue", "pickupStallThresholdMinutes"],
   "queue.stuck_sweep_interval_seconds": ["queue", "stuckSweepIntervalSeconds"],
@@ -370,6 +504,7 @@ const KEY_TO_PATH: Record<SettingsValidKey, string[]> = {
   "queue.wake_retry_interval_seconds": ["queue", "wakeRetryIntervalSeconds"],
   "queue.wake_retry_cap": ["queue", "wakeRetryCap"],
   "queue.wake_unconfirmed_window_minutes": ["queue", "wakeUnconfirmedWindowMinutes"],
+  "queue.wake_human_rung": ["queue", "wakeHumanRung"],
   "queue.wake_swap_grace_seconds": ["queue", "wakeSwapGraceSeconds"],
 };
 
@@ -383,6 +518,22 @@ export interface ResolvedSetting {
 
 export function isSettingsValidKey(key: string): key is SettingsValidKey {
   return (SETTINGS_VALID_KEYS as readonly string[]).includes(key);
+}
+
+/**
+ * The keys that define what this daemon may reach, and so are worth recording when a caller changes
+ * them over HTTP.
+ *
+ * `files.allowlist` is the allowlist the /api/files routes enforce (domain/files/path-safety.ts) and
+ * `progress.scan_roots` is the tree the progress scan walks. Both are ordinary settings: the Settings
+ * page saves and resets them through `POST`/`DELETE /api/config/:key`, and that stays. What a reader
+ * of the event stream could not see before is that they changed at all, so a change is published as
+ * `settings.changed`. Recording it is the point; refusing it would take away a path people use.
+ */
+export const BOUNDARY_SETTING_KEYS: readonly SettingsValidKey[] = ["files.allowlist", "progress.scan_roots"];
+
+export function isBoundarySettingKey(key: string): boolean {
+  return (BOUNDARY_SETTING_KEYS as readonly string[]).includes(key);
 }
 
 const REMOVED_CONTEXT_KEY = "context.packs_root";
@@ -413,14 +564,13 @@ function assertNoRemovedContextSetting(fileConfig: Record<string, unknown>): voi
 // CLOSED to {enabled}). The closed-set discipline applies to the store's key
 // GRAMMAR: only this pattern is accepted beyond SETTINGS_VALID_KEYS; every
 // other unknown key keeps the existing reject-loud behavior byte-for-byte.
-// hostId segment: [A-Za-z0-9_-]+ (a dotted host id is inexpressible in
-// dotted keys — the write gate rejects it as unknown; readers warn-and-
-// ignore); RESERVED segments (the flat toggle tails + 'enabled') never parse
+// The fixed prefix/suffix delimit the literal host id, including dots.
+// RESERVED segments (the flat toggle tails + 'enabled') never parse
 // as host ids, so the flat keys and the dynamic class cannot collide.
 // No env-var mapping for the dynamic class in v1 — file/API only.
 // Twin: packages/cli/src/config-store.ts carries the same class (parity test
 // pins them — the host-registry twin discipline).
-const FEED_HOST_KEY_RE = /^feed\.subscriptions\.([A-Za-z0-9_-]+)\.enabled$/;
+const FEED_HOST_KEY_RE = /^feed\.subscriptions\.([A-Za-z0-9_.-]+)\.enabled$/;
 // Reserved in BOTH spellings: the key-level snake_case toggle tails AND the
 // camelCase FILE-level leaf names (KEY_TO_PATH maps audit_log→auditLog etc.),
 // so no host id can ever shadow a flat toggle at either layer.
@@ -467,6 +617,22 @@ function getNestedValue(obj: Record<string, unknown>, parts: string[]): unknown 
     current = (current as Record<string, unknown>)[part];
   }
   return current;
+}
+
+/**
+ * After a reset deletes a leaf key, remove any now-empty object literals along
+ * the leaf's own parent path, walking from the deepest parent toward the root.
+ * Stops as soon as a parent still has a key (a sibling, or an unrelated key),
+ * so unrelated empty objects elsewhere in the file are never touched. If the
+ * walk empties the root itself, it is left as `{}` rather than removed.
+ */
+function pruneEmptyAncestors(root: Record<string, unknown>, parentParts: string[]): void {
+  for (let depth = parentParts.length; depth >= 1; depth--) {
+    const obj = getNestedValue(root, parentParts.slice(0, depth));
+    if (obj == null || typeof obj !== "object" || Object.keys(obj).length > 0) break;
+    const grandparent = depth === 1 ? root : (getNestedValue(root, parentParts.slice(0, depth - 1)) as Record<string, unknown>);
+    delete grandparent[parentParts[depth - 1]!];
+  }
 }
 
 function setNestedValue(obj: Record<string, unknown>, parts: string[], value: unknown): void {
@@ -557,6 +723,10 @@ function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string |
   switch (key) {
     case "daemon.port": return 7433;
     case "daemon.host": return "127.0.0.1";
+    case "daemon.db_conflict": return "warn";
+    case "daemon.seat_poll_interval_ms": return 1000;
+    case "daemon.identity_poll_interval_ms": return 5000;
+    case "daemon.start_readiness_wait_seconds": return 180;
     case "db.path": return path.join(path.dirname(DEFAULT_CONFIG_PATH), "openrig.sqlite");
     case "transcripts.enabled": return true;
     case "transcripts.path": return path.join(path.dirname(DEFAULT_CONFIG_PATH), "transcripts");
@@ -574,9 +744,12 @@ function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string |
     case "topology.root": return DEFAULT_TOPOLOGY_ROOT;
     case "context.root": return DEFAULT_CONTEXT_ROOT;
     case "context.system_world": return "default";
+    case "specs.builtins_visible": return true;
     case "skills.root": return DEFAULT_SKILLS_ROOT;
+    case "skills.router_line.enabled": return false;
     case "onboarding.default_pack.enabled": return true;
     case "launch.non_interruptive": return false;
+    case "launch.codex_login_shell": return false;
     case "health.context_pressure.warning_percent": return 95;
     case "health.context_pressure.critical_percent": return 99;
     // Preview Terminal v0 (PL-018) defaults — match cli/src/config-store.ts.
@@ -585,6 +758,7 @@ function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string |
     case "ui.preview.default_lines": return 50;
     case "ui.timezone": return "America/Los_Angeles";
     case "ui.enabled": return false;
+    case "ui.topology_remote_seats": return false;
     case "recovery.auto_drive_provider_prompts": return false;
     case "recovery.provider_auth_env_allowlist": return "";
     // V1 Phase 4 — Advisor default per universal-shell.md L83;
@@ -611,6 +785,7 @@ function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string |
     // the canonical restore skill; compact_instruction is intentionally
     // blank because Claude's native compact summary is less reliable
     // than the explicit pre-compact and post-compact user-channel flow.
+    case "policies.claude_compaction.preparation_root": return "";
     case "policies.claude_compaction.enabled": return false;
     case "policies.claude_compaction.threshold_percent": return 80;
     case "policies.claude_compaction.pre_compact_instruction": return DEFAULT_CLAUDE_COMPACTION_PRE_COMPACT_INSTRUCTION;
@@ -630,6 +805,29 @@ function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string |
     // (herdr's pane label already carries identity; the inner tmux status
     // is redundant chrome). Operator flip is future-launches-only.
     case "terminal.status_bar": return false;
+    case "terminal.tmux_server": return "inherit";
+    case "terminal.history_limit": return 10000;
+    case "terminal.fixed_geometry": return false;
+    case "terminal.inherit_tmux_environment": return false;
+    case "output.compact": return false;
+    case "output.whoami_peers": return 8;
+    case "output.rebuild_recaps": return 3;
+    case "provider.usage_windows": return false;
+    case "provider.selected": return "";
+    case "bundle.services_enabled": return false;
+    // Slice 02 — Pi cost facts from persisted entries; off until the switch is on.
+    case "usage.pi_cost_facts": return false;
+    case "usage.pi_openrouter_charge": return false;
+    // Input-box evidence for verified Claude Code and Codex sends; off until the switch is on.
+    case "transport.local_user_guard": return false;
+    case "transport.verify_input_box": return false;
+    // Ordinary sends reach a seat with a draft at its prompt unless the setting says refuse.
+    case "transport.draft_delivery": return "deliver";
+    // Slice 22 — typed decisions off, no consumers, shipped templates only.
+    case "decisions.enabled": return false;
+    case "decisions.consumers": return "";
+    case "decisions.template_dir": return "";
+    case "acp.to": return "";
     // OPR.0.4.6.FS-1 W2 — retention defaults (arch D3 safe values: archive
     // terminal+aged transitions >30d; prune watchdog_history >14d keep-50/job;
     // 500 rows/qitems per bounded batch; enabled by default).
@@ -637,7 +835,14 @@ function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string |
     case "retention.transitions_days": return 30;
     case "retention.watchdog_days": return 14;
     case "retention.usage_samples_days": return 14;
+    case "retention.events_days": return 0; // 0 = keep; pruning is opt-in
+    case "retention.closed_content_days": return 0; // 0 = keep; closed-work erasure is opt-in
+    case "retention.closed_metadata_days": return 0;
+    case "retention.erasure_ledger": return ""; // empty = keep no ledger
     case "retention.watchdog_keep_per_job": return 50;
+    case "retention.stream_days": return 30;
+    case "retention.stream_max_items": return 20000;
+    case "stream.intake": return "queue.worker";
     case "retention.batch_size": return 500;
     case "queue.pickup_stall_threshold_minutes": return 3;
     case "queue.stuck_sweep_interval_seconds": return 300;
@@ -646,6 +851,7 @@ function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string |
     case "queue.wake_retry_cap": return 3;
     case "queue.wake_unconfirmed_window_minutes": return 30;
     case "queue.wake_swap_grace_seconds": return 180;
+    case "queue.wake_human_rung": return "always";
     default: return "";
   }
 }
@@ -669,6 +875,20 @@ function coerceValue(key: SettingsValidKey, raw: string, workspaceRoot: string):
 // in `set()`. Lockstep with cli/src/config-store.ts KEY_CONSTRAINTS so the
 // daemon's HTTP write surface (/api/config POST) rejects the same input
 // the CLI rejects.
+/** What a validator can say about the values it accepts, kept on the validator itself so it cannot drift from it. */
+interface ConstraintMeta { choices?: readonly string[]; format?: string }
+type KeyConstraint = ((raw: string, coerced: string | number | boolean) => void) & { meta?: ConstraintMeta };
+function described(meta: ConstraintMeta, check: (raw: string, coerced: string | number | boolean) => void): KeyConstraint {
+  return Object.assign(check, { meta });
+}
+/** A closed list of accepted strings: the list is both what is enforced and what the browser view reports. */
+function choiceConstraint(choices: readonly string[], message: (raw: string) => string, trim = false): KeyConstraint {
+  return described({ choices }, (raw) => {
+    if (!choices.includes(trim ? (raw ?? "").trim() : raw)) throw new Error(message(raw));
+  });
+}
+const PROVIDER_SELECTED_CHOICES: readonly string[] = ["", "claude", "codex", "claude,codex", "codex,claude"];
+
 function positiveIntegerConstraint(key: string) {
   return (raw: string, coerced: string | number | boolean): void => {
     if (!/^\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced <= 0) {
@@ -689,7 +909,34 @@ function percentageConstraint(key: string) {
   };
 }
 
-const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, (raw: string, coerced: string | number | boolean) => void>> = {
+const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, KeyConstraint>> = {
+  "terminal.tmux_server": choiceConstraint(["inherit", "isolated"],
+    (raw) => `Invalid value for terminal.tmux_server: must be "inherit" or "isolated", got "${raw}"`),
+  "daemon.db_conflict": choiceConstraint(["warn", "stop"], () => "daemon.db_conflict must be warn or stop"),
+  "daemon.seat_poll_interval_ms": (raw, value) => {
+    // Startup-only: the seat pollers read it once when the daemon starts. Only slower than the 1 s default, up to the
+    // ceiling the structural observation's expiry allows (seat-activity-service.ts MAX_SEAT_POLL_INTERVAL_MS).
+    if (!/^\d+$/.test(raw.trim()) || typeof value !== "number" || !Number.isSafeInteger(value) || value < 1000 || value > 2000) {
+      throw new Error("Invalid daemon.seat_poll_interval_ms: must be a whole number of milliseconds in [1000, 2000]");
+    }
+  },
+  "daemon.identity_poll_interval_ms": (raw, value) => {
+    // Startup-only: the identity reconciler reads it once when the daemon starts. Only slower than the 5 s default, up to
+    // a cap on the cadence of sweep attempts, not a freshness deadline (see the MAX_IDENTITY_POLL_INTERVAL_MS comment in
+    // seat-identity-reconciler.ts).
+    if (!/^\d+$/.test(raw.trim()) || typeof value !== "number" || !Number.isSafeInteger(value) || value < 5000 || value > 30000) {
+      throw new Error("Invalid daemon.identity_poll_interval_ms: must be a whole number of milliseconds in [5000, 30000]");
+    }
+  },
+  "daemon.start_readiness_wait_seconds": (raw, coerced) => {
+    // The ceiling is the Node timer bound on a caller's budget (DAEMON_START_READINESS_WAIT_MAX_SECONDS in
+    // daemon-shutdown.ts): the TUI's start call can't time out later than 2^31 - 1 ms.
+    if (!/^\d+$/.test(raw.trim()) || typeof coerced !== "number" || !Number.isSafeInteger(coerced) || coerced < 1 || coerced > 2147464) {
+      throw new Error(`Invalid value for daemon.start_readiness_wait_seconds: must be a whole number of seconds in [1, 2147464], got "${raw}"`);
+    }
+  },
+  "transport.draft_delivery": choiceConstraint(["refuse", "deliver"],
+    (raw) => `Invalid value for transport.draft_delivery: must be "refuse" or "deliver", got "${raw}"`),
   "transcripts.lines": (raw, value) => {
     if (!/^\d+$/.test(raw.trim()) || typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > 1_000_000) {
       throw new Error("Invalid transcripts.lines: must be an integer in [1, 1000000]");
@@ -705,27 +952,60 @@ const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, (raw: string, coerced: s
       throw new Error(`Invalid value for runtime.readiness_timeout_seconds: must be an integer in [1, 600], got "${raw}"`);
     }
   },
-  "ui.timezone": (_raw, value) => {
+  "terminal.history_limit": (raw, coerced) => {
+    if (!/^\d+$/.test(raw.trim()) || typeof coerced !== "number" || !Number.isSafeInteger(coerced) || coerced < 2000 || coerced > 1_000_000) {
+      throw new Error(`Invalid value for terminal.history_limit: must be an integer in [2000, 1000000], got "${raw}"`);
+    }
+  },
+  // Constraint gap fix — lockstep with cli/src/config-store.ts KEY_CONSTRAINTS.
+  // daemon.port had no entry, so `rig config set daemon.port 99999` stored
+  // 99999 and the next daemon start died with a raw ERR_SOCKET_BAD_PORT
+  // from serve(). The check range-validates the value the runtime actually
+  // consumes — the same parseInt the boot path runs on OPENRIG_PORT
+  // (startServer) — rather than the raw input format, so everything that
+  // resolves today keeps resolving: 7433abc, 7433.5 and +7433 resolve to
+  // 7433, 1e4 to 1, 0x1D11 to 0, and a quoted in-range port in config.json
+  // ("7434") stays "7434". Only ports that cannot be bound are refused.
+  // 0 stays legal: checkPort treats port <= 0 as "always available" and the
+  // repo's own preflight tests write daemon.port = 0 on purpose. The
+  // ui.preview.* keys are deliberately unconstrained: their consumers
+  // floor/clamp out-of-range values today (refresh 0 disables polling on
+  // purpose; max_pins floors to 1; the daemon preview route falls back to
+  // 50 lines), so tightening them here would refuse input that works.
+  "daemon.port": (raw, coerced) => {
+    const port = parseInt(String(coerced), 10);
+    if (Number.isNaN(port) || port < 0 || port > 65535) {
+      throw new Error(`Invalid value for daemon.port: must be an integer in [0, 65535], got "${raw}"`);
+    }
+  },
+  "ui.timezone": described({ format: "iana-timezone" }, (_raw, value) => {
     try {
       if (typeof value !== "string" || !value || /^[+-]/.test(value)) throw new Error();
       new Intl.DateTimeFormat("en-US", { timeZone: value });
     } catch { throw new Error("Invalid ui.timezone: use an IANA timezone such as America/Los_Angeles or Europe/London"); }
-  },
+  }),
   "health.context_pressure.warning_percent": percentageConstraint("health.context_pressure.warning_percent"),
   "health.context_pressure.critical_percent": percentageConstraint("health.context_pressure.critical_percent"),
   "policies.idle_gate_qitem.scan_interval_seconds": positiveIntegerConstraint("policies.idle_gate_qitem.scan_interval_seconds"),
   "policies.idle_gate_qitem.active_wake_interval_seconds": positiveIntegerConstraint("policies.idle_gate_qitem.active_wake_interval_seconds"),
-  "policies.idle_gate_qitem.auto_register": (raw) => {
-    const v = (raw ?? "").trim();
-    if (v !== "off" && v !== "all") {
-      throw new Error(`Invalid value for policies.idle_gate_qitem.auto_register: must be "off" or "all", got "${raw}"`);
-    }
-  },
+  "policies.idle_gate_qitem.auto_register": choiceConstraint(["off", "all"],
+    (raw) => `Invalid value for policies.idle_gate_qitem.auto_register: must be "off" or "all", got "${raw}"`, true),
   // Policy threshold: integer in [1, 100]. Documented contract from
   // slice 27 README. parseInt's permissive coercion ("80abc" → 80;
   // "80.5" → 80) is not safe for a key the daemon's compaction trigger
   // reads at every poll tick; runtime validator rejects what the
   // contract forbids per banked feedback_static_gates_mirror_runtime_validators.
+  // Checks the typed value too: a config.json array would otherwise pass as its String() form.
+  "provider.selected": described({ choices: PROVIDER_SELECTED_CHOICES }, (_raw, value) => {
+    if (typeof value !== "string" || !PROVIDER_SELECTED_CHOICES.includes(value)) {
+      throw new Error("Invalid provider.selected: use claude, codex, claude,codex, or an empty string for no recorded choice");
+    }
+  }),
+  "policies.claude_compaction.preparation_root": described({ format: "absolute-path-or-empty" }, (_raw, value) => {
+    if (typeof value !== "string" || (value !== "" && (!path.isAbsolute(value) || value.includes("\0")))) {
+      throw new Error("Invalid policies.claude_compaction.preparation_root: use an absolute path or an empty string for the default");
+    }
+  }),
   "policies.claude_compaction.threshold_percent": (raw, coerced) => {
     const trimmed = (raw ?? "").trim();
     if (!/^-?\d+$/.test(trimmed)) {
@@ -772,6 +1052,17 @@ const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, (raw: string, coerced: s
   // cli/src/config-store.ts KEY_CONSTRAINTS twin so the daemon HTTP write
   // surface rejects exactly what the CLI rejects. `retention.enabled` is a
   // boolean (coerceValue enforces true/false) — no constraint entry needed.
+  // Slice 15 P5 — the whoami peer bound; lockstep with the CLI twin.
+  "output.rebuild_recaps": (raw, value) => {
+    if (!/^\d+$/.test(raw.trim()) || typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`Invalid value for output.rebuild_recaps: must be an integer >= 0, got "${raw}"`);
+    }
+  },
+  "output.whoami_peers": (raw, coerced) => {
+    if (!/^-?\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 1) {
+      throw new Error(`Invalid value for output.whoami_peers: must be an integer >= 1, got "${raw}"`);
+    }
+  },
   "retention.transitions_days": (raw, coerced) => {
     if (!/^-?\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 1) {
       throw new Error(`Invalid value for retention.transitions_days: must be an integer >= 1, got "${raw}"`);
@@ -787,11 +1078,51 @@ const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, (raw: string, coerced: s
       throw new Error(`Invalid value for retention.usage_samples_days: must be an integer >= 1, got "${raw}"`);
     }
   },
+  // 0 (the default) keeps these events; a positive day count turns their pruning on.
+  "retention.events_days": (raw, coerced) => {
+    if (!/^-?\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 0) {
+      throw new Error(`Invalid value for retention.events_days: must be an integer >= 0 (0 keeps the events), got "${raw}"`);
+    }
+  },
+  // 0 (the default) keeps closed work; a positive day count turns its erasure on (queue-erasure).
+  "retention.closed_content_days": (raw, coerced) => {
+    if (!/^-?\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 0) {
+      throw new Error(`Invalid value for retention.closed_content_days: must be an integer >= 0 (0 keeps the content), got "${raw}"`);
+    }
+  },
+  "retention.closed_metadata_days": (raw, coerced) => {
+    if (!/^-?\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 0) {
+      throw new Error(`Invalid value for retention.closed_metadata_days: must be an integer >= 0 (0 keeps the rows), got "${raw}"`);
+    }
+  },
+  // Empty (the default) keeps no erasure ledger; otherwise an absolute file path, kept outside the backed-up data.
+  "retention.erasure_ledger": described({ format: "absolute-path-or-empty" }, (raw) => {
+    const value = (raw ?? "").trim();
+    if (value !== "" && !value.startsWith("/")) {
+      throw new Error(`Invalid value for retention.erasure_ledger: must be empty or an absolute file path, got "${raw}"`);
+    }
+  }),
   "retention.watchdog_keep_per_job": (raw, coerced) => {
     if (!/^-?\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 0) {
       throw new Error(`Invalid value for retention.watchdog_keep_per_job: must be an integer >= 0, got "${raw}"`);
     }
   },
+  "retention.stream_days": (raw, coerced) => {
+    if (!/^-?\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 1) {
+      throw new Error(`Invalid value for retention.stream_days: must be an integer >= 1, got "${raw}"`);
+    }
+  },
+  "retention.stream_max_items": (raw, coerced) => {
+    if (!/^-?\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 1) {
+      throw new Error(`Invalid value for retention.stream_max_items: must be an integer >= 1, got "${raw}"`);
+    }
+  },
+  "stream.intake": described({ format: "queue.worker, off, or member@rig" }, (raw) => {
+    const val = (raw ?? "").trim();
+    if (val !== "off" && val !== "queue.worker" && !/^[a-zA-Z0-9\-_.]+@[a-zA-Z0-9\-_.]+$/.test(val)) {
+      throw new Error(`Invalid value for stream.intake: must be "queue.worker", a canonical session (<seat>@<rig>), or "off", got "${raw}"`);
+    }
+  }),
   "retention.batch_size": (raw, coerced) => {
     if (!/^-?\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 1) {
       throw new Error(`Invalid value for retention.batch_size: must be an integer >= 1, got "${raw}"`);
@@ -805,6 +1136,19 @@ const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, (raw: string, coerced: s
   "queue.wake_retry_cap": positiveIntegerConstraint("queue.wake_retry_cap"),
   "queue.wake_unconfirmed_window_minutes": positiveIntegerConstraint("queue.wake_unconfirmed_window_minutes"),
   "queue.wake_swap_grace_seconds": positiveIntegerConstraint("queue.wake_swap_grace_seconds"),
+  "queue.wake_human_rung": choiceConstraint(["always", "explicit-only"],
+    (raw) => `Invalid value for queue.wake_human_rung: must be "always" or "explicit-only", got "${raw}"`),
+  "decisions.template_dir": described({ format: "absolute-path-or-empty" }, (_raw, value) => {
+    if (typeof value !== "string" || (value !== "" && (!path.isAbsolute(value) || value.includes("\0")))) {
+      throw new Error("Invalid decisions.template_dir: use an absolute path, or an empty string for the shipped templates only");
+    }
+  }),
+  // rig acp serve's receiver when --to isn't given: a team seat, member@rig, or empty for none.
+  "acp.to": described({ format: "member@rig-or-empty" }, (_raw, value) => {
+    if (typeof value !== "string" || (value !== "" && !/^[^@\s]+@[^@\s]+$/.test(value))) {
+      throw new Error("Invalid acp.to: use the seat that receives your ACP tasks as member@rig, or an empty string for none");
+    }
+  }),
 };
 
 function validateKeyConstraints(key: SettingsValidKey, raw: string, coerced: string | number | boolean): void {
@@ -830,12 +1174,66 @@ function validateTypedFileValue(key: SettingsValidKey, value: string | number | 
   check(raw, value);
 }
 
+/** What the browser view reports about a key's values, read from the rules that govern it. */
+export interface SettingKeyDescription {
+  /** Whether POST and DELETE /api/config/:key accept this key. */
+  writeRoute: boolean;
+  type?: "boolean" | "integer" | "string" | "enum";
+  choices?: string[];
+  range?: { min?: number; max?: number };
+  format?: string;
+}
+
+const ACCEPTED_INTEGER_LIMIT = Number.MAX_SAFE_INTEGER;
+
+/** The interval of whole numbers a key's validator accepts, found by asking the validator itself; a side it does not bound is left out. */
+function acceptedIntegerRange(key: SettingsValidKey, start: number): { min?: number; max?: number } | undefined {
+  const check = KEY_CONSTRAINTS[key];
+  if (!check) return undefined;
+  const accepts = (n: number): boolean => {
+    try { check(String(n), n); return true; } catch { return false; }
+  };
+  if (!accepts(start)) return undefined;
+  const range: { min?: number; max?: number } = {};
+  if (!accepts(ACCEPTED_INTEGER_LIMIT)) {
+    let lo = start, hi = ACCEPTED_INTEGER_LIMIT;
+    while (hi - lo > 1) { const mid = Math.floor(lo + (hi - lo) / 2); if (accepts(mid)) lo = mid; else hi = mid; }
+    range.max = lo;
+  }
+  if (!accepts(-ACCEPTED_INTEGER_LIMIT)) {
+    let lo = -ACCEPTED_INTEGER_LIMIT, hi = start;
+    while (hi - lo > 1) { const mid = Math.floor(lo + (hi - lo) / 2); if (accepts(mid)) hi = mid; else lo = mid; }
+    range.min = hi;
+  }
+  return range.min === undefined && range.max === undefined ? undefined : range;
+}
+
+/** Derived from coerceValue (the type), KEY_CONSTRAINTS (choices, format, range) and the key grammar (write route); no second list. */
+export function describeSettingKey(key: string): SettingKeyDescription {
+  if (parseFeedHostSubscriptionKey(key)) return { writeRoute: true, type: "boolean" };
+  if (!isSettingsValidKey(key)) return { writeRoute: false };
+  const fallback = getDefaultValue(key, "");
+  const meta = KEY_CONSTRAINTS[key]?.meta;
+  const out: SettingKeyDescription = { writeRoute: true };
+  if (typeof fallback === "boolean") out.type = "boolean";
+  else if (typeof fallback === "number") {
+    out.type = "integer";
+    const range = acceptedIntegerRange(key, fallback);
+    if (range) out.range = range;
+  } else out.type = meta?.choices ? "enum" : "string";
+  if (meta?.choices) out.choices = [...meta.choices];
+  if (meta?.format) out.format = meta.format;
+  return out;
+}
+
 /**
  * Slice 27 — projected Claude auto-compaction policy. ContextMonitor
  * consumes this snapshot per-poll; the PreCompact hook reads the same
  * shape via direct config.json read (without depending on the daemon).
  */
 export interface ClaudeCompactionPolicy {
+  /** Empty or absent keeps workspace-first preparation; read for each new attempt. */
+  preparationRoot?: string;
   enabled: boolean;
   thresholdPercent: number;
   preCompactInstruction: string;
@@ -994,6 +1392,7 @@ export class SettingsStore {
     const fc = this.readConfigFile();
     const wr = this.resolveWorkspaceRootRaw(fc);
     return {
+      preparationRoot: this.resolveOne("policies.claude_compaction.preparation_root", fc, wr).value as string,
       enabled: this.resolveOne("policies.claude_compaction.enabled", fc, wr).value as boolean,
       thresholdPercent: this.resolveOne("policies.claude_compaction.threshold_percent", fc, wr).value as number,
       preCompactInstruction: this.resolveOne("policies.claude_compaction.pre_compact_instruction", fc, wr).value as string,
@@ -1152,9 +1551,9 @@ export class SettingsStore {
     const out: Array<{ hostId: string; enabled: boolean }> = [];
     for (const [segment, node] of Object.entries(subs as Record<string, unknown>)) {
       if (node === null || typeof node !== "object" || Array.isArray(node)) continue; // flat toggle leaves — not host nodes
-      if (FEED_HOST_RESERVED_SEGMENTS.has(segment) || !/^[A-Za-z0-9_-]+$/.test(segment)) {
+      if (FEED_HOST_RESERVED_SEGMENTS.has(segment) || !/^[A-Za-z0-9_.-]+$/.test(segment)) {
         process.stderr.write(
-          `[openrig-settings] feed.subscriptions.${segment} ignored as a host subscription: segment is ${FEED_HOST_RESERVED_SEGMENTS.has(segment) ? "a reserved toggle name" : "not a valid host id segment ([A-Za-z0-9_-]+)"}\n`,
+          `[openrig-settings] feed.subscriptions.${segment} ignored as a host subscription: segment is ${FEED_HOST_RESERVED_SEGMENTS.has(segment) ? "a reserved toggle name" : "not a valid host id segment ([A-Za-z0-9_.-]+)"}\n`,
         );
         continue;
       }
@@ -1194,7 +1593,8 @@ export class SettingsStore {
     if (!existsSync(this.configPath)) return;
     const fc = this.readConfigFile();
     const parts = KEY_TO_PATH[key];
-    const parent = getNestedValue(fc, parts.slice(0, -1)) as Record<string, unknown> | undefined;
+    const parentParts = parts.slice(0, -1);
+    const parent = getNestedValue(fc, parentParts) as Record<string, unknown> | undefined;
     if (parent && parts[parts.length - 1]! in parent) {
       delete parent[parts[parts.length - 1]!];
       if (key === "health.context_pressure.warning_percent" || key === "health.context_pressure.critical_percent") {
@@ -1207,6 +1607,7 @@ export class SettingsStore {
           throw new Error(`Invalid context-pressure policy: warning (${warning}) must be less than critical (${critical})`);
         }
       }
+      pruneEmptyAncestors(fc, parentParts);
     }
     this.writeConfig(JSON.stringify(fc, null, 2) + "\n");
   }

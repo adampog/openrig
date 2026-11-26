@@ -4,6 +4,7 @@
 // 40,000 truncation; top-level text is the screen-reader/notification fallback)
 // https://docs.slack.dev/reference/block-kit/blocks/section-block/ (3,000)
 // https://docs.slack.dev/reference/block-kit/blocks/ (50 blocks)
+import { createHash } from "node:crypto";
 import { MAX_OPTION_LABEL, type HumanQuestion } from "../../human-questions.js";
 
 export const SLACK_TEXT_CAP = 3900; // Our conservative complete-fallback budget, not Slack’s hard limit.
@@ -13,11 +14,36 @@ export const DEFAULT_BODY_EXCERPT = SLACK_SECTION_CAP;
 
 export interface QitemLike {
   qitemId: string;
+  ownerNotificationKind?: string | null;
   summary?: string | null;
   body?: string | null;
   destinationSession?: string | null;
   /** #193 — structured questions, rendered as one button row per question. */
   humanQuestions?: readonly HumanQuestion[] | null;
+  /** Posted into a registered shared channel (0.7.3): nobody there can answer, so questions show as text, not buttons. */
+  sharedChannel?: boolean | null;
+  /** #1013 — row state + tags, so a workflow gate PARKED on a human seat can be
+   *  re-rendered for the person instead of posting the seat's agent packet. */
+  state?: string | null;
+  tags?: readonly string[] | null;
+  /** #1013 — the structured evidenceRef: for a parked gate it rides the evidence link/media
+   *  path when it is an https ref, else it renders as one Evidence line (never the packet). */
+  evidenceRef?: string | null;
+  /** The code fence an earlier part of a split brief left open; this body starts inside it. */
+  bodyOpenFence?: string | null;
+}
+
+/** #1013 — a workflow gate row parked on a human seat (the projector parks it
+ * `state=blocked, blocked_on=<human seat>` and tags it `gate`; every workflow gate also
+ * carries the `workflow` tag — the projector and the runtime both set it). Agents also
+ * put `gate` on rows they write by hand, so requiring both keeps a hand-tagged row's
+ * own body intact. A gate's body is the agent packet — instance/step/Continuation lines
+ * for the seat that resumes after sign-off — while the person needs only the headline
+ * (`gate.summary`, plain language per C6) and the evidence link. The row itself is
+ * untouched; this gates the OUTBOUND render only. */
+export function isHumanGatePacket(q: Pick<QitemLike, "state" | "tags">): boolean {
+  const tags = q.tags ?? [];
+  return q.state === "blocked" && tags.includes("gate") && tags.includes("workflow");
 }
 
 /** M1 A5b — an outbound image attachment. A media-bearing OutboundDecision carries these;
@@ -36,22 +62,38 @@ export interface OutboundMessageOpts {
   extraBlocks?: unknown[];
   /** M1 A5b: outbound image attachments, rendered as Block Kit `image` blocks (the wired seam). */
   mediaRefs?: SlackMediaRef[];
-  /** #47 — an https evidenceRef that is NOT an image (GitLab issue link, PROOF.md URL, …),
-   *  rendered as a plain link in the message text + a context block. NEVER a Block Kit
-   *  `image` block: Slack rejects the ENTIRE message with `invalid_blocks` when an image
-   *  block's URL is not a real image, silently and permanently breaking delivery. */
+  /** An HTTPS evidence reference rendered as a link in the message text and context block. */
   evidenceLink?: string | null;
   /** S10 / A1.2 — the structured seat-attribution header (rig/host/seat/session), rendered as
    *  one sender context line in ONE honest bot identity. Authorship lives in OUR record;
    *  Slack's transport actor stays the app. NEVER a per-message username/icon override. */
   attribution?: SeatAttribution;
+  /** The machine this post comes from, shown after the sender ("from lead@my-rig on vps04") when
+   *  the sender's session doesn't already name a host. Absent: the sender line is unchanged. */
+  machine?: string;
+  machineFallback?: string;
   /** S10 interim loudness rule: an escalation MENTIONS its human (`<@Uxxx>`); everything else
    *  stays quiet-threaded. The value is the Slack USER ID (mention semantics require the id,
    *  never a display name). */
   mentionUserId?: string;
   /** Stable decision/part identity. Included in the complete fallback budget. */
   reconcileMarker?: string;
+  /** A retry that couldn't confirm whether an earlier attempt landed says so in one context line, left out when it
+   *  doesn't fit. */
+  possibleRepeat?: boolean;
+  /** A post whose ask OpenRig couldn't check is still open says so in the same line, left out the same way. */
+  stateUnconfirmed?: boolean;
+  /** A post made although the person's quiet hours couldn't be read says so in the same line, left out the same way. */
+  quietUnreadable?: boolean;
+  /** A post whose evidence file won't be attached because it's outside the shared roots its writer may read says so in
+   *  the same line, left out the same way. */
+  evidenceNotAttached?: boolean;
 }
+
+const POSSIBLE_REPEAT_NOTE = "Delivery may repeat after an earlier unconfirmed attempt.";
+const STATE_UNCONFIRMED_NOTE = "OpenRig couldn't check that this ask is still open.";
+const QUIET_UNREADABLE_NOTE = "OpenRig couldn't read your quiet hours.";
+const EVIDENCE_NOT_ATTACHED_NOTE = "The evidence file isn't attached: it's outside the files its sender may share.";
 
 /** A1.2 — the four attribution fields. */
 export interface SeatAttribution {
@@ -100,7 +142,9 @@ export function buildImageBlocks(mediaRefs: readonly SlackMediaRef[] | undefined
  *  exactly these (one producer, one parser: see parseQuestionAction). */
 export const QUESTION_BLOCK_PREFIX = "or-q:";
 export const OPTION_ACTION_PREFIX = "or-opt:";
-const TYPED_REPLY_HINT = "Or reply in this thread with your own answer.";
+export const TYPED_REPLY_HINT = "Or reply in this thread with your own answer. A typed reply submits your answer without waiting for every question to be answered.";
+export const CHANNEL_REPLY_HINT = "Reply in this thread with your answer.";
+export const HUMAN_REQUIRED_REPLY_HINT = "Reply in this thread after this question to answer it. Earlier and extra messages still reach the agent as conversation.";
 
 /** Parse a clicked button back into its question and option ids; null if it is not ours. */
 export function parseQuestionAction(blockId: unknown, actionId: unknown): { questionId: string; optionId: string } | null {
@@ -111,14 +155,26 @@ export function parseQuestionAction(blockId: unknown, actionId: unknown): { ques
   return questionId && optionId ? { questionId, optionId } : null;
 }
 
+export function recommendationLabel(label: string, recommended = false): string {
+  return recommended && !/\(recommended\)/i.test(label) ? `${label} (recommended)` : label;
+}
+
 /** #193 — the questions as blocks (a section, then a button row, per question) plus the
- *  complete text they must also appear as in the accessible fallback. */
-function buildQuestionBlocks(questions: readonly HumanQuestion[]): { blocks: unknown[]; text: string } {
+ *  complete text they must also appear as in the accessible fallback. Without buttons (a shared channel, where a click
+ *  records nothing), each question's options are a list and the reader is asked to reply in the thread. */
+function buildQuestionBlocks(questions: readonly HumanQuestion[], buttons = true, resolved = false): { blocks: unknown[]; text: string } {
   const blocks: unknown[] = [];
   const lines: string[] = [];
   for (const q of questions) {
     const question = bounded(`*${inert(q.question)}*`, SLACK_SECTION_CAP, "question");
+    const options = q.options.map((o) => `• ${recommendationLabel(inert(o.label), o.recommended)}`);
     blocks.push({ type: "section", text: { type: "mrkdwn", text: question } });
+    lines.push(question, ...options);
+    // A resolved decision keeps its questions as history: options as text, no live buttons, no reply hint.
+    if (!buttons || resolved) {
+      blocks.push({ type: "section", text: { type: "mrkdwn", text: bounded(options.join("\n"), SLACK_SECTION_CAP, "options") } });
+      continue;
+    }
     blocks.push({
       type: "actions",
       block_id: `${QUESTION_BLOCK_PREFIX}${q.id}`,
@@ -130,10 +186,11 @@ function buildQuestionBlocks(questions: readonly HumanQuestion[]): { blocks: unk
         text: { type: "plain_text", text: bounded(inert(o.label), MAX_OPTION_LABEL, "option label") },
       })),
     });
-    lines.push(question, ...q.options.map((o) => `• ${inert(o.label)}${o.recommended ? " (recommended)" : ""}`));
   }
-  blocks.push({ type: "context", elements: [{ type: "mrkdwn", text: TYPED_REPLY_HINT }] });
-  lines.push(TYPED_REPLY_HINT);
+  if (resolved) return { blocks, text: lines.join("\n") };
+  const hint = buttons ? TYPED_REPLY_HINT : CHANNEL_REPLY_HINT;
+  blocks.push({ type: "context", elements: [{ type: "mrkdwn", text: hint }] });
+  lines.push(hint);
   return { blocks, text: lines.join("\n") };
 }
 
@@ -153,10 +210,12 @@ export function containsSecret(text: string): boolean {
   });
 }
 
+const REDACTED_SECRET = "[redacted-secret]";
+
 export function redactSecrets(text: string): string {
   let out = text;
   for (const p of SECRET_PATTERNS) {
-    out = out.replace(p, "[redacted-secret]");
+    out = out.replace(p, REDACTED_SECRET);
   }
   return out;
 }
@@ -178,6 +237,196 @@ function inert(text: string): string {
   return escapeSlackText(redactSecrets(text));
 }
 
+/** Split a matched bare URL from what follows it in the sentence: trailing punctuation, a
+ *  `)` or `]` with no opening partner inside the URL, and closing `**` or unbalanced `__`
+ *  markers. `…/Function_(mathematics)` and `#object.__init__` stay whole. */
+function trimBareUrl(match: string): [url: string, rest: string] {
+  const count = (s: string, part: string) => s.split(part).length - 1;
+  let url = match;
+  for (;;) {
+    if (url.endsWith("**")) url = url.slice(0, -2);
+    else if (url.endsWith("__") && count(url, "__") % 2 === 1) url = url.slice(0, -2);
+    else if (/[.,;:!?]$/.test(url)) url = url.slice(0, -1);
+    else if (url.endsWith(")") && count(url, ")") > count(url, "(")) url = url.slice(0, -1);
+    else if (url.endsWith("]") && count(url, "]") > count(url, "[")) url = url.slice(0, -1);
+    else return [url, match.slice(url.length)];
+  }
+}
+
+/** Convert one non-fenced, already-redacted line of Markdown to inert Slack mrkdwn. The line is
+ *  escaped first, so it holds no raw `<` or `>`, and `<n>` can mark a code span or link set aside
+ *  without colliding with input. A Markdown `[text](url)` or a Slack `<url|text>` / `<url>` becomes
+ *  a live link only for a safe https URL without `<`, `>` or `|` and a label (code included)
+ *  without `|`; otherwise it stays escaped text. */
+function inlineMarkdownToMrkdwn(line: string): string {
+  const held: string[] = [];
+  const hold = (rendered: string) => `<${held.push(rendered) - 1}>`;
+  const restore = (s: string) => s.replace(/<(\d+)>/g, (_, i: string) => held[Number(i)] ?? "");
+  const link = (original: string, url: string, label?: string) => {
+    const text = label === undefined ? undefined : restore(label);
+    const raw = url.replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&amp;", "&");
+    if (!isSafeHttpsUrl(raw) || /[<>|]/.test(raw) || text?.includes("|")) return original;
+    return hold(text === undefined ? `<${url}>` : `<${url}|${text}>`);
+  };
+  return restore(escapeSlackText(line)
+    .replace(/`[^`\n]+`/g, hold)
+    .replace(/\[([^\]\n]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)/g, (m, label: string, url: string) => link(m, url, label))
+    .replace(/&lt;(https:\/\/[^\s|]+?)(?:\|(.+?))?&gt;/g, (m, url: string, label?: string) => link(m, url, label))
+    // A bare URL is held as written: Slack links it, and `__` or `**` inside it is not bold.
+    .replace(/https:\/\/[^\s<>|`]+/g, (m) => {
+      const [url, rest] = trimBareUrl(m);
+      return hold(url) + rest;
+    })
+    .replace(/\*\*(?=\S)(.+?)(?<=\S)\*\*/g, "*$1*")
+    .replace(/__(?=\S)(.+?)(?<=\S)__/g, "*$1*"));
+}
+
+const FENCE_PATTERN = /^ {0,3}(`{3,}|~{3,})/;
+
+/** One pass over the lines: the converted text, and the fence still open at its end ("" if none). */
+function convertMarkdown(text: string, openFence: string): { text: string; openFence: string } {
+  let fence = openFence;
+  const lines = redactSecrets(text).split("\n").map((line) => {
+    const marker = FENCE_PATTERN.exec(line)?.[1];
+    if (fence) {
+      if (marker && marker[0] === fence[0] && marker.length >= fence.length && /^ {0,3}[`~]+\s*$/.test(line)) fence = "";
+      return escapeSlackText(line);
+    }
+    if (marker) {
+      fence = marker;
+      return escapeSlackText(line);
+    }
+    const heading = /^#{1,6}\s+(.*?)(?:\s+#+)?\s*$/.exec(line);
+    if (heading) {
+      if (!heading[1]) return "";
+      const inner = inlineMarkdownToMrkdwn(heading[1]);
+      return /^\*[^*\n]+\*$/.test(inner) ? inner : `*${inner}*`;
+    }
+    // Section mrkdwn has no list syntax; a plain "- " reads better than a typed bullet character.
+    const item = /^(\s*)[-*+]\s+(.*)$/.exec(line);
+    if (item) {
+      const [, indent = "", rest = ""] = item;
+      return `${indent}- ${inlineMarkdownToMrkdwn(rest)}`;
+    }
+    return inlineMarkdownToMrkdwn(line);
+  });
+  return { text: lines.join("\n"), openFence: fence };
+}
+
+/** Agent-written Markdown as Slack mrkdwn, through the same inert pipeline as every other
+ *  queue-controlled field (secrets redacted, then &, <, > escaped). `**b**`/`__b__` become
+ *  `*b*`, `#` headings a bold line, `-`/`*`/`+` list items `- ` (indent kept), and safe https
+ *  `[text](url)` and `<url|text>` links live links. A list marker needs a following space, so
+ *  `*bold*` is not a list item. Code spans and ``` or ~~~ fenced blocks are only escaped. `openFence` is the
+ *  fence a split brief's earlier part left open (see openFenceAfter). */
+export function markdownToSlackMrkdwn(text: string, openFence = ""): string {
+  const converted = convertMarkdown(text, openFence);
+  // Slack knows only ``` blocks, and only inside one message: a part that starts or ends inside one is wrapped to match.
+  const head = openFence.startsWith("`") ? "```\n" : "";
+  const tail = converted.openFence.startsWith("`") ? "\n```" : "";
+  return `${head}${converted.text}${tail}`;
+}
+
+/** Room a split part needs for the ``` lines markdownToSlackMrkdwn may add around it. */
+export const CODE_FENCE_ROOM = 8;
+
+/** The fence still open after `text`, so the next part of a split brief continues inside it. */
+export function openFenceAfter(text: string, openFence = ""): string {
+  return convertMarkdown(text, openFence).openFence;
+}
+
+type RichInline =
+  | { type: "text"; text: string; style?: { bold?: boolean; code?: boolean } }
+  | { type: "link"; url: string; text?: string };
+
+// Code spans, Markdown links, Slack links, bare https URLs, then **bold**, __bold__ and *bold*.
+const RICH_INLINE = /`([^`\n]+)`|\[([^\]\n]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)|<(https:\/\/[^\s|>]+)(?:\|([^>\n]+))?>|(https:\/\/[^\s<>|`]+)|\*\*(?=\S)(.+?)(?<=\S)\*\*|__(?=\S)(.+?)(?<=\S)__|\*(?=\S)([^*\n]+?)(?<=\S)\*/g;
+
+/** One already-redacted list item as rich text elements. Rich text is never parsed for
+ *  mentions or links, so plain text needs no escaping; a link element is emitted only for a
+ *  URL that passes the same checks as a mrkdwn link. */
+function richInline(text: string): RichInline[] {
+  const out: RichInline[] = [];
+  const plain = (t: string) => {
+    const last = out.at(-1);
+    if (last?.type === "text" && !last.style) last.text += t;
+    else if (t) out.push({ type: "text", text: t });
+  };
+  const re = new RegExp(RICH_INLINE.source, "g");
+  let at = 0;
+  for (let m = re.exec(text); m; m = re.exec(text)) {
+    plain(text.slice(at, m.index));
+    const [all, code, mdLabel, mdUrl, slackUrl, slackLabel, bare, b1, b2, b3] = m;
+    const url = mdUrl ?? slackUrl;
+    const label = mdLabel ?? slackLabel;
+    const bold = b1 ?? b2 ?? b3;
+    at = m.index + all.length;
+    if (code !== undefined) out.push({ type: "text", text: code, style: { code: true } });
+    else if (bare !== undefined) {
+      const [target] = trimBareUrl(bare);
+      if (isSafeHttpsUrl(target)) out.push({ type: "link", url: target });
+      else plain(target);
+      // What follows the URL (closing markers included) is parsed again.
+      at = re.lastIndex = m.index + target.length;
+    } else if (bold !== undefined) {
+      // Bold content is parsed again, so a link inside stays a link and the text around it is bold.
+      for (const el of richInline(bold)) out.push(el.type === "text" ? { ...el, style: { ...el.style, bold: true } } : el);
+    } else if (url !== undefined && isSafeHttpsUrl(url) && !/[<>|]/.test(url)) out.push(label ? { type: "link", url, text: label } : { type: "link", url });
+    else plain(all);
+  }
+  plain(text.slice(at));
+  return out.length ? out : [{ type: "text", text: " " }];
+}
+
+const LIST_ITEM = /^(\s*)(?:([-*+])|(\d{1,9})[.)])\s+(.*)$/;
+// ponytail: Slack documents no indent maximum; 4 covers real briefs and keeps clear of invalid_blocks.
+const MAX_LIST_INDENT = 4;
+
+/** The body as blocks: runs of list items (outside code fences) become one native `rich_text`
+ *  list block each; everything else stays mrkdwn sections. Nesting is two spaces per level. */
+export function buildBodyBlocks(text: string, openFence = ""): unknown[] {
+  type List = { type: "rich_text_list"; style: "bullet" | "ordered"; indent: number; offset?: number; elements: unknown[] };
+  const blocks: unknown[] = [];
+  let fence = openFence;
+  let runFence = openFence;
+  let run: string[] = [];
+  let lists: List[] = [];
+  const flushText = () => {
+    const source = run.join("\n");
+    run = [];
+    if (!source.trim()) return;
+    const converted = markdownToSlackMrkdwn(source, runFence);
+    if (converted.trim()) blocks.push({ type: "section", text: { type: "mrkdwn", text: bounded(converted, SLACK_SECTION_CAP, "body") } });
+  };
+  const flushLists = () => {
+    if (lists.length) blocks.push({ type: "rich_text", elements: lists });
+    lists = [];
+  };
+  for (const line of redactSecrets(text).split("\n")) {
+    const item = fence ? null : LIST_ITEM.exec(line);
+    if (item) {
+      flushText();
+      const [, lead = "", bullet, number, rest = ""] = item;
+      const style = bullet ? "bullet" : "ordered";
+      const indent = Math.min(MAX_LIST_INDENT, Math.floor(lead.replaceAll("\t", "  ").length / 2));
+      const section = { type: "rich_text_section", elements: richInline(rest) };
+      const last = lists.at(-1);
+      if (last && last.style === style && last.indent === indent) last.elements.push(section);
+      // An ordered run keeps its own numbering (a list starting at 5, or resuming after a nested list or a split).
+      else if (number && Number(number) > 1) lists.push({ type: "rich_text_list", style, indent, offset: Number(number) - 1, elements: [section] });
+      else lists.push({ type: "rich_text_list", style, indent, elements: [section] });
+      continue;
+    }
+    flushLists();
+    if (!run.length) runFence = fence;
+    run.push(line);
+    fence = openFenceAfter(line, fence);
+  }
+  flushText();
+  flushLists();
+  return blocks;
+}
+
 function isSafeHttpsUrl(url: string): boolean {
   if (!/^https:\/\/\S+$/.test(url) || containsSecret(url)) return false;
   try {
@@ -188,19 +437,26 @@ function isSafeHttpsUrl(url: string): boolean {
   }
 }
 
-/** #47 — render a non-image https evidenceRef as a plain link instead of a Block Kit
- *  `image` block. The URL arrives pre-validated as `^https://\S+$` from the delivery
+/** Render an HTTPS evidence reference as a link. The URL arrives
+ *  pre-filtered as `^https://\S+$` from the delivery
  *  layer; item-7 hygiene still applies (a secret-bearing URL is refused, never
  *  forwarded), and a URL carrying mrkdwn-breaking `<`, `>`, `|` degrades to escaped
  *  plain text rather than a link. Returns null when there is nothing safe to render. */
-function buildEvidenceLink(url: string | null | undefined): { text: string; block: unknown } | null {
+function buildEvidenceLink(url: string | null | undefined): { text: string; compactText: string; block: unknown } | null {
   const ref = typeof url === "string" ? url.trim() : "";
   if (!ref || !isSafeHttpsUrl(ref)) return null;
   const escapedRef = inert(ref);
   const text = `Evidence: ${escapedRef}`;
-  const context = bounded(/[<>|]/.test(ref) ? text : `Evidence: <${escapedRef}|evidence>`, SLACK_SECTION_CAP, "evidence context");
+  const labels = /[<>|]/.test(ref) ? [text] : [
+    `Evidence: <${escapedRef}|evidence>`,
+    `<${escapedRef}|evidence>`,
+    `<${escapedRef}>`,
+  ];
+  // Slack auto-links bare URLs in mrkdwn. Keep the complete escaped URL even when its label can't fit.
+  const context = labels.find(label => label.length <= SLACK_SECTION_CAP)
+    ?? bounded(escapedRef, SLACK_SECTION_CAP, "evidence context");
   const block = { type: "context", elements: [{ type: "mrkdwn", text: context }] };
-  return { text, block };
+  return { text, compactText: escapedRef, block };
 }
 
 /** S10 fix-r3 (R2 exactly-once) — the STRUCTURAL reconciliation identity: a bounded,
@@ -268,28 +524,155 @@ function bounded(text: string, max: number, field: string): string {
   return text;
 }
 
+/** Longest tag value the gate context line shows, in characters, ellipsis included. */
+export const GATE_CONTEXT_VALUE_CAP = 80;
+
+/** Shorten a redacted tag value to GATE_CONTEXT_VALUE_CAP characters: its start and end around
+ * `…`, then the first 12 hex characters of the SHA-256 of the whole value. Labels that differ at
+ * the start or end stay visibly distinct; for labels that differ only in the cut middle, the
+ * digest makes a collision unlikely but doesn't rule it out. Counts code points, so no surrogate
+ * pair is split, and keeps a redaction marker whole or leaves it out, never cut. */
+function shortenGateValue(value: string): string {
+  const tokens: string[] = [];
+  value.split(REDACTED_SECRET).forEach((part, index) => {
+    if (index > 0) tokens.push(REDACTED_SECRET);
+    tokens.push(...Array.from(part));
+  });
+  const width = (token: string) => (token === REDACTED_SECRET ? REDACTED_SECRET.length : 1);
+  if (tokens.reduce((sum, token) => sum + width(token), 0) <= GATE_CONTEXT_VALUE_CAP) return value;
+  const hash = ` #${createHash("sha256").update(value).digest("hex").slice(0, 12)}`;
+  const room = GATE_CONTEXT_VALUE_CAP - hash.length - 1;
+  const take = (from: string[], budget: number): string[] => {
+    const kept: string[] = [];
+    let used = 0;
+    for (const token of from) {
+      if (used + width(token) > budget) break;
+      kept.push(token);
+      used += width(token);
+    }
+    return kept;
+  };
+  const head = take(tokens, Math.floor(room / 2));
+  const tail = take([...tokens.slice(head.length)].reverse(), room - Math.floor(room / 2)).reverse();
+  return `${head.join("")}…${tail.join("")}${hash}`;
+}
+
+/** PR #1143 review — the one-line workflow/instance context for a rendered human gate,
+ * built from the row's own `workflow:` / `instance:` / `step:` tags. The step rides along
+ * only when tagged. Missing tags render as `?` so the line never names the wrong workflow.
+ * A hand-made row can carry a tag of any length, so each value is redacted, then shortened
+ * (shortenGateValue), and only then is the line escaped, so no escape is split.
+ * `instanceOnly` gives the shorter line that still tells two instances apart. */
+export function buildGateContextLine(tags: readonly string[], instanceOnly = false): string {
+  const tagValue = (prefix: string): string => {
+    const raw = tags.find((t) => t.startsWith(`${prefix}:`))?.slice(prefix.length + 1);
+    return raw ? shortenGateValue(redactSecrets(raw)) : "?";
+  };
+  if (instanceOnly) return escapeSlackText(`instance ${tagValue("instance")}`);
+  const parts = [`Workflow ${tagValue("workflow")}`, `instance ${tagValue("instance")}`];
+  const step = tagValue("step");
+  if (step !== "?") parts.push(`step ${step}`);
+  return escapeSlackText(parts.join(" · "));
+}
+
 /** Pure, deterministic rendering. Queue metadata stays in the durable request;
- * the human sees one subject, complete body and one sender attribution. */
+ * the human sees one sender attribution first, then one subject and the complete body.
+ * Where many agents post to one channel, who is asking comes before the ask, in the
+ * blocks and in the fallback text a notification shows. */
 export function buildOutboundMessage(q: QitemLike, opts: OutboundMessageOpts): SlackMessagePayload {
   const summary = inert(String(q.summary || "(no summary)"));
-  const body = bounded(inert(String(q.body || "")), SLACK_SECTION_CAP, "body");
+  // #1013 — a gate parked on a human renders from the structured fields: the headline IS
+  // the ask (gate.summary) and the evidenceRef rides the evidence link/media path. When
+  // that path won't carry it (a local path, not an https ref), the body falls to a single
+  // Evidence line — the raw agent packet (instance/step/Continuation lines for the seat
+  // that resumes after sign-off) never does. Without a plain-language summary there is
+  // nothing to show the person instead, so the packet stays as the fallback.
+  const humanGate = isHumanGatePacket(q) && String(q.summary ?? "").trim() !== "";
+  // PR #1143 review — two instances of the same workflow parked at the same gate otherwise
+  // render byte-identical messages. One short line from the row's own tags tells the person
+  // which workflow instance is asking (never the agent packet).
+  const gateContext = humanGate ? buildGateContextLine(q.tags ?? []) : null;
+  const gateEvidence = String(q.evidenceRef ?? "").trim();
+  // The Evidence path drops out only when the render already carries that same reference —
+  // an https ref riding as the evidence link, or a media attachment whose URL IS the ref.
+  // An image of a DIFFERENT artifact (the common screenshot case) keeps the Evidence line:
+  // without it the human cannot find the referenced document.
+  const gateEvidenceCarried = Boolean(opts.evidenceLink)
+    || (opts.mediaRefs ?? []).some((m) => m.imageUrl === gateEvidence);
+  const body = humanGate
+    ? (!gateEvidence || gateEvidenceCarried
+      ? ""
+      : bounded(`Evidence: ${inert(gateEvidence)}`, SLACK_SECTION_CAP, "body"))
+    : bounded(markdownToSlackMrkdwn(String(q.body || ""), q.bodyOpenFence ?? ""), SLACK_SECTION_CAP, "body");
   const mention = opts.mentionUserId ? `<@${opts.mentionUserId}> :rotating_light: ` : "";
   const headline = bounded(`${mention}*${summary}*`, SLACK_SECTION_CAP, "subject");
-  const attr = bounded(`from ${inert(opts.attribution?.session || opts.sourceLabel)}`, 2000, "sender");
+  const sender = `From ${inert(opts.attribution?.session || opts.sourceLabel)}`;
+  const machineSeg = (value: string | undefined) =>
+    opts.attribution && !opts.attribution.host && value ? ` on ${inert(value)}` : "";
   const imageBlocks = buildImageBlocks(opts.mediaRefs);
   const attachmentText = imageBlocks.map((b) => `Image: ${(b as { alt_text: string }).alt_text}`).join("\n");
   const evidence = buildEvidenceLink(opts.evidenceLink);
-  const questionParts = q.humanQuestions?.length ? buildQuestionBlocks(q.humanQuestions) : null;
+  const resolvedDecision = q.ownerNotificationKind === "human-decision-resolved";
+  const questionParts = q.humanQuestions?.length ? buildQuestionBlocks(q.humanQuestions, !q.sharedChannel, resolvedDecision) : null;
   if (opts.extraBlocks?.length) {
     throw new HumanMessageShapeError("Extra blocks have no complete accessible fallback. Use mediaRefs for images or author supplemental human detail.");
   }
-  const text = bounded([headline, body, questionParts?.text, attr, evidence ? evidence.text : null, attachmentText, opts.reconcileMarker].filter(Boolean).join("\n"), SLACK_TEXT_CAP, "complete fallback");
-  const blocks: unknown[] = [{ type: "section", text: { type: "mrkdwn", text: headline } }];
-  if (body.trim()) blocks.push({ type: "section", text: { type: "mrkdwn", text: body } });
+  const replyHint = q.ownerNotificationKind === "human-required"
+    ? HUMAN_REQUIRED_REPLY_HINT : null;
+  // The tail is computed per machine label: the sender line, the supplementary
+  // context/repeat decisions that depend on it, and the complete fallback. A
+  // configured display name must never refuse a delivery (reviewer on #3265):
+  // when the complete fallback overflows the text cap even though the sender
+  // line fits, the tail is recomputed once with the durable host ID, keeping
+  // the chosen label whenever it fits.
+  const computeTail = (machineValue: string | undefined) => {
+    let machine = machineSeg(machineValue);
+    if (sender.length + machine.length > 2000 && machine && opts.machineFallback) machine = machineSeg(opts.machineFallback);
+    const attrFor = bounded(`${sender}${machine}`, 2000, "sender");
+    const fallback = (context: string | null, repeat: string | null = null) => {
+      const render = (evidenceText?: string) =>
+        [attrFor, headline, repeat, context, body, questionParts?.text, replyHint, evidenceText, attachmentText, opts.reconcileMarker]
+          .filter(Boolean).join("\n");
+      const text = render(evidence?.text);
+      return evidence && text.length > SLACK_TEXT_CAP ? render(evidence.compactText) : text;
+    };
+    // The gate context line is supplementary: when it alone would push the complete fallback over
+    // budget, the instance part alone is tried, and the line is left out only when even that
+    // doesn't fit, rather than refusing the gate.
+    let shownContext = gateContext;
+    if (gateContext && fallback(gateContext).length > SLACK_TEXT_CAP && fallback(null).length <= SLACK_TEXT_CAP) {
+      const instanceLine = buildGateContextLine(q.tags ?? [], true);
+      shownContext = fallback(instanceLine).length <= SLACK_TEXT_CAP ? instanceLine : null;
+    }
+    // The repeat, state, quiet-hours and evidence notes are supplementary too: left out rather than refusing a message they would push
+    // over a limit.
+    const notes = [opts.possibleRepeat ? POSSIBLE_REPEAT_NOTE : null, opts.stateUnconfirmed ? STATE_UNCONFIRMED_NOTE : null,
+      opts.quietUnreadable ? QUIET_UNREADABLE_NOTE : null, opts.evidenceNotAttached ? EVIDENCE_NOT_ATTACHED_NOTE : null].filter(Boolean).join(" ");
+    const shownRepeat = notes && fallback(shownContext, notes).length <= SLACK_TEXT_CAP ? notes : null;
+    return { attr: attrFor, shownContext, shownRepeat, text: fallback(shownContext, shownRepeat) };
+  };
+  // A configured display name that fits the sender line can still push the
+  // COMPLETE fallback over the text cap: the durable host ID is tried before
+  // anything refuses, and the chosen label stays whenever it fits.
+  let tail = computeTail(opts.machine);
+  if (tail.text.length > SLACK_TEXT_CAP && opts.machineFallback) tail = computeTail(opts.machineFallback);
+  const { attr, shownContext, shownRepeat } = tail;
+  const text = bounded(tail.text, SLACK_TEXT_CAP, "complete fallback");
+  const blocks: unknown[] = [{ type: "context", elements: [{ type: "mrkdwn", text: attr }] }, { type: "section", text: { type: "mrkdwn", text: headline } }];
+  const repeatBlock = shownRepeat ? { type: "context", elements: [{ type: "mrkdwn", text: shownRepeat }] } : null;
+  if (repeatBlock) blocks.push(repeatBlock);
+  if (shownContext) blocks.push({ type: "context", elements: [{ type: "mrkdwn", text: shownContext }] });
+  const bodySection = { type: "section", text: { type: "mrkdwn", text: body } };
+  const bodyBlocks = !body.trim() ? [] : humanGate ? [bodySection] : buildBodyBlocks(String(q.body || ""), q.bodyOpenFence ?? "");
+  const bodyAt = blocks.length;
+  blocks.push(...bodyBlocks);
   if (questionParts) blocks.push(...questionParts.blocks);
+  if (replyHint) blocks.push({ type: "context", elements: [{ type: "mrkdwn", text: replyHint }] });
   blocks.push(...imageBlocks);
   if (evidence) blocks.push(evidence.block);
-  blocks.push({ type: "context", elements: [{ type: "mrkdwn", text: attr }] });
+  // A body split into many list and text runs falls back to one mrkdwn section rather than refusing the message.
+  if (blocks.length > 50 && bodyBlocks.length > 1) blocks.splice(bodyAt, bodyBlocks.length, bodySection);
+  if (repeatBlock && blocks.length > 50) blocks.splice(blocks.indexOf(repeatBlock), 1);
   if (blocks.length > 50) throw new HumanMessageShapeError("Message exceeds 50 Slack blocks. Reduce attachments before sending.");
   return { text, blocks };
 }

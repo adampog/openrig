@@ -9,14 +9,14 @@ applies-when: |
   agent-image capture/fork/protection, or Claude guided-compaction behavior.
 siblings: [packaging-bootstrap-bundles.md, agent-spec-and-startup.md]
 prerequisite-reads: [../README.md, agent-spec-and-startup.md]
-last-verified-against-source: 2caac7dd1bb16585138a6f7c1dd8b1f0752c49f7
-last-updated: 2026-10-05
+last-verified-against-source: e8f0ab340db773392ec8be75b072d1c0f3068a50
+last-updated: 2026-11-12
 ---
 
 # Content libraries and compaction
 
 This module describes source at main commit
-`2caac7dd1bb16585138a6f7c1dd8b1f0752c49f7`. Source paths below are repository-relative.
+`e8f0ab340db773392ec8be75b072d1c0f3068a50`. Source paths below are repository-relative.
 Context packs, plugins and agent images have filesystem-backed content and daemon-side
 discovery. Their consumers can read database identity, mutate files, deliver messages or
 launch sessions; the whole layer is not a read-only catalog.
@@ -123,20 +123,24 @@ is refused; the other content checks are advisory.
 
 `packages/daemon/src/domain/skill-catalog.ts` resolves a seat's skill loadout from the
 catalog at `skills.root` (`catalog.yaml`, schema `openrig.skill-catalog/v1`) and the system,
-topology and project selections. It projects skills into `<cwd>/.claude/skills` or
-`<cwd>/.agents/skills` and tracks what it owns in
-`<cwd>/.openrig/skill-loadouts/<runtime>.json`. Each projection reports `current`, `missing`,
-`shadowed`, `stale` or `conflicting`. `rig skill loadout --runtime <runtime>` inspects the
-composed projection and reconciles it only with `--apply`; `rig skill audit` is a separate
+topology and project selections. For a working directory it projects skills into
+`<cwd>/.claude/skills` or `<cwd>/.agents/skills` and tracks what it owns in
+`<cwd>/.openrig/skill-loadouts/<runtime>.json`. For a Claude or Codex team seat it takes a
+`location` instead: the seat's own storage outside the project, with its `skill-loadout.json`
+there, and for Claude the `openrig:<id>` names its generated plugin gives. Each projection
+reports `current`, `missing`, `shadowed`, `stale` or `conflicting`.
+`rig skill loadout --runtime <runtime>` inspects the composed projection for a working
+directory, `rig skill loadout --seat <session|self>` does the same for one seat's own skills,
+and both reconcile only with `--apply`; `rig skill audit` is a separate
 read-only provenance and freshness audit. Launch applies the selected loadout per seat.
 
 For a Claude Code or Codex seat, the profile resolver also adds each selected plugin's skills to
-that loadout (`packages/daemon/src/domain/profile-resolver.ts:287–308`, with
-`resolvePluginSkills()` at `skill-catalog.ts:368`). Neither runtime reads skills from the plugin
+that loadout (`packages/daemon/src/domain/profile-resolver.ts:309–330`, with
+`resolvePluginSkills()` at `skill-catalog.ts:460`). Neither runtime reads skills from the plugin
 folder projected into the working directory. The skills are projected under their plain names,
 and a skill the profile already selects keeps its source. A kept plugin copy (an edited or
 user-owned one, or OpenRig's own copy whose plugin source changed or moved after the loadout
-was resolved, `skill-catalog.ts:937–945`) gives a `plugin_skill_kept` warning, and an unreadable one gives
+was resolved, `skill-catalog.ts:1060–1068`) gives a `plugin_skill_kept` warning, and an unreadable one gives
 `plugin_skill_skipped`. If plugin skills can't be projected at all, the seat starts without them
 and gets a `plugin_skills_not_projected` warning (`rigspec-instantiator.ts:2045`).
 
@@ -188,7 +192,8 @@ The routes mount at `/api/agent-images` and expose list/sync, snapshot/fork,
 entry/preview, pin/unpin, delete and prune.
 `packages/cli/src/commands/agent-image.ts` owns the image library commands. The top-level
 `rig fork` verb (`packages/cli/src/commands/fork.ts`) drives `POST /fork`; `--keep-image`
-also captures a pinned image.
+also captures a pinned image. Forking a Claude Code seat needs Claude Code 2.0.73 or later,
+because the fork is launched with its own `--session-id`.
 
 ## Plugins
 
@@ -214,6 +219,27 @@ from the older bundled plugin and rejects duplicate vendored hook registrations 
 providers. Cached plugin versions are excluded from that duplicate-provider check. Startup
 constructs the service while building the daemon's dependencies and doesn't catch that
 rejection, so a duplicate vendored hook stops daemon creation.
+
+Vendoring at daemon start (`ensureVendored` in `plugin-vendor-service.ts`) seeds a bundled
+plugin that isn't installed, and refreshes an installed one only when the bundled manifest
+version is strictly newer, backing up what it replaces. At an equal version it leaves the
+installed content unchanged, though it may reconcile file modes on byte-identical files; a newer
+installed version is left as it is. That describes this start-time path only, not every way a
+plugin can be installed or updated, and daemon start vendors only `openrig-core`
+(`ensureLatest("openrig-core")` in `startup.ts`). `openrig-core` keeps its own `0.1.x` line, so a
+change to its packaged files needs a greater version for an installed copy to refresh. The
+`openrig` plugin ships inside the CLI, and an app installs it from the package; its four manifests
+carry the CLI's release version, set in release preparation, while development source keeps them
+at `0.1.0`. `npm run pack:release` refuses a missing `openrig`
+manifest, or one that doesn't carry the CLI's version, in source or in the assembled CLI. It also
+refuses a baseline (`scripts/fixtures/packaged-plugins-last-release.json`) whose release isn't
+earlier than the CLI's, or that has no archive hash or plugins, and changed plugin bytes without a
+greater version than that release's. Those baseline checks read the file's own fields: they don't
+prove the baseline is the published, latest or complete release archive, so a successful pack
+prints the baseline it used, to confirm against the registry. Refresh the baseline from the
+published archive with the snapshot, validate and replace steps at the end of
+[`scripts/check-packaged-plugin-versions.mjs`](../../../scripts/check-packaged-plugin-versions.mjs);
+`--snapshot` on its own only prints the JSON.
 
 `packages/daemon/src/routes/plugins.ts` exposes GET-only inspection at `/api/plugins`:
 list, detail, used-by and file list/read. The file routes use the discovered plugin root as
@@ -263,6 +289,14 @@ Code. Its implementation requires Claude Code, observed usage and a valid intege
 post-restore cooldown (10 minutes), the deduplication window (60 seconds) and the
 already-triggered latch; an active manual attempt also blocks it.
 
+While the policy is enabled with a valid threshold (`managedCompactionActive` in
+`packages/daemon/src/adapters/kernel-authority.ts`, using the enforcer's exported `isValidThresholdPercent`),
+`operationalLaunchArgs` merges `idleCompaction: false` into the Claude launch's one `--settings` value, adding one
+when there is none. Fresh launch, fork, resume (`claude-code-adapter.ts`) and restore (`claude-resume.ts`) all build
+their Claude arguments there. The policy is read at each launch; a running session keeps the settings it was launched
+with. Claude Code before 2.1.290 ignores the key, Claude's managed settings take precedence over `--settings`, and
+`autoCompactEnabled` is not set.
+
 `/compact` is held behind a preparation attempt:
 
 1. The first above-threshold tick starts an attempt with its own ID, the seat's occupant
@@ -271,13 +305,22 @@ already-triggered latch; an active manual attempt also blocks it.
 2. The agent writes `RESTORE-MAP.md.tmp` with its file-edit tool, completion marker last.
    Later ticks return `preparation_pending` until that exact map is complete. The map path is under the seat's working directory
    (`.openrig/compaction/preparation/<session>/<attempt>/`, with a `.gitignore` of `*`) when
-   that is writable, otherwise under `compaction/preparation/` in the OpenRig home.
+   that is writable, otherwise under `compaction/preparation/` in the OpenRig home. An explicit
+   `policies.claude_compaction.preparation_root` instead places maps at `<root>/<session>/<attempt>/`
+   for both manual and automatic attempts; failure to prepare that root stops the attempt without fallback.
 3. The daemon atomically renames the completed temp file to `RESTORE-MAP.md` in its existing
    final send checks, after rechecking the attempt and occupant. An already-complete final map
    remains compatible. Only then is `/compact` sent, with the final map path appended to the
    compact instruction. Publication failure cannot authorize `/compact`.
 4. The continuation then runs below the threshold: turn boundary, restore prompt, then a
-   read-depth audit prompt (each item marked `FULL`, `PARTIAL` or `NOT_READ`).
+   read-depth audit prompt (each item marked `FULL`, `PARTIAL` or `NOT_READ`), one stage per
+   poll tick. A seat refreshes its usage sample only when it takes a turn, so when the sample is
+   stale, unknown or has no percentage and a stage is pending, the monitor drains that stage
+   without one (`context-monitor.ts:175`, `claude-compaction-enforcer.ts:436`). Only a fresh,
+   known sample can start a compaction. The sample-less drain reads readiness from the pane alone
+   and counts a timer-less live status row, such as `✻ Compacting conversation…`, as work
+   (`session-transport.ts:153-161`); a recent hook showing work or a waiting person still
+   refuses. It records no width receipt, because the only figure would be the pre-compact one.
 
 An automatic attempt has a 25-minute ceiling that starts once the prep is delivered. A stale
 occupant generation, the policy becoming disabled, or the deadline passing stops it. A prep
@@ -293,7 +336,7 @@ over the global extra file, and an extra file that declares a different seat is 
 manually through `/api/compaction/trigger`, `cancel` and `state`, which use the terminal
 bearer-token middleware; it passes every request through when no token is configured.
 `--skip-map` skips the map requirement once, `--cancel` ends the preparation, and `--state`
-shows the attempt, its expected map and its deadline. A manual attempt has 120 seconds for
+shows the attempt, its expected map and its deadline. Ordinary approval prompts during preparation can be answered within that same deadline; OpenRig waits without answering them. A manual attempt has 180 seconds for
 preparation and the idle wait.
 
 The below-threshold continuation checks policy enablement too, except for an explicitly
@@ -307,6 +350,96 @@ are files. Startup supplies live generation
 resolution and a post-restore callback that records a managed-width receipt, so the wider
 operation also has persistent effects. Do not infer durable lifecycle completion from
 a library read or one successfully queued message.
+
+## Pi native compaction
+
+`rig compact <pi-seat>` asks for Pi's native `compact` RPC; it does not run
+Claude's preparation, restore or audit lifecycle. This section was checked against
+omo 5.1.48 (engine senpi 2026.10.25-2), the Pi fork used for the live probe. It
+does not claim general Pi support: the `unsupported` detection below matches that
+fork's error text. The other sections retain their earlier verification
+boundaries. OMP is excluded even though it shares runner code, and
+`rig compact-plan` remains Claude-only.
+
+### Trigger through the guarded send path
+
+[`PiCompactionService`](../../../packages/daemon/src/domain/pi-compaction-service.ts)
+is wired beside the Claude enforcer in
+[`startup.ts`](../../../packages/daemon/src/startup.ts), with
+`PiRuntimeAdapter.readRunnerSidecar()` as its reader and the session transport's
+ordinary `send()` as its writer. [`compaction.ts`](../../../packages/daemon/src/routes/compaction.ts)
+dispatches `/api/compaction/trigger` and `/api/compaction/state` by runtime.
+
+1. The service mints one attempt id and sends the reserved
+   `/openrig-compact <attempt-id>` input with `openrigNotice`. It uses no raw tmux
+   call and no separate state probe. The guarded send path supplies what the
+   removed handshake covered: a typing-guard hold, an interactive prompt, the bound
+   occupant/pane, and a person's draft where the seat's draft protection reads the
+   Pi editor. Otherwise the control can join a draft, as any message to a Pi agent
+   can, and that attempt reads uncertain. Those are the same refusals every other
+   send to the seat gets.
+2. The selected node, session and pane are re-checked by the delivery guard at the
+   actual text write and at Enter. The service binds the runner's `launchId`
+   before the send and checks it at those same two moments, through the send's
+   `beforeWrite` callback, so a request cannot reach a replacement occupant or a
+   rebound runner.
+3. The caller's actor reaches the same terminal-policy check the Claude path uses
+   (`claude-compaction-enforcer.ts`). `TerminalPolicyStore.check(nodeId,
+   "compaction", actor)` is consulted before any input; self, peer and
+   unattributed handling are unchanged, so a denied peer is refused with
+   `terminal_policy_refused`. This is the existing rule applied to Pi.
+4. The trigger returns `submitted_unconfirmed` when the guarded send delivered
+   text and Enter, and `uncertain` when input may have been written but the result
+   is unconfirmed. Only a proven pre-input refusal (the transport's own reasons,
+   an already-running compaction, unsupported, or the policy) is "not started".
+   The send passes the transport's bounded idle wait: a working agent is waited
+   for, an over-budget wait returns the transport's own not-idle reason, and an
+   unknown reading still sends. No probe and no new refusal code are added.
+   A request is recorded before its send is awaited, so two overlapping triggers
+   share one send. A runner-confirmed compact RPC awaiting Pi's answer, or a run
+   that started and has no end, holds a later request. A draft-only or otherwise
+   unconfirmed attempt reads `uncertain` without a lasting `already_in_progress` refusal.
+
+### The requested run, scoped to its launch
+
+[`RunnerCore`](../../../packages/daemon/src/adapters/pi-runner.ts) turns the exact
+reserved input into the native `compact` RPC, naming the attempt in the RPC id.
+It stamps that attempt id onto the sidecar `compaction` record at
+`compaction_start`; an automatic run (threshold/overflow) never takes it.
+
+- `compaction_start` writes the runner's `compaction` record and emits
+  `active/compaction`. `compaction_end` writes its terminal record and attempts
+  `Stop/compaction` unless pending attention suppresses that advisory post.
+- The service reads the sidecar, not the activity, for status. The requested
+  attempt reports `completed`, `failed`, `aborted` or `unsupported` only from a
+  record whose attempt id matches. The runner keeps the last attempt-stamped
+  record in `requestedCompaction`, beside `compaction`: a later automatic run
+  replaces `compaction` without erasing a requested completion. A record from an
+  earlier request is never this request's answer; the automatic run is shown
+  separately as `automatic`.
+- A request that may have been submitted with no result, and a start with no end,
+  both report `uncertain` (`submitted_no_result` and `started_no_end`), including
+  in the CLI, never "was not started". The service saves one current request,
+  scoped to the agent and runner launch, before guarded input can be submitted.
+  A daemon restart therefore reads the newest request as `uncertain` even if its
+  text joined a draft or was written without Enter. The runner separately records
+  `pendingCompaction.attemptId` while its compact RPC awaits Pi's answer.
+  Runner restart drops the launch-scoped record and pending id.
+- The runner re-arms idle heartbeats at `compaction_end` even when the terminal
+  post is lost or attention suppresses it. Activity is advisory; completion is
+  durable in the sidecar.
+
+An older Pi build that rejects native `compact` records an explicit unsupported
+error; subsequent triggers refuse rather than retrying as text. The first trigger
+can have returned submission success before that RPC error arrives. `--skip-map`
+is accepted but ignored for Pi; `--cancel` rejects Pi with `runtime_filter` and
+supplies no native abort path.
+
+`pi-compaction-seam.test.ts` drives the real RunnerCore input/RPC handling, atomic sidecar output, service and activity store with synthetic Pi events. Its cases cover
+optional request identity, delayed or lost terminal activity, ordered beats,
+durable completion scoped by attempt id, a requested completion kept beside a
+later automatic run, and idle re-arming. This is an executable producer/consumer
+proof using the real runner and sidecar, not a live Pi process or tmux test.
 
 ## Related maps
 

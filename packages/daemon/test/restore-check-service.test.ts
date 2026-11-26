@@ -72,7 +72,7 @@ function startupContextProbe(options?: {
   status?: "ok" | "missing" | "malformed" | "probe_error";
   evidence?: string;
   resolvedStartupFiles?: Array<{ absolutePath: string; required: boolean; path?: string; deliveryHint?: string; ownerRoot?: string }>;
-  projectionEntries?: Array<{ absolutePath: string; effectiveId?: string; category?: string; sourcePath?: string; resourceType?: string }>;
+  projectionEntries?: Array<{ absolutePath: string; effectiveId?: string; category?: string; sourcePath?: string; resourceType?: string; resourcePath?: string }>;
   runtime?: string;
 }) {
   if (options?.status && options.status !== "ok") {
@@ -93,7 +93,7 @@ function startupContextProbe(options?: {
 function mockDeps(overrides?: Partial<RestoreCheckDeps & {
   getStartupContext: (nodeId: string) => unknown;
 }>): RestoreCheckDeps {
-  return {
+  const deps: RestoreCheckDeps = {
     stateDir: "/custom-instance",
     listRigs: () => [{ rigId: "rig-1", name: "test-rig" }],
     getNodeInventory: () => [
@@ -109,12 +109,14 @@ function mockDeps(overrides?: Partial<RestoreCheckDeps & {
       } as NodeInventoryEntry,
     ],
     hasSnapshot: () => true,
-    // Independent fixture for the newly shared snapshot pre-validation.
+    // Independent fixture for the newly shared snapshot pre-validation. Its nodes are the rig's seats, as a snapshot of
+    // the rig records them, so restore's membership includes every seat the test's inventory has.
     getRestoreInputs: (rigId) => ({
       snapshot: { id: "snap-1", kind: "full", data: {
         rig: { id: rigId, name: "test-rig", createdAt: "", updatedAt: "" },
-        nodes: [], sessions: [], edges: [], checkpoints: {},
-      } },
+        nodes: deps.getNodeInventory(rigId).flatMap((node) => node.nodeId ? [{ id: node.nodeId, logicalId: node.logicalId }] : []),
+        sessions: [], edges: [], checkpoints: {},
+      } } as never,
       servicesRecord: null,
     }),
     getLatestSnapshot: () => null,
@@ -123,9 +125,11 @@ function mockDeps(overrides?: Partial<RestoreCheckDeps & {
     readFile: () => VALID_HOST_INFRA_DECLARATION,
     getStartupContext: () => startupContextProbe(),
     probeQueueStore: () => ({ available: true, evidence: "SQLite queue store is available" }),
+    getDesiredClaudeActivityHooks: () => ({ status: "known", selected: false }),
     getClaudeActivityHookEvents: () => ["SessionStart", "UserPromptSubmit"],
     ...overrides,
   };
+  return deps;
 }
 
 describe("RestoreCheckService", () => {
@@ -946,13 +950,13 @@ describe("RestoreCheckService", () => {
     expect(hookChecks).toHaveLength(0);
   });
 
-  it.each([undefined, "*", "startup|resume", "startup, resume", "^(startup|resume)$"])("checks usable selected activity-hook matcher %s", (matcher) => {
+  it.each([undefined, "*", "startup|resume", "startup, resume", "^(startup|resume)$"].flatMap(matcher => ["node", "'/runtime/node'", "exec node", "exec '/runtime/node'"].map(executable => ({ matcher, executable }))))("checks usable selected activity-hook matcher $matcher / $executable", ({ matcher, executable }) => {
     const cwd = path.join(os.tmpdir(), "restore-check-activity-seat");
     const settingsPath = path.join(cwd, ".claude", "settings.local.json");
     const relayPath = RELAY_PATH;
     const events = ["SessionStart", "UserPromptSubmit"];
     const settings = JSON.stringify({ hooks: Object.fromEntries(events.map((event) => [event, [{ matcher, hooks: [
-      { type: "command", command: `node '${relayPath}'` },
+      { type: "command", command: `${executable} '${relayPath}'` },
     ] }]])) });
     const service = new RestoreCheckService(mockDeps({
       getNodeInventory: () => [claudeNode({ cwd })],
@@ -1042,6 +1046,39 @@ describe("RestoreCheckService", () => {
     expect(hook?.evidence).toContain("UserPromptSubmit");
   });
 
+  it.each(["managed", "plugin", "both"])("keeps old equal-version %s delivery ready without the optional diagnostic or elicitation hooks", channel => {
+    const cwd = "/fixture-project", pluginDir = "/custom-instance/plugins/openrig-core";
+    const settingsPath = path.join(cwd, ".claude/settings.local.json");
+    const oldEvents = ["SessionStart", "UserPromptSubmit", "PostToolBatch", "Stop", "StopFailure", "Notification"];
+    const files = new Map([
+      [settingsPath, JSON.stringify({ hooks: Object.fromEntries(oldEvents.map(event => [event, [{
+        hooks: [{ type: "command", command: `node '${RELAY_PATH}'` }],
+      }]])) })],
+      [RELAY_PATH, "// old managed relay"],
+      [path.join(pluginDir, ".claude-plugin/plugin.json"), JSON.stringify({ name: "openrig-core", version: "0.1.24", hooks: "./hooks/claude.json" })],
+      [path.join(pluginDir, "hooks/claude.json"), JSON.stringify({ hooks: Object.fromEntries(oldEvents.map(event => [event, [{
+        hooks: [{ type: "command", command: 'node "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/activity-relay.cjs" --from-plugin' }],
+      }]])) })],
+      [path.join(pluginDir, "hooks/scripts/activity-relay.cjs"), "// old plugin relay"],
+    ]);
+    const projectionEntries = [
+      ...(channel !== "plugin" ? [{ absolutePath: "/source/activity-hooks", category: "runtime_resource", resourceType: "claude_activity_hooks" }] : []),
+      ...(channel !== "managed" ? [{ absolutePath: pluginDir, category: "plugin" }] : []),
+    ];
+    const service = new RestoreCheckService(mockDeps({
+      getNodeInventory: () => [claudeNode({ cwd })],
+      getStartupContext: () => startupContextProbe({ projectionEntries }),
+      getClaudeActivityHookEvents: () => ["SessionStart", "UserPromptSubmit", "PermissionRequest", "Elicitation", "ElicitationResult",
+        "PostToolBatch", "Stop", "StopFailure", "Notification"],
+      exists: file => files.has(file) || file.endsWith("host-infra.json"),
+      readFile: file => files.get(file) ?? VALID_HOST_INFRA_DECLARATION,
+    }));
+    const hook = service.check({}).checks.find(entry => entry.check === "seat.dev-impl@test-rig.hooks");
+    expect(hook?.status).toBe("green");
+    expect(hook?.evidence).not.toContain("missing");
+    expect(files.has(path.join(pluginDir, "hooks/scripts/permission-stop-descriptor.cjs"))).toBe(false);
+  });
+
   it("does not count stale project-local commands as delivered instance hooks", () => {
     const cwd = "/project";
     const settingsPath = path.join(cwd, ".claude", "settings.local.json");
@@ -1066,6 +1103,246 @@ describe("RestoreCheckService", () => {
     const hook = new RestoreCheckService(mockDeps()).check({}).checks.find((entry) => entry.check === "seat.dev-impl@test-rig.hooks");
     expect(hook?.status).toBe("green");
     expect(hook?.evidence).toContain("not selected");
+  });
+
+  it.each(["selected", "unknown", "throws"])("keeps absent saved channels with %s desired metadata nonblocking", (kind) => {
+    const desired = () => {
+      if (kind === "throws") throw new Error("unreadable source");
+      return kind === "selected" ? { status: "known" as const, selected: true }
+        : { status: "unknown" as const, evidence: "unreadable source" };
+    };
+    const service = new RestoreCheckService(mockDeps({ getDesiredClaudeActivityHooks: desired }));
+    for (const opts of [{}, { compact: true, includeReady: true }]) {
+      const result = service.check(opts);
+      expect(result.verdict).toBe("restorable_with_caveats");
+      expect(result.readiness.status).toBe("ready_with_caveats");
+      expect(result.rigs[0]?.classCounts.ready_with_caveats).toBe(1);
+      const hook = result.checks.find(c => c.check.endsWith(".hooks"));
+      expect(hook).toMatchObject({ status: "yellow", remediation: "" });
+      expect(hook?.evidence).toContain(kind === "selected" ? "stale selection" : "unknown");
+      expect(result.repairPacket?.some(step => step.rationale === hook?.evidence) ?? false).toBe(false);
+      expect(result.recovery.actions).toEqual([]);
+    }
+  });
+
+  it("does not add desired-profile resolution to omitted ready detail or composed no-hooks polls", () => {
+    let reads = 0;
+    const service = new RestoreCheckService(mockDeps({ getDesiredClaudeActivityHooks: () => {
+      reads++; return { status: "known", selected: true };
+    } }));
+    expect(service.check({ compact: true }).checks.some(c => c.check.endsWith(".hooks"))).toBe(false);
+    service.check({ noHooks: true, recoveryOnly: true });
+    expect(reads).toBe(0);
+    service.check({ compact: true, includeReady: true });
+    expect(reads).toBe(1);
+  });
+
+  // A seat that isn't running is named by what restore does with it; it blocks the rig only when restore can't bring it back.
+  it.each([
+    ["kept attached as an external CLI", { attachmentType: "external_cli" }, null, "Restore leaves this seat as it is: it's attached as an external CLI"],
+    ["outside the roster restore uses", {}, [], "Restore leaves this seat as it is: it isn't in the roster this restore uses"],
+    ["brought back from its saved startup context", { restorePolicy: "relaunch_fresh" }, null, "restore brings it back from its saved startup context"],
+  ] as const)("a detached seat %s reads yellow, named, and doesn't block the rig", (_label, seat, rosterIds, said) => {
+    const result = new RestoreCheckService(mockDeps({
+      getNodeInventory: () => [claudeNode({ sessionStatus: "detached", startupStatus: "ready", tmuxAttachCommand: null, ...seat })],
+      ...(rosterIds ? { getRestoreInputs: (rigId: string) => ({
+        snapshot: { id: "snap-1", kind: "full", data: { rig: { id: rigId, name: "test-rig", createdAt: "", updatedAt: "" },
+          nodes: [], sessions: [], edges: [], checkpoints: {}, topologyRoster: { version: 1, source: "materialized_topology", intendedNodeIds: [...rosterIds] } } },
+        servicesRecord: null,
+      }) as never } : {}),
+    })).check({ noQueue: true, noHooks: true }) as any;
+    const readiness = result.checks.find((entry: { check: string }) => entry.check === "seat.dev-impl@test-rig.readiness");
+    expect(readiness).toMatchObject({ status: "yellow", evidence: expect.stringContaining(said) });
+    expect(result.checks.filter((entry: { status: string }) => entry.status === "red")).toEqual([]);
+    expect(result.verdict).not.toBe("not_restorable");
+  });
+
+  const emptyRosterInputs = (rigId: string) => ({
+    snapshot: { id: "snap-1", kind: "full", data: { rig: { id: rigId, name: "test-rig", createdAt: "", updatedAt: "" },
+      nodes: [], sessions: [], edges: [], checkpoints: {}, topologyRoster: { version: 1, source: "materialized_topology", intendedNodeIds: [] } } },
+    servicesRecord: null,
+  }) as never;
+
+  // A running, ready seat keeps its true readiness, and restore-check names what restore would do with it beside that, in
+  // compact output too.
+  it.each([
+    ["kept attached as an external CLI", { attachmentType: "external_cli" }, false, "it's attached as an external CLI"],
+    ["outside the roster restore uses", {}, true, "it isn't in the roster this restore uses"],
+  ] as const)("a running, ready seat %s is named with what restore does", (_label, seat, emptyRoster, said) => {
+    const result = new RestoreCheckService(mockDeps({
+      getNodeInventory: () => [claudeNode(seat)],
+      ...(emptyRoster ? { getRestoreInputs: emptyRosterInputs } : {}),
+    })).check({ compact: true, noQueue: true, noHooks: true }) as any;
+    const readiness = result.checks.find((entry: { check: string }) => entry.check === "seat.dev-impl@test-rig.readiness");
+    expect(readiness).toMatchObject({ status: "yellow", evidence: expect.stringContaining(`Seat running and ready: dev-impl@test-rig. Restore leaves this seat as it is: ${said}`) });
+    expect(result.rigs[0]).toMatchObject({ runningReadyNodes: 1 });
+    expect(result.verdict).toBe("restorable_with_caveats");
+  });
+
+  // Restore doesn't launch a seat it leaves as it is, so that seat's missing startup context or startup file doesn't block
+  // the rig; it's still named.
+  it.each([
+    ["external CLI", "no saved startup context", { attachmentType: "external_cli" }, false, startupContextProbe({ status: "missing", evidence: "Persisted startup context missing" })],
+    ["roster-excluded", "no saved startup context", {}, true, startupContextProbe({ status: "missing", evidence: "Persisted startup context missing" })],
+    ["external CLI", "a missing required startup file", { attachmentType: "external_cli" }, false, startupContextProbe({ resolvedStartupFiles: [{ absolutePath: "/gone/notes.md", required: true }] })],
+    ["roster-excluded", "a missing required startup file", {}, true, startupContextProbe({ resolvedStartupFiles: [{ absolutePath: "/gone/notes.md", required: true }] })],
+  ] as const)("a detached %s seat with %s and no resume token doesn't block the rig", (_kind, _missing, seat, emptyRoster, context) => {
+    const result = new RestoreCheckService(mockDeps({
+      getNodeInventory: () => [claudeNode({ sessionStatus: "detached", startupStatus: "ready", tmuxAttachCommand: null, ...seat })],
+      getStartupContext: () => context,
+      exists: (target: string) => target !== "/gone/notes.md",
+      ...(emptyRoster ? { getRestoreInputs: emptyRosterInputs } : {}),
+    })).check({ noQueue: true, noHooks: true }) as any;
+    const startup = result.checks.find((entry: { check: string }) => entry.check.startsWith("seat.dev-impl@test-rig.startup"));
+    expect(startup).toMatchObject({ status: "yellow", evidence: expect.stringContaining("Restore doesn't launch this seat") });
+    expect(result.checks.filter((entry: { status: string }) => entry.status === "red")).toEqual([]);
+    expect(result.verdict).toBe("restorable_with_caveats");
+  });
+
+  // A snapshot from before rosters were recorded restores its own nodes, so restore skips a seat added since. restore-check
+  // reads that same membership: the later seat is left as it is, never brought back, and its startup inputs don't block.
+  it.each([
+    ["saved startup inputs", startupContextProbe(), "green"],
+    ["missing startup inputs", startupContextProbe({ status: "missing", evidence: "Persisted startup context missing" }), "yellow"],
+  ] as const)("a seat added after a pre-roster snapshot, with %s, reads left as it is", (_label, lateContext, startupStatus) => {
+    const late = claudeNode({ nodeId: "node-2", logicalId: "dev.late", canonicalSessionName: "dev-late@test-rig",
+      sessionStatus: "detached", startupStatus: "ready", tmuxAttachCommand: null, restorePolicy: "relaunch_fresh" });
+    const result = new RestoreCheckService(mockDeps({
+      getNodeInventory: () => [claudeNode(), late],
+      getStartupContext: (nodeId: string) => nodeId === "node-2" ? lateContext : startupContextProbe(),
+      getRestoreInputs: (rigId: string) => ({
+        snapshot: { id: "snap-1", kind: "full", data: { rig: { id: rigId, name: "test-rig", createdAt: "", updatedAt: "" },
+          nodes: [{ id: "node-1", logicalId: "dev.impl" }], sessions: [], edges: [], checkpoints: {} } },
+        servicesRecord: null,
+      }) as never,
+    })).check({ noQueue: true, noHooks: true }) as any;
+    const lateChecks = result.checks.filter((entry: { check: string }) => entry.check.startsWith("seat.dev-late@test-rig."));
+    expect(lateChecks.find((entry: { check: string }) => entry.check.endsWith(".readiness"))).toMatchObject({
+      status: "yellow", evidence: expect.stringContaining("Restore leaves this seat as it is: it isn't in the roster this restore uses"),
+    });
+    expect(lateChecks.find((entry: { check: string }) => entry.check.endsWith(".startup-context"))?.status).toBe(startupStatus);
+    expect(result.checks.some((entry: { evidence: string }) => entry.evidence.includes("brings it back"))).toBe(false);
+    expect(result.checks.filter((entry: { status: string }) => entry.status === "red")).toEqual([]);
+    expect(result.verdict).toBe("restorable_with_caveats");
+  });
+
+  // Restore stops a resume-policy seat that had a session but has no resume token before it starts anything, so a saved
+  // startup context doesn't bring it back: it stays red.
+  it("a detached resume seat with no resume token stays red, though its startup context is saved", () => {
+    const result = new RestoreCheckService(mockDeps({
+      getNodeInventory: () => [claudeNode({ sessionStatus: "detached", startupStatus: "ready", tmuxAttachCommand: null })],
+    })).check({ noQueue: true, noHooks: true }) as any;
+    const readiness = result.checks.find((entry: { check: string }) => entry.check === "seat.dev-impl@test-rig.readiness");
+    expect(readiness).toMatchObject({ status: "red", evidence: expect.not.stringContaining("brings it back") });
+    expect(result.verdict).toBe("not_restorable");
+  });
+
+  it("preserves independent red and unknown causes alongside a stale selection", () => {
+    const overrides = { getDesiredClaudeActivityHooks: () => ({ status: "known" as const, selected: true }) };
+    // A stopped seat restore can't bring back (no saved startup context, no resume token) stays red.
+    expect(new RestoreCheckService(mockDeps({ ...overrides, probeQueueStore: () => ({ available: false, evidence: "broken" }),
+      getNodeInventory: () => [claudeNode({ sessionStatus: "exited" })],
+      getStartupContext: () => startupContextProbe({ status: "missing", evidence: "Persisted startup context missing" }),
+    })).check({}).verdict).toBe("not_restorable");
+    // One restore brings back (a fresh-start seat with its saved startup context) is named yellow instead, and doesn't
+    // block the rig on its own.
+    expect(new RestoreCheckService(mockDeps({ ...overrides, probeQueueStore: () => ({ available: false, evidence: "broken" }),
+      getNodeInventory: () => [claudeNode({ sessionStatus: "exited", restorePolicy: "relaunch_fresh" })],
+    })).check({}).verdict).toBe("restorable_with_caveats");
+    expect(new RestoreCheckService(mockDeps({ ...overrides, getRestoreInputs: () => { throw new Error("unreadable snapshot"); },
+    })).check({}).verdict).toBe("unknown");
+  });
+
+  it.each(["available", "missing-manifest", "malformed-manifest", "unreadable-relay", "disabled", "malformed-settings", "missing-event"])("inspects saved core plugin %s without treating selection as delivery", (kind) => {
+    const dir = "/custom-instance/plugins/openrig-core", cwd = "/fixture-project";
+    const settingsPath = path.join(cwd, ".claude/settings.local.json");
+    const files = new Map([
+      [path.join(dir, ".claude-plugin/plugin.json"), JSON.stringify({ name: "openrig-core", hooks: "./hooks/claude.json" })],
+      [path.join(dir, "hooks/claude.json"), JSON.stringify({ hooks: { Stop: [{ hooks: [{ command: "node activity-relay.cjs" }] }] } })],
+      [path.join(dir, "hooks/scripts/activity-relay.cjs"), "// fixture relay"],
+      [settingsPath, JSON.stringify({ disableAllHooks: kind === "disabled" })],
+    ]);
+    if (kind === "missing-manifest") files.delete(path.join(dir, ".claude-plugin/plugin.json"));
+    if (kind === "malformed-manifest") files.set(path.join(dir, ".claude-plugin/plugin.json"), "{");
+    if (kind === "malformed-settings") files.set(settingsPath, "{");
+    const service = new RestoreCheckService(mockDeps({
+      getNodeInventory: () => [claudeNode({ cwd })],
+      getStartupContext: () => startupContextProbe({ projectionEntries: [{ category: "plugin", absolutePath: dir }] }),
+      getClaudeActivityHookEvents: () => kind === "missing-event" ? ["Stop", "SessionStart", "PermissionRequest"] : ["Stop", "PermissionRequest"],
+      exists: f => files.has(f) || f.endsWith("host-infra.json"),
+      readFile: f => {
+        if (kind === "unreadable-relay" && f.endsWith("activity-relay.cjs")) throw new Error("unreadable");
+        if (files.has(f)) return files.get(f)!;
+        if (f.endsWith("host-infra.json")) return VALID_HOST_INFRA_DECLARATION;
+        throw new Error("missing");
+      },
+    }));
+    const hook = service.check({}).checks.find(c => c.check.endsWith(".hooks"));
+    expect(hook?.status).toBe(kind === "available" ? "green" : "yellow");
+    expect(hook?.evidence).toContain("Saved openrig-core plugin channel is selected");
+    expect(hook?.remediation).toBe("");
+  });
+
+  // A workspace restored onto another home: the saved selection names the old home's plugin folder. A plugin selected
+  // under the OpenRig home is read in this instance's home, as restore will launch it, so it still counts as selected.
+  it("reads a saved core plugin selected under the OpenRig home in this instance's home, after the home moved", () => {
+    const dir = "/custom-instance/plugins/openrig-core", cwd = "/fixture-project";
+    const files = new Map([
+      [path.join(dir, ".claude-plugin/plugin.json"), JSON.stringify({ name: "openrig-core", hooks: "./hooks/claude.json" })],
+      [path.join(dir, "hooks/claude.json"), JSON.stringify({ hooks: { Stop: [{ hooks: [{ command: "node activity-relay.cjs" }] }] } })],
+      [path.join(dir, "hooks/scripts/activity-relay.cjs"), "// fixture relay"],
+      [path.join(cwd, ".claude/settings.local.json"), JSON.stringify({})],
+    ]);
+    const service = new RestoreCheckService(mockDeps({
+      getNodeInventory: () => [claudeNode({ cwd })],
+      getStartupContext: () => startupContextProbe({ projectionEntries: [{ category: "plugin", resourcePath: "openrig-home:plugins/openrig-core",
+        absolutePath: "/old-home/.openrig/plugins/openrig-core" }] }),
+      getClaudeActivityHookEvents: () => ["Stop", "PermissionRequest"],
+      exists: f => files.has(f) || f.endsWith("host-infra.json"),
+      readFile: f => {
+        if (files.has(f)) return files.get(f)!;
+        if (f.endsWith("host-infra.json")) return VALID_HOST_INFRA_DECLARATION;
+        throw new Error("missing");
+      },
+    }));
+    const hook = service.check({}).checks.find(c => c.check.endsWith(".hooks"));
+    expect(hook?.status).toBe("green");
+    expect(hook?.evidence).toContain("Saved openrig-core plugin channel is selected");
+  });
+
+  it("keeps projected activity-resource evidence when a selected core plugin is broken", () => {
+    const cwd = "/fixture-project";
+    const settingsPath = path.join(cwd, ".claude", "settings.local.json");
+    const pluginDir = "/custom-instance/plugins/openrig-core";
+    const events = ["SessionStart", "UserPromptSubmit"];
+    const settings = JSON.stringify({ hooks: Object.fromEntries(events.map(event => [event, [{ hooks: [
+      { type: "command", command: `node '${RELAY_PATH}'` },
+    ] }]])) });
+    const service = new RestoreCheckService(mockDeps({
+      getNodeInventory: () => [claudeNode({ cwd })],
+      getStartupContext: () => startupContextProbe({ projectionEntries: [
+        { absolutePath: "/source/activity-hooks", category: "runtime_resource", resourceType: "claude_activity_hooks" },
+        { absolutePath: pluginDir, category: "plugin" },
+      ] }),
+      getClaudeActivityHookEvents: () => events,
+      exists: () => true,
+      readFile: candidate => {
+        if (candidate === settingsPath) return settings;
+        if (candidate === path.join(pluginDir, ".claude-plugin", "plugin.json")) return "{";
+        return VALID_HOST_INFRA_DECLARATION;
+      },
+    }));
+
+    const result = service.check({});
+    const hook = result.checks.find(entry => entry.check === "seat.dev-impl@test-rig.hooks");
+    expect(hook).toMatchObject({ status: "yellow", remediation: "" });
+    expect(hook?.evidence).toContain(`activity hooks are projected in ${settingsPath}`);
+    expect(hook?.evidence).toContain(`relay present at ${RELAY_PATH}`);
+    expect(hook?.evidence).toContain("hook execution is not verified");
+    expect(hook?.evidence).toContain("Saved openrig-core plugin channel is selected but its assets could not be trusted");
+    expect(result.verdict).toBe("restorable_with_caveats");
+    expect(result.readiness.status).toBe("ready_with_caveats");
+    expect(result.repairPacket?.some(step => step.rationale === hook?.evidence) ?? false).toBe(false);
   });
 
   it("Codex and infrastructure hook checks are green not-applicable without hook repair steps", () => {
@@ -1530,8 +1807,9 @@ describe("RestoreCheckService", () => {
 
     const result = service.check({ noHooks: true }) as any;
 
-    // The stopped-seat red still wins the aggregate; the input unknown stays named.
-    expect(result.readiness.status).toBe("not_ready");
+    // With restore's inputs unreadable, what restore does with the stopped seat is unknown (a caveat), so the unknown
+    // restore input decides the aggregate, and stays named.
+    expect(result.readiness.status).toBe("unknown");
     expect(result.rigs[0].status).toBe("unknown");
     expect(result.recovery).toEqual({
       status: "unknown",

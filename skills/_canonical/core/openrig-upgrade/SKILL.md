@@ -16,7 +16,6 @@ metadata:
     stage: factory-approved
     sibling_skills:
       - openrig-user
-      - openrig-operator
       - forming-an-openrig-mental-model
 ---
 
@@ -43,6 +42,8 @@ Before acting, name the rigs and seats whose continuity matters. On a production
 host, use the host's normal operator ceremony. On a recovery-friendly build VM,
 the orchestrator may adopt a tested runtime directly, but still observes each
 step and stops on unexplained drift.
+
+For opt-in **delivery-only** maintenance, read `rig context get reference/daemon-http-clients.md#per-rig-delivery-drain`: `/api/rigs/:rigId/delivery-drain` requires an explicit END; **automatic native starts are NOT deferred**.
 
 ## When recovery crosses an instance boundary
 
@@ -99,9 +100,10 @@ node "$SKILL_DIR/scripts/backup-sqlite.mjs" \
   --destination "/safe/path/openrig-before-upgrade.sqlite"
 ```
 
-The helper refuses to overwrite a destination, uses SQLite's backup operation,
-and verifies the backup with `PRAGMA integrity_check`. It does not stop the
-daemon or restore a database.
+The helper refuses to overwrite a destination, uses the `sqlite3` CLI `.backup`
+command when available (falling back to an in-process backup via `node:sqlite`
+when the CLI is absent), and verifies the backup with `PRAGMA integrity_check`.
+It does not stop the daemon or restore a database.
 
 ### Plan or apply safe managed-plugin refreshes
 
@@ -225,11 +227,17 @@ host in front of you.
    process are gone. If the command returns while either remains, stop: inspect
    identity and use the host's authorized recovery procedure. Do not blindly
    signal a PID.
-7. Start the target with `rig daemon start` or the host's known wrapper. Verify
-   daemon status, process path, listener, version, and database integrity.
-8. Run the plugin refresh helper in plan mode. Apply safe writes only after the
-   three roots and classifications make sense; resolve preserved paths one at a
-   time when required.
+7. Before starting the target, account for its startup refresh of managed plugins
+   and marked global skills. This runtime preserves differing replaced files under
+   `$OPENRIG_HOME/backups/managed-refresh/` and reports each recovery path; if the
+   target lacks that preservation, copy those trees first. Start it with
+   `rig daemon start` or the host's known wrapper. Verify daemon status, process
+   path, listener, version, and database integrity. Recovery copies retain bytes;
+   they do not promise custom behaviour remains active after refresh.
+8. Run the plugin refresh helper in plan mode. Its plan governs only the helper's
+   later writes, not startup writes that already happened. Apply safe writes only
+   after the three roots and classifications make sense; resolve preserved paths
+   one at a time when required.
 9. Verify protected seats with `rig ps --nodes -A --json`, representative
    `rig capture`, and `rig restore-check` where applicable. `-A` is required:
    without it the node read is your CURRENT rig only, and a daemon upgrade

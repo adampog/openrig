@@ -4,7 +4,7 @@
 // spec is uncached, and missed-item re-creation (the crash-surviving
 // guarantee's honest twin: one OPEN item per occurrence at all times).
 
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,6 +14,8 @@ import { migrate } from "../src/db/migrate.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { OutboxHandler } from "../src/domain/outbox-handler.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
+import { makeTopologyDestinationCheck, makeQueueRecordingCheck } from "../src/domain/queue-destination-check.js";
+import { loadHumanRegistry } from "../src/domain/gateway/human-registry.js";
 import { WatchdogJobsRepository } from "../src/domain/watchdog-jobs-repository.js";
 import { WorkflowRuntime } from "../src/domain/workflow-runtime.js";
 import { runWorkflowBootSweep } from "../src/domain/workflow-boot-sweep.js";
@@ -63,7 +65,10 @@ describe("WF-5 FR-2 class (b): detection-time stuck exception items", () => {
     migrate(db, ALL_MIGRATIONS);
     const bus = new EventBus(db);
     db.prepare(`INSERT INTO rigs (id, name) VALUES ('r-1', 'rig')`).run();
-    const queueRepo = new QueueRepository(db, bus, { validateRig: () => true });
+    const topology = makeTopologyDestinationCheck({
+      findRigsByName: name => db.prepare("SELECT id FROM rigs WHERE name = ?").all(name), loadHumanRegistry,
+    });
+    const queueRepo = new QueueRepository(db, bus, { validateRig: topology, canRecordDestination: makeQueueRecordingCheck(topology) });
     queueRepo.attachOutbox(new OutboxHandler(db));
     const runtime = new WorkflowRuntime({ db, eventBus: bus, queueRepo });
     const watchdogJobsRepo = new WatchdogJobsRepository(db);
@@ -104,6 +109,18 @@ describe("WF-5 FR-2 class (b): detection-time stuck exception items", () => {
     rmSync(tmp, { recursive: true, force: true });
   });
 
+  it.each(["orch-lead@absent-rig", "ops-rescue@{rig}"])("production recording sends a stuck exception to the person before creating for %s", async destination => {
+    const f = await build(SPEC.replace("wf5-stuck-pipeline", "wf5-stuck-unavailable").replace("orch-lead@rig", destination));
+    expect(f.queueRepo.acceptsDestination(destination)).toBe(false);
+    const create = vi.spyOn(f.queueRepo, "create");
+    const result = await sweep(f);
+    expect(result.exceptionItemsCreated).toBe(1);
+    expect(exceptionRows(db)).toMatchObject([{ destination_session: "human@host", tier: "human-gate" }]);
+    expect(create.mock.calls.map(([input]) => input.destinationSession)).toEqual(["human@host"]);
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({ humanAlert: true }));
+    expect(db.prepare("SELECT 1 FROM queue_items WHERE destination_session = ?").get(destination)).toBeUndefined();
+  });
+
   it("the sweep creates ONE item for an overdue instance, routed per the dial with the ordinary tier and the occurrence tag", async () => {
     const f = await build();
     const result = await sweep(f);
@@ -128,6 +145,20 @@ describe("WF-5 FR-2 class (b): detection-time stuck exception items", () => {
     const second = await sweep(f);
     expect(second.stuckSurfaced).toBe(1);
     expect(second.exceptionItemsCreated).toBe(0);
+    expect(exceptionRows(db)).toHaveLength(1);
+  });
+
+  it("routes an overdue exception to its owner despite a Slack failure notice at the sender", async () => {
+    const f = await build();
+    const notice = () => f.queueRepo.create({ sourceSession: "ops@rig", destinationSession: "ops@rig",
+      body: "The human notice could not be delivered.", nudge: false,
+      tags: ["slack-undeliverable", `recovery-for:${f.packetId}`] });
+    await notice();
+    expect((await sweep(f)).exceptionItemsCreated).toBe(1);
+    expect(exceptionRows(db)).toHaveLength(1);
+    expect(exceptionRows(db)[0]!.destination_session).toBe("orch-lead@rig");
+    await notice();
+    expect((await sweep(f)).exceptionItemsCreated).toBe(0);
     expect(exceptionRows(db)).toHaveLength(1);
   });
 
@@ -165,6 +196,7 @@ describe("WF-5 FR-2 class (b): detection-time stuck exception items", () => {
       resolveRoute: () => null,
       humanFallbackSeat: "human@host",
     });
+    const create = vi.spyOn(f.queueRepo, "create");
     await runWorkflowBootSweep({
       instanceStore: f.runtime.instanceStore,
       queueRepo: f.queueRepo,
@@ -175,6 +207,8 @@ describe("WF-5 FR-2 class (b): detection-time stuck exception items", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]!.destination_session).toBe("human@host");
     expect(rows[0]!.tier).toBe("human-gate");
+    // A stuck workflow routed to the person is an approval whose wait costs now: it alerts.
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({ destinationSession: "human@host", humanAlert: true }));
   });
 
   it("a closed diagnostic is honored until a new underlying episode, without re-creating the same action", async () => {

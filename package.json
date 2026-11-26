@@ -1,6 +1,6 @@
 {
   "name": "openrig",
-  "version": "0.6.7",
+  "version": "0.7.1",
   "private": true,
   "license": "Apache-2.0",
   "type": "module",
@@ -19,16 +19,19 @@
     "typecheck:prep": "npm run build -w packages/daemon",
     "lint": "npm run typecheck:prep && tsc --noEmit --project packages/daemon/tsconfig.json && tsc --noEmit --project packages/ui/tsconfig.json && tsc --noEmit --project packages/cli/tsconfig.json && tsc --noEmit --project packages/tui/tsconfig.json",
     "build:package": "bash scripts/build-package.sh",
+    "pack:release": "node scripts/pack-release.mjs",
     "test:tui-package": "node scripts/test-tui-package.mjs",
     "mirror-skills": "node scripts/mirror-skills.mjs",
     "mirror-skills:check": "node scripts/mirror-skills.mjs --check",
     "generate-context-packs": "node scripts/generate-context-packs.mjs",
     "generate-context-packs:check": "node scripts/generate-context-packs.mjs --check",
     "gate:substance": "node scripts/check-substance-gate.mjs",
-    "gate": "node scripts/gate-lane.mjs"
+    "gate": "node scripts/gate-lane.mjs",
+    "test:mcp-package": "node scripts/test-mcp-package.mjs"
   },
   "engines": {
-    "node": "^22 || ^24"
+    "node": "^22.14.0 || ^24",
+    "npm": ">=10"
   },
   "allowScripts": {
     "better-sqlite3@13.0.3": true,

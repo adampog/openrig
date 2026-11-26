@@ -1,3 +1,4 @@
+import stringWidth from "string-width";
 import { describe, expect, it } from "vitest";
 import { createViewState } from "../src/state.js";
 import { parseCommand } from "../src/grammar.js";
@@ -48,7 +49,7 @@ describe("PULSE view (5.2 Wave B — increment 1: static skeleton from the appro
     expect(body).toContain("dev50-driver@openrig-build");
     // label==referent: the blocking AGENT is named (resolved blockerSession), NOT the qitem pointer
     expect(body).toContain("blocked on review-r1@openrig-build");
-    expect(body).not.toContain("qitem-20260805-review");
+    expect(body).not.toContain("qitem-demo-05-review");
     expect(body).toContain("terminal verdict for 51209941");
     expect(body).not.toContain("human sign-off pending"); // human-blocked → not here
 
@@ -63,8 +64,16 @@ describe("PULSE view (5.2 Wave B — increment 1: static skeleton from the appro
     expect(iBlocked).toBeLessThan(iLanes);
   });
 
+  it("draws JUST FINISHED clocks in the TUI's time zone", () => {
+    const v = createViewState({ instanceId: "t", timeZone: "Asia/Kolkata", ...withSnap });
+    v.dispatch({ type: "tab", tab: "pulse" });
+    const body = renderScreen(v.get(), snap, { cols: 140, rows: 44, nowMs: DEMO_NOW }).lines.join("\n");
+    expect(body).toContain("17:14");
+    expect(body).not.toContain("11:44");
+  });
+
   it("builds the three lanes + footer LIVE from the demo snapshot (label==referent honesty)", () => {
-    const v = createViewState({ instanceId: "t", ...withSnap });
+    const v = createViewState({ instanceId: "t", timeZone: "UTC", ...withSnap });
     v.dispatch({ type: "tab", tab: "pulse" });
     const body = renderScreen(v.get(), snap, { cols: 140, rows: 44, nowMs: DEMO_NOW }).lines.join("\n");
 
@@ -394,4 +403,42 @@ describe("PULSE view (5.2 Wave B) — tab-strip active PULSE renders bold [P2]",
     // the trailing active "PULSE" is the bold token; "[ PULSE ]" is dim, not bold
     expect(boldText(tabLine)).toContain("PULSE");
   });
+});
+
+it.each([
+  { kind: "wide characters", label: "界".repeat(36), clipped: true },
+  { kind: "combining characters", label: "e\u0301".repeat(36), clipped: true },
+  { kind: "short combining labels", label: "e\u0301".repeat(12), clipped: false },
+])("holds the next Pulse lane at its terminal column after $kind", ({ label, clipped }) => {
+  const { lanes } = demoPulseModel();
+  const [now, finished] = lanes;
+  now.rows[0]!.label = label;
+  finished.rows[0]!.label = "finish-marker";
+  const plain = renderLanes(lanes)[0]!.text;
+  const at = plain.indexOf("finish-marker");
+  expect(at).toBeGreaterThan(0);
+  const prefix = `${finished.rows[0]!.glyph} ${finished.rows[0]!.time ?? ""}`.trimEnd() + " ";
+  expect(stringWidth(plain.slice(0, at))).toBe(33 + stringWidth(prefix));
+  if (clipped) expect(plain).toContain("…   ");
+  else expect(plain).toContain(label);
+});
+
+it("keeps UP NEXT on the rendered Pulse screen when a NOW label has combining marks", () => {
+  const combining = structuredClone(snap);
+  combining.inProgress.find((q) => q.destinationSession === "dev50-driver@openrig-build")!.summary = "e\u0301".repeat(36);
+  const v = createViewState({ instanceId: "t", getSnapshot: () => combining });
+  v.dispatch({ type: "tab", tab: "pulse" });
+  const screen = renderScreen(v.get(), combining, { cols: 120, rows: 44, nowMs: DEMO_NOW, colorMode: "truecolor" });
+  const index = screen.lines.findIndex((line) => line.includes("e\u0301"));
+  expect(index).toBeGreaterThan(0);
+  const plain = screen.lines[index]!;
+  expect(stringWidth(plain)).toBe(120);
+  expect(plain).toContain("○ RM ceremony");
+
+  const styled = stylizeLines(screen, createStyle("truecolor"))[index]!;
+  expect(styled.replace(/\x1b\[[0-9;]*m/g, "")).toBe(plain);
+  expect(styled).toContain("RM ceremony");
+
+  const upNextColumn = stringWidth(plain.slice(0, plain.indexOf("○ RM ceremony"))) + 1;
+  expect(screen.contentTargets.some((t) => t.y === index + 1 && t.x1 <= upNextColumn && upNextColumn <= t.x2)).toBe(true);
 });

@@ -8,10 +8,12 @@ import type {
   SkillResource, GuidanceResource, SubagentResource, RuntimeResource, PluginResource,
 } from "./types.js";
 import type { ResolvedAgentSpec, ResourceCollision } from "./agent-resolver.js";
+import { resolveAuthoredCwd } from "./cwd-resolution.js";
 import { resolveStartup } from "./startup-resolver.js";
-import { discoverSkillsForRuntime, parseSkillFrontmatter, type SkillRuntime } from "./skill-discovery.js";
+import { discoverSkillsForRuntime, findNamedSkillsForRuntime, parseSkillFrontmatter, scanCacheFor, type SkillRuntime } from "./skill-discovery.js";
 import { inspectSkillDirectory, resolvePluginSkills, resolveSkillLoadout, type SkillLoadout } from "./skill-catalog.js";
 import { resolvePluginPath } from "./projection-planner.js";
+import { selectedCorePluginDir, vendoredCorePluginDir } from "./claude-core-plugin-env.js";
 
 // -- Types --
 
@@ -30,16 +32,25 @@ export interface ResolvedResources {
   runtimeResources: QualifiedResource[];
 }
 
+/** Where each selected plugin resolved to, as the projection and the plugin-skill loadout see it. */
+export function selectedPluginPaths(resources: ResolvedResources): string[] {
+  return resources.plugins.map((plugin) =>
+    resolvePluginPath((plugin.resource as PluginResource).source.path, plugin.sourcePath));
+}
+
 export interface ResolvedNodeConfig {
   runtime: string;
   model: string | undefined;
   effort: string | undefined;
+  advisor?: string;
   cwd: string;
   restorePolicy: string;
   /** OPR.0.5.6.20 — resolved continuity mode (canonical vocabulary; most-specific-wins). */
   compactionStrategy: string;
   /** Resolved continuity mechanic; absent unless explicitly declared. */
   mechanic: string | undefined;
+  /** #2940: the seat is relaunched when it falls (most-specific-wins; absent everywhere = false). */
+  keepAlive: boolean;
   lifecycle: LifecycleDefaults | undefined;
   selectedResources: ResolvedResources;
   startup: StartupBlock;
@@ -83,11 +94,27 @@ export interface ResolutionContext {
   /** A selected System World that could not be resolved. This is a launch
    *  refusal, never a silent fallback to the legacy catalog selector. */
   systemWorldError?: string;
+  /** One preflight's identity (#1653): its members share raw skill-library and catalog scans of identical inputs.
+   *  Absent, every resolution reads the filesystem fresh. */
+  scanScope?: string;
 }
 
 export type ResolutionResult =
   | { ok: true; config: ResolvedNodeConfig }
   | { ok: false; errors: string[] };
+
+/** Inspect only the authored runtime-resource selection: no skill discovery, projection or startup resolution. */
+export function resolveProfileRuntimeResources(
+  base: ResolvedAgentSpec, imports: ResolvedAgentSpec[], profileName: string,
+): { ok: true; resources: QualifiedResource[] } | { ok: false; errors: string[] } {
+  const profile = base.spec.profiles[profileName];
+  if (!profile) return { ok: false, errors: [`Profile "${profileName}" not found in spec "${base.spec.name}"`] };
+  const errors: string[] = [];
+  const selected = resolveProfileUses({ ...profile, uses: {
+    skills: [], guidance: [], subagents: [], plugins: [], runtimeResources: profile.uses.runtimeResources,
+  } }, buildResourcePool(base, imports), base.spec.name, errors);
+  return selected ? { ok: true, resources: selected.runtimeResources } : { ok: false, errors };
+}
 
 // -- Constants --
 
@@ -111,6 +138,14 @@ const RESTORE_POLICY_LEVEL: Record<string, number> = {
 
 // -- Public API --
 
+/** Resolve member > profile > agent Advisor preferences, skipping blank or non-string candidates. */
+export function resolveAdvisorModel(member: unknown, profile?: unknown, defaults?: unknown): string | undefined {
+  for (const candidate of [member, profile, defaults]) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+  }
+  return undefined;
+}
+
 /**
  * Resolve effective node configuration from agent spec, profile, and rig context.
  * @param ctx - resolution context with all inputs
@@ -126,6 +161,10 @@ export function resolveNodeConfig(ctx: ResolutionContext): ResolutionResult {
   const profile = spec.profiles[profileName];
   if (!profile) {
     return { ok: false, errors: [`Profile "${profileName}" not found in spec "${spec.name}". Available: ${Object.keys(spec.profiles).join(", ") || "(none)"}` ] };
+  }
+
+  if (profile.uses.skills.some((ref) => typeof ref !== "string")) {
+    return { ok: false, errors: [`Profile "${profileName}" has a non-string skill ID`] };
   }
 
   // 2. Build combined resource pool
@@ -152,11 +191,11 @@ export function resolveNodeConfig(ctx: ResolutionContext): ResolutionResult {
     ? rawEffort.trim()
     : undefined;
 
+  const advisor = resolveAdvisorModel(member.advisor, profile.preferences?.advisor, spec.defaults?.advisor);
+
   const cwd = ctx.cwdOverride
     ? nodePath.resolve(ctx.cwdOverride)
-    : ctx.specRoot
-      ? (nodePath.isAbsolute(member.cwd) ? member.cwd : nodePath.resolve(ctx.specRoot, member.cwd))
-      : member.cwd;
+    : resolveAuthoredCwd(member.cwd, ctx.specRoot || null);
 
   // 2b. Augment the pool with filesystem-discovered skills. Rig-local
   // resources.skills (already in the pool from buildResourcePool) win
@@ -167,14 +206,20 @@ export function resolveNodeConfig(ctx: ResolutionContext): ResolutionResult {
   // skill-discovery.listScanRoots; here we only enforce that
   // rig-local declarations are not overwritten by discovery.
   let rejectedSkillsByBasename: Map<string, { path: string; reason: string }> = new Map();
+  const scanCache = scanCacheFor(ctx.scanScope);
   if (runtime === "claude-code" || runtime === "codex" || runtime === "pi") {
-    const discovery = discoverSkillsForRuntime({
+    const discoveryPaths = {
       runtime: runtime as SkillRuntime,
       homedir: ctx.homedir ?? osHomedir(),
       cwd,
       specInstallDir: ctx.specRoot,
       ...(ctx.skillsRoot ? { skillsRoot: ctx.skillsRoot } : {}),
-    });
+    };
+    // #1653: only skills the profile names can be selected, so look those up by folder. Scanning every skill on the
+    // machine, once per member, froze the daemon on a large user folder; it now runs only for a name not found that way.
+    const wanted = new Set(profile.uses.skills.filter((ref) => !pool.skills.has(ref)));
+    const named = findNamedSkillsForRuntime(discoveryPaths, wanted);
+    const discovery = named.length === wanted.size ? { skills: named, rejected: [] } : discoverSkillsForRuntime(discoveryPaths, scanCache);
     for (const discovered of discovery.skills) {
       if (pool.skills.has(discovered.id)) continue; // rig-local-wins
       pool.skills.set(discovered.id, [{
@@ -194,8 +239,27 @@ export function resolveNodeConfig(ctx: ResolutionContext): ResolutionResult {
     }
   }
 
+  // S04 — compose independently-selected managed skills around the existing
+  // topology selector (profile.uses.skills). System comes from catalog.yaml;
+  // project comes from project.yaml install.skills. Topology resources that
+  // are not catalog-managed retain the established AgentSpec/local behavior.
+  const catalogRoot = ctx.skillsRoot ?? nodePath.join(ctx.homedir ?? osHomedir(), ".openrig", "skills");
+  const catalogResult = resolveSkillLoadout({
+    catalogRoot,
+    ...(ctx.systemSkills !== undefined ? { systemSkills: ctx.systemSkills } : {}),
+    topologySkills: profile.uses.skills,
+    projectRoot: cwd,
+    allowMissingTopology: true,
+    scanCache,
+  });
+  // Discovery reads only the working tree, so it can't find a catalog skill whose folder or SKILL.md was deleted or
+  // whose name was edited. A profile skill the catalog skipped for uncommitted content is named below, not missing.
+  const skippedTopology = new Set(catalogResult.ok
+    ? (catalogResult.loadout.skipped ?? []).filter((skip) => skip.selectedBy.includes("topology")).map((skip) => skip.id)
+    : []);
+
   // 3. Resolve profile uses against the augmented pool
-  const selectedResult = resolveProfileUses(profile, pool, spec.name, errors);
+  const selectedResult = resolveProfileUses(profile, pool, spec.name, errors, skippedTopology);
   if (errors.length > 0) {
     // Augment "skills: \"<id>\" not found in resource pool" errors
     // with the structural-rejection reason when the basename matches
@@ -212,22 +276,26 @@ export function resolveNodeConfig(ctx: ResolutionContext): ResolutionResult {
     return { ok: false, errors: enhanced };
   }
 
-  // S04 — compose independently-selected managed skills around the existing
-  // topology selector (profile.uses.skills). System comes from catalog.yaml;
-  // project comes from project.yaml install.skills. Topology resources that
-  // are not catalog-managed retain the established AgentSpec/local behavior.
-  const catalogRoot = ctx.skillsRoot ?? nodePath.join(ctx.homedir ?? osHomedir(), ".openrig", "skills");
-  const catalogResult = resolveSkillLoadout({
-    catalogRoot,
-    ...(ctx.systemSkills !== undefined ? { systemSkills: ctx.systemSkills } : {}),
-    topologySkills: profile.uses.skills,
-    projectRoot: cwd,
-    allowMissingTopology: true,
-  });
   if (!catalogResult.ok) {
     return { ok: false, errors: catalogResult.errors.map((error) => `${error.code}: ${error.message}`) };
   }
-  const skillWarnings: string[] = [];
+  const skips = catalogResult.loadout.skipped ?? [];
+  const skillWarnings: string[] = skips.map((skip) => skip.message);
+  // Filesystem discovery scans the catalog's working tree too, and a profile may declare a source inside a catalog
+  // folder, so a skipped folder's bytes could still reach the adapter through the profile's selection. Drop a
+  // selection whose source is a skipped folder or inside one; a source elsewhere, such as a rig bundle, keeps it.
+  const skippedDirs = skips.map((skip) => ({ real: realDir(skip.sourceDir), dir: skip.sourceDir }));
+  for (let i = selectedResult!.skills.length - 1; i >= 0 && skippedDirs.length > 0; i--) {
+    const entry = selectedResult!.skills[i]!;
+    const resource = entry.resource as SkillResource;
+    const source = realDir(nodePath.isAbsolute(resource.path) ? resource.path : nodePath.resolve(entry.sourcePath, resource.path));
+    const skipped = skippedDirs.find(({ real }) => source === real || isWithin(real, source));
+    if (!skipped) continue;
+    selectedResult!.skills.splice(i, 1);
+    if (!skips.some((skip) => skip.id === entry.effectiveId && skip.selectedBy.length > 0)) {
+      skillWarnings.push(`selected_skill_skipped: '${entry.effectiveId}' (selected by topology) is inside ${skipped.dir}, which has uncommitted content; a copy already projected is kept as it was, and the new content is not projected until it is committed or restored`);
+    }
+  }
   for (const managed of catalogResult.loadout.entries) {
     const qualified: QualifiedResource = {
       effectiveId: managed.id,
@@ -291,9 +359,13 @@ export function resolveNodeConfig(ctx: ResolutionContext): ResolutionResult {
     const selectedIds = new Set(selectedResult!.skills.map((skill) => skill.effectiveId));
     for (const plugin of selectedResult!.plugins) {
       const resource = plugin.resource as PluginResource;
+      const pluginRoot = resolvePluginPath(resource.source.path, plugin.sourcePath);
+      // Except the vendored openrig-core on a Claude seat: the seat loads that plugin itself, skills included
+      // (CLAUDE_CODE_PLUGIN_DIRS, by seatCorePluginDir's rule), so a loadout copy would load each skill twice.
+      if (runtime === "claude-code" && vendoredCorePluginDir() && selectedCorePluginDir([pluginRoot])) continue;
       const pluginSkills = resolvePluginSkills({
         pluginId: resource.id,
-        pluginRoot: resolvePluginPath(resource.source.path, plugin.sourcePath),
+        pluginRoot,
         runtime,
         pluginType: resource.pluginType,
       });
@@ -343,10 +415,12 @@ export function resolveNodeConfig(ctx: ResolutionContext): ResolutionResult {
       runtime,
       model,
       effort,
+      advisor,
       cwd,
       restorePolicy: restorePolicyResult.policy,
       compactionStrategy: compactionResult.strategy,
       mechanic: mechanicResult.mechanic,
+      keepAlive: resolveKeepAlive(spec, profile, member),
       lifecycle,
       selectedResources: selectedResult!,
       startup,
@@ -361,6 +435,20 @@ export function resolveNodeConfig(ctx: ResolutionContext): ResolutionResult {
       ...(skillWarnings.length ? { skillWarnings } : {}),
     },
   };
+}
+
+function realDir(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return nodePath.resolve(path);
+  }
+}
+
+/** True when `child` is strictly inside `root`; `root-other` beside `root` is not. */
+function isWithin(root: string, child: string): boolean {
+  const rel = nodePath.relative(root, child);
+  return rel !== "" && rel !== ".." && !rel.startsWith(`..${nodePath.sep}`) && !nodePath.isAbsolute(rel);
 }
 
 /** Only profile-selected resources reach this check. Ambient cwd/home discovery
@@ -450,6 +538,8 @@ function resolveProfileUses(
   pool: ResourcePool,
   baseSpecName: string,
   errors: string[],
+  /** Skill references the managed catalog skipped for uncommitted content: reported there, never missing here. */
+  skippedSkills: ReadonlySet<string> = new Set(),
 ): ResolvedResources | null {
   const result: ResolvedResources = {
     skills: [],
@@ -472,6 +562,7 @@ function resolveProfileUses(
     for (const ref of refs) {
       const entries = pool[cat].get(ref);
       if (!entries || entries.length === 0) {
+        if (cat === "skills" && skippedSkills.has(ref)) continue;
         errors.push(`Profile uses ${cat}: "${ref}" not found in resource pool`);
         continue;
       }
@@ -523,6 +614,17 @@ function resolveCompactionStrategy(
     current = canonical;
   }
   return { ok: true, strategy: current };
+}
+
+/** #2940: keep_alive is most-specific-wins like the continuity mode (spec default < profile < member), and either
+ *  direction: a member can turn off what its agent spec turns on. A level that doesn't declare it doesn't participate;
+ *  absent everywhere is off. The schemas have already refused a value that isn't a boolean. */
+export function resolveKeepAlive(
+  spec: Pick<AgentSpec, "defaults">,
+  profile: Pick<ProfileSpec, "lifecycle"> | undefined,
+  member: Pick<RigSpecPodMember, "keepAlive">,
+): boolean {
+  return member.keepAlive ?? profile?.lifecycle?.keepAlive ?? spec.defaults?.lifecycle?.keepAlive ?? false;
 }
 
 /** S20 A8: mechanic follows the exact shipped strategy path: spec default < profile < member. */
