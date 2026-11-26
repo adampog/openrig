@@ -1,3 +1,18 @@
+<!-- BEGIN TWO-SEAT-OVERRIDE-20261019 -->
+# Two-seat restore — 2026-10-19
+
+Alan authorized this rig to run exactly two seats. This dated instruction supersedes legacy multi-seat, bench, Jev routing and QA-only role text for these seats.
+
+- orch.lead: Claude Code, model opus; owns planning, scope and independent review/checks of the exact builder candidate.
+- dev.qa: existing Codex conversation retained under its stable name; now owns implementation, builds and repairs. It does not approve its own work.
+- Use seat-local sub-agents for parallel, exploratory and throwaway work. Do not add persistent seats.
+- Keep the existing project/hardware boundaries. Resuming the rig authorizes checking the queue/docs, not new hardware, flash or publish work.
+
+On resume run `rig whoami --json`, then read this note, `docs/seat-history/README.md` and current job/mission stop notes. Retired histories are uncommitted under `docs/seat-history/retired-20261019/`. Preserve original native conversations and handover gaps honestly.
+
+Pocket-tank hard hold: Alan stopped CoreS3 touch work on 2026-10-14. It remains stopped. Do not restart CoreS3 touch, hardware, flashing, serial access, radio activity, publishing or pushes without Alan explicitly authorizing that specific work.
+<!-- END TWO-SEAT-OVERRIDE-20261019 -->
+
 # pocket-tank-build culture
 
 The pocket-tank-build team builds and tests pocket-tank, the human's own project: a 14.3M-parameter
@@ -236,10 +251,6 @@ the commands as written. A seat added later does not get the rig's culture, so e
 `CULTURE.md` itself; and `--rig-root` is needed because a relative path would otherwise resolve
 against the daemon's folder. The `WORKDIR` placeholder is replaced by `sed` because a seat added
 this way would otherwise work in the rig folder.
-
-`rig add` joins the new seat to the rig's open Herdr wall and waits for that, so it can take a few
-seconds; a join that fails is reported as a warning and the seat is still added. Add `--no-view`
-to skip Herdr, for example when no wall is open.
 
 Count what is running before you start one (the limit is three):
 

@@ -85,6 +85,6 @@ These are operator instructions, not actions in slice 01. The dedicated path avo
 repinning the existing Omarchy rigs' definition worktree. The operator clones firmware,
 configures project firmware and Jev, chooses central versus project mission placement,
 and proves actual build/native tests in slice 02. Do not launch from a switching checkout.
-See CULTURE.md for start/stop/remove commands and `rig add --no-view`.
+See CULTURE.md for start/stop/remove commands.
 
 Local commits only; pushing requires the human's go-ahead through advisor.

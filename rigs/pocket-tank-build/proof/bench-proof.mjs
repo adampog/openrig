@@ -2,7 +2,7 @@
 // Proof for pocket-tank-rig slice 01, bench seats. Runs the pocket-tank-build definition on a PRIVATE
 // daemon and tmux server (the repo's hermetic scaffold) with every seat's runtime swapped to `stub`,
 // and drives it with the exact commands CULTURE.md gives the orchestrator. It never touches the daemon
-// or tmux you run on, ~/.openrig, Herdr (every add runs with --no-view), or the pocket-tank repo.
+// or tmux you run on, ~/.openrig, or the pocket-tank repo.
 //
 //   node --import tsx rigs/pocket-tank-build/proof/bench-proof.mjs
 //
@@ -111,7 +111,7 @@ try {
   // [pod, bench file, member id]. Every bench seat is an implementer.
   const bench = [["dev", "fable", "fable"], ["dev", "codex", "codex"], ["dev", "qwen", "qwen"], ["hw", "hw-expert", "expert"], ["ml", "ml-expert", "expert"]];
   for (const [pod, file, id] of bench) {
-    const r = await sh(`${CMD.start(pod, file)} --no-view`, cwdOf(`${pod}-${id}`));
+    const r = await sh(CMD.start(pod, file), cwdOf(`${pod}-${id}`));
     check(`start ${pod}.${id} with the CULTURE.md command`, r.code === 0, (r.stdout + r.stderr).trim().split("\n").slice(0, 3).join(" | "));
     check(`${pod}.${id} was handed the rig's culture`, agentsMd(`${pod}-${id}`).includes("pocket-tank-build culture"));
     check(`${pod}.${id} was handed its role guidance`, /# Role: Implementer/.test(await capture(`${pod}-${id}@${RIG_NAME}`)));
@@ -127,7 +127,7 @@ try {
   // mission NOTES). The startup entry in bench/*.yaml is what delivers CULTURE.md.
   const bare = join(scaffold.root, "bare.yaml");
   writeFileSync(bare, stringify({ member: { id: "bare", agent_ref: "local:../../packages/daemon/specs/agents/development/implementer", runtime: "stub", profile: "default", cwd: cwdOf("hw-bare") } }));
-  const bareAdd = await rigJson("add", rigId, "hw", bare, "--rig-root", rigDir, "--no-view");
+  const bareAdd = await rigJson("add", rigId, "hw", bare, "--rig-root", rigDir);
   check("control: a seat added without the startup entry lacks the rig's culture", bareAdd.code === 0 && !agentsMd("hw-bare").includes("pocket-tank-build culture") && agentsMd("hw-bare").includes("OpenRig default culture"));
 
   nodes = await psNodes();
@@ -157,7 +157,7 @@ try {
 
   // Extra builder from the template, on a chosen model, then removed.
   const extraCmd = CMD.extra.replace("<model>", "sonnet").replace("<id>", "extra1");
-  const extra = await sh(`${extraCmd} --no-view`, cwdOf("dev-extra1"));
+  const extra = await sh(extraCmd, cwdOf("dev-extra1"));
   check("add an extra builder from the template with the CULTURE.md command", extra.code === 0, (extra.stdout + extra.stderr).trim().split("\n").slice(0, 3).join(" | "));
   nodes = await psNodes();
   check("the extra builder is on the chosen model", nodes.find((n) => n.logicalId === "dev.extra1")?.model === "sonnet");
